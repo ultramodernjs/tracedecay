@@ -2284,6 +2284,7 @@ impl ProjectCognitiveRecallMountV1 {
         check_current_session_source_exclusion(
             &destination,
             source.session_id().as_str(),
+            source.source_key().as_str(),
             exclusions,
         )
         .map_err(|_| "caller_excluded_canonical_session")?;
@@ -2314,12 +2315,25 @@ impl ProjectCognitiveRecallMountV1 {
             stored.retrieval_anchor_id(),
             self.scope.project_id.as_str(),
             source.provider().as_str(),
-            canonical_session_id,
+            source.session_id().as_str(),
         )?;
-        selected
+        // Hydration may yield while the owning source is redacted, deleted or
+        // replaced. Recheck that same canonical owner before returning its text.
+        let refreshed = selected
             .authority
-            .validate_mount()
-            .map_err(|_| "current canonical observation mount changed")?;
+            .resolve_current_session_observation(
+                self.routing.active_provider(),
+                &destination,
+                observation_id,
+                &control.operation,
+            )
+            .await
+            .map_err(|_| "current canonical observation changed during hydration")?;
+        if refreshed.observation() != stored.observation()
+            || refreshed.retrieval_anchor() != stored.retrieval_anchor()
+        {
+            return Err("current canonical observation changed during hydration");
+        }
         control
             .operation
             .snapshot()
@@ -2499,12 +2513,19 @@ struct MountedCanonicalRecordStoreV1 {
 fn check_current_session_source_exclusion(
     destination: &OwnedExactScope,
     canonical_session_id: &str,
+    canonical_source_key: &str,
     exclusions: Option<&CognitiveRecallExclusions>,
 ) -> Result<(), RecallDenialReason> {
-    // The observation journey uses this same key for session deletion. A
-    // provider may omit that alias; the confirmed owning row still binds it.
+    // The confirmed owner supplies the canonical source key even when the
+    // provider omits it. The request-scoped session alias remains accepted.
     let source_key = destination.session_forget_source_key(canonical_session_id);
-    if exclusions.is_some_and(|exclusions| exclusions.source_refs.contains(&source_key)) {
+    if exclusions.is_some_and(|exclusions| {
+        exclusions.source_refs.contains(&source_key)
+            || exclusions
+                .source_refs
+                .iter()
+                .any(|key| key == canonical_source_key)
+    }) {
         return Err(RecallDenialReason::RequestExcluded {
             field: "source_refs".to_owned(),
         });
@@ -2842,6 +2863,15 @@ pub(crate) async fn advisory_memory_context_for_call(
             detail,
         ))
     };
+    let Some(runtime) =
+        tracedecay_runtime_core::native_runtime::tokio_handle("memory_provider.advisory_recall")
+    else {
+        return unavailable(
+            AdvisoryRecallUnavailableV1::RuntimeUnavailable,
+            "memory provider Tokio runtime unavailable",
+        );
+    };
+    tracedecay_runtime_core::native_runtime::in_tokio_context(runtime, async move {
     let memory_policy = match call.memory_policy {
         Ok(policy) => policy,
         Err((outcome, detail)) => return unavailable(outcome, &detail),
@@ -2954,6 +2984,7 @@ pub(crate) async fn advisory_memory_context_for_call(
              waiting for it; the host answer is delivered unchanged",
         ),
     }
+    }).await
 }
 
 /// How far past its own slice the advisory lane's outer net waits.
@@ -4371,6 +4402,8 @@ pub enum AdvisoryRecallUnavailableV1 {
     /// the provider failed to terminate, and it claims nothing about what the
     /// provider invocation is holding.
     LaneDeadlineExceeded,
+    /// The host's provider runtime is unavailable before any provider contact.
+    RuntimeUnavailable,
     /// The host clock could not stamp the recall.
     HostClockUnavailable,
     /// The derived request identity was not usable.
@@ -4416,6 +4449,7 @@ impl AdvisoryRecallUnavailableV1 {
             Self::PublicationWithheld => "advisory_publication_withheld",
             Self::DeadlineElapsed => "advisory_deadline_elapsed",
             Self::LaneDeadlineExceeded => "advisory_lane_deadline_exceeded",
+            Self::RuntimeUnavailable => "advisory_runtime_unavailable",
             Self::HostClockUnavailable => "advisory_host_clock_unavailable",
             Self::RequestIdentityInvalid => "advisory_request_identity_invalid",
             Self::RequestInvalid => "advisory_request_invalid",
@@ -10653,6 +10687,7 @@ mod current_session_content_tests {
             check_current_session_source_exclusion(
                 &destination,
                 &owning_row.session_id,
+                "canonical-source.current-session-content",
                 Some(&exclusions),
             ),
             Err(RecallDenialReason::RequestExcluded {
@@ -10663,6 +10698,7 @@ mod current_session_content_tests {
             check_current_session_source_exclusion(
                 &destination,
                 "session.foreign",
+                "canonical-source.foreign",
                 Some(&exclusions),
             )
             .is_ok()
@@ -10673,9 +10709,70 @@ mod current_session_content_tests {
             check_current_session_source_exclusion(
                 &other_destination,
                 &owning_row.session_id,
+                "canonical-source.current-session-content",
                 Some(&exclusions),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn canonical_source_exclusion_survives_caller_session_and_scope_digest_changes() {
+        let destination = OwnedExactScope::new(
+            "profile.current-session-content",
+            PROJECT,
+            "repository.current-session-content",
+            "worktree.current-session-content",
+            "refs/heads/current-session-content",
+            "later-caller-session",
+            format!("sha256:{}", "c".repeat(64)),
+        )
+        .unwrap();
+        let canonical_source_key = "canonical-source.previous-session";
+        let exclusions = CognitiveRecallExclusions {
+            source_refs: vec![canonical_source_key.to_owned()],
+            ..CognitiveRecallExclusions::default()
+        };
+        assert!(matches!(
+            check_current_session_source_exclusion(
+                &destination,
+                SESSION,
+                canonical_source_key,
+                Some(&exclusions),
+            ),
+            Err(RecallDenialReason::RequestExcluded { .. })
+        ));
+        let mut later = destination;
+        later.agent_session_id = "another-caller-session".to_owned();
+        later.resolved_scope_digest = format!("sha256:{}", "d".repeat(64));
+        assert!(matches!(
+            check_current_session_source_exclusion(
+                &later,
+                SESSION,
+                canonical_source_key,
+                Some(&exclusions),
+            ),
+            Err(RecallDenialReason::RequestExcluded { .. })
+        ));
+    }
+
+    #[test]
+    fn previous_session_content_uses_its_canonical_owner_instead_of_the_caller() {
+        let anchor = RetrievalAnchorId::new("anchor.previous-session-content").unwrap();
+        let outcome = complete(page(&anchor));
+        assert_eq!(
+            current_session_message_text(outcome, &anchor, PROJECT, PROVIDER, SESSION).unwrap(),
+            CONTENT
+        );
+        assert!(
+            current_session_message_text(
+                complete(page(&anchor)),
+                &anchor,
+                PROJECT,
+                PROVIDER,
+                "later-caller-session",
+            )
+            .is_err()
         );
     }
 

@@ -18,7 +18,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -42,7 +41,9 @@ use super::super::graph_activation::{
     install_injected_activation_gate, set_injected_activation_failures,
     set_injected_publication_deadline,
 };
-use super::super::tests::{OwnerSignals, application_context, query_authority};
+use super::super::tests::{
+    OwnerSignals, application_context, commit_fixture_checkout, query_authority,
+};
 use super::{CodeIndexSchedulerRegistryV1, CodeIndexSeatParkV1, CodeIndexSeatWaitV1};
 use crate::project_reads::project_code_graph_projection_read_port;
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
@@ -98,9 +99,7 @@ impl Fixture {
         let project = root.path().join("project");
         fs::create_dir_all(project.join("src")).expect("create source root");
         fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("write source");
-        run_git_in(&project, &["init", "-q", "-b", "main"]);
-        run_git_in(&project, &["add", "."]);
-        run_git_in(&project, &["commit", "-qm", "fixture"]);
+        commit_fixture_checkout(&project);
 
         // Pre-create the scoped store hierarchy owner-private, exactly as the
         // daemon would have on an earlier run, so the only violation in play
@@ -575,6 +574,73 @@ async fn published_text_projection_outlasts_a_store_reader_beside_graph_activati
     fixture.registry.shutdown().await;
 }
 
+/// Graph activation waits for the publication's text projection to open its
+/// build and take its reservation, nothing more. Releasing it only after a
+/// first advance that also committed a corpus-sized page batch serialized the
+/// graph build behind that batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_activation_starts_before_the_published_text_projection_commits_a_page() {
+    let (fixture, admission) =
+        Fixture::mount_with_poisoned_artifacts_root_held("project.graph-before-pages", |_| {})
+            .await;
+    let scope = fixture
+        .registry
+        .serving_code_scope(&fixture.project)
+        .await
+        .expect("mounted scope");
+    let gate = install_injected_activation_gate(&scope.worktree_id);
+    let (opened, release_opened) = fixture
+        .registry
+        .pause_next_opened_published_text_projection(fixture.project.clone());
+    drop(admission);
+
+    tokio::time::timeout(CONVERGENCE_DEADLINE, opened)
+        .await
+        .expect("the published text projection opens its build")
+        .expect("opened gate sender");
+    tokio::time::timeout(CONVERGENCE_DEADLINE, gate.wait_until_started())
+        .await
+        .expect("graph activation starts beside the opened text projection");
+    let canonical = canonical_existing_identity(&fixture.project).expect("canonical project");
+    let text = {
+        let mounted = fixture.registry.mounted.lock().await;
+        mounted
+            .get(&canonical)
+            .expect("mounted worktree")
+            .text_generation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    .expect("the publication installed its text owner before activation");
+    let generation_id = text.metadata().manifest().generation_id.clone();
+    let committed_pages = text
+        .text_progress_slot
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot()
+        .filter(|progress| progress.generation_id == generation_id.as_str())
+        .map_or(0, |progress| progress.committed_pages);
+    assert_eq!(
+        committed_pages, 0,
+        "graph activation started only after the text projection committed source pages"
+    );
+
+    release_opened
+        .send(())
+        .expect("release the opened projection");
+    let mut signals = OwnerSignals::subscribe(&fixture.registry, &fixture.project).await;
+    tokio::time::timeout(CONVERGENCE_DEADLINE, async {
+        while !text.query_owners_are_ready() {
+            signals.changed().await;
+        }
+    })
+    .await
+    .expect("the text owner finishes its pages beside the held graph activation");
+    gate.release();
+    fixture.registry.shutdown().await;
+}
+
 /// Exact and lexical serving does not depend on native graph. A retryable
 /// activation failure used to replace the whole prepared triple with
 /// `Ok((Err, None, None))`, which failed the serving swap's own guard, so the
@@ -882,6 +948,150 @@ async fn a_seat_wait_answers_a_parked_worker_with_its_park() {
     fixture.registry.shutdown().await;
 }
 
+/// A worker re-woken as fast as it parks is never between passes when the
+/// wait looks: the successor pass is already running by then. The park a pass
+/// rewrote after the wait began still answers it once that pass has settled
+/// (#4238).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_wait_answers_a_rewritten_park_while_the_next_pass_is_already_running() {
+    let fixture =
+        Fixture::mount_with_poisoned_artifacts_root("project.seat-wait-busy", |_| {}).await;
+    fixture
+        .wait_for_seated_generation()
+        .await
+        .expect("a healthy worktree seats its generation");
+    let mut signals = OwnerSignals::subscribe(&fixture.registry, &fixture.project).await;
+    let deadline = (tokio::time::Instant::now() + CONVERGENCE_DEADLINE).into_std();
+    while !fixture
+        .registry
+        .subscribe_owner_activity(&fixture.project)
+        .await
+        .is_some_and(|activity| activity.pass_finished() && !activity.wake_pending())
+    {
+        signals.changed_before(deadline).await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never went idle"
+        );
+    }
+    let (park_slot, passes) = {
+        let canonical = canonical_existing_identity(&fixture.project).expect("canonical project");
+        let mounted = fixture.registry.mounted.lock().await;
+        let worktree = mounted.get(&canonical).expect("mounted worktree");
+        (
+            std::sync::Arc::clone(&worktree.convergence_park),
+            std::sync::Arc::clone(&worktree.reconcile_in_progress),
+        )
+    };
+    let park = || {
+        super::park_convergence(
+            &park_slot,
+            "injected contract violation".to_owned(),
+            "restore the violated contract",
+            None,
+            true,
+        );
+    };
+    park();
+
+    let waiting = std::sync::Arc::new(tokio::sync::Notify::new());
+    let wait = tokio::spawn({
+        let registry = fixture.registry.clone();
+        let project = fixture.project.clone();
+        let waiting = std::sync::Arc::clone(&waiting);
+        async move {
+            registry
+                .wait_for_seat(
+                    &project,
+                    std::time::Instant::now() + CONVERGENCE_DEADLINE,
+                    |_| {
+                        waiting.notify_one();
+                        async {
+                            Ok::<Option<CodeIndexSeatWaitV1<()>>, std::convert::Infallible>(None)
+                        }
+                    },
+                )
+                .await
+        }
+    });
+    waiting.notified().await;
+
+    let rewriting_pass = super::super::ReconcilePassGuard::enter(&passes);
+    park();
+    drop(rewriting_pass);
+    let _next_pass = super::super::ReconcilePassGuard::enter(&passes);
+
+    let waited = tokio::time::timeout(CONVERGENCE_DEADLINE, wait)
+        .await
+        .expect("a rewritten park ends the wait although the next pass is running")
+        .expect("wait task")
+        .expect("infallible probe");
+    let CodeIndexSeatWaitV1::Parked(CodeIndexSeatParkV1::Convergence(park)) = waited else {
+        panic!("the wait must answer with the rewritten park: {waited:?}");
+    };
+    assert_eq!(park.observed_passes, 2);
+    fixture.registry.shutdown().await;
+}
+
+/// A worker that panics outside its per-step guard is gone, so no pass will
+/// install the seat a read waits for. The worktree reports the panic as a
+/// terminal park on its freshness, and a readiness wait answers with that
+/// park instead of waiting out its budget (#4023).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicked_worker_parks_its_worktree_and_ends_seat_waits() {
+    let (fixture, held) =
+        Fixture::mount_with_poisoned_artifacts_root_held("project.worker-panic", |_| {}).await;
+    CodeIndexSchedulerRegistryV1::panic_next_worker_pass(&fixture.project);
+    drop(held);
+
+    let waited = tokio::time::timeout(
+        CONVERGENCE_DEADLINE,
+        fixture.registry.wait_for_readiness(
+            &fixture.project,
+            CodeIndexReadinessTargetV1::Ready,
+            CONVERGENCE_DEADLINE * 2,
+        ),
+    )
+    .await
+    .expect("a dead worker ends the wait before its budget")
+    .expect("freshness read");
+    let CodeIndexReadinessWaitReadV1::Unreachable { reason } = waited else {
+        panic!("the wait must answer with the dead worker's park: {waited:?}");
+    };
+    assert_eq!(reason, "code_index_convergence_parked");
+    let park = fixture
+        .registry
+        .dashboard_freshness(&fixture.project)
+        .await
+        .expect("mounted freshness")
+        .parked
+        .expect("status reports the dead worker");
+    assert!(
+        park.reason.contains("injected code-index worker panic"),
+        "{}",
+        park.reason
+    );
+    assert!(!park.retries_on_wake, "no wake reaches a dead worker");
+    assert!(
+        fixture
+            .registry
+            .subscribe_owner_activity(&fixture.project)
+            .await
+            .expect("mounted activity")
+            .pass_finished(),
+        "a dead worker runs no pass"
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .background_reconcile_admission()
+            .available_permits(),
+        1,
+        "a dead worker must give back its reconcile permit to other worktrees"
+    );
+    fixture.registry.shutdown().await;
+}
+
 /// A readiness wait (`status` `wait_for`) ends as soon as the registry is
 /// cancelled: a worktree shutting down installs nothing more, so the wait
 /// reports the closed registry instead of spending its budget.
@@ -912,21 +1122,4 @@ async fn a_readiness_wait_ends_when_the_registry_is_cancelled() {
     };
     assert_eq!(reason, "code_index_scheduler_registry_closed");
     fixture.registry.shutdown().await;
-}
-
-fn run_git_in(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_AUTHOR_NAME", "TraceDecay Test")
-        .env("GIT_AUTHOR_EMAIL", "test@tracedecay.invalid")
-        .env("GIT_COMMITTER_NAME", "TraceDecay Test")
-        .env("GIT_COMMITTER_EMAIL", "test@tracedecay.invalid")
-        .output()
-        .expect("git command should run");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }

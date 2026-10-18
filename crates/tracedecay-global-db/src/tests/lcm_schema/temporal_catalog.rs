@@ -8,7 +8,7 @@ use crate::tests::harness::{
     HostAdmissionScope, HostAdmissionTestRuntimeV1, seed_projected_messages,
 };
 
-#[tokio::test]
+#[asupersync::test]
 async fn fresh_temporal_schema_stores_and_searches_a_summary_node() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -67,7 +67,7 @@ async fn fresh_temporal_schema_stores_and_searches_a_summary_node() {
     assert!(rows.next().await.unwrap().is_none());
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_payload_manifest_schema_is_payload_global() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -179,7 +179,7 @@ async fn temporal_payload_manifest_schema_is_payload_global() {
 
 mod admission;
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_query_indexes_cover_exact_lookup_shapes() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -306,7 +306,7 @@ async fn temporal_schema_query_indexes_cover_exact_lookup_shapes() {
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_root_retrieval_indexes_cover_catalog_and_large_query_shapes() {
     const OCCURRENCE_ROOT_INDEX: &str = "idx_session_occurrences_root_generation_order";
     const SUMMARY_ROOT_INDEX: &str = "idx_session_summary_nodes_root_created_order";
@@ -631,7 +631,10 @@ async fn retained_root_index_rows(conn: &impl QueryExecutor) -> Vec<(&'static st
         ("session_temporal_resets", "session_id"),
         ("session_query_cursor_keys", "key_version"),
         ("session_relation_effect_journal", "session_id, generation"),
-        ("session_temporal_schema_migrations", "name"),
+        (
+            tracedecay_runtime_core::db::schema_version::TABLE,
+            "component",
+        ),
     ] {
         let mut rows = conn
             .query(&format!("SELECT * FROM {table} ORDER BY {order}"), ())
@@ -646,7 +649,7 @@ async fn retained_root_index_rows(conn: &impl QueryExecutor) -> Vec<(&'static st
     retained
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_root_occurrence_index_rebuild_preserves_registered_state() {
     let directory = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(directory.path())
@@ -682,6 +685,7 @@ async fn temporal_schema_root_occurrence_index_rebuild_preserves_registered_stat
         "session_occurrences",
         "source_cursors",
         "session_temporal_resets",
+        tracedecay_runtime_core::db::schema_version::TABLE,
     ] {
         assert!(
             retained
@@ -778,7 +782,7 @@ async fn temporal_schema_root_occurrence_index_rebuild_preserves_registered_stat
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_root_occurrence_index_rebuild_refuses_other_schema_drift() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sessions.db");
@@ -813,7 +817,7 @@ async fn temporal_schema_root_occurrence_index_rebuild_refuses_other_schema_drif
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_root_occurrence_index_rebuild_rolls_back_on_authority_drift() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sessions.db");
@@ -853,7 +857,7 @@ async fn temporal_schema_root_occurrence_index_rebuild_rolls_back_on_authority_d
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_root_occurrence_index_rebuild_rejects_unreleased_key_orders() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("sessions.db");
@@ -887,7 +891,7 @@ async fn temporal_schema_root_occurrence_index_rebuild_rejects_unreleased_key_or
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_rejects_unexpected_indexes_without_dropping_them() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -940,7 +944,7 @@ async fn temporal_schema_rejects_unexpected_indexes_without_dropping_them() {
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_refuses_markerless_malformed_fts_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -975,7 +979,7 @@ async fn temporal_schema_refuses_markerless_malformed_fts_without_mutation() {
         "unexpected reason: {reason}"
     );
     assert!(
-        !table_exists(&db_path, "session_temporal_schema_migrations").await,
+        !table_exists(&db_path, "tracedecay_schema_version").await,
         "typed refusal must not install the temporal marker"
     );
     assert!(
@@ -998,7 +1002,7 @@ async fn temporal_schema_refuses_markerless_malformed_fts_without_mutation() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_rejects_missing_fts_without_rebuilding_it() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -1070,7 +1074,7 @@ async fn temporal_schema_rejects_missing_fts_without_rebuilding_it() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_rejects_missing_graph_publication_authority_without_rebuilding_it() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");

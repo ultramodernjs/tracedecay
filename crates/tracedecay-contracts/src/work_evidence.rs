@@ -104,6 +104,8 @@ pub enum WorkEvidenceRootReadErrorV1 {
     Stale,
     #[error("Work evidence root authority is unavailable")]
     Unavailable,
+    #[error("Work evidence root storage failed: {0}")]
+    Storage(crate::WorkStorageFailureV1),
     #[error("Work evidence root read was cancelled")]
     Cancelled,
     #[error("Work evidence root read timed out")]
@@ -519,7 +521,7 @@ pub struct WorkEvidenceRetrievalServiceV1<R, A, T, S, H> {
 impl<R, A, T, S, H> WorkEvidenceRetrievalServiceV1<R, A, T, S, H>
 where
     R: WorkEvidenceRootReadPortV1,
-    A: WorkProductOwnerAuthorizationPortV1,
+    A: WorkProductOwnerAuthorizationPortV1 + Send + Sync,
     T: WorkAttemptReceiptReadPortV1,
     S: WorkTaskSessionPortV1,
     H: WorkAnchorHydrationPortV1,
@@ -755,6 +757,9 @@ where
             RequestAdmission::Admitted => {}
             RequestAdmission::Cancelled => return Err(WorkProductApplicationErrorV1::Cancelled),
             RequestAdmission::TimedOut => return Err(WorkProductApplicationErrorV1::TimedOut),
+            RequestAdmission::GrantExpired => {
+                return Err(WorkProductApplicationErrorV1::NotAuthorized);
+            }
         }
         request
             .selection
@@ -798,7 +803,7 @@ impl<R, A, T, S, H> WorkTaskSessionReauthorizationPortV1
     for WorkEvidenceRetrievalServiceV1<R, A, T, S, H>
 where
     R: WorkEvidenceRootReadPortV1,
-    A: WorkProductOwnerAuthorizationPortV1,
+    A: WorkProductOwnerAuthorizationPortV1 + Send + Sync,
     T: WorkAttemptReceiptReadPortV1,
     S: WorkTaskSessionPortV1,
     H: WorkAnchorHydrationPortV1,
@@ -982,7 +987,7 @@ fn validate_root(
         || root
             .relations
             .iter()
-            .any(|relation| !relation_touches_task(relation, &request.task_id))
+            .any(|relation| !relation.touches_task(&request.task_id))
         || root
             .proposal_decisions
             .iter()
@@ -999,28 +1004,6 @@ fn validate_root(
         return Err(WorkProductApplicationErrorV1::EvidenceAuthorityUnavailable);
     }
     Ok(())
-}
-
-fn relation_touches_task(relation: &WorkProductRelationV1, task_id: &TaskId) -> bool {
-    match relation {
-        WorkProductRelationV1::MilestoneContainsTask { task_id: task, .. }
-        | WorkProductRelationV1::Evidence { task_id: task, .. }
-        | WorkProductRelationV1::AcceptedAttempt { task_id: task, .. }
-        | WorkProductRelationV1::Handoff { task_id: task, .. }
-        | WorkProductRelationV1::ProposalDecision { task_id: task, .. } => task == task_id,
-        WorkProductRelationV1::Gates {
-            dependency,
-            dependent,
-        } => dependency == task_id || dependent == task_id,
-        WorkProductRelationV1::Informational { source, target } => {
-            source == task_id || target == task_id
-        }
-        WorkProductRelationV1::CausalCandidate { cause, effect } => {
-            cause == task_id || effect == task_id
-        }
-        WorkProductRelationV1::InitiativeContainsPlan { .. }
-        | WorkProductRelationV1::PlanContainsMilestone { .. } => false,
-    }
 }
 
 fn validate_task_session(
@@ -1082,6 +1065,7 @@ fn task_session_reauthorization_error(
         | WorkProductApplicationErrorV1::GraphAuthorityUnavailable
         | WorkProductApplicationErrorV1::EvidenceAuthorityUnavailable
         | WorkProductApplicationErrorV1::ProposalAuthorityUnavailable
+        | WorkProductApplicationErrorV1::Storage(_)
         | WorkProductApplicationErrorV1::CursorRefused(_)
         | WorkProductApplicationErrorV1::Cancelled
         | WorkProductApplicationErrorV1::TimedOut => {
@@ -1175,7 +1159,7 @@ fn hydration_omission(
     })
 }
 
-fn root_error(error: WorkEvidenceRootReadErrorV1) -> WorkProductApplicationErrorV1 {
+pub(crate) fn root_error(error: WorkEvidenceRootReadErrorV1) -> WorkProductApplicationErrorV1 {
     match error {
         WorkEvidenceRootReadErrorV1::NotFoundOrNotAuthorized => {
             WorkProductApplicationErrorV1::NotFoundOrNotAuthorized
@@ -1183,6 +1167,9 @@ fn root_error(error: WorkEvidenceRootReadErrorV1) -> WorkProductApplicationError
         WorkEvidenceRootReadErrorV1::Stale => WorkProductApplicationErrorV1::VersionConflict,
         WorkEvidenceRootReadErrorV1::Unavailable => {
             WorkProductApplicationErrorV1::EvidenceAuthorityUnavailable
+        }
+        WorkEvidenceRootReadErrorV1::Storage(failure) => {
+            WorkProductApplicationErrorV1::Storage(failure)
         }
         WorkEvidenceRootReadErrorV1::Cancelled => WorkProductApplicationErrorV1::Cancelled,
         WorkEvidenceRootReadErrorV1::TimedOut => WorkProductApplicationErrorV1::TimedOut,

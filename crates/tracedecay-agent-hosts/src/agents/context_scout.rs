@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracedecay_contracts::context_scout::{
-    ContextScoutAddressV1, ContextScoutCandidateV1, ContextScoutCategoryV1,
-    ContextScoutDeliveryOutcomeV1, ContextScoutDeliveryReceiptV1, ContextScoutDeliveryWindowV1,
-    ContextScoutDurableClaimV1, ContextScoutDurableQueueEntryV1,
+    ContextScoutAddressV1, ContextScoutCandidateEvidenceV1, ContextScoutCandidateV1,
+    ContextScoutCategoryV1, ContextScoutDeliveryOutcomeV1, ContextScoutDeliveryReceiptV1,
+    ContextScoutDeliveryWindowV1, ContextScoutDurableClaimV1, ContextScoutDurableQueueEntryV1,
     ContextScoutEvidenceAvailabilityV1, ContextScoutFeedbackKindV1, ContextScoutFeedbackV1,
     ContextScoutLeaseV1, ContextScoutModelBackendV1, ContextScoutModelOutcomeV1,
     ContextScoutModelReceiptV1, ContextScoutRouteV1, ContextScoutSuggestionEnvelopeV1,
@@ -31,8 +31,11 @@ use tracedecay_runtime_core::cancellation::{CancellationToken, MonotonicDeadline
 use tracedecay_tokenizer::o200k_base;
 
 pub mod address_registry;
+pub mod decision_engine;
+pub mod intent_pass;
 pub mod model;
 pub mod owner;
+pub mod session_window;
 
 const MAX_SCOUT_TEXT_BYTES: usize = 4 * 1024;
 const MAX_SCOUT_CANDIDATES: usize = 32;
@@ -47,7 +50,10 @@ mod store;
 #[cfg(test)]
 mod store_tests;
 
-pub use evidence::ContextScoutEvidenceEnvelopeExt;
+pub use evidence::{
+    ContextScoutCandidateEvidenceExt, ContextScoutEvidenceEnvelopeExt,
+    ContextScoutSessionClaimInputV1, ContextScoutSessionEvidenceExt,
+};
 pub use store::ProjectContextScoutDurableStoreV1;
 
 pub(crate) trait ContextScoutAddressExt {
@@ -78,11 +84,18 @@ pub(crate) trait ContextScoutCandidateExt {
 
 impl ContextScoutCandidateExt for ContextScoutCandidateV1 {
     fn validate(&self, limits: ContextScoutLimitsV1) -> Result<(), ContextScoutErrorV1> {
+        // Code evidence cites at least one anchor; session evidence cites
+        // none, its window digest is the citation.
+        let anchors_in_bounds = match &self.evidence {
+            ContextScoutCandidateEvidenceV1::Code(_) => {
+                (1..=limits.max_evidence).contains(&self.evidence.anchor_count())
+            }
+            ContextScoutCandidateEvidenceV1::Session(_) => self.evidence.anchor_count() == 0,
+        };
         if self.dedupe_key == [0; 32]
             || !safe_suggestion_text(&self.suggestion_text)
             || self.suggestion_text.len() > limits.max_text_bytes
-            || self.evidence.anchor_count() == 0
-            || self.evidence.anchor_count() > limits.max_evidence
+            || !anchors_in_bounds
             || self.expires_at.0 <= 0
         {
             return Err(ContextScoutErrorV1::InvalidCandidate);
@@ -148,6 +161,8 @@ pub enum ContextScoutTriggerV1 {
     SavedEdit,
     StopBoundary,
     ExplicitRequest,
+    /// A session intent pass at a prompt, completed-tool, or stop boundary.
+    IntentBoundary,
 }
 
 /// Content-free daemon receptivity state. The selector owns delivery timing;
@@ -183,7 +198,9 @@ pub const fn select_context_scout_delivery_window(
     }
     match input.trigger {
         ContextScoutTriggerV1::SavedEdit => ContextScoutDeliveryWindowV1::NextBoundary,
-        ContextScoutTriggerV1::StopBoundary => ContextScoutDeliveryWindowV1::Immediate,
+        ContextScoutTriggerV1::StopBoundary | ContextScoutTriggerV1::IntentBoundary => {
+            ContextScoutDeliveryWindowV1::Immediate
+        }
         ContextScoutTriggerV1::ExplicitRequest => ContextScoutDeliveryWindowV1::OnRequest,
     }
 }
@@ -203,6 +220,8 @@ pub enum ContextScoutSuppressionV1 {
     EvidencePartial,
     EvidenceStale,
     EvidenceUnavailable,
+    /// A suggestion for the same session is already pending delivery.
+    PendingSibling,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,7 +292,7 @@ pub enum ContextScoutMutationOperationV1 {
 }
 
 impl ContextScoutMutationOperationV1 {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Cancel => "context_scout_cancel",
             Self::Claim => "context_scout_claim",
@@ -391,7 +410,7 @@ pub fn select_deterministic_context_scout(
             saw_unavailable = true;
             continue;
         }
-        match candidate.evidence.availability {
+        match candidate.evidence.availability() {
             ContextScoutEvidenceAvailabilityV1::Complete => {}
             ContextScoutEvidenceAvailabilityV1::Partial
                 if input.delivery_window == ContextScoutDeliveryWindowV1::OnRequest => {}
@@ -473,8 +492,8 @@ pub struct ContextScoutModelCandidateInputV1 {
     pub citation_anchor_ids: Vec<RetrievalAnchorId>,
 }
 
-/// Structured model output may refine text only. It must select one supplied
-/// deterministic candidate and cite exactly that candidate's durable anchors.
+/// Structured model output may refine text only. It must echo the supplied
+/// deterministic candidate's dedupe key and cite exactly its durable anchors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextScoutModelCandidateV1 {
@@ -670,14 +689,7 @@ pub async fn select_model_assisted_context_scout(
             model_receipt: None,
         });
     }
-    let Some(request) = model_request(input, limits)? else {
-        return Ok(ContextScoutSelectionV1 {
-            route: ContextScoutRouteV1::DeterministicFallback,
-            decision: deterministic,
-            model_outcome: ContextScoutModelOutcomeV1::TokenBudgetExceeded,
-            model_receipt: None,
-        });
-    };
+    let request = model_request(selected_candidate);
     if let Err(error) = execution.validate_input(&request) {
         return Ok(ContextScoutSelectionV1 {
             route: ContextScoutRouteV1::DeterministicFallback,
@@ -770,53 +782,18 @@ fn valid_model_receipt(
         && receipt.estimated_cost_microusd.is_some()
 }
 
-fn model_request(
-    input: &ContextScoutSelectionInputV1,
-    limits: ContextScoutLimitsV1,
-) -> Result<Option<ContextScoutModelRequestV1>, ContextScoutErrorV1> {
-    limits.validate()?;
-    input.address.validate()?;
-    if input.candidates.len() > limits.max_candidates {
-        return Err(ContextScoutErrorV1::InvalidCandidate);
+/// Only the deterministic pick reaches the model. Refined text keeps that
+/// candidate's citations, so text from any other candidate would add context
+/// those anchors do not support.
+fn model_request(selected: &ContextScoutCandidateV1) -> ContextScoutModelRequestV1 {
+    ContextScoutModelRequestV1 {
+        candidates: vec![ContextScoutModelCandidateInputV1 {
+            dedupe_key: selected.dedupe_key,
+            category: selected.category,
+            suggestion_text: selected.suggestion_text.clone(),
+            citation_anchor_ids: selected.evidence.anchors().cloned().collect(),
+        }],
     }
-    validate_candidate_set(&input.candidates, limits)?;
-    let mut eligible = input
-        .candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.durable()
-                && candidate.expires_at.0 > input.now.0
-                && !input.delivered_dedupe_keys.contains(&candidate.dedupe_key)
-        })
-        .collect::<Vec<_>>();
-    eligible.sort_by(|left, right| {
-        right
-            .relevance_score
-            .cmp(&left.relevance_score)
-            .then_with(|| left.dedupe_key.cmp(&right.dedupe_key))
-            .then_with(|| left.category.cmp(&right.category))
-            .then_with(|| left.suggestion_text.cmp(&right.suggestion_text))
-    });
-    let candidates = eligible
-        .into_iter()
-        .map(|candidate| ContextScoutModelCandidateInputV1 {
-            dedupe_key: candidate.dedupe_key,
-            category: candidate.category,
-            suggestion_text: candidate.suggestion_text.clone(),
-            citation_anchor_ids: candidate.evidence.anchors().cloned().collect(),
-        })
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    let request = ContextScoutModelRequestV1 { candidates };
-    let Some(tokens) = serialized_token_count(&request) else {
-        return Ok(None);
-    };
-    if tokens > limits.max_model_input_tokens {
-        return Ok(None);
-    }
-    Ok(Some(request))
 }
 
 fn validated_model_candidate(
@@ -831,6 +808,9 @@ fn validated_model_candidate(
     let output_tokens = serialized_token_count(&output)?;
     if !base.durable()
         || !safe_suggestion_text(&output.suggestion_text)
+        || !unsupported_code_tokens(&base.suggestion_text, &output.suggestion_text).is_empty()
+        // A dropped error code, path, or number loses what the citations support.
+        || !unsupported_code_tokens(&output.suggestion_text, &base.suggestion_text).is_empty()
         || output.suggestion_text.len() > limits.max_text_bytes
         || output_tokens > limits.max_model_output_tokens
         || output.cited_anchor_ids.len() > limits.max_evidence
@@ -847,6 +827,29 @@ fn validated_model_candidate(
         suggestion_text: output.suggestion_text,
         ..base.clone()
     })
+}
+
+/// Code-like tokens of `refined` that never occur in `original`. The model
+/// sees only the original text, so such a token is an invented identifier,
+/// path, or number presented under the original's exact citations.
+fn unsupported_code_tokens<'a>(original: &str, refined: &'a str) -> BTreeSet<&'a str> {
+    refined
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | ':' | '/' | '.' | '-'))
+        })
+        .map(|token| token.trim_matches(['.', ',', ':', ';', '-']))
+        .filter(|token| code_like_token(token) && !original.contains(token))
+        .collect()
+}
+
+fn code_like_token(token: &str) -> bool {
+    token.contains(['_', '/', '.'])
+        || token.contains("::")
+        || token.bytes().any(|byte| byte.is_ascii_digit())
+        || token
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
 }
 
 fn validate_candidate_set(
@@ -1240,6 +1243,9 @@ fn validate_durable_envelope(
         || envelope.configuration_revision == [0; 32]
         || envelope.delivery_window == ContextScoutDeliveryWindowV1::Suppressed
         || !envelope.candidate.durable()
+        // The public projection pins a content generation, so session
+        // evidence must carry the generation it was judged against.
+        || envelope.candidate.evidence.code_generation_id().is_none()
     {
         return Err(ContextScoutErrorV1::DirtyOverlayDurabilityViolation);
     }
@@ -1276,7 +1282,22 @@ impl ContextScoutDurableQueueEntryExt for ContextScoutDurableQueueEntryV1 {
                 | ContextScoutModelOutcomeV1::InvalidOutput,
                 None,
             ) => {}
+            // The intent pass records its engine outcome in the session
+            // evidence's decision receipt, never in a Codex model receipt.
+            (ContextScoutRouteV1::DecisionEngine, outcome, None)
+                if self
+                    .envelope
+                    .candidate
+                    .evidence
+                    .as_session()
+                    .is_some_and(|evidence| evidence.decision.outcome == outcome) => {}
             _ => return Err(ContextScoutErrorV1::InvalidCandidate),
+        }
+        // Session evidence is produced only by the intent pass.
+        if self.envelope.candidate.evidence.as_session().is_some()
+            != (self.route == ContextScoutRouteV1::DecisionEngine)
+        {
+            return Err(ContextScoutErrorV1::InvalidCandidate);
         }
         validate_durable_envelope(&self.envelope)?;
         if self.work.address != self.envelope.address
@@ -1359,6 +1380,18 @@ pub struct ContextScoutControlV1 {
     pub mode: ContextScoutRuntimeModeV1,
     pub model_path: Option<ContextScoutModelBackendV1>,
     pub limits: ContextScoutLimitsV1,
+    /// Pinned session intent pass, absent when none is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<ContextScoutIntentControlV1>,
+}
+
+/// Behavior pin of the configured intent pass: whether it runs and the digest
+/// of its whole settings block (engine, window, questions, lifecycle bounds).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextScoutIntentControlV1 {
+    pub enabled: bool,
+    pub settings_digest: [u8; 32],
 }
 
 impl ContextScoutControlV1 {
@@ -1370,6 +1403,9 @@ impl ContextScoutControlV1 {
                     | (ContextScoutRuntimeModeV1::ConfiguredModel, None)
             )
             || self.model_path == Some(ContextScoutModelBackendV1::Disabled)
+            || self
+                .intent
+                .is_some_and(|intent| intent.settings_digest == [0; 32])
         {
             return Err(ContextScoutErrorV1::InvalidLimits);
         }
@@ -1567,21 +1603,35 @@ where
         mode: ContextScoutRuntimeModeV1,
         model_execution: ContextScoutModelExecutionV1,
     ) -> Result<ContextScoutRuntimeOutcomeV1, ContextScoutErrorV1> {
-        let selection = match mode {
-            ContextScoutRuntimeModeV1::Deterministic => ContextScoutSelectionV1 {
-                route: ContextScoutRouteV1::Deterministic,
+        let selection = if let Some(model_outcome) = intent_pass_model_outcome(input)? {
+            // Intent-pass candidates were judged by the decision engine when
+            // they were built; selection among them is deterministic, and the
+            // route records the engine outcome their receipts carry.
+            ContextScoutSelectionV1 {
+                route: ContextScoutRouteV1::DecisionEngine,
                 decision: select_deterministic_context_scout(input, limits)?,
-                model_outcome: ContextScoutModelOutcomeV1::NotRequested,
+                model_outcome,
                 model_receipt: None,
-            },
-            ContextScoutRuntimeModeV1::ConfiguredModel => {
-                select_model_assisted_context_scout(input, limits, &self.model, model_execution)
-                    .await?
+            }
+        } else {
+            match mode {
+                ContextScoutRuntimeModeV1::Deterministic => ContextScoutSelectionV1 {
+                    route: ContextScoutRouteV1::Deterministic,
+                    decision: select_deterministic_context_scout(input, limits)?,
+                    model_outcome: ContextScoutModelOutcomeV1::NotRequested,
+                    model_receipt: None,
+                },
+                ContextScoutRuntimeModeV1::ConfiguredModel => {
+                    select_model_assisted_context_scout(input, limits, &self.model, model_execution)
+                        .await?
+                }
             }
         };
         self.last_route = Some(selection.route);
-        self.last_model_outcome = Some(selection.model_outcome);
-        self.last_model_receipt.clone_from(&selection.model_receipt);
+        if selection.route != ContextScoutRouteV1::DecisionEngine {
+            self.last_model_outcome = Some(selection.model_outcome);
+            self.last_model_receipt.clone_from(&selection.model_receipt);
+        }
         if selection.model_outcome == ContextScoutModelOutcomeV1::Cancelled {
             self.last_suppression = Some(ContextScoutSuppressionV1::Cancelled);
             return Ok(ContextScoutRuntimeOutcomeV1::Suppressed {
@@ -1676,14 +1726,35 @@ where
     }
 }
 
+/// The engine outcome of an intent-pass selection, `None` for code-evidence
+/// selections. One intent pass offers session evidence only, all of it from
+/// one engine exchange; mixing evidence kinds is a malformed input.
+fn intent_pass_model_outcome(
+    input: &ContextScoutSelectionInputV1,
+) -> Result<Option<ContextScoutModelOutcomeV1>, ContextScoutErrorV1> {
+    let mut outcomes = input.candidates.iter().map(|candidate| {
+        candidate
+            .evidence
+            .as_session()
+            .map(|evidence| evidence.decision.outcome)
+    });
+    let Some(first) = outcomes.next() else {
+        return Ok(None);
+    };
+    if outcomes.any(|outcome| outcome != first) {
+        return Err(ContextScoutErrorV1::InvalidCandidate);
+    }
+    Ok(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::TempDir;
-    use tracedecay_contracts::context_scout::ContextScoutEvidenceEnvelopeV1;
+    use tracedecay_contracts::context_scout::ContextScoutCandidateEvidenceV1;
 
     fn address() -> ContextScoutAddressV1 {
         ContextScoutAddressV1 {
@@ -1753,8 +1824,8 @@ mod tests {
         );
     }
 
-    fn evidence() -> ContextScoutEvidenceEnvelopeV1 {
-        super::evidence::fixture_context_scout_evidence()
+    fn evidence() -> ContextScoutCandidateEvidenceV1 {
+        super::evidence::fixture_context_scout_evidence().into()
     }
 
     fn candidate(key: u8, score: u16) -> ContextScoutCandidateV1 {
@@ -1790,6 +1861,7 @@ mod tests {
     }
 
     fn model_execution() -> ContextScoutModelExecutionV1 {
+        warm_token_counter();
         ContextScoutModelExecutionV1::new(
             MonotonicDeadline::at(Instant::now() + Duration::from_secs(5)),
             CancellationToken::new(),
@@ -1955,7 +2027,7 @@ mod tests {
     #[test]
     fn dirty_overlay_never_crosses_durable_checkpoint_or_receipt_boundary() {
         let mut overlay = candidate(1, 10);
-        overlay.evidence.content =
+        overlay.evidence.as_code_mut().unwrap().content =
             tracedecay_domain::feedback::FeedbackContentIdentityV1::EphemeralOverlay {
                 session_id: tracedecay_domain::SessionId::new("session.overlay").unwrap(),
                 owner_client_id: tracedecay_domain::HostInstanceId::new("client.overlay").unwrap(),
@@ -2243,7 +2315,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_cancelled_execution_never_calls_the_model_assistant() {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let cancellation = CancellationToken::new();
         cancellation.cancel();
         let execution = ContextScoutModelExecutionV1::new(
@@ -2256,14 +2328,14 @@ mod tests {
             &input(vec![candidate(1, 10)]),
             ContextScoutLimitsV1::bounded_defaults(),
             &RecordingModel {
-                calls: Arc::clone(&calls),
+                requests: Arc::clone(&requests),
             },
             execution,
         )
         .await
         .unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.lock().unwrap().len(), 0);
         assert_eq!(
             selection.model_outcome,
             ContextScoutModelOutcomeV1::Cancelled
@@ -2324,6 +2396,251 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(selection.route, ContextScoutRouteV1::DeterministicFallback);
+    }
+
+    #[cfg(feature = "token-counting")]
+    fn stale_candidate(key: u8, score: u16) -> ContextScoutCandidateV1 {
+        let fresh = super::evidence::fixture_context_scout_evidence();
+        let mut sources = fresh.sources.clone();
+        sources[0].contribution_state = tracedecay_contracts::RetrieverContributionState::Stale;
+        sources[0].temporal.freshness = tracedecay_contracts::FreshnessState::Stale;
+        let evidence = tracedecay_contracts::context_scout::ContextScoutEvidenceEnvelopeV1::claim(
+            fresh.scope,
+            fresh.authorized_scope,
+            fresh.content,
+            fresh.code_generation_id,
+            fresh.authority,
+            fresh.redaction,
+            sources,
+            fresh.claimed_at,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.availability,
+            ContextScoutEvidenceAvailabilityV1::Stale
+        );
+        ContextScoutCandidateV1 {
+            evidence: evidence.into(),
+            ..candidate(key, score)
+        }
+    }
+
+    #[cfg(feature = "token-counting")]
+    fn model_candidate_input(
+        candidate: &ContextScoutCandidateV1,
+    ) -> ContextScoutModelCandidateInputV1 {
+        ContextScoutModelCandidateInputV1 {
+            dedupe_key: candidate.dedupe_key,
+            category: candidate.category,
+            suggestion_text: candidate.suggestion_text.clone(),
+            citation_anchor_ids: candidate.evidence.anchors().cloned().collect(),
+        }
+    }
+
+    #[cfg(feature = "token-counting")]
+    #[tokio::test]
+    async fn model_request_carries_only_the_deterministically_selected_candidate() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let selection = select_model_assisted_context_scout(
+            &input(vec![
+                candidate(2, 10),
+                stale_candidate(3, 30),
+                candidate(1, 20),
+            ]),
+            ContextScoutLimitsV1::bounded_defaults(),
+            &RecordingModel {
+                requests: Arc::clone(&requests),
+            },
+            model_execution(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![ContextScoutModelRequestV1 {
+                candidates: vec![ContextScoutModelCandidateInputV1 {
+                    dedupe_key: [1; 32],
+                    category: ContextScoutCategoryV1::Retrieval,
+                    suggestion_text: "Use evidence 1.".to_owned(),
+                    citation_anchor_ids: vec![RetrievalAnchorId::new("anchor.scout").unwrap()],
+                }],
+            }]
+        );
+        assert_eq!(selection.route, ContextScoutRouteV1::ModelAssisted);
+        let ContextScoutDecisionV1::Ready { envelope } = selection.decision else {
+            panic!("refined selection should stay ready");
+        };
+        assert_eq!(envelope.candidate.dedupe_key, [1; 32]);
+        assert_eq!(
+            envelope.candidate.suggestion_text,
+            "Refined: Use evidence 1."
+        );
+    }
+
+    #[cfg(feature = "token-counting")]
+    #[tokio::test]
+    async fn input_budget_counts_only_the_selected_candidate() {
+        let candidates = (1..=8)
+            .map(|key| candidate(key, 100 - u16::from(key)))
+            .collect::<Vec<_>>();
+        let selected_only = ContextScoutModelRequestV1 {
+            candidates: vec![model_candidate_input(&candidates[0])],
+        };
+        let whole_set = ContextScoutModelRequestV1 {
+            candidates: candidates.iter().map(model_candidate_input).collect(),
+        };
+        let mut limits = ContextScoutLimitsV1::bounded_defaults();
+        limits.max_model_input_tokens = serialized_token_count(&selected_only).unwrap();
+        assert!(serialized_token_count(&whole_set).unwrap() > limits.max_model_input_tokens);
+        let execution = ContextScoutModelExecutionV1::new(
+            MonotonicDeadline::at(Instant::now() + Duration::from_secs(5)),
+            CancellationToken::new(),
+            limits,
+        )
+        .unwrap();
+
+        let selection = select_model_assisted_context_scout(
+            &input(candidates),
+            limits,
+            &RecordingModel {
+                requests: Arc::new(Mutex::new(Vec::new())),
+            },
+            execution,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            (selection.route, selection.model_outcome),
+            (
+                ContextScoutRouteV1::ModelAssisted,
+                ContextScoutModelOutcomeV1::Succeeded
+            )
+        );
+    }
+
+    #[cfg(feature = "token-counting")]
+    struct RewritingModel(&'static str);
+
+    #[cfg(feature = "token-counting")]
+    impl ContextScoutModelAssistantV1 for RewritingModel {
+        fn backend(&self) -> ContextScoutModelBackendV1 {
+            ContextScoutModelBackendV1::CodexAppServer
+        }
+
+        fn propose(
+            &self,
+            request: ContextScoutModelRequestV1,
+            _execution: ContextScoutModelExecutionV1,
+        ) -> ContextScoutModelFuture<'_> {
+            let text = self.0;
+            Box::pin(async move {
+                let candidate = request
+                    .candidates
+                    .first()
+                    .ok_or(ContextScoutModelErrorV1::InvalidOutput)?;
+                Ok(ContextScoutModelProposalV1 {
+                    candidate: ContextScoutModelCandidateV1 {
+                        selected_dedupe_key: candidate.dedupe_key,
+                        suggestion_text: text.to_owned(),
+                        cited_anchor_ids: candidate.citation_anchor_ids.clone(),
+                    },
+                    receipt: model_receipt(),
+                })
+            })
+        }
+    }
+
+    #[cfg(feature = "token-counting")]
+    async fn refine_diagnostic(refined: &'static str) -> ContextScoutSelectionV1 {
+        let diagnostic = ContextScoutCandidateV1 {
+            category: ContextScoutCategoryV1::Diagnostic,
+            suggestion_text: "error[E0308]: mismatched types in order_total at src/orders.rs:42"
+                .to_owned(),
+            ..candidate(1, 10)
+        };
+        select_model_assisted_context_scout(
+            &input(vec![diagnostic]),
+            ContextScoutLimitsV1::bounded_defaults(),
+            &RewritingModel(refined),
+            model_execution(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "token-counting")]
+    fn selected_text(selection: &ContextScoutSelectionV1) -> &str {
+        let ContextScoutDecisionV1::Ready { envelope } = &selection.decision else {
+            panic!("selection should stay ready");
+        };
+        &envelope.candidate.suggestion_text
+    }
+
+    #[cfg(feature = "token-counting")]
+    #[tokio::test]
+    async fn refinement_inventing_or_dropping_code_tokens_falls_back_to_deterministic_text() {
+        for invented in [
+            "Fix the mismatched types in apply_tax at src/orders.rs:42 (E0308).",
+            "Fix the mismatched types in order_total at src/billing.rs (E0308).",
+            "Fix the mismatched types in order_total at src/orders.rs:42 (E0308) via TaxRate.",
+            "Fix the mismatched types in order_total at src/orders.rs:42.",
+            "Fix the mismatched types in order_total (E0308).",
+        ] {
+            let selection = refine_diagnostic(invented).await;
+            assert_eq!(
+                (selection.route, selection.model_outcome),
+                (
+                    ContextScoutRouteV1::DeterministicFallback,
+                    ContextScoutModelOutcomeV1::InvalidOutput
+                ),
+                "{invented}"
+            );
+            assert_eq!(
+                selected_text(&selection),
+                "error[E0308]: mismatched types in order_total at src/orders.rs:42"
+            );
+            assert!(selection.model_receipt.is_none());
+        }
+    }
+
+    #[cfg(feature = "token-counting")]
+    #[tokio::test]
+    async fn faithful_rewording_keeps_the_model_refinement() {
+        let reworded = "Fix the mismatched types in order_total at src/orders.rs:42 (E0308).";
+        let selection = refine_diagnostic(reworded).await;
+        assert_eq!(
+            (selection.route, selection.model_outcome),
+            (
+                ContextScoutRouteV1::ModelAssisted,
+                ContextScoutModelOutcomeV1::Succeeded
+            )
+        );
+        assert_eq!(selected_text(&selection), reworded);
+    }
+
+    #[test]
+    fn unsupported_code_tokens_flag_only_code_like_tokens_absent_from_the_original() {
+        let original = "error[E0308]: mismatched types in order_total at src/orders.rs:42";
+        for (refined, expected) in [
+            ("Plain words only, rewritten freely.", vec![]),
+            ("Check order_total in src/orders.rs:42 for E0308.", vec![]),
+            ("Check apply_tax.", vec!["apply_tax"]),
+            ("See src/billing.rs.", vec!["src/billing.rs"]),
+            ("Line 43 instead.", vec!["43"]),
+            ("Use TaxRate or orderTotal.", vec!["TaxRate", "orderTotal"]),
+            ("Call orders::total now.", vec!["orders::total"]),
+            ("Open config.toml first.", vec!["config.toml"]),
+            ("Rust CI is red; well-known issue.", vec![]),
+            ("apply_tax and apply_tax again.", vec!["apply_tax"]),
+        ] {
+            assert_eq!(
+                unsupported_code_tokens(original, refined),
+                BTreeSet::from_iter(expected),
+                "{refined}"
+            );
+        }
     }
 
     #[test]
@@ -2435,7 +2752,7 @@ mod tests {
 
     #[derive(Clone)]
     struct RecordingModel {
-        calls: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ContextScoutModelRequestV1>>>,
     }
 
     impl ContextScoutModelAssistantV1 for RecordingModel {
@@ -2448,9 +2765,8 @@ mod tests {
             request: ContextScoutModelRequestV1,
             _execution: ContextScoutModelExecutionV1,
         ) -> ContextScoutModelFuture<'_> {
-            let calls = Arc::clone(&self.calls);
+            self.requests.lock().unwrap().push(request.clone());
             Box::pin(async move {
-                calls.fetch_add(1, Ordering::SeqCst);
                 let candidate = request
                     .candidates
                     .first()
@@ -2458,7 +2774,7 @@ mod tests {
                 Ok(ContextScoutModelProposalV1 {
                     candidate: ContextScoutModelCandidateV1 {
                         selected_dedupe_key: candidate.dedupe_key,
-                        suggestion_text: "Evidence-bound model refinement.".to_owned(),
+                        suggestion_text: format!("Refined: {}", candidate.suggestion_text),
                         cited_anchor_ids: candidate.citation_anchor_ids.clone(),
                     },
                     receipt: model_receipt(),
@@ -2471,9 +2787,9 @@ mod tests {
     #[tokio::test]
     async fn durable_runtime_replays_exact_entry_and_cancellation_is_generation_bound() {
         let (_temporary, store) = durable_store().await;
-        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let model = RecordingModel {
-            calls: Arc::clone(&calls),
+            requests: Arc::clone(&requests),
         };
         let mut runtime = ContextScoutDurableRuntimeV1::new(Arc::clone(&store), model.clone());
         let outcome = runtime
@@ -2494,7 +2810,7 @@ mod tests {
         };
         assert_eq!(store_outcome, ContextScoutDurableStoreOutcomeV1::Stored);
         assert_eq!(entry.route, ContextScoutRouteV1::ModelAssisted);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.lock().unwrap().len(), 1);
         let status = runtime
             .status(ContextScoutControlV1 {
                 configuration_revision: [16; 32],
@@ -2502,6 +2818,7 @@ mod tests {
                 mode: ContextScoutRuntimeModeV1::ConfiguredModel,
                 model_path: Some(ContextScoutModelBackendV1::CodexAppServer),
                 limits: ContextScoutLimitsV1::bounded_defaults(),
+                intent: None,
             })
             .unwrap();
         assert_eq!(
@@ -2608,11 +2925,11 @@ mod tests {
     #[tokio::test]
     async fn controlled_model_execution_cannot_widen_daemon_limits() {
         let (_temporary, store) = durable_store().await;
-        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = ContextScoutDurableRuntimeV1::new(
             Arc::clone(&store),
             RecordingModel {
-                calls: Arc::clone(&calls),
+                requests: Arc::clone(&requests),
             },
         );
         let limits = ContextScoutLimitsV1::bounded_defaults();
@@ -2622,6 +2939,7 @@ mod tests {
             mode: ContextScoutRuntimeModeV1::ConfiguredModel,
             model_path: Some(ContextScoutModelBackendV1::CodexAppServer),
             limits,
+            intent: None,
         };
         let widened_execution = ContextScoutModelExecutionV1 {
             deadline: MonotonicDeadline::at(Instant::now() + Duration::from_secs(5)),
@@ -2636,7 +2954,7 @@ mod tests {
                 .await,
             Err(ContextScoutErrorV1::InvalidLimits)
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.lock().unwrap().len(), 0);
         assert!(queued_entries(&store).await.is_empty());
     }
 
@@ -2672,6 +2990,7 @@ mod tests {
                 mode: ContextScoutRuntimeModeV1::ConfiguredModel,
                 model_path: Some(ContextScoutModelBackendV1::CodexAppServer),
                 limits: ContextScoutLimitsV1::bounded_defaults(),
+                intent: None,
             })
             .unwrap();
         assert_eq!(
@@ -2751,6 +3070,7 @@ mod tests {
                 mode: ContextScoutRuntimeModeV1::Deterministic,
                 model_path: None,
                 limits: ContextScoutLimitsV1::bounded_defaults(),
+                intent: None,
             })
             .unwrap();
         assert_eq!(
@@ -2769,15 +3089,15 @@ mod tests {
     #[tokio::test]
     async fn dirty_overlay_never_invokes_model_or_durable_queue() {
         let (_temporary, store) = durable_store().await;
-        let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = ContextScoutDurableRuntimeV1::new(
             Arc::clone(&store),
             RecordingModel {
-                calls: Arc::clone(&calls),
+                requests: Arc::clone(&requests),
             },
         );
         let mut dirty = candidate(2, 10);
-        dirty.evidence.content =
+        dirty.evidence.as_code_mut().unwrap().content =
             tracedecay_domain::feedback::FeedbackContentIdentityV1::EphemeralOverlay {
                 session_id: tracedecay_domain::SessionId::new("session.overlay").unwrap(),
                 owner_client_id: tracedecay_domain::HostInstanceId::new("client.overlay").unwrap(),
@@ -2800,7 +3120,352 @@ mod tests {
                 .await,
             Err(ContextScoutErrorV1::InvalidEvidence)
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.lock().unwrap().len(), 0);
         assert!(queued_entries(&store).await.is_empty());
+    }
+
+    #[cfg(feature = "token-counting")]
+    struct ProposalCapturingModel<M> {
+        inner: M,
+        proposal: Mutex<Option<ContextScoutModelProposalV1>>,
+    }
+
+    #[cfg(feature = "token-counting")]
+    impl<M: ContextScoutModelAssistantV1> ContextScoutModelAssistantV1 for ProposalCapturingModel<M> {
+        fn backend(&self) -> ContextScoutModelBackendV1 {
+            self.inner.backend()
+        }
+
+        fn propose(
+            &self,
+            request: ContextScoutModelRequestV1,
+            execution: ContextScoutModelExecutionV1,
+        ) -> ContextScoutModelFuture<'_> {
+            Box::pin(async move {
+                let result = self.inner.propose(request, execution).await;
+                if let Ok(proposal) = &result {
+                    *self.proposal.lock().unwrap() = Some(proposal.clone());
+                }
+                result
+            })
+        }
+    }
+
+    /// Keeps the backend's failure reason, which the Scout outcome taxonomy
+    /// collapses (a spawn failure and a retryable error both read `Unavailable`).
+    #[cfg(feature = "token-counting")]
+    struct ErrorCapturingBackend {
+        inner: Arc<dyn tracedecay_automation_runtime::automation::backend::AgentTaskBackend>,
+        error: Mutex<Option<String>>,
+    }
+
+    #[cfg(feature = "token-counting")]
+    impl tracedecay_automation_runtime::automation::backend::AgentTaskBackend
+        for ErrorCapturingBackend
+    {
+        fn run_task(
+            &self,
+            request: &tracedecay_automation_runtime::automation::backend::AgentTaskRequest,
+        ) -> Result<
+            tracedecay_automation_runtime::automation::backend::AgentTaskResponse,
+            tracedecay_automation_runtime::automation::backend::AgentTaskError,
+        > {
+            let result = self.inner.run_task(request);
+            if let Err(error) = &result {
+                *self.error.lock().unwrap() = Some(error.to_string());
+            }
+            result
+        }
+
+        fn executable(&self) -> Option<&std::path::Path> {
+            self.inner.executable()
+        }
+    }
+
+    /// The prompt runner the composition root registers in
+    /// `tracedecay-project`'s `runtime_ports`; a test process has no root.
+    #[cfg(feature = "token-counting")]
+    fn eval_codex_prompt_runner(
+        prompt: &str,
+        config: &tracedecay_automation_runtime::ports::codex_app_server::SummaryConfig,
+        thread_source: &str,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<
+        tracedecay_automation_runtime::ports::codex_app_server::Summary,
+        tracedecay_automation_runtime::automation::backend::AgentTaskError,
+    > {
+        use tracedecay_sessions::runtime::hosts::codex_app_server as sessions;
+        let config = sessions::CodexAppServerSummaryConfig {
+            codex_bin: config.codex_bin.to_string_lossy().into_owned(),
+            model: config.model.clone(),
+            timeout: config.timeout,
+        };
+        match response_schema {
+            Some(schema) => sessions::run_prompt_with_codex_app_server_response_schema(
+                prompt,
+                &config,
+                thread_source,
+                schema,
+            ),
+            None => sessions::run_prompt_with_codex_app_server(prompt, &config, thread_source),
+        }
+        .map(
+            |summary| tracedecay_automation_runtime::ports::codex_app_server::Summary {
+                text: summary.text,
+                model: summary.model,
+            },
+        )
+        .map_err(|error| {
+            tracedecay_automation_runtime::automation::backend::AgentTaskError::new(
+                error.class,
+                error.message,
+            )
+        })
+    }
+
+    /// Answers the Codex app-server prompt port with `claude -p`, so the
+    /// production prompt, response schema, validation, and drift guard can be
+    /// measured against a second model when no Codex login is available.
+    #[cfg(feature = "token-counting")]
+    fn eval_claude_prompt_runner(
+        prompt: &str,
+        config: &tracedecay_automation_runtime::ports::codex_app_server::SummaryConfig,
+        _thread_source: &str,
+        response_schema: Option<&serde_json::Value>,
+    ) -> Result<
+        tracedecay_automation_runtime::ports::codex_app_server::Summary,
+        tracedecay_automation_runtime::automation::backend::AgentTaskError,
+    > {
+        use tracedecay_automation_runtime::automation::backend::{
+            AgentTaskError, AgentTaskFailureClass,
+        };
+        let mut command = std::process::Command::new(&config.codex_bin);
+        command.args([
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+        ]);
+        command.args([
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--tools",
+            "",
+        ]);
+        if let Some(model) = &config.model {
+            command.args(["--model", model]);
+        }
+        if let Some(schema) = response_schema {
+            command.args(["--json-schema", &schema.to_string()]);
+        }
+        let output = command.output().map_err(|error| {
+            AgentTaskError::new(AgentTaskFailureClass::Unavailable, error.to_string())
+        })?;
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            AgentTaskError::new(
+                AgentTaskFailureClass::MalformedOutput,
+                format!("{error}: {}", String::from_utf8_lossy(&output.stderr)),
+            )
+        })?;
+        let text = match reply.get("structured_output") {
+            Some(structured) => structured.to_string(),
+            None => reply["result"].as_str().unwrap_or_default().to_owned(),
+        };
+        Ok(
+            tracedecay_automation_runtime::ports::codex_app_server::Summary {
+                text,
+                model: reply["modelUsage"]
+                    .as_object()
+                    .and_then(|models| models.keys().next().cloned()),
+            },
+        )
+    }
+
+    /// Measures factual drift of live Scout refinement over a synthetic
+    /// diagnostic corpus about the `evals/agent_adoption/fixture` orders crate.
+    ///
+    /// Ignored by default; it costs one provider call per case and repetition.
+    /// Run it with `TRACEDECAY_SCOUT_LIVE_EVAL_CODEX` set to the absolute path
+    /// of a `codex` executable (the production backend), or with
+    /// `TRACEDECAY_SCOUT_LIVE_EVAL_CLAUDE` set to a `claude` executable that
+    /// stands in for it. `TRACEDECAY_SCOUT_LIVE_EVAL_MODEL` sets the model and
+    /// `TRACEDECAY_SCOUT_LIVE_EVAL_REPS` the repetitions per case (default 1).
+    /// Bazel gives the test a throwaway `HOME`, so `CODEX_HOME` must name the
+    /// real Codex login:
+    ///
+    /// ```text
+    /// CODEX_HOME=~/.codex TRACEDECAY_SCOUT_LIVE_EVAL_CODEX=/path/to/codex \
+    /// TRACEDECAY_SCOUT_LIVE_EVAL_MODEL=<model> TRACEDECAY_SCOUT_LIVE_EVAL_REPS=3 \
+    /// env -u CC -u CXX bazel run //crates/tracedecay-agent-hosts:unit_test -- \
+    ///   --ignored --nocapture live_refinement_eval
+    /// ```
+    ///
+    /// Each row reports the route, the model outcome, the deterministic text,
+    /// the raw model proposal, the code-like tokens that proposal added (even
+    /// when the guard rejected it), receipt usage and cost, and wall time. It
+    /// asserts only that every case ends in a defined route.
+    #[cfg(feature = "token-counting")]
+    #[tokio::test]
+    #[ignore = "live provider call per case; needs TRACEDECAY_SCOUT_LIVE_EVAL_CODEX or _CLAUDE"]
+    async fn live_refinement_eval() {
+        use super::model::ProductionContextScoutModelAssistantV1;
+        use tracedecay_automation_runtime::automation::backend::{
+            AgentTaskBackend, CodexAppServerBackend,
+        };
+        use tracedecay_domain::configuration::LcmSummarizerExecutableV1;
+
+        const TIMEOUT_SECS: u64 = 120;
+        let (executable, runner): (
+            _,
+            tracedecay_automation_runtime::ports::codex_app_server::RunPrompt,
+        ) = match (
+            std::env::var_os("TRACEDECAY_SCOUT_LIVE_EVAL_CODEX"),
+            std::env::var_os("TRACEDECAY_SCOUT_LIVE_EVAL_CLAUDE"),
+        ) {
+            (Some(codex), _) => (codex, eval_codex_prompt_runner),
+            (None, Some(claude)) => (claude, eval_claude_prompt_runner),
+            (None, None) => {
+                eprintln!("skipped: set TRACEDECAY_SCOUT_LIVE_EVAL_CODEX or _CLAUDE");
+                return;
+            }
+        };
+        tracedecay_automation_runtime::ports::codex_app_server::register(runner);
+        let executable = LcmSummarizerExecutableV1::configured(
+            std::fs::canonicalize(executable).expect("the eval executable must exist"),
+        )
+        .expect("canonical eval executable");
+        let reps: usize = std::env::var("TRACEDECAY_SCOUT_LIVE_EVAL_REPS")
+            .ok()
+            .map_or(1, |reps| {
+                reps.parse()
+                    .expect("TRACEDECAY_SCOUT_LIVE_EVAL_REPS is a count")
+            });
+        let model = std::env::var("TRACEDECAY_SCOUT_LIVE_EVAL_MODEL").ok();
+        let backend: Arc<dyn AgentTaskBackend> =
+            Arc::new(CodexAppServerBackend::new(model, TIMEOUT_SECS, &executable));
+        let limits = ContextScoutLimitsV1::bounded_defaults();
+        let cases = [
+            (
+                "type_error",
+                ContextScoutCategoryV1::Diagnostic,
+                "error[E0308]: mismatched types at src/pricing.rs:15:9 in compute_total: \
+                 expected `u64`, found `u32`",
+            ),
+            (
+                "unused_variable",
+                ContextScoutCategoryV1::Diagnostic,
+                "warning: unused variable: `percent` at src/discount.rs:7:34 in apply_discount",
+            ),
+            (
+                "failing_assertion",
+                ContextScoutCategoryV1::Verification,
+                "test pricing::tests::grand_total_includes_tax failed: assertion `left == right` \
+                 failed, left: 1080, right: 1000",
+            ),
+            (
+                "review_comment",
+                ContextScoutCategoryV1::Retrieval,
+                "Review: reserve_stock in src/inventory.rs decrements stock before \
+                 check_availability succeeds, so a failed order still consumes inventory.",
+            ),
+            (
+                "ci_failure",
+                ContextScoutCategoryV1::Verification,
+                "CI job orders-fixture-test failed: the first failing test is \
+                 orders::tests::place_order_rejects_unknown_sku in src/orders.rs.",
+            ),
+            (
+                "coordination",
+                ContextScoutCategoryV1::Coordination,
+                "Another active agent edited src/orders.rs place_order in the last few minutes; \
+                 coordinate before changing it.",
+            ),
+        ];
+        println!(
+            "case\troute\tmodel_outcome\ttext_guard\tdeterministic\trefined\tunsupported\tinput_tokens\t\
+             output_tokens\tcost_microusd\twall_ms\tbackend_error"
+        );
+        let runs = (1..=reps).flat_map(|rep| cases.iter().map(move |&case| (rep, case)));
+        for (rep, (name, category, text)) in runs {
+            let recorder = Arc::new(ErrorCapturingBackend {
+                inner: Arc::clone(&backend),
+                error: Mutex::new(None),
+            });
+            let model = ProposalCapturingModel {
+                inner: ProductionContextScoutModelAssistantV1::new(
+                    Arc::clone(&recorder) as Arc<dyn AgentTaskBackend>,
+                    ContextScoutModelBackendV1::CodexAppServer,
+                ),
+                proposal: Mutex::new(None),
+            };
+            let execution = ContextScoutModelExecutionV1::new(
+                MonotonicDeadline::at(Instant::now() + Duration::from_secs(TIMEOUT_SECS + 5)),
+                CancellationToken::new(),
+                limits,
+            )
+            .unwrap();
+            let case = ContextScoutCandidateV1 {
+                category,
+                suggestion_text: text.to_owned(),
+                ..candidate(1, 10)
+            };
+            let started = Instant::now();
+            let selection = select_model_assisted_context_scout(
+                &input(vec![case.clone()]),
+                limits,
+                &model,
+                execution,
+            )
+            .await
+            .unwrap();
+            let wall_ms = started.elapsed().as_millis();
+            let proposal = model.proposal.into_inner().unwrap();
+            let refined = proposal
+                .as_ref()
+                .map_or("-", |proposal| &proposal.candidate.suggestion_text);
+            // The receipt gate admits only a priced Codex turn, so a stand-in
+            // model always falls back; this column judges its text alone.
+            let text_guard = proposal.as_ref().map_or("-", |proposal| {
+                let accepted = validated_model_candidate(
+                    &case,
+                    limits,
+                    case.dedupe_key,
+                    proposal.candidate.clone(),
+                );
+                if accepted.is_some() {
+                    "accepted"
+                } else {
+                    "rejected"
+                }
+            });
+            let unsupported = proposal.as_ref().map_or_else(Vec::new, |proposal| {
+                unsupported_code_tokens(text, &proposal.candidate.suggestion_text)
+                    .into_iter()
+                    .collect()
+            });
+            let receipt = proposal.as_ref().map(|proposal| &proposal.receipt);
+            let usage =
+                |value: Option<u64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
+            println!(
+                "{name}/r{rep}\t{:?}\t{:?}\t{text_guard}\t{text}\t{refined}\t{}\t{}\t{}\t{}\t{wall_ms}\t{}",
+                selection.route,
+                selection.model_outcome,
+                unsupported.join(","),
+                usage(receipt.and_then(|receipt| receipt.input_tokens)),
+                usage(receipt.and_then(|receipt| receipt.output_tokens)),
+                usage(receipt.and_then(|receipt| receipt.estimated_cost_microusd)),
+                recorder.error.lock().unwrap().as_deref().unwrap_or("-"),
+            );
+            assert!(
+                matches!(
+                    selection.route,
+                    ContextScoutRouteV1::ModelAssisted | ContextScoutRouteV1::DeterministicFallback
+                ),
+                "{name} ended in {:?}",
+                selection.route
+            );
+        }
     }
 }

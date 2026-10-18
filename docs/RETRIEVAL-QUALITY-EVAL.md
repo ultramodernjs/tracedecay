@@ -87,12 +87,12 @@ computes:
 - **`jaccard`** = `project_memory_jaccard`, the exact Jaccard similarity
   between `project_memory_tokens(query)` and `project_memory_fact_tokens(fact)`
   (fact tokens are content + tags + entities, tokenized identically).
-- **`holographic`** = `project_memory_holographic_score`: FHRR-2048 binding of
+- **`holographic`** = `project_memory_holographic_score`: MAP-C 2048-dimension binding of
   content + normalized entities via `HolographicEncoder`
   (`crates/tracedecay-session-memory/src/memory/encoding.rs`, unchanged in
   spirit from the pre-rewrite code), every token still becomes a
   deterministic SHA-256-derived coefficient vector; there is no semantic
-  embedding model. The raw FHRR similarity is rescaled with
+  embedding model. The raw cosine similarity is rescaled with
   `midpoint(sim, 1.0)` (i.e. `(sim + 1) / 2`), so the usable band is still
   `[0, 1]` with an unrelated-content floor near 0.5.
 - **`trust`** = the fact's persisted `trust_score` (a `Confidence` in
@@ -147,57 +147,13 @@ These modes still carry **no query-relevance signal**, a fact is ranked by
 trust alone once it matches the requested entity/entities, same as the
 pre-rewrite pipeline.
 
-## 2. Entity extraction (`crates/tracedecay-session-memory/src/memory/entities.rs`)
+## 2. Entity normalization (`crates/tracedecay-session-memory/src/memory/entities.rs`)
 
-`extract_entities` combines five sources, in document order, de-duplicated
-case-insensitively:
-
-- quoted spans (`"…"` / `'…'`, with apostrophe-as-delimiter suppressed
-  between two alphanumeric characters so possessives/contractions don't pair
-  into a giant span),
-- `aka` / `a.k.a.` / `also known as` aliases,
-- code-like tokens: file paths, `::`-qualified Rust symbols, `tracedecay_*`
-  tool names, and `snake_case`/`camelCase` identifiers,
-- multi-word capitalized phrases, and
-- **single-token capitalized proper nouns** (e.g. `Postgres`, `Tokio`,
-  `Kubernetes`, `Database`), filtered by a sentence-function-word stoplist
-  (`is_common_sentence_word`: articles, pronouns, auxiliaries, etc.).
-
-Every candidate is additionally shape-checked (`is_valid_entity`): at most 80
-characters, at most 6 words, and, for anything that isn't a single trusted
-code token, every word must be a clean identifier-ish token (no stray
-sentence punctuation).
-
-### Risk A, resolved
-
-An earlier version of this document flagged entity extraction as brittle
-because (1) the leading-verb exclusion list matched only exact base forms
-(`Prefer`, not `Prefers`), so `"Prefers Tokio for async runtime"` was captured
-verbatim as the noisy entity `"Prefers Tokio"` instead of `"Tokio"`, and (2)
-single capitalized tokens were never extracted at all (only ≥2-word
-capitalized sequences), so `probe("Tokio")` / `probe("Postgres")` could never
-reach a fact that only mentioned the bare noun.
-
-Both are fixed in the current `entities.rs`:
-
-- `is_non_entity_leading_word` now matches every common inflection of the
-  ~14 leading verbs (`add/adds/added/adding`, `prefer/prefers/preferred/
-  preferring`, `use/uses/used/using`, etc.), case-insensitively, not just the
-  base form. `"Prefers Tokio"` now strips the leading verb and yields
-  `"Tokio"` (plus the remainder phrase `"Prefers Tokio"` itself no longer
-  survives verbatim).
-- `push_capitalized_sequence` / `push_single_capitalized` now also emit a
-  bare single capitalized token as its own entity (still filtered by
-  `is_common_sentence_word`), so `Postgres`, `Tokio`, `Kubernetes`, and
-  `Database` are all extractable as entities in their own right, not only as
-  part of a ≥2-word phrase.
-
-Both fixes are covered by unit tests in `entities.rs` itself, notably
-`leading_verbs_match_across_inflections`,
-`leading_verb_no_longer_swallows_following_entity`,
-`single_capitalized_proper_nouns_are_extracted`, and
-`verb_led_multiword_phrase_exposes_head_noun`, and the code comments
-explicitly cite "Risk A" as the motivation for the change.
+Retrieval does not extract entities from free text. Facts carry the entity
+lists their writers supply, and `normalize_entity` trims surrounding
+punctuation and collapses whitespace before entity candidates are matched.
+An earlier heuristic extractor (`extract_entities`) had no production caller
+and was removed.
 
 ## 3. Remaining considerations
 
@@ -286,7 +242,7 @@ has acted on it.
 
 ## 5. Reproducing this evaluation
 
-The tool surface changed along with the retrieval rewrite: memory operations
+The tool interface changed along with the retrieval rewrite: memory operations
 are now separate MCP tools (`fact_store_add`, `fact_store_search`,
 `fact_store_probe`, `fact_store_reason`, …) rather than one `fact_store` tool
 with an `action` field, and the CLI's `tracedecay tool <name> --args '<json>'`

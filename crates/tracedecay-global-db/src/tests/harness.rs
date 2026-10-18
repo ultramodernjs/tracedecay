@@ -477,7 +477,12 @@ impl RegisteredGlobalDbHarness {
 
     #[cfg(test)]
     pub(crate) fn revoke(&mut self) {
-        drop(self._scope.take());
+        drop(self.take_scope());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_scope(&mut self) -> Option<DaemonDatabaseScope> {
+        self._scope.take()
     }
 
     /// Remounts through daemon admission, which defers historical convergence
@@ -588,25 +593,6 @@ impl HostAdmissionTestRuntimeV1 {
                 },
             )?;
         Self::open(profile_root.as_ref(), None).await
-    }
-
-    /// Wraps databases whose authority is retained by a higher composition
-    /// runtime. This constructor grants no authority and owns no runtime scope.
-    #[doc(hidden)]
-    pub fn from_registered_databases_for_test(
-        profile_registry: RegisteredGlobalDbLeaseV1,
-        profile_registered: RegisteredGlobalDbLeaseV1,
-        project_registered: Option<RegisteredGlobalDbLeaseV1>,
-    ) -> Self {
-        Self {
-            profile_registry,
-            _profile_registry_owner: None,
-            profile_registered,
-            _profile_registered_owner: None,
-            project_registered,
-            _project_registered_owner: None,
-            _scope: None,
-        }
     }
 
     pub fn registered_database(&self, scope: HostAdmissionScope) -> Option<&RegisteredGlobalDb> {
@@ -817,26 +803,6 @@ impl HostAdmissionTestRuntimeV1 {
             row.get(4)?,
             row.get(5)?,
         ))
-    }
-
-    pub async fn delete_session_message_for_test(
-        &self,
-        scope: HostAdmissionScope,
-        provider: &str,
-        message_id: &str,
-    ) -> tracedecay_domain::errors::Result<u64> {
-        let transaction = self
-            .session_database_for_test(scope)?
-            .begin_write_transaction()
-            .await?;
-        let deleted = transaction
-            .execute(
-                "DELETE FROM lcm_raw_messages WHERE provider = ?1 AND message_id = ?2",
-                tracedecay_runtime_core::db::engine::params![provider, message_id],
-            )
-            .await?;
-        transaction.commit().await?;
-        Ok(deleted)
     }
 
     pub async fn project_session_message_count_for_test(
@@ -1629,6 +1595,9 @@ impl Executor for RegisteredGlobalDbTestFixture {
 }
 
 #[cfg(test)]
+crate::observation_projection::impl_send_projection_derive!(RegisteredGlobalDbTestFixture);
+
+#[cfg(test)]
 pub(crate) async fn open_registered_test_fixture(
     path: &std::path::Path,
     scope: tracedecay_runtime_core::db::TestDatabaseRuntimeScope,
@@ -1649,7 +1618,7 @@ mod session_publication_tests {
 
     use super::RegisteredGlobalDbHarness;
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn independently_issued_leases_share_session_publication_ownership() {
         let harness =
             RegisteredGlobalDbHarness::open_without_relation_graph("session-publication-leases")
@@ -1690,7 +1659,7 @@ mod session_publication_tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn separate_registered_owners_publish_sessions_independently() {
         let first =
             RegisteredGlobalDbHarness::open_without_relation_graph("session-publication-first")
@@ -1709,7 +1678,7 @@ mod session_publication_tests {
         drop(first_held);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn cancelled_session_publication_waiters_preserve_current_and_next_owner() {
         let harness =
             RegisteredGlobalDbHarness::open_without_relation_graph("session-publication-cancel")
@@ -1721,9 +1690,14 @@ mod session_publication_tests {
         let cancellation = CancellationToken::new();
         let mut dropped_waiter = Box::pin(dropped_lease.session_publication_guard());
         let mut cancelled_waiter = Box::pin(async {
-            tokio::select! {
-                _ = cancellation.cancelled() => None,
-                guard = cancelled_lease.session_publication_guard() => Some(guard),
+            match futures_util::future::select(
+                Box::pin(cancellation.cancelled()),
+                Box::pin(cancelled_lease.session_publication_guard()),
+            )
+            .await
+            {
+                futures_util::future::Either::Left(((), _)) => None,
+                futures_util::future::Either::Right((guard, _)) => Some(guard),
             }
         });
         let mut surviving_waiter = Box::pin(surviving_lease.session_publication_guard());

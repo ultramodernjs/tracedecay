@@ -4,11 +4,12 @@ use std::future::Future;
 
 use super::audit::audit_from_transaction;
 use super::codec::insert_configuration_projections;
-use super::mutation::{commit_configuration_transaction, validate_commit_bindings};
+use super::mutation::commit_configuration_transaction;
 use super::read::{
     current_revision_id_from_executor, read_change_plan_from_executor, read_revision_from_executor,
     validate_snapshot_registry_completeness_with_registry,
 };
+use super::transact_config;
 use super::write::{insert_change_plan, insert_snapshot_entries};
 use super::{
     ChangePlanId, ConfigurationAuditEvent, ConfigurationAuditEventId, ConfigurationCommitV1,
@@ -100,29 +101,17 @@ impl ConfigurationRevisionStore for GlobalDbConfigurationControlStore<'_> {
         let plan = plan.clone();
         async move {
             tracing::Instrument::instrument(
-                async {
+                async move {
                     plan.validate().map_err(ConfigurationStoreError::from)?;
-                    let transaction = self
-                        .db
-                        .begin_write_transaction()
-                        .await
-                        .map_err(unavailable_store)?;
-                    let outcome = match read_change_plan_from_executor(
-                        &transaction,
-                        &plan.plan.plan_id,
-                    )
-                    .await
-                    {
-                        Ok(Some(existing)) if existing == plan => Ok(()),
-                        Ok(Some(_)) => Err(ConfigurationStoreError::IdempotencyConflict),
-                        Ok(None) => insert_change_plan(&transaction, &plan).await,
-                        Err(error) => Err(error),
-                    };
-                    crate::sqlite_persist::commit_outcome(
-                        transaction,
-                        outcome,
-                        ConfigurationStoreError::Unavailable,
-                    )
+                    transact_config(self.db, unavailable_store, async move |transaction| {
+                        match read_change_plan_from_executor(&transaction, &plan.plan.plan_id).await
+                        {
+                            Ok(Some(existing)) if existing == plan => Ok(()),
+                            Ok(Some(_)) => Err(ConfigurationStoreError::IdempotencyConflict),
+                            Ok(None) => insert_change_plan(&transaction, &plan).await,
+                            Err(error) => Err(error),
+                        }
+                    })
                     .await
                 },
                 tracing::trace_span!("global_db.configuration.persist.plan"),
@@ -159,18 +148,10 @@ impl ConfigurationRevisionStore for GlobalDbConfigurationControlStore<'_> {
         &self,
         commit: ConfigurationCommitV1,
     ) -> ConfigurationStoreResult<ConfigurationMutationReceiptV1> {
-        validate_commit_bindings(&commit)?;
-        let transaction = self
-            .db
-            .begin_write_transaction()
-            .await
-            .map_err(unavailable_store)?;
-        let outcome = commit_configuration_transaction(&transaction, &commit, false, None).await;
-        crate::sqlite_persist::commit_outcome(
-            transaction,
-            outcome,
-            ConfigurationStoreError::Unavailable,
-        )
+        commit.validate().map_err(ConfigurationStoreError::from)?;
+        transact_config(self.db, unavailable_store, async move |transaction| {
+            commit_configuration_transaction(&transaction, &commit, false, None).await
+        })
         .await
     }
 

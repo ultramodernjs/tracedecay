@@ -16,6 +16,7 @@
  * enumerate them, and a key added later is covered by construction rather than
  * by remembering to add it to the event handler.
  */
+import { dashboardFetch } from '../auth/credential.ts';
 import { useQuery } from '@tanstack/react-query';
 import {
   DashboardEnvelopeV1Schema,
@@ -33,7 +34,7 @@ import type { WireSchema } from './wireSchema.ts';
 
 /** The prefix every registry query key starts with, and the one the daemon's
  * `project_registry_changed` invalidation names. */
-export const PROJECT_REGISTRY_ROOT = 'projects';
+const PROJECT_REGISTRY_ROOT = 'projects';
 
 /** `status` on a 404 from `GET /api/projects/{id}`: the registry was read and
  * holds no project under that id. Verbatim from `src/dashboard/projects.rs`. */
@@ -75,7 +76,7 @@ export async function fetchProjectRegistry<T>(
 ): Promise<ProjectRegistryResult<T>> {
   let response: Response;
   try {
-    response = await fetch(url, { headers: { accept: 'application/json' }, ...init });
+    response = await dashboardFetch(url, { headers: { accept: 'application/json' }, ...init });
   } catch (err) {
     if (init?.signal?.aborted === true) throw err;
     return { outcome: 'transport', state: 'offline' };

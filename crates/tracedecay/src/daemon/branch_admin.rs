@@ -12,18 +12,21 @@ use tracedecay_application::pr_tracking::{
     manual_branch_source_owns_artifacts,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_host_admission::{HostAdmissionBroker, HostAdmissionRuntime, SpoolOpenReport};
 use tracedecay_mcp::{ErrorCode, JsonRpcRequest, JsonRpcResponse, McpTransport};
 #[cfg(unix)]
 use tracedecay_runtime_core::branch::BranchAddOutcome;
 #[cfg(unix)]
 use tracedecay_runtime_core::cancellation::CancellationToken;
+#[cfg(unix)]
+use tracedecay_runtime_core::native_runtime;
 
 #[cfg(any(unix, test))]
 use super::ProjectServerKey;
 use super::StoreOwnerKey;
 #[cfg(unix)]
 use super::scheduler::{AutomationSchedulerHandle, AutomationSchedulerSignal};
-use super::{DaemonHandshake, DatabaseOwnerRegistry, write_json_rpc_response};
+use super::{DaemonHandshake, DatabaseOwnerRegistry, write_daemon_response};
 use tracedecay_agent_hosts::native_integration::DaemonNativeIntegrationServiceRegistry;
 #[cfg(unix)]
 use tracedecay_automation_runtime::automation::maintenance_termination::MaintenanceTaskTermination;
@@ -47,8 +50,9 @@ mod remote_deletion_lifecycle;
 pub(in crate::daemon) mod remote_recovery_lifecycle;
 mod session_runtime_shutdown;
 
-type HostAdmissionBrokers =
-    Arc<tokio::sync::Mutex<HashMap<PathBuf, tracedecay_host_admission::SharedHostAdmissionBroker>>>;
+type HostAdmissionBrokerSlot =
+    Arc<tokio::sync::OnceCell<tracedecay_host_admission::SharedHostAdmissionBroker>>;
+type HostAdmissionBrokers = Arc<tokio::sync::Mutex<HashMap<PathBuf, HostAdmissionBrokerSlot>>>;
 /// One profile session refresh service per profile session store. The service
 /// owns the opaque refresh handles it issued, so every route that reaches the
 /// same store (project MCP servers and the projectless client) must share the
@@ -120,9 +124,8 @@ struct MaintenanceReaperKey {
 
 #[cfg(unix)]
 struct MaintenanceReaperHandle {
-    retired_task: tokio::task::AbortHandle,
+    retired_task: Arc<native_runtime::NativeTask<()>>,
     termination: Arc<MaintenanceTaskTermination>,
-    _task: tokio::task::JoinHandle<()>,
 }
 
 #[cfg(unix)]
@@ -257,8 +260,10 @@ struct MaintenanceReaperFinalizer {
 #[cfg(unix)]
 impl Drop for MaintenanceReaperFinalizer {
     fn drop(&mut self) {
-        self.termination.finish();
+        // Termination is the reaper's completion latch: waiters that wake on it
+        // must already see the registry record gone.
         self.registry.finish(&self.key);
+        self.termination.finish();
     }
 }
 
@@ -337,7 +342,6 @@ struct ProfileHostAdmissionBootstrapContext {
     session_runtime_registry:
         Arc<tokio::sync::OnceCell<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>>>,
     host_admission_brokers: HostAdmissionBrokers,
-    host_admission_broker_gate: Arc<tokio::sync::Mutex<()>>,
     profile_host_admission_replay: Weak<ProfileHostAdmissionReplayRegistry>,
 }
 
@@ -379,7 +383,12 @@ impl ProfileHostAdmissionBootstrapContext {
                     error.to_string(),
                 )
             })?;
-        let broker = self.open_broker(&broker_path).await?;
+        let broker = open_host_admission_broker(
+            &self.host_admission_brokers,
+            &broker_path,
+            HostAdmissionRuntime::open_for_database,
+        )
+        .await?;
         let Some(replay) = self.profile_host_admission_replay.upgrade() else {
             return Err(TraceDecayError::project_route(
                 "daemon_shutting_down",
@@ -392,27 +401,24 @@ impl ProfileHostAdmissionBootstrapContext {
             .await;
         Ok(())
     }
+}
 
-    #[tracing::instrument(name = "daemon.branch_admin.open_broker", level = "trace", skip_all)]
-    async fn open_broker(
-        &self,
-        path: &Path,
-    ) -> Result<tracedecay_host_admission::SharedHostAdmissionBroker> {
-        if let Some(broker) = self.host_admission_brokers.lock().await.get(path).cloned() {
-            return Ok(broker);
-        }
-
-        let _open = self.host_admission_broker_gate.lock().await;
-        let brokers = self.host_admission_brokers.lock().await;
-        if let Some(broker) = brokers.get(path) {
-            return Ok(Arc::clone(broker));
-        }
-        drop(brokers);
+/// Returns the cached broker for `path`, opening its runtime at most once.
+/// Openers of one path share its in-flight open; a slow spool open never
+/// delays the first open of another path.
+#[tracing::instrument(name = "daemon.branch_admin.open_broker", level = "trace", skip_all)]
+async fn open_host_admission_broker(
+    brokers: &HostAdmissionBrokers,
+    path: &Path,
+    open: impl FnOnce(&Path) -> Result<(HostAdmissionRuntime, SpoolOpenReport)> + Send + 'static,
+) -> Result<tracedecay_host_admission::SharedHostAdmissionBroker> {
+    let slot = Arc::clone(brokers.lock().await.entry(path.to_path_buf()).or_default());
+    slot.get_or_try_init(|| async {
         let open_path = path.to_path_buf();
-        let (runtime, _) = tokio::task::spawn_blocking(move || {
+        let (runtime, _) = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             let _span =
                 tracing::trace_span!("daemon.branch_admin.host_admission_runtime.open").entered();
-            tracedecay_host_admission::HostAdmissionRuntime::open_for_database(&open_path)
+            open(&open_path)
         })
         .await
         .map_err(|_| {
@@ -422,13 +428,10 @@ impl ProfileHostAdmissionBootstrapContext {
                 "host-admission spool runtime task failed",
             )
         })??;
-        let broker = Arc::new(tracedecay_host_admission::HostAdmissionBroker::new(runtime));
-        self.host_admission_brokers
-            .lock()
-            .await
-            .insert(path.to_path_buf(), Arc::clone(&broker));
-        Ok(broker)
-    }
+        Ok(Arc::new(HostAdmissionBroker::new(runtime)))
+    })
+    .await
+    .cloned()
 }
 
 /// Coordinates every daemon operation that can create, rekey, or remove a
@@ -458,11 +461,14 @@ pub(super) struct StoreAdministration {
         Arc<tokio::sync::Mutex<Vec<RetainedProjectShutdownOwner>>>,
     project_routes: crate::mcp::project_route::SharedHookProjectRouteCache,
     host_admission_brokers: HostAdmissionBrokers,
-    host_admission_broker_gate: Arc<tokio::sync::Mutex<()>>,
     profile_host_admission_replay: Arc<ProfileHostAdmissionReplayRegistry>,
     profile_session_refresh_services: ProfileSessionRefreshServices,
     session_sync_service: Arc<tracedecay_session_runtime::session_sync::DaemonSessionSyncService>,
     store_telemetry_sampling: tracedecay_maintenance::telemetry::StoreTelemetrySamplingRegistry,
+    /// Held by a maintenance tick while its telemetry pass or a store unit
+    /// leases stores, and by a capacity retirement's store release, which
+    /// refuses a leased store.
+    maintenance_store_clients: Arc<tokio::sync::Mutex<()>>,
     #[cfg(unix)]
     automation_schedulers:
         Arc<tokio::sync::Mutex<HashMap<ProjectServerKey, AutomationSchedulerHandle>>>,
@@ -497,7 +503,7 @@ struct ManualBranchPublicationTasks {
     closed: AtomicBool,
     join_failed: AtomicBool,
     cancellation: CancellationToken,
-    tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    tasks: tokio::sync::Mutex<Vec<ManualBranchPublication>>,
 }
 
 #[cfg(unix)]
@@ -507,8 +513,41 @@ impl Default for ManualBranchPublicationTasks {
             closed: AtomicBool::new(false),
             join_failed: AtomicBool::new(false),
             cancellation: CancellationToken::new(),
-            tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            tasks: tokio::sync::Mutex::new(Vec::new()),
         }
+    }
+}
+
+/// One admitted publication; dropping it aborts the task, as a dropped
+/// `JoinSet` did.
+#[cfg(unix)]
+struct ManualBranchPublication(native_runtime::NativeTask<()>);
+
+#[cfg(unix)]
+impl Drop for ManualBranchPublication {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(unix)]
+impl ManualBranchPublicationTasks {
+    /// Logs and records a publication that ended without completing.
+    fn record_join_failure(&self, action: &str, outcome: native_runtime::NativeTaskOutcome<()>) {
+        let reason = match outcome {
+            native_runtime::NativeTaskOutcome::Completed(()) => return,
+            native_runtime::NativeTaskOutcome::Cancelled => "task cancelled".to_owned(),
+            native_runtime::NativeTaskOutcome::Panicked(panic) => format!("task panicked: {panic}"),
+        };
+        self.join_failed.store(true, Ordering::Release);
+        log_daemon_event(
+            "manual_branch_publication",
+            &[
+                ("action", action.to_owned()),
+                ("outcome", "task_join_failed".to_owned()),
+                ("reason", reason),
+            ],
+        );
     }
 }
 
@@ -560,7 +599,6 @@ impl Default for StoreAdministration {
             retained_project_shutdown_owners: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             project_routes: crate::mcp::project_route::SharedHookProjectRouteCache::default(),
             host_admission_brokers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            host_admission_broker_gate: Arc::new(tokio::sync::Mutex::new(())),
             profile_host_admission_replay: Arc::new(
                 ProfileHostAdmissionReplayRegistry::with_replay_pass(Arc::new(
                     |broker, profile_root| {
@@ -576,6 +614,7 @@ impl Default for StoreAdministration {
             ),
             store_telemetry_sampling:
                 tracedecay_maintenance::telemetry::StoreTelemetrySamplingRegistry::default(),
+            maintenance_store_clients: Arc::default(),
             #[cfg(unix)]
             automation_schedulers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(unix)]
@@ -645,25 +684,26 @@ impl StoreAdministration {
                     "manual branch publication admission is closed",
                 ));
             }
-            while let Some(result) = tasks.try_join_next() {
-                if let Err(error) = result {
+            tasks.retain(|task| match task.0.try_finished() {
+                Some(outcome) => {
                     self.manual_branch_publications
-                        .join_failed
-                        .store(true, Ordering::Release);
-                    log_daemon_event(
-                        "manual_branch_publication",
-                        &[
-                            ("action", "reap".to_owned()),
-                            ("outcome", "task_join_failed".to_owned()),
-                            ("reason", error.to_string()),
-                        ],
-                    );
+                        .record_join_failure("reap", outcome);
+                    false
                 }
-            }
-            let cancellation = self.manual_branch_publications.cancellation.clone();
-            tasks.spawn(async move {
-                let _ = result_sender.send(publication(cancellation).await);
+                None => true,
             });
+            let cancellation = self.manual_branch_publications.cancellation.clone();
+            let task = native_runtime::NativeTask::spawn(async move {
+                let _ = result_sender.send(publication(cancellation).await);
+            })
+            .map_err(|error| {
+                TraceDecayError::project_route(
+                    "branch_tracking_failed",
+                    true,
+                    format!("manual branch publication could not start: {error}"),
+                )
+            })?;
+            tasks.push(ManualBranchPublication(task));
         }
         Ok(result_receiver)
     }
@@ -733,24 +773,14 @@ impl StoreAdministration {
         &self,
     ) -> std::result::Result<(), String> {
         self.cancel_manual_branch_publications();
-        let mut tasks = {
+        let tasks = {
             let mut owned = self.manual_branch_publications.tasks.lock().await;
             std::mem::take(&mut *owned)
         };
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result {
-                self.manual_branch_publications
-                    .join_failed
-                    .store(true, Ordering::Release);
-                log_daemon_event(
-                    "manual_branch_publication",
-                    &[
-                        ("action", "shutdown".to_owned()),
-                        ("outcome", "task_join_failed".to_owned()),
-                        ("reason", error.to_string()),
-                    ],
-                );
-            }
+        for task in tasks {
+            let outcome = task.0.wait().await;
+            self.manual_branch_publications
+                .record_join_failure("shutdown", outcome);
         }
         if self
             .manual_branch_publications
@@ -778,6 +808,10 @@ impl StoreAdministration {
         self.store_telemetry_sampling.clone()
     }
 
+    pub(super) fn maintenance_store_clients(&self) -> &tokio::sync::Mutex<()> {
+        &self.maintenance_store_clients
+    }
+
     pub(super) fn project_routes(&self) -> crate::mcp::project_route::SharedHookProjectRouteCache {
         self.project_routes.clone()
     }
@@ -794,6 +828,10 @@ impl StoreAdministration {
         mut self,
         owner_profile: tracedecay_runtime_core::config::ProfileRoot,
     ) -> Self {
+        self.store_telemetry_sampling =
+            tracedecay_maintenance::telemetry::StoreTelemetrySamplingRegistry::persisted_under(
+                owner_profile.data_dir(),
+            );
         self.owner_profile = Some(owner_profile);
         self
     }
@@ -878,6 +916,14 @@ impl StoreAdministration {
         &self,
     ) -> Result<tracedecay_global_db::RegisteredGlobalDbLeaseV1> {
         let database = Box::pin(self.raw_registered_profile_database()).await?;
+        self.refuse_remotely_deleted_profile(&database).await?;
+        Ok(database)
+    }
+
+    async fn refuse_remotely_deleted_profile(
+        &self,
+        database: &tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+    ) -> Result<()> {
         let profile_id = self.profile_identity()?.profile_id().as_str();
         if database
             .remote_account_deletion_tombstone(profile_id)
@@ -890,7 +936,7 @@ impl StoreAdministration {
                 "authenticated profile was remotely deleted",
             ));
         }
-        Ok(database)
+        Ok(())
     }
 
     async fn raw_registered_profile_database(
@@ -907,19 +953,7 @@ impl StoreAdministration {
     )]
     pub(super) async fn ensure_account_active(&self) -> Result<()> {
         let database = Box::pin(self.raw_registered_profile_database()).await?;
-        let profile_id = self.profile_identity()?.profile_id().as_str();
-        if database
-            .remote_account_deletion_tombstone(profile_id)
-            .await?
-            .is_some()
-        {
-            return Err(TraceDecayError::project_route(
-                "remote_deleted",
-                false,
-                "authenticated profile was remotely deleted",
-            ));
-        }
-        Ok(())
+        self.refuse_remotely_deleted_profile(&database).await
     }
 
     #[tracing::instrument(
@@ -966,18 +1000,29 @@ impl StoreAdministration {
     pub(super) async fn mounted_registered_session_databases(
         &self,
     ) -> Result<Vec<tracedecay_global_db::RegisteredGlobalDbLeaseV1>> {
-        let profile_root =
-            authority::canonical_identity_path(self.profile_identity()?.profile_root())?;
+        authority::canonical_identity_path(self.profile_identity()?.profile_root())?;
+        Ok(match self.mounted_session_runtime_registry().await {
+            Some(registry) => registry.mounted_session_databases().await,
+            None => Vec::new(),
+        })
+    }
+
+    /// The profile's session-runtime registry when it is already open; never
+    /// opens it.
+    pub(super) async fn mounted_session_runtime_registry(
+        &self,
+    ) -> Option<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>> {
+        let profile_root = self
+            .profile_identity()
+            .and_then(|identity| authority::canonical_identity_path(identity.profile_root()))
+            .ok()?;
         let registry = {
             let registries = self.session_runtime_registries.lock().await;
             registries
                 .get(&profile_root)
                 .map(|entry| Arc::clone(&entry.registry))
         };
-        let Some(registry) = registry.and_then(|registry| registry.get().cloned()) else {
-            return Ok(Vec::new());
-        };
-        Ok(registry.mounted_session_databases().await)
+        registry.and_then(|registry| registry.get().cloned())
     }
 
     /// The profile's session-runtime registry map and its canonical root,
@@ -999,30 +1044,6 @@ impl StoreAdministration {
     }
 
     #[tracing::instrument(
-        name = "daemon.branch_admin.mounted_project_servers",
-        level = "trace",
-        skip_all
-    )]
-    pub(super) async fn mounted_project_servers(&self) -> Vec<Arc<crate::mcp::McpServer>> {
-        let Ok(profile_root) = self
-            .profile_identity()
-            .and_then(|identity| authority::canonical_identity_path(identity.profile_root()))
-        else {
-            return Vec::new();
-        };
-
-        {
-            let servers = self.project_servers.lock().await;
-            servers
-                .servers
-                .iter()
-                .filter(|(key, _)| key.owner.profile_root == profile_root)
-                .map(|(_, entry)| Arc::clone(&entry.server))
-                .collect::<Vec<_>>()
-        }
-    }
-
-    #[tracing::instrument(
         name = "daemon.branch_admin.mounted_project_graphs",
         level = "trace",
         skip_all
@@ -1030,10 +1051,29 @@ impl StoreAdministration {
     pub(super) async fn mounted_project_graphs(
         &self,
     ) -> Vec<Arc<tracedecay_project::project::TraceDecay>> {
-        let servers = self.mounted_project_servers().await;
-        let mut graphs = Vec::with_capacity(servers.len());
-        for server in &servers {
-            graphs.push(server.cg().await);
+        let Ok(profile_root) = self
+            .profile_identity()
+            .and_then(|identity| authority::canonical_identity_path(identity.profile_root()))
+        else {
+            return Vec::new();
+        };
+
+        // A cloned server handle counts as a client lease, and a bounded route
+        // bind never evicts a leased server. Take the graph slots under the
+        // registry lock and read them after it drops, so a held graph swap
+        // parks neither a route bind nor an eviction.
+        let slots = {
+            let servers = self.project_servers.lock().await;
+            servers
+                .servers
+                .iter()
+                .filter(|(key, _)| key.owner.profile_root == profile_root)
+                .map(|(_, entry)| entry.server.graph_slot())
+                .collect::<Vec<_>>()
+        };
+        let mut graphs = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            graphs.push(slot.read().await.clone());
         }
         graphs
     }
@@ -1162,18 +1202,7 @@ impl StoreAdministration {
         &self,
         database: &tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     ) -> Result<tracedecay_host_admission::SharedHostAdmissionBroker> {
-        let profile_id = self.profile_identity()?.profile_id().as_str();
-        if database
-            .remote_account_deletion_tombstone(profile_id)
-            .await?
-            .is_some()
-        {
-            return Err(TraceDecayError::project_route(
-                "remote_deleted",
-                false,
-                "authenticated profile was remotely deleted",
-            ));
-        }
+        self.refuse_remotely_deleted_profile(database).await?;
         self.host_admission_broker_for_path(database.db_path())
             .await
     }
@@ -1188,47 +1217,15 @@ impl StoreAdministration {
         database_path: &Path,
     ) -> Result<tracedecay_host_admission::SharedHostAdmissionBroker> {
         let path = authority::canonical_identity_path(database_path)?;
-        if let Some(broker) = self.host_admission_brokers.lock().await.get(&path).cloned() {
-            self.maybe_ensure_user_profile_host_admission_replay(&path, &broker)
-                .await;
-            return Ok(broker);
-        }
-
-        // Serialize first-open publication without retaining the broker map
-        // lock across blocking filesystem work.
-        let _open = self.host_admission_broker_gate.lock().await;
-        let state = {
-            let brokers = self.host_admission_brokers.lock().await;
-            if let Some(broker) = brokers.get(&path) {
-                Arc::clone(broker)
-            } else {
-                drop(brokers);
-                let open_path = path.clone();
-                let (runtime, _) = tokio::task::spawn_blocking(move || {
-                    let _span =
-                        tracing::trace_span!("daemon.branch_admin.host_admission_runtime.open")
-                            .entered();
-                    tracedecay_host_admission::HostAdmissionRuntime::open_for_database(&open_path)
-                })
-                .await
-                .map_err(|_| {
-                    TraceDecayError::project_route(
-                        "spool_runtime_unavailable",
-                        true,
-                        "host-admission spool runtime task failed",
-                    )
-                })??;
-                let broker = Arc::new(tracedecay_host_admission::HostAdmissionBroker::new(runtime));
-                self.host_admission_brokers
-                    .lock()
-                    .await
-                    .insert(path.clone(), Arc::clone(&broker));
-                broker
-            }
-        };
-        self.maybe_ensure_user_profile_host_admission_replay(&path, &state)
+        let broker = open_host_admission_broker(
+            &self.host_admission_brokers,
+            &path,
+            HostAdmissionRuntime::open_for_database,
+        )
+        .await?;
+        self.maybe_ensure_user_profile_host_admission_replay(&path, &broker)
             .await;
-        Ok(state)
+        Ok(broker)
     }
 
     /// Kick the coalesced user-profile replay worker. Never awaits a replay pass.
@@ -1301,7 +1298,6 @@ impl StoreAdministration {
             profile_identity,
             session_runtime_registry,
             host_admission_brokers: Arc::clone(&self.host_admission_brokers),
-            host_admission_broker_gate: Arc::clone(&self.host_admission_broker_gate),
             profile_host_admission_replay: Arc::downgrade(&self.profile_host_admission_replay),
         };
         let operation: ProfileHostAdmissionBootstrapOperation = Arc::new(move || {
@@ -1341,7 +1337,7 @@ impl StoreAdministration {
         broker: &tracedecay_host_admission::SharedHostAdmissionBroker,
     ) {
         let is_user_sessions = broker_path.file_name().and_then(|name| name.to_str())
-            == Some(tracedecay_sessions::runtime::USER_SESSIONS_DB_FILENAME);
+            == Some(tracedecay_runtime_core::storage::USER_SESSIONS_DB_FILENAME);
         if !is_user_sessions {
             return;
         }
@@ -1488,7 +1484,7 @@ impl StoreAdministration {
         mut reservation: MaintenanceReaperReservation,
         kind: MaintenanceReaperKind,
         owner: ProjectServerKey,
-        task: tokio::task::JoinHandle<()>,
+        task: native_runtime::NativeTask<()>,
         termination: Arc<MaintenanceTaskTermination>,
         cleanup: F,
     ) where
@@ -1507,31 +1503,44 @@ impl StoreAdministration {
             barrier.block();
         }
 
-        let retired_task = task.abort_handle();
         task.abort();
-        let mut state = self.retirement_reapers.state();
-        let key = MaintenanceReaperRegistry::next_key(&mut state, kind, &owner);
+        let retired_task = Arc::new(task);
+        let key =
+            MaintenanceReaperRegistry::next_key(&mut self.retirement_reapers.state(), kind, &owner);
         let finalizer = MaintenanceReaperFinalizer {
             registry: Arc::clone(&self.retirement_reapers),
             key: key.clone(),
             termination: Arc::clone(&termination),
         };
         let (start, registered) = tokio::sync::oneshot::channel();
-        let reaper = tokio::spawn(tracing::Instrument::instrument(
+        let reaped_task = Arc::clone(&retired_task);
+        // Spawned before the registry lock: a refused spawn drops the
+        // finalizer, which takes that lock.
+        if let Err(error) = native_runtime::NativeTask::spawn(tracing::Instrument::instrument(
             async move {
                 let _finalizer = finalizer;
                 let _ = registered.await;
-                let _ = task.await;
+                let _ = reaped_task.wait().await;
                 cleanup.await;
             },
             tracing::trace_span!("daemon.branch_admin.retirement_reaper"),
-        ));
+        )) {
+            log_daemon_event(
+                "retirement_reaper",
+                &[
+                    ("owner", format!("{:?}", owner.owner.project_id)),
+                    ("outcome", "runtime_unavailable".to_owned()),
+                    ("error", error),
+                ],
+            );
+            return;
+        }
+        let mut state = self.retirement_reapers.state();
         let replaced = state.reapers.insert(
             key,
             MaintenanceReaperHandle {
                 retired_task,
                 termination,
-                _task: reaper,
             },
         );
         debug_assert!(replaced.is_none());
@@ -1633,7 +1642,7 @@ impl StoreAdministration {
         timeout: std::time::Duration,
         stop_accepting: bool,
     ) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let changed = self.retirement_reapers.changed.notified();
             let (pending, matching) = {
@@ -1674,13 +1683,13 @@ impl StoreAdministration {
                 task.abort();
             }
             if matching.is_empty() {
-                if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                if native_runtime::timeout_at(deadline, changed).await.is_err() {
                     return false;
                 }
                 continue;
             }
             for (_, termination) in matching {
-                if tokio::time::timeout_at(deadline, termination.wait())
+                if native_runtime::timeout_at(deadline, termination.wait())
                     .await
                     .is_err()
                 {
@@ -2081,7 +2090,7 @@ pub(super) async fn write_branch_admin_response(
         }
         (Ok(_), Err(error)) => branch_admin_error_response(request.id, &error),
     };
-    write_json_rpc_response(transport, &response).await
+    write_daemon_response(transport, &response).await
 }
 
 #[cfg(test)]
@@ -2187,6 +2196,55 @@ mod tests {
         administration.shutdown_host_admission_replay().await;
     }
 
+    /// A spool open can stall for seconds on fsync under load. A first open of
+    /// one database must not park the first open of an unrelated database,
+    /// while a second opener of the same database shares the in-flight open.
+    #[tokio::test]
+    async fn stalled_first_open_does_not_block_an_unrelated_first_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let stalled_path = temp.path().join("stalled.db");
+        let unrelated_path = temp.path().join("unrelated.db");
+        let brokers: HostAdmissionBrokers = Arc::default();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let (stalled, (shared, unrelated)) = tokio::join!(
+            open_host_admission_broker(&brokers, &stalled_path, move |path| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                HostAdmissionRuntime::open_for_database(path)
+            }),
+            async {
+                entered_rx.await.expect("stalled open started");
+                tokio::join!(
+                    open_host_admission_broker(&brokers, &stalled_path, |_| {
+                        panic!("a concurrent opener of the same path must share the open")
+                    }),
+                    async {
+                        // Deadlock guard only: the stalled open stays held
+                        // until the unrelated open returns.
+                        let unrelated = tokio::time::timeout(
+                            Duration::from_mins(1),
+                            open_host_admission_broker(
+                                &brokers,
+                                &unrelated_path,
+                                HostAdmissionRuntime::open_for_database,
+                            ),
+                        )
+                        .await
+                        .expect("an unrelated first open waited on another path's open");
+                        release_tx.send(()).unwrap();
+                        unrelated
+                    },
+                )
+            },
+        );
+
+        let stalled = stalled.unwrap();
+        assert!(Arc::ptr_eq(&stalled, &shared.unwrap()));
+        assert!(!Arc::ptr_eq(&stalled, &unrelated.unwrap()));
+    }
+
     #[tokio::test]
     async fn profile_replay_uses_installed_hermes_callback_to_commit_receipt() {
         let temp = tempfile::tempdir().unwrap();
@@ -2271,14 +2329,10 @@ mod tests {
             .ensure_profile_host_admission_bootstrap(&profile_root)
             .await
             .unwrap();
-        // The worker performs a real session-runtime-registry open before it
-        // can surface the spool error, so give it a generous (still bounded)
-        // wait; completion notifies immediately, so a healthy run never
-        // sleeps this long.
         assert_eq!(
             administration
                 .profile_host_admission_replay
-                .wait_bootstrap_completed(&profile_root, Duration::from_mins(1))
+                .wait_bootstrap_completed(&profile_root, None)
                 .await,
             BootstrapCompletion::Completed,
             "production bootstrap worker must publish its terminal state"
@@ -2347,13 +2401,16 @@ mod tests {
 
         let unrelated_path = temp.path().join("unrelated.db");
         std::fs::File::create(&unrelated_path).unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            administration.host_admission_broker_for_path(&unrelated_path),
-        )
-        .await
-        .expect("typed bootstrap terminal must not block unrelated broker opens")
-        .unwrap();
+        // An unrelated first open takes only the broker map lock; its own
+        // spool fsyncs are real IO with no latency contract.
+        assert!(
+            administration.host_admission_brokers.try_lock().is_ok(),
+            "typed bootstrap terminal must not block unrelated broker opens"
+        );
+        administration
+            .host_admission_broker_for_path(&unrelated_path)
+            .await
+            .unwrap();
         administration.shutdown_host_admission_replay().await;
     }
 

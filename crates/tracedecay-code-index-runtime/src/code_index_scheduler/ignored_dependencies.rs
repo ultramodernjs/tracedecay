@@ -24,7 +24,7 @@ use super::{
     CodeIndexWorktreeSchedulerV1, LatestCompleteCodeIndexV1, SourceContentManifestV1,
     StaticLanguageRegistry, now_micros, projection_key,
 };
-use crate::code_index::languages::LanguageRegistry;
+use tracedecay_code_index::languages::LanguageRegistry;
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 pub const ADMITTED_SOURCE_READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -256,6 +256,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         previous_roster: Vec<CodeIndexIgnoredSourceAdmissionV1>,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<CodeIndexIgnoredDependencyBuildV1, CodeIndexSchedulerErrorV1> {
+        let began_under = self.epoch.load(std::sync::atomic::Ordering::Acquire);
         let _workers = self.ensure_worker_plan()?;
         let _worker_memory = match self.reserve_worker_memory() {
             Ok(reservation) => reservation,
@@ -326,7 +327,10 @@ impl CodeIndexWorktreeSchedulerV1 {
         let generation_id = generation.manifest().generation_id.clone();
         drop((retained_bytes, retained_reservations));
         self.latest_content_identity = Some(generation.snapshot().content_identity.clone());
-        self.mark_reconciled(SourceContentManifestV1::for_snapshot(generation.snapshot()));
+        self.mark_reconciled(
+            SourceContentManifestV1::for_snapshot(generation.snapshot()),
+            began_under,
+        );
         let latest = self.bind_latest_complete(
             self.decoded_publication(&generation)
                 .map_err(CodeIndexProductionErrorV1::Publication)?,
@@ -844,7 +848,7 @@ fn prove_gix_ignored(root: &Path, logical_path: &str) -> Result<(), CodeIndexSch
         .map_err(|error| CodeIndexSchedulerErrorV1::Git(error.to_string()))?;
     let ignored = excludes
         .at_path(Path::new(logical_path), None)
-        .map_err(CodeIndexSchedulerErrorV1::Io)?
+        .map_err(|error| CodeIndexSchedulerErrorV1::Git(error.to_string()))?
         .is_excluded();
     if ignored {
         Ok(())

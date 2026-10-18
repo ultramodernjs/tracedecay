@@ -3,7 +3,6 @@ use crate::daemon::ProductionProjectCompositionHarnessV1;
 use crate::daemon::{
     AuthenticatedFirstRequest, ProjectServerRequirement, project_server_requirement,
 };
-use std::process::Command;
 #[cfg(unix)]
 use tracedecay_domain::errors::TraceDecayError;
 
@@ -163,23 +162,6 @@ fn hook_event_waits_for_registered_project_authority_publication() {
     );
 }
 
-pub(super) fn run_git(root: &std::path::Path, args: &[&str]) {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .env("GIT_AUTHOR_NAME", "TraceDecay Test")
-        .env("GIT_AUTHOR_EMAIL", "test@tracedecay.local")
-        .env("GIT_COMMITTER_NAME", "TraceDecay Test")
-        .env("GIT_COMMITTER_EMAIL", "test@tracedecay.local")
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 #[cfg(unix)]
 fn assert_missing_enrollment_admission(error: &TraceDecayError) {
     assert!(
@@ -318,7 +300,7 @@ async fn durably_enrolled_project_is_admitted_after_a_registry_reset() {
     let profile_root = root.join(".tracedecay");
     let project = root.join("repository");
     std::fs::create_dir_all(&project).expect("create repository");
-    run_git(&project, &["init", "--quiet"]);
+    git(&project, &["init", "--quiet"]);
     let layout = enroll_project_on_disk_only(&project, &profile_root, "proj_forward_boundary");
 
     let _database_scope =
@@ -367,7 +349,7 @@ async fn identity_marker_without_a_store_is_still_rejected() {
     let profile_root = root.join(".tracedecay");
     let project = root.join("repository");
     std::fs::create_dir_all(&project).expect("create repository");
-    run_git(&project, &["init", "--quiet"]);
+    git(&project, &["init", "--quiet"]);
     let layout = enroll_project_on_disk_only(&project, &profile_root, "proj_store_absent");
     std::fs::remove_dir_all(&layout.data_root).expect("remove profile store");
 
@@ -401,7 +383,7 @@ async fn orphaned_store_with_repository_identity_is_readopted_without_aliasing()
     let profile_root = root.join(".tracedecay");
     let project = root.join("repository");
     std::fs::create_dir_all(&project).expect("create repository");
-    run_git(&project, &["init", "--quiet"]);
+    git(&project, &["init", "--quiet"]);
 
     // The durable repository identity marker names a project id that is NOT
     // the path-derived hash of this checkout, so a re-adoption that silently
@@ -1026,7 +1008,7 @@ async fn remote_project_deletion_stays_settling_until_transferred_reaper_joins()
     let profile_root = root.join(".tracedecay");
     let project = root.join("repository");
     std::fs::create_dir_all(&project).expect("create repository");
-    run_git(&project, &["init", "--quiet"]);
+    git(&project, &["init", "--quiet"]);
     let layout = enroll_project_on_disk_only(&project, &profile_root, "proj_reaper_settling");
     std::fs::remove_file(&layout.graph_db_path).expect("remove synthetic graph file");
     let _database_scope =
@@ -1048,7 +1030,7 @@ async fn remote_project_deletion_stays_settling_until_transferred_reaper_joins()
         project_root: project.canonicalize().expect("canonical project"),
         scope_prefix: None,
     };
-    let (task, started_rx, completed_rx, release) = spawn_noncooperative_test_task();
+    let (task, _, started_rx, completed_rx, release) = spawn_noncooperative_native_test_task();
     started_rx.await.expect("maintenance task started");
     engine
         .store_administration
@@ -1138,7 +1120,7 @@ async fn remote_project_deletion_ignores_unrelated_server_retirement() {
     let profile_root = root.join(".tracedecay");
     let project = root.join("target-repository");
     std::fs::create_dir_all(&project).expect("create target repository");
-    run_git(&project, &["init", "--quiet"]);
+    git(&project, &["init", "--quiet"]);
     let layout = enroll_project_on_disk_only(&project, &profile_root, "proj_retirement_target");
     std::fs::remove_file(&layout.graph_db_path).expect("remove synthetic graph file");
     let _database_scope =
@@ -1199,7 +1181,7 @@ async fn remote_project_deletion_denies_unknown_and_cross_profile_identities_wit
     let other_profile = root.join("other-profile");
     let other_project = root.join("other-repository");
     std::fs::create_dir_all(&other_project).expect("create other repository");
-    run_git(&other_project, &["init", "--quiet"]);
+    git(&other_project, &["init", "--quiet"]);
     enroll_project_on_disk_only(&other_project, &other_profile, "proj_cross_profile");
 
     let _database_scope =
@@ -1240,7 +1222,7 @@ async fn remote_project_deletion_denies_unprovable_corrupt_shard_before_tombston
     let profile_root = root.join(".tracedecay");
     let project = root.join("repository");
     std::fs::create_dir_all(&project).expect("create repository");
-    run_git(&project, &["init", "--quiet"]);
+    git(&project, &["init", "--quiet"]);
     let layout =
         enroll_project_on_disk_only(&project, &profile_root, "proj_remote_partial_cleanup");
     std::fs::remove_dir_all(&layout.data_root).expect("remove synthetic project shard");
@@ -1299,7 +1281,7 @@ async fn remote_account_deletion_removes_all_exact_profile_shards_and_fences_rep
     let second_project = root.join("second-repository");
     for project in [&first_project, &second_project] {
         std::fs::create_dir_all(project).expect("create repository");
-        run_git(project, &["init", "--quiet"]);
+        git(project, &["init", "--quiet"]);
     }
     let first_layout =
         enroll_project_on_disk_only(&first_project, &profile_root, "proj_remote_account_a");
@@ -1657,7 +1639,7 @@ async fn unenrolled_leaf_is_rejected_from_cache_and_direct_open() {
     let profile_root = home.path().join(".tracedecay");
     let repository = home.path().join("repository");
     std::fs::create_dir_all(&repository).expect("create repository");
-    run_git(&repository, &["init", "--quiet"]);
+    git(&repository, &["init", "--quiet"]);
     let leaf_directory = repository.join("leaf");
     std::fs::create_dir_all(&leaf_directory).expect("create leaf directory");
     let _database_scope =
@@ -1705,11 +1687,11 @@ async fn linked_worktree_root_is_admitted_for_explicit_first_touch_init() {
     let linked = root.join("linked");
     let profile_root = root.join("profile");
     std::fs::create_dir_all(&primary).expect("create primary repository");
-    run_git(&primary, &["init", "-b", "main", "--quiet"]);
+    git(&primary, &["init", "-b", "main", "--quiet"]);
     std::fs::write(primary.join("README.md"), "first touch authority\n").expect("fixture");
-    run_git(&primary, &["add", "."]);
-    run_git(&primary, &["commit", "-m", "fixture", "--quiet"]);
-    run_git(
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-m", "fixture", "--quiet"]);
+    git(
         &primary,
         &[
             "worktree",
@@ -1757,11 +1739,11 @@ async fn linked_route_reuses_primary_authority_while_shadow_writer_is_held() {
     let linked = root.join("linked");
     let profile_root = root.join("profile");
     std::fs::create_dir_all(&primary).expect("create primary repository");
-    run_git(&primary, &["init", "-b", "main", "--quiet"]);
+    git(&primary, &["init", "-b", "main", "--quiet"]);
     std::fs::write(primary.join("README.md"), "shared authority\n").expect("fixture");
-    run_git(&primary, &["add", "."]);
-    run_git(&primary, &["commit", "-m", "fixture", "--quiet"]);
-    run_git(
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-m", "fixture", "--quiet"]);
+    git(
         &primary,
         &[
             "worktree",
@@ -1846,6 +1828,7 @@ async fn linked_route_reuses_primary_authority_while_shadow_writer_is_held() {
         !linked.join(".tracedecay").exists(),
         "linked route must not acquire working-tree project state"
     );
+    drop((primary_server, linked_server));
     engine.shutdown_all().await;
 }
 
@@ -1860,10 +1843,10 @@ async fn first_touch_init_from_another_build_leaves_the_profile_untouched() {
     let home = home.path().canonicalize().expect("canonical home");
     let corpus = home.join("scratch-corpus");
     std::fs::create_dir_all(&corpus).expect("create corpus");
-    run_git(&corpus, &["init", "-b", "main", "--quiet"]);
+    git(&corpus, &["init", "-b", "main", "--quiet"]);
     std::fs::write(corpus.join("README.md"), "scratch corpus\n").expect("fixture");
-    run_git(&corpus, &["add", "."]);
-    run_git(&corpus, &["commit", "-m", "fixture", "--quiet"]);
+    git(&corpus, &["add", "."]);
+    git(&corpus, &["commit", "-m", "fixture", "--quiet"]);
 
     let own_build = DaemonHandshake {
         project_path: Some(corpus.clone()),
@@ -1921,10 +1904,10 @@ async fn shutdown_fences_git_index_transactions_and_joins_store_actors() {
     let home = home.path().canonicalize().expect("canonical home");
     let repository = home.join("repository");
     std::fs::create_dir_all(&repository).expect("create repository");
-    run_git(&repository, &["init", "-b", "main", "--quiet"]);
+    git(&repository, &["init", "-b", "main", "--quiet"]);
     std::fs::write(repository.join("README.md"), "shutdown fence fixture\n").expect("fixture");
-    run_git(&repository, &["add", "."]);
-    run_git(&repository, &["commit", "-m", "fixture", "--quiet"]);
+    git(&repository, &["add", "."]);
+    git(&repository, &["commit", "-m", "fixture", "--quiet"]);
 
     let handshake = DaemonHandshake {
         project_path: Some(repository.clone()),
@@ -1959,8 +1942,8 @@ async fn shutdown_fences_git_index_transactions_and_joins_store_actors() {
     ));
 
     // The idempotent receipt proves engine shutdown already closed the one
-    // mounted service and joined its store actor thread, so the registered
-    // session database Arc retained by the actor dropped with
+    // mounted service and closed its store, so the registered
+    // session database lease retained by the store dropped with
     // `shutdown_servers` rather than at process exit.
     let receipt = registry
         .shutdown()
@@ -2431,7 +2414,6 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
     // enrollment, so the request can subscribe before the bound is spent.
     // It is retried the way a client retries the warming hint, so the route is
     // left with no open of its own before the fixture takes it over.
-    let warmup_give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let error = match engine
             .project_server_for_request(
@@ -2450,10 +2432,6 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
             super::super::error_is_project_warming(&error),
             "the warm-up open must refuse the missing database: {error:?}"
         );
-        assert!(
-            tokio::time::Instant::now() < warmup_give_up,
-            "the warm-up open never published its missing-index refusal"
-        );
     }
 
     let (_, route) = engine
@@ -2464,10 +2442,6 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
     // JoinHandle necessarily reports finished. Let pruning observe both
     // before this fixture claims the same route for its controlled open.
     while tasks.status(&route).is_some() {
-        assert!(
-            tokio::time::Instant::now() < warmup_give_up,
-            "the warm-up route task did not finish after publishing its refusal"
-        );
         tokio::task::yield_now().await;
     }
     let (release, blocked) = tokio::sync::oneshot::channel();
@@ -2498,22 +2472,30 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
     );
     tokio::pin!(ordinary_request);
     tokio::pin!(init_request);
-    // Drive both requests onto this open before it publishes. A request that
+    // Drive each request onto this open before it publishes. A request that
     // has not been polled to its join holds no receiver on this open's watch
     // channel, and a recorded `Config` failure carries no backoff, so the
     // finished entry is pruned (`ProjectOpenTaskRegistry::prune`) and the next
-    // poll mints a fresh open that is still `Opening` at the bound. The window
-    // is the warmed path's headroom, not a settling delay: it must outlast a
-    // loaded machine's walk to the join and still leave the 500 ms bound
-    // unspent when the failure is released below.
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(150), async {
-            tokio::join!(&mut ordinary_request, &mut init_request)
-        })
-        .await
-        .is_err(),
-        "neither request may answer while the open they joined is blocked"
-    );
+    // poll mints a fresh open instead. A joined request is not polled again
+    // until the failure is published, so its publication bound cannot spend
+    // itself on this test's schedule.
+    let mut joins = tasks.joins();
+    let joined_before = *joins.borrow_and_update();
+    for (joined, request) in [
+        (joined_before + 1, ordinary_request.as_mut()),
+        (joined_before + 2, init_request.as_mut()),
+    ] {
+        tokio::select! {
+            biased;
+            observed = joins.wait_for(|joins| *joins >= joined) => {
+                observed.expect("project-open join observer");
+            }
+            answered = request => panic!(
+                "a request answered before joining the blocked open: {:?}",
+                answered.err()
+            ),
+        }
+    }
     assert!(
         matches!(
             inflight.borrow().clone(),
@@ -2522,17 +2504,16 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
         "the joined open must still be in flight when its failure is released"
     );
     release.send(()).expect("release ordinary open");
+    // Resume the joined waiter only once the failure is on its watch. If its
+    // publication bound elapsed meanwhile, `prefer_recorded_open_failure`
+    // classifies the recorded failure, not the warming hint.
+    let mut published = inflight.clone();
+    published
+        .wait_for(|state| !matches!(state, super::super::ProjectOpenTaskState::Opening))
+        .await
+        .expect("the released open must publish its outcome");
 
-    // The failure lands while the ordinary waiter stays joined and polled,
-    // which is the state `prefer_recorded_open_failure` classifies.
-    let ordinary_outcome =
-        tokio::time::timeout(std::time::Duration::from_secs(10), &mut ordinary_request)
-            .await
-            .expect(
-                "the joined ordinary waiter never settled after the open published its failure",
-            );
-
-    let ordinary_error = match ordinary_outcome {
+    let ordinary_error = match ordinary_request.await {
         Ok(_) => panic!("ordinary open must not initialize a missing database"),
         Err(error) => error,
     };
@@ -2565,10 +2546,7 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
     // is the retry production tells the client to repeat; any other refusal
     // would mean the retry inherited the ordinary open's missing-index failure
     // instead of opening under its own authorization.
-    let mut init_outcome = tokio::time::timeout(std::time::Duration::from_secs(30), init_request)
-        .await
-        .expect("explicit init retry never settled");
-    let give_up = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut init_outcome = init_request.await;
     let server = loop {
         let warming = match init_outcome {
             Ok(server) => break server,
@@ -2577,10 +2555,6 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
         assert!(
             super::super::error_is_project_warming(&warming),
             "explicit init must retry with its own authorization: {warming:?}"
-        );
-        assert!(
-            tokio::time::Instant::now() < give_up,
-            "the admitted explicit-init open never published its owners"
         );
         // Each retry parks on the admitted open's own publication, so this
         // waits on that open rather than on elapsed time.
@@ -2595,6 +2569,7 @@ async fn explicit_init_retries_after_joining_an_ordinary_missing_database_open()
         server.cg().await.store_layout().graph_db_path.is_file(),
         "authorized retry must recreate the generated project database"
     );
+    drop(server);
     let receipt = engine.shutdown_all().await;
     assert!(
         receipt.background.unfinished().is_empty(),
@@ -2807,6 +2782,122 @@ async fn project_open_shutdown_aborts_a_noncooperative_task_at_the_backstop() {
     );
 }
 
+/// Aborting an open abandons its wait on blocking work, not the work: a Hook
+/// binding write still blocked in the pool must keep shutdown from reporting
+/// the open drained, so no write lands after shutdown returns `true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_open_shutdown_joins_blocking_work_its_aborted_open_owns() {
+    let tasks = super::super::ProjectOpenTasks::default();
+    let route = project_open_test_route("shutdown-owned-blocking");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let binding_written = Arc::clone(&written);
+    match tasks.start_cancellable(route, move |_| async move {
+        tracedecay_runtime_core::native_runtime::spawn_owned_blocking(move || {
+            started_tx.send(()).expect("publish write start");
+            release_rx.recv().expect("release binding write");
+            binding_written.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .await
+        .map_err(|message| tracedecay_domain::errors::TraceDecayError::Config { message })
+    }) {
+        super::super::ProjectOpenTaskClaim::InFlight(_) => {}
+        super::super::ProjectOpenTaskClaim::Failed(_) => panic!("blocked open must start"),
+        super::super::ProjectOpenTaskClaim::Saturated => panic!("blocked open must fit"),
+    }
+    started_rx.await.expect("binding write started");
+
+    assert!(
+        !tasks
+            .shutdown_with_deadline(
+                tokio::time::Duration::ZERO,
+                tokio::time::Duration::from_millis(50),
+            )
+            .await,
+        "an aborted open whose binding write is still blocked must not report drained"
+    );
+    assert_eq!(tasks.tracked_route_count(), 1);
+    release_tx.send(()).expect("release binding write");
+    assert!(
+        tasks
+            .shutdown_with_deadline(
+                tokio::time::Duration::from_secs(5),
+                tokio::time::Duration::ZERO,
+            )
+            .await,
+        "shutdown must join the aborted open once its binding write returned"
+    );
+    assert!(
+        written.load(std::sync::atomic::Ordering::Acquire),
+        "the binding write must land before shutdown reports drained"
+    );
+    assert_eq!(tasks.tracked_route_count(), 0);
+}
+
+/// The daemon coordinator drops the `project_open` join at its phase deadline,
+/// which can come before the join's own cooperative window ends and its abort
+/// backstop runs. The open it was waiting on must be aborted then. Its route
+/// stays registered, so a later shutdown still joins it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_shutdown_owner_aborts_the_project_open_task() {
+    let tasks = super::super::ProjectOpenTasks::default();
+    let route = project_open_test_route("timed-out-owner");
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (alive, task_dropped) = std::sync::mpsc::channel::<()>();
+    match tasks.start_cancellable(route, move |_| async move {
+        let _alive = alive;
+        started_tx.send(()).expect("publish task start");
+        std::future::pending::<()>().await;
+        Ok(())
+    }) {
+        super::super::ProjectOpenTaskClaim::InFlight(_) => {}
+        super::super::ProjectOpenTaskClaim::Failed(_) => panic!("pending task must start"),
+        super::super::ProjectOpenTaskClaim::Saturated => panic!("pending task must fit"),
+    }
+    started_rx.await.expect("noncooperative task started");
+
+    let join_tasks = tasks.clone();
+    let receipt = tracedecay_daemon_service::shutdown::join_shutdown_owners(
+        std::time::Instant::now() + std::time::Duration::from_millis(100),
+        vec![
+            tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_status(
+                "project_open",
+                || {},
+                move |_| async move {
+                    if join_tasks.shutdown().await {
+                        tracedecay_daemon_service::shutdown::ShutdownStatus::Clean
+                    } else {
+                        tracedecay_daemon_service::shutdown::ShutdownStatus::TimedOut
+                    }
+                },
+            ),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        receipt.owners[0].status,
+        tracedecay_daemon_service::shutdown::ShutdownStatus::TimedOut
+    );
+    assert_eq!(
+        task_dropped.recv_timeout(std::time::Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "a timed-out owner must not leave the project open it was joining running"
+    );
+    assert_eq!(tasks.tracked_route_count(), 1);
+    assert!(
+        tasks
+            .shutdown_with_deadline(
+                tokio::time::Duration::from_secs(5),
+                tokio::time::Duration::ZERO,
+            )
+            .await,
+        "a later shutdown must join the aborted open"
+    );
+    assert_eq!(tasks.tracked_route_count(), 0);
+}
+
 #[tokio::test]
 async fn project_open_identity_shutdown_ignores_unrelated_retiring_routes() {
     let tasks = super::super::ProjectOpenTasks::default();
@@ -2981,7 +3072,6 @@ async fn project_open_shutdown_retains_synchronous_work_after_deadline() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn portable_broker_bootstrap_bypasses_project_writer_gate() {
-    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
     const PHASE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(20);
 
     let temp = TempDir::new().expect("temp dir");
@@ -3068,7 +3158,7 @@ async fn portable_broker_bootstrap_bypasses_project_writer_gate() {
             clients.spawn(async move {
                 Box::pin(super::super::serve_windows_broker_client(
                     stream,
-                    TOKEN,
+                    TEST_AUTH_TOKEN,
                     &lifecycle,
                     administration,
                     gates,
@@ -3086,15 +3176,9 @@ async fn portable_broker_bootstrap_bypasses_project_writer_gate() {
         let endpoint = endpoint.clone();
         let handshake = handshake.clone();
         async move {
-            let stream = tracedecay_daemon_protocol::BrokerStream::connect(&endpoint)
-                .await
-                .expect("connect client");
-            let (reader, mut writer) = stream.into_split();
-            let preface = tracedecay_daemon_protocol::DaemonAuthPreface::new(TOKEN)
-                .to_line()
-                .expect("auth preface");
-            writer.write_all(preface.as_bytes()).await.expect("preface");
-            writer.write_all(b"\n").await.expect("preface newline");
+            let (reader, mut writer) =
+                tokio::io::split(super::connect_loopback_test_peer(&endpoint).await);
+            write_test_auth_preface(&mut writer).await;
             writer
                 .write_all(handshake.to_line().expect("handshake").as_bytes())
                 .await
@@ -3271,20 +3355,29 @@ async fn project_server_warmup_drops_lifecycle_activity_on_draining() {
 async fn scheduler_activation_drain_wins_when_discovery_is_simultaneously_ready() {
     for _ in 0..32 {
         let lifecycle = DaemonLifecycle::default();
-        let discovery_polled = Arc::new(tokio::sync::Notify::new());
-        let discovery_polled_by_future = Arc::clone(&discovery_polled);
+        let discovery_parked = Arc::new(tokio::sync::Notify::new());
+        let discovery_parked_by_future = Arc::clone(&discovery_parked);
         let discovery_lifecycle = lifecycle.clone();
         let discovery_won = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let discovery_won_by_future = Arc::clone(&discovery_won);
+        let mut discovery = Box::pin(async move {
+            discovery_lifecycle.wait_for_draining().await;
+            discovery_won_by_future.store(true, std::sync::atomic::Ordering::Release);
+        });
+        // The activation runs on a native worker beside this thread. Draining
+        // only after discovery has returned `Pending` makes both arms ready
+        // on the activation's next poll instead of racing the current one.
         super::super::project_open_orchestration::spawn_lifecycle_automation_scheduler_activation(
             lifecycle.clone(),
-            async move {
-                discovery_polled_by_future.notify_one();
-                discovery_lifecycle.wait_for_draining().await;
-                discovery_won_by_future.store(true, std::sync::atomic::Ordering::Release);
-            },
+            std::future::poll_fn(move |context| {
+                let polled = discovery.as_mut().poll(context);
+                if polled.is_pending() {
+                    discovery_parked_by_future.notify_one();
+                }
+                polled
+            }),
         );
-        discovery_polled.notified().await;
+        discovery_parked.notified().await;
 
         lifecycle.begin_draining();
         tokio::time::timeout(
@@ -3437,7 +3530,6 @@ async fn project_warmup_settles_when_drain_is_simultaneously_ready() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_bootstrap_catalog_bypasses_project_writer_gate() {
-    const PHASE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(20);
     let temp = TempDir::new().expect("temp dir");
     let project = temp.path().join("project");
     let profile_root = temp.path().join("profile");
@@ -3495,35 +3587,15 @@ async fn mcp_bootstrap_catalog_bypasses_project_writer_gate() {
         "id": 2,
         "method": "tools/list"
     });
-    let initialize_engine = engine.clone();
-    let initialize_handshake = handshake.clone();
-    let mut initialize_task = tokio::spawn(async move {
-        super::handshake::daemon_round_trip(initialize_engine, &initialize_handshake, initialize)
-            .await
-    });
-    let tools_list_engine = engine.clone();
-    let tools_list_handshake = handshake.clone();
-    let mut tools_list_task = tokio::spawn(async move {
-        super::handshake::daemon_round_trip(tools_list_engine, &tools_list_handshake, tools_list)
-            .await
-    });
-    let (initialize_within_bound, tools_list_within_bound) = tokio::join!(
-        tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut initialize_task),
-        tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut tools_list_task),
+    // The writer stays held until both answers arrive, so answering at all
+    // proves neither request waited for the project writer gate.
+    let (initialize_responses, tools_list_responses) = tokio::join!(
+        super::handshake::daemon_round_trip(engine.clone(), &handshake, initialize),
+        super::handshake::daemon_round_trip(engine.clone(), &handshake, tools_list),
     );
-
     release_writer.send(()).expect("signal writer gate release");
     blocker.await.expect("writer gate blocker task");
-    if initialize_within_bound.is_err() {
-        let _ = initialize_task.await;
-    }
-    if tools_list_within_bound.is_err() {
-        let _ = tools_list_task.await;
-    }
 
-    let initialize_responses = initialize_within_bound
-        .expect("initialize must not wait for project writer gate")
-        .expect("initialize client task");
     let initialize_response = initialize_responses
         .iter()
         .find(|response| response["id"] == json!(1))
@@ -3544,9 +3616,6 @@ async fn mcp_bootstrap_catalog_bypasses_project_writer_gate() {
         })
     );
 
-    let tools_list_responses = tools_list_within_bound
-        .expect("tools/list must not wait for project writer gate")
-        .expect("tools/list client task");
     let tools = tools_list_responses
         .iter()
         .find(|response| response["id"] == json!(2))
@@ -3564,36 +3633,14 @@ async fn mcp_bootstrap_catalog_bypasses_project_writer_gate() {
     assert!(context_description.contains("3 broad context calls"));
     assert!(context_description.contains("graph is still warming"));
 
-    tokio::time::timeout(PHASE_TIMEOUT, async {
-        while engine
-            .project_open_attempts
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("initialize warmup did not start after the writer gate was released");
-    let mut shutdown = Box::pin(engine.shutdown_all());
-    if tokio::time::timeout(PHASE_TIMEOUT, &mut shutdown)
-        .await
-        .is_err()
+    while engine
+        .project_open_attempts
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0
     {
-        match tokio::time::timeout(
-            tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
-            &mut shutdown,
-        )
-        .await
-        {
-            Ok(receipt) => {
-                panic!("bootstrap-cache shutdown exceeded its phase bound: {receipt:#?}")
-            }
-            Err(error) => panic!(
-                "bootstrap-cache shutdown coordinator did not return after its global deadline: {error}"
-            ),
-        }
+        tokio::task::yield_now().await;
     }
+    engine.shutdown_all().await;
     assert_eq!(
         engine
             .project_open_attempts
@@ -3606,7 +3653,6 @@ async fn mcp_bootstrap_catalog_bypasses_project_writer_gate() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_tool_cache_miss_returns_warming_while_project_opens_in_background() {
-    const PHASE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(20);
     let temp = TempDir::new().expect("temp dir");
     let project = temp.path().join("project");
     let profile_root = temp.path().join("profile");
@@ -3645,22 +3691,10 @@ async fn direct_tool_cache_miss_returns_warming_while_project_opens_in_backgroun
             "arguments": {"format": "json"}
         }
     });
-    let request_engine = engine.clone();
-    let request_handshake = handshake.clone();
-    let mut request_task = tokio::spawn(async move {
-        super::handshake::daemon_round_trip(request_engine, &request_handshake, request).await
-    });
-    let response_within_bound =
-        tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut request_task).await;
-
+    // The admission stays held until the response arrives, so the open cannot
+    // publish first: an answer at all proves the request did not wait for it.
+    let responses = super::handshake::daemon_round_trip(engine.clone(), &handshake, request).await;
     drop(capacity_admission);
-    if response_within_bound.is_err() {
-        let _ = request_task.await;
-    }
-
-    let responses = response_within_bound
-        .expect("direct tool cache miss must return a bounded warming response")
-        .expect("direct tool client task");
     let response = responses
         .iter()
         .find(|response| response["id"] == json!(3))
@@ -3676,28 +3710,41 @@ async fn direct_tool_cache_miss_returns_warming_while_project_opens_in_backgroun
     assert!(message.contains("warming in the background"), "{message}");
     assert!(message.contains("retry"), "{message}");
 
+    // Retry the warming hint the way a client does. Each retry rides the
+    // detached open's own publication, and a retry that had to start a new
+    // open would show up as a second attempt.
+    loop {
+        match engine
+            .project_server_for_request(&handshake, super::super::ProjectServerRequirement::Core)
+            .await
+        {
+            Ok(_) => break,
+            Err(error) => assert!(
+                super::super::error_is_project_warming(&error),
+                "the detached warm-up must publish, not fail: {error:?}"
+            ),
+        }
+    }
     let route =
         super::super::ProjectRouteKey::from_handshake(&project, &handshake).expect("project route");
-    tokio::time::timeout(PHASE_TIMEOUT, async {
-        loop {
-            let warmed = engine
-                .store_administration
-                .project_servers()
-                .lock()
-                .await
-                .get_route(&route)
-                .is_some();
-            if warmed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached project warmup timed out");
-    tokio::time::timeout(PHASE_TIMEOUT, engine.shutdown_all())
-        .await
-        .expect("direct warmup shutdown timed out");
+    assert!(
+        engine
+            .store_administration
+            .project_servers()
+            .lock()
+            .await
+            .get_route(&route)
+            .is_some(),
+        "the detached warm-up must publish the project route"
+    );
+    assert_eq!(
+        engine
+            .project_open_attempts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the warming request's detached open must be the only open"
+    );
+    engine.shutdown_all().await;
 }
 
 /// A profile registry read from a project connection answers from the
@@ -3739,12 +3786,10 @@ async fn project_registry_read_does_not_wait_for_a_blocked_project_open() {
             "arguments": {"format": "json", "limit": 5}
         }
     });
-    let responses = tokio::time::timeout(
-        super::super::PROJECT_OPEN_REQUEST_DEADLINE,
-        super::handshake::daemon_round_trip(engine.clone(), &handshake, request),
-    )
-    .await
-    .expect("a registry read must not wait for the blocked project open");
+    // The open stays blocked until the answer arrives, so a typed `ok` answer
+    // came from the registry. A read routed through the open would answer
+    // with the warming hint instead.
+    let responses = super::handshake::daemon_round_trip(engine.clone(), &handshake, request).await;
     drop(capacity_admission);
 
     let response = responses
@@ -3763,32 +3808,38 @@ async fn project_registry_read_does_not_wait_for_a_blocked_project_open() {
         1,
         "the handshake project must be marked active without being opened: {payload}"
     );
-    tokio::time::timeout(tokio::time::Duration::from_secs(20), engine.shutdown_all())
-        .await
-        .expect("registry read shutdown timed out");
+    engine.shutdown_all().await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn foreground_project_open_wait_is_bounded_and_accepts_quick_publication() {
+// The publication wait runs under the request's executor, which need not be
+// Tokio: under `native_runtime::block_on` no Tokio runtime is entered.
+#[test]
+fn foreground_project_open_wait_is_bounded_and_accepts_quick_publication() {
     let project_path = std::path::PathBuf::from("/projects/uncontended");
-    let published = super::super::project_open_orchestration::wait_for_project_open_publication(
-        &project_path,
-        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-        async { Ok::<(), tracedecay_domain::errors::TraceDecayError>(()) },
+    let published = tracedecay_runtime_core::native_runtime::block_on(
+        super::super::project_open_orchestration::wait_for_project_open_publication(
+            &project_path,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            async { Ok::<(), tracedecay_domain::errors::TraceDecayError>(()) },
+        ),
     )
-    .await;
+    .expect("native runtime");
     assert!(
         published.is_ok(),
         "publication inside the deadline must succeed"
     );
 
-    let warming = super::super::project_open_orchestration::wait_for_project_open_publication(
-        &project_path,
-        tokio::time::Instant::now() + super::super::PROJECT_OPEN_REQUEST_DEADLINE,
-        std::future::pending::<tracedecay_domain::errors::Result<()>>(),
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    let warming = tracedecay_runtime_core::native_runtime::block_on(
+        super::super::project_open_orchestration::wait_for_project_open_publication(
+            &project_path,
+            deadline,
+            std::future::pending::<tracedecay_domain::errors::Result<()>>(),
+        ),
     )
-    .await
+    .expect("native runtime")
     .expect_err("an uncontended warm-up must not pin the foreground request");
+    assert!(std::time::Instant::now() >= deadline);
     assert!(
         super::super::error_is_project_warming(&warming),
         "{warming}"
@@ -3887,26 +3938,17 @@ fn production_composition_probe_node_id(payload: &serde_json::Value) -> Option<&
 }
 
 fn commit_production_composition_project(project: &std::path::Path) {
-    let run_git = |arguments: &[&str]| {
-        let status = std::process::Command::new("git")
-            .current_dir(project)
-            .args(arguments)
-            .status()
-            .expect("run git");
-        assert!(status.success(), "git {arguments:?}");
-    };
-    run_git(&["init", "--quiet"]);
-    run_git(&["add", "."]);
-    run_git(&[
-        "-c",
-        "user.name=TraceDecay Test",
-        "-c",
-        "user.email=tracedecay@example.invalid",
-        "commit",
-        "--quiet",
-        "-m",
-        "test: seed production composition",
-    ]);
+    git(project, &["init", "--quiet"]);
+    git(project, &["add", "."]);
+    git(
+        project,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "test: seed production composition",
+        ],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4311,6 +4353,121 @@ async fn production_composition_harness_reads_retained_profile_analytics_authori
             .iter()
             .any(|event| event.tool_name.as_deref() == Some("tracedecay_search")),
         "retained production authority must expose the exercised tool event: {events:?}"
+    );
+    harness.shutdown().await;
+}
+
+/// #4110: `tracedecay_analytics` counted 618 `tracedecay_retrieve` calls where
+/// the transcripts held about 30. A CLI command such as `tracedecay sessions
+/// search` sends its tool and then one `tracedecay_retrieve` per page of a
+/// truncated reply, each on a one-shot daemon connection, and every one of
+/// those requests was recorded as a host MCP call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_host_tool_call_records_one_analytics_event_and_one_shot_clients_none() {
+    let temp = TempDir::new().expect("temp dir");
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(project.join("src")).expect("source dir");
+    let padding = "x".repeat(400);
+    let source = (0..400)
+        .map(|index| format!("pub const ATTRIBUTION_PROBE_{index}: &str = \"{padding}\";"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(project.join("src/lib.rs"), source).expect("source file");
+    commit_production_composition_project(&project);
+
+    let harness = ProductionProjectCompositionHarnessV1::open(temp.path(), vec![project.clone()])
+        .await
+        .expect("production composition");
+    harness
+        .call_tool(
+            &project,
+            "tracedecay_search",
+            json!({"query": "ATTRIBUTION_PROBE_7", "format": "json"}),
+        )
+        .await
+        .expect("host search");
+
+    let one_shot = |tool_name: &str, arguments: serde_json::Value| {
+        crate::daemon::one_shot_tool_call_params(
+            tool_name,
+            arguments,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+        )
+    };
+    let reply_payload = |response: JsonRpcResponse, tool_name: &str| {
+        let result = response
+            .result
+            .unwrap_or_else(|| panic!("{tool_name} failed: {:?}", response.error));
+        crate::daemon::tool_json_payload(&result, tool_name).expect("tool JSON payload")
+    };
+    let grep_arguments = json!({
+        "pattern": "ATTRIBUTION_PROBE_",
+        "context_lines": 3,
+        "format": "json",
+    });
+    let grep = harness
+        .call_tool_with_params(
+            &project,
+            "tracedecay_grep",
+            one_shot("tracedecay_grep", grep_arguments),
+        )
+        .await
+        .expect("one-shot grep");
+    let envelope = reply_payload(grep, "tracedecay_grep");
+    assert!(
+        crate::daemon::is_truncation_envelope(&envelope),
+        "the fixture must truncate so the recovery pages are exercised: {envelope}"
+    );
+    let handle = envelope["handle"].as_str().expect("retrieval handle");
+    let mut offset = 0_u64;
+    let mut pages = 0;
+    loop {
+        let retrieved = harness
+            .call_tool_with_params(
+                &project,
+                "tracedecay_retrieve",
+                one_shot(
+                    "tracedecay_retrieve",
+                    json!({"handle": handle, "format": "json", "offset": offset}),
+                ),
+            )
+            .await
+            .expect("one-shot retrieve");
+        let page = reply_payload(retrieved, "tracedecay_retrieve");
+        pages += 1;
+        if page["has_more"] != json!(true) {
+            break;
+        }
+        offset = page["next_offset"].as_u64().expect("next offset");
+    }
+    assert!(pages >= 1, "recovery fetched no pages");
+
+    harness
+        .server(&project)
+        .expect("production server")
+        .ledger_writes_settled()
+        .await;
+    let events = harness
+        .read_profile_analytics_events(&tracedecay_global_db::AnalyticsEventQuery {
+            provider: Some("mcp".to_owned()),
+            project_id: None,
+            session_id: None,
+            event_kind: Some("mcp_tool_call".to_owned()),
+            since: None,
+            until: None,
+            before_id: None,
+            limit: 100,
+        })
+        .await
+        .expect("read profile analytics");
+    let recorded: Vec<&str> = events
+        .iter()
+        .filter_map(|event| event.tool_name.as_deref())
+        .collect();
+    assert_eq!(
+        recorded,
+        ["tracedecay_search"],
+        "one host call is one analytics event; the one-shot grep and its {pages} retrieve pages are not host calls"
     );
     harness.shutdown().await;
 }

@@ -87,7 +87,7 @@ fn lock_skill_store(profile_root: &Path) -> Result<FileLease> {
 
 async fn lock_skill_store_async(profile_root: &Path) -> Result<FileLease> {
     let profile_root = profile_root.to_path_buf();
-    tokio::task::spawn_blocking(move || lock_skill_store(&profile_root))
+    tracedecay_runtime_core::native_runtime::spawn_blocking(move || lock_skill_store(&profile_root))
         .await
         .map_err(|error| config_error(format!("managed skill lock task failed: {error}")))?
 }
@@ -782,18 +782,6 @@ fn set_managed_skill_state_unlocked(
     Ok(skill)
 }
 
-pub async fn update_managed_skill(
-    profile_root: &Path,
-    id: &str,
-    update: ManagedSkillUpdate,
-) -> Result<ManagedSkill> {
-    let lock = lock_skill_store_async(profile_root).await?;
-    let skill = apply_managed_skill_update_unlocked(profile_root, id, None, update)?;
-    drop(lock);
-    record_skill_patch_best_effort(profile_root, &skill, "update").await;
-    Ok(skill)
-}
-
 pub async fn set_managed_skill_pinned(
     profile_root: &Path,
     id: &str,
@@ -817,7 +805,7 @@ pub async fn apply_managed_skill_update(
     update: ManagedSkillUpdate,
 ) -> Result<ManagedSkill> {
     let lock = lock_skill_store_async(profile_root).await?;
-    let skill = apply_managed_skill_update_unlocked(profile_root, id, Some(base_checksum), update)?;
+    let skill = apply_managed_skill_update_unlocked(profile_root, id, base_checksum, update)?;
     drop(lock);
     record_skill_patch_best_effort(profile_root, &skill, "automatic_update").await;
     Ok(skill)
@@ -826,11 +814,11 @@ pub async fn apply_managed_skill_update(
 fn apply_managed_skill_update_unlocked(
     profile_root: &Path,
     id: &str,
-    base_checksum: Option<&str>,
+    base_checksum: &str,
     update: ManagedSkillUpdate,
 ) -> Result<ManagedSkill> {
     let skill = load_managed_skill_unlocked(profile_root, id)?;
-    if base_checksum.is_some_and(|checksum| checksum != skill.metadata.checksum) {
+    if base_checksum != skill.metadata.checksum {
         return Err(config_error(format!(
             "base_checksum for managed skill id '{id}' is stale"
         )));

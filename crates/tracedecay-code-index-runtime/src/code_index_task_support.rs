@@ -1,6 +1,7 @@
 //! Owned task settlement and exact-source cursor helpers for code-index search.
 
 use tracedecay_query::code_search;
+use tracedecay_runtime_core::native_runtime;
 
 use crate::code_index_scheduler;
 
@@ -73,25 +74,51 @@ pub async fn generation_for_hydration(
     }
 }
 
+/// Awaits `task` to completion, checking `termination` every `poll_interval`
+/// while it runs. A terminal outcome is answered only once the task settles,
+/// so the work never outlives the request that owns what it holds.
 pub async fn settle_owned_blocking_task<T, O>(
-    mut task: tokio::task::JoinHandle<T>,
+    task: impl Future<Output = Result<T, String>>,
     poll_interval: std::time::Duration,
     mut termination: impl FnMut() -> Option<O>,
-) -> Result<Result<T, tokio::task::JoinError>, O> {
-    let mut terminal = None;
-    let mut control_poll = tokio::time::interval(poll_interval);
-    control_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+) -> Result<Result<T, String>, O> {
+    let mut task = std::pin::pin!(task);
     loop {
-        tokio::select! {
-            result = &mut task => {
-                return match terminal {
-                    Some(outcome) => Err(outcome),
-                    None => Ok(result),
-                };
+        if let Some(outcome) = termination() {
+            let _ = task.await;
+            return Err(outcome);
+        }
+        match native_runtime::timeout(poll_interval, task.as_mut()).await {
+            Ok(result) => return Ok(result),
+            Err(native_runtime::TimeoutError::Elapsed) => {}
+            Err(native_runtime::TimeoutError::TimerUnavailable(error)) => {
+                tracing::warn!(%error, "owned task settles without termination polls");
+                let result = task.await;
+                return termination().map_or(Ok(result), Err);
             }
-            _ = control_poll.tick(), if terminal.is_none() => {
-                terminal = termination();
-            }
+        }
+    }
+}
+
+/// Starts `work` on the native runtime and detaches it. For work that never
+/// reaches Tokio. A refused start is logged, and `work` is dropped.
+#[track_caller]
+pub(crate) fn spawn_detached(event: &'static str, work: impl Future<Output = ()> + Send + 'static) {
+    if let Err(error) = native_runtime::NativeTask::spawn(work) {
+        tracing::warn!(event, %error, "native task did not start");
+    }
+}
+
+/// Awaits a task that [`native_runtime::NativeTask::spawn`] started, or
+/// reports why it did not start, so the caller has one failure path.
+pub(crate) async fn join_native<T: Clone + Send + Sync + 'static>(
+    task: &Result<native_runtime::NativeTask<T>, String>,
+) -> Result<T, String> {
+    match task.as_ref().map_err(Clone::clone)?.wait().await {
+        native_runtime::NativeTaskOutcome::Completed(value) => Ok(value),
+        native_runtime::NativeTaskOutcome::Cancelled => Err("native task was cancelled".to_owned()),
+        native_runtime::NativeTaskOutcome::Panicked(payload) => {
+            Err(format!("native task panicked: {payload}"))
         }
     }
 }
@@ -163,7 +190,7 @@ mod tests {
             .try_acquire_owned()
             .expect("search permit");
         let (release, blocked) = std::sync::mpsc::channel();
-        let worker = tokio::task::spawn_blocking(move || {
+        let worker = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             let _permit = permit;
             blocked.recv().expect("worker release");
             7_u8

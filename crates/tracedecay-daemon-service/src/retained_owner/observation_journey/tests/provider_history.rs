@@ -304,6 +304,46 @@ impl CurrentObservationFixture {
             .unwrap()
     }
 
+    fn reopen_authority(&mut self) {
+        let previous = &self.authority;
+        let data_root = self._temp.path().join("provider-data");
+        let reader = Arc::new(HookOriginReaderV1::new(
+            data_root.clone(),
+            previous.registered_shard.brain_id.clone(),
+            previous.profile_id.clone(),
+        ));
+        reader.bind_data_root(&data_root).unwrap();
+        let bridge = HistoryIdentityBridgeV1::admit(
+            &self.project_root,
+            &previous.profile_id,
+            &previous.mounted_scope,
+            &previous.registered_shard,
+        )
+        .unwrap();
+        self.authority = Arc::new(ProviderHistoryAuthorityV1 {
+            mounted_scope: previous.mounted_scope.clone(),
+            profile_id: previous.profile_id.clone(),
+            registered_shard: previous.registered_shard.clone(),
+            session_db: previous.session_db.clone(),
+            mounted_reader: reader,
+            mounted_bridge: Some(Arc::new(bridge)),
+            observations: Arc::new(previous.session_db.observation_store()),
+            dispositions: Arc::clone(&previous.dispositions),
+            original_authority: None,
+            journal: Arc::new(
+                SqliteObservationJournal::open(
+                    data_root.join("current-observation.sqlite"),
+                    ObservationJourneyPolicyV1::project_default().retention,
+                )
+                .unwrap(),
+            ),
+            provider_id: previous.provider_id.clone(),
+            policy_revision: previous.policy_revision,
+            runtime: tokio::runtime::Handle::current(),
+        });
+        self.authority.validate_mount().unwrap();
+    }
+
     async fn current(
         &self,
         destination: &OwnedExactScope,
@@ -542,7 +582,42 @@ async fn current_canonical_observation_resolves_without_original_history_grant()
 }
 
 #[tokio::test]
-async fn current_canonical_observation_denies_foreign_provider_session_and_checkout() {
+async fn reopened_canonical_authority_resolves_a_prior_session_without_redelivery() {
+    let mut fixture = CurrentObservationFixture::new().await;
+    let original = fixture
+        .current(&fixture.destination(CURRENT_SESSION), &control())
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .authority
+            .journal
+            .inspect(&JournalInspectionFilterV1::default())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    fixture.reopen_authority();
+    let recalled = fixture
+        .current(&fixture.destination("session.after-reopen"), &control())
+        .await
+        .unwrap();
+    assert_eq!(recalled.observation(), original.observation());
+    assert_eq!(recalled.retrieval_anchor(), original.retrieval_anchor());
+    assert!(fixture.authority.original_authority.is_none());
+    assert!(
+        fixture
+            .authority
+            .journal
+            .inspect(&JournalInspectionFilterV1::default())
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn current_canonical_observation_denies_foreign_provider_and_checkout() {
     let fixture = CurrentObservationFixture::new().await;
     let destination = fixture.destination(CURRENT_SESSION);
     let foreign_provider = OwnedProviderId::new("ncm").unwrap();
@@ -558,14 +633,15 @@ async fn current_canonical_observation_denies_foreign_provider_session_and_check
             .await,
         Err(ProviderHistoryErrorV1::ClaimMismatch("mounted provider"))
     ));
-    assert!(matches!(
-        fixture
-            .current(&fixture.destination("foreign-session"), &control())
-            .await,
-        Err(ProviderHistoryErrorV1::Ineligible(
-            "canonical session namespace"
-        ))
-    ));
+    let prior_session = fixture
+        .current(&fixture.destination("later-caller-session"), &control())
+        .await
+        .unwrap();
+    assert_eq!(prior_session.observation(), fixture.stored.observation());
+    assert_eq!(
+        prior_session.observation().source().session_id().as_str(),
+        CURRENT_SESSION
+    );
     let mounted = &fixture.authority.mounted_scope;
     let foreign_project = ResolvedScope::new(
         ProjectId::new("project.foreign-current-observation").unwrap(),
@@ -589,7 +665,7 @@ async fn current_canonical_observation_denies_foreign_provider_session_and_check
 #[tokio::test]
 async fn current_canonical_observation_denies_stale_session_owner_and_git_mount() {
     let fixture = CurrentObservationFixture::new().await;
-    let destination = fixture.destination(CURRENT_SESSION);
+    let destination = fixture.destination("later-session-owner-check");
     let registered = &fixture.authority.session_db;
     let mut session = registered
         .get_session("claude", CURRENT_SESSION)
@@ -616,6 +692,32 @@ async fn current_canonical_observation_denies_stale_session_owner_and_git_mount(
         fixture.current(&destination, &control()).await,
         Err(ProviderHistoryErrorV1::Ineligible("mounted scope changed"))
     ));
+}
+
+#[tokio::test]
+async fn prior_session_locator_cannot_replace_its_canonical_observation() {
+    let fixture = CurrentObservationFixture::new().await;
+    let destination = fixture.destination("later-session-replacement-check");
+    let original = fixture.current(&destination, &control()).await.unwrap();
+    let transaction = fixture
+        .authority
+        .session_db
+        .begin_write_transaction()
+        .await
+        .unwrap();
+    assert!(
+        transaction
+            .execute(
+                "UPDATE observations SET observation_json = '{}' WHERE observation_id = ?1",
+                [original.observation().observation_id().as_str()],
+            )
+            .await
+            .is_err()
+    );
+    transaction.rollback().await.unwrap();
+    let current = fixture.current(&destination, &control()).await.unwrap();
+    assert_eq!(current.observation(), original.observation());
+    assert_eq!(current.retrieval_anchor(), original.retrieval_anchor());
 }
 
 #[tokio::test]
@@ -650,7 +752,7 @@ async fn current_canonical_observation_denies_cancelled_and_expired_reads() {
 #[tokio::test]
 async fn current_canonical_observation_denies_redaction_in_owning_session_store() {
     let fixture = CurrentObservationFixture::new().await;
-    let destination = fixture.destination(CURRENT_SESSION);
+    let destination = fixture.destination("later-session-after-ingestion");
     assert!(fixture.current(&destination, &control()).await.is_ok());
     let disposition = RetrievalAnchorDispositionRecordV1::new(
         "disposition.current-observation.redacted",

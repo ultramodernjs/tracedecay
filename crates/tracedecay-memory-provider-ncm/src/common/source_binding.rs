@@ -264,6 +264,100 @@ mod tests {
             project_source_id(&NcmNamespace::from_exact_scope(&other_delivery), &original).unwrap(),
             expected.source_id,
         );
+        other_delivery.worktree_identity = "another-worktree".to_owned();
+        assert_ne!(
+            project_source_id(&NcmNamespace::from_exact_scope(&other_delivery), &original).unwrap(),
+            expected.source_id,
+        );
+    }
+
+    #[test]
+    fn current_checkout_recall_preserves_delivery_binding_and_refuses_forgery() {
+        let (delivery, _) = fixture();
+        let namespace =
+            NcmNamespace::from_scope(&delivery, NcmNamespaceBinding::CheckoutObservationsV1);
+        let observation = json!({
+            "source_identity": {"canonical_observation_id": format!("sha256:{}", "ac".repeat(32))},
+            "observation_kind": "session.message_committed.v1",
+            "payload_contract": "tracedecay.memory.observation.session-message.v1",
+            "canonical_payload": {
+                "version": 1, "provider": "codex", "native_record_kind": "message",
+                "stable_record_id": "stored-record", "relations": {"session_id": "canonical-session", "project_id": delivery.project_id},
+                "facts": [{"kind": "message", "role": "assistant", "content": "Remember this checkout"}]
+            }
+        });
+        let observed = call(&delivery, ProviderOperation::Observe, observation.clone());
+        let provenance = project_current_attribution(&observed, &observation, &namespace).unwrap();
+        let retained = decode_capsule(&provenance).unwrap();
+        let source_id = current_source_binding(&namespace, &delivery, &observation)
+            .unwrap()
+            .source_id;
+        let mut query_scope = delivery.clone();
+        query_scope.agent_session_id = "new-session".to_owned();
+        query_scope.resolved_scope_digest = format!("sha256:{}", "ef".repeat(32));
+        let query = call(&query_scope, ProviderOperation::Recall, json!({}));
+        let admitted =
+            retained_source(&query, &namespace, &retained, &provenance, &source_id, None).unwrap();
+        assert_eq!(
+            admitted.source_key(),
+            delivery.session_forget_source_key("canonical-session")
+        );
+        assert_ne!(
+            admitted.source_key(),
+            query_scope.session_forget_source_key("canonical-session")
+        );
+        assert!(
+            validate_current_source_binding(
+                &namespace,
+                &query_scope,
+                &retained,
+                &provenance,
+                &source_id
+            )
+            .is_none()
+        );
+        for field in [
+            "profile_id",
+            "project_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch_identity",
+        ] {
+            let mut foreign = scope_value(&query_scope);
+            foreign[field] = json!("foreign");
+            let query = call(
+                &scope(&foreign).unwrap(),
+                ProviderOperation::Recall,
+                json!({}),
+            );
+            assert!(
+                retained_source(&query, &namespace, &retained, &provenance, &source_id, None)
+                    .is_none(),
+                "{field}"
+            );
+        }
+        for malformed in [
+            Value::Null,
+            json!({"version": 2, "source_id": source_id, "legacy_source_id": "forged"}),
+            json!({"version": 1, "source_id": source_id}),
+            json!({"version": 1, "source_id": "forged", "legacy_source_id": "forged"}),
+        ] {
+            let mut forged = provenance.clone();
+            forged["source_binding"] = malformed;
+            assert!(
+                retained_source(&query, &namespace, &retained, &forged, &source_id, None).is_none()
+            );
+        }
+        let mut forged = retained.clone();
+        forged["canonical_payload"]["provider"] = json!("claude");
+        assert!(
+            retained_source(&query, &namespace, &forged, &provenance, &source_id, None).is_none()
+        );
+        forged = retained.clone();
+        forged["canonical_payload"]["relations"]["session_id"] = json!("forged-session");
+        assert!(
+            retained_source(&query, &namespace, &forged, &provenance, &source_id, None).is_none()
+        );
     }
 
     #[test]

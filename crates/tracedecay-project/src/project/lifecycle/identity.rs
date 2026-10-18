@@ -1,7 +1,9 @@
 //! Store-layout identity resolution: mapping a project root to its
 //! authoritative store layout.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use tracedecay_domain::errors::{ProjectOpenFailureKind, Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
@@ -86,7 +88,14 @@ impl TraceDecay {
     ) -> Result<StoreLayout> {
         let profile_root = open_options.resolved_profile_root()?;
         storage::refuse_retired_checkout_layout(&profile_root, project_root)?;
-        let mut selected = storage::resolve_persisted_layout(project_root, &profile_root)?;
+        // Every profile reads the same `.git/` marker. One naming a shard this
+        // profile does not hold yields to the registry, and only names the
+        // project when nothing else does.
+        let (mut selected, unheld_marker_layout) =
+            match storage::resolve_persisted_layout(project_root, &profile_root)? {
+                Some(layout) if layout.data_root.is_dir() => (Some(layout), None),
+                unheld => (None, unheld),
+            };
         // Every linked worktree resolves through its repository, attached or
         // not; suppressing this for detached worktrees dropped them onto the
         // path-hashed identity fallback and minted a duplicate store.
@@ -145,19 +154,25 @@ impl TraceDecay {
                 {
                     return Err(TraceDecayError::Config { message });
                 }
-                if let Some(registry_database) = registry_database
-                    && let Some(layout) =
+                if let Some(registry_database) = registry_database {
+                    let adopted: Pin<
+                        Box<dyn Future<Output = Result<Option<StoreLayout>>> + Send + '_>,
+                    > = Box::pin(
                         tracedecay_application::project_adoption::adopt_moved_nongit_project(
                             project_root,
                             &profile_root,
                             registry_database,
                             adoption,
-                        )
-                        .await?
-                {
-                    return Ok(layout);
+                        ),
+                    );
+                    if let Some(layout) = adopted.await? {
+                        return Ok(layout);
+                    }
                 }
-                storage::default_profile_sharded_layout(project_root, &profile_root)
+                match unheld_marker_layout {
+                    Some(layout) => Ok(layout),
+                    None => storage::default_profile_sharded_layout(project_root, &profile_root),
+                }
             }
             None => Err(TraceDecayError::project_open(
                 ProjectOpenFailureKind::IdentityUnregistered,
@@ -244,14 +259,16 @@ impl TraceDecay {
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
     ) -> Result<StoreLayout> {
-        Self::resolve_store_layout_for_authority(
-            project_root,
-            open_options,
-            None,
-            true,
-            &MovedStoreAdoption::Never,
-        )
-        .await
+        let adoption = MovedStoreAdoption::Never;
+        let resolved: Pin<Box<dyn Future<Output = Result<StoreLayout>> + Send + '_>> =
+            Box::pin(Self::resolve_store_layout_for_authority(
+                project_root,
+                open_options,
+                None,
+                true,
+                &adoption,
+            ));
+        resolved.await
     }
 }
 
@@ -262,7 +279,7 @@ mod tests {
     /// First touch of a root under the OS temp directory against a durable
     /// profile is refused before any layout, and therefore any shard
     /// directory, exists. A hermetic (temp) profile still admits temp roots.
-    #[tokio::test]
+    #[asupersync::test]
     async fn first_touch_refuses_an_ephemeral_root_before_minting_a_layout() {
         const PROFILE_ENV: &str = "TRACEDECAY_EPHEMERAL_ROOT_FIXTURE_PROFILE";
         let Some(profile) = std::env::var_os(PROFILE_ENV) else {
@@ -353,7 +370,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn first_touch_refuses_a_retired_checkout_enrollment_marker() {
         let project = tempfile::TempDir::new().expect("project");
         let hermetic = tempfile::TempDir::new().expect("hermetic profile");

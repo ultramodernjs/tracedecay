@@ -1017,8 +1017,7 @@ pub async fn inbox(
             let label = Path::new(&project.display_root)
                 .file_name()
                 .and_then(|name| name.to_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| project.display_root.clone());
+                .map_or_else(|| project.display_root.clone(), str::to_owned);
             let project_root = PathBuf::from(&project.canonical_root);
             let freshness = match state.code_index_freshness_reader.as_ref() {
                 Some(reader) => reader(project_root.clone()).await,
@@ -2279,14 +2278,8 @@ async fn read_git_projections(
         );
     };
     let root = state.project_root.clone();
-    let project_sessions = state.lcm_db.clone();
-    tokio::task::spawn_blocking(move || {
-        let authority = match project_sessions {
-            Some(project_sessions) => {
-                GitReadAuthorityV1::new_with_project_sessions(root, scope.clone(), project_sessions)
-            }
-            None => GitReadAuthorityV1::new(root, scope.clone()),
-        };
+    tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
+        let authority = GitReadAuthorityV1::new(root, scope.clone());
         let bounds = GitQueryBounds {
             max_entries: 100,
             ..GitQueryBounds::default()

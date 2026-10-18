@@ -1679,7 +1679,7 @@ impl CommonRecallProfileV1 {
         };
         let Some(grant) = grant else {
             // Without history, original-source claims remain outside the
-            // allowlist. Current-session locators still require host hydration.
+            // allowlist. Current record locators still require host hydration.
             return Ok(Self {
                 granted_sources: Vec::new(),
             });
@@ -1724,7 +1724,10 @@ impl CommonRecallProfileV1 {
             ));
         }
         if sources.is_empty() {
-            return Self::check_current_session_locator(candidate);
+            return Self::check_current_record_locator(candidate);
+        }
+        if candidate.exact_scope_identity.scope_binding != ScopeBinding::ExactCodingScope {
+            return Err(invalid("original observation requires exact coding scope"));
         }
         for source in sources {
             let attribution = source.to_owned_attribution()?;
@@ -1737,14 +1740,16 @@ impl CommonRecallProfileV1 {
         Ok(())
     }
 
-    fn check_current_session_locator(
+    fn check_current_record_locator(
         candidate: &RecallCandidateV1,
     ) -> Result<(), RecallDenialReason> {
         let invalid = || RecallDenialReason::InvalidSourceAttribution {
             detail: "current observation requires one canonical record claim".to_owned(),
         };
-        if candidate.exact_scope_identity.scope_binding != ScopeBinding::ExactCodingScope
-            || candidate.provenance.get("state").and_then(Value::as_str) != Some("available")
+        if !matches!(
+            candidate.exact_scope_identity.scope_binding,
+            ScopeBinding::ExactCodingScope | ScopeBinding::CheckoutObservations
+        ) || candidate.provenance.get("state").and_then(Value::as_str) != Some("available")
             || candidate.provenance.get("original_sources") != Some(&serde_json::json!([]))
         {
             return Err(invalid());
@@ -2572,7 +2577,10 @@ mod request_context_tests {
             &call,
             &parts.temporal,
             usize::try_from(parts.budgets.maximum_candidates).unwrap(),
-            &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+            &RecallScopeBindingsV1::new([
+                ScopeBinding::ExactCodingScope,
+                ScopeBinding::CheckoutObservations,
+            ]),
             &reply,
             true,
         )
@@ -2607,6 +2615,51 @@ mod request_context_tests {
             !crate::recall_context_pack::ProviderItemProvenanceV1::from_candidate(candidate)
                 .is_hydrated()
         );
+    }
+
+    #[test]
+    fn common_profile_checkout_locator_requires_five_identities_and_no_session_claim() {
+        let mut candidate = current_candidate();
+        candidate.exact_scope_identity.scope_binding = ScopeBinding::CheckoutObservations;
+        candidate.exact_scope_identity.agent_session_id.clear();
+        candidate.exact_scope_identity.resolved_scope_digest.clear();
+        let admitted = common_admission(candidate.clone(), UnknownValidityPolicy::Degrade, None);
+        assert_eq!(admitted.admitted.len(), 1);
+        assert!(admitted.admitted[0].original_sources().is_empty());
+        for (field, expected) in [
+            ("worktree", ScopeField::WorktreeIdentity),
+            ("branch", ScopeField::BranchIdentity),
+        ] {
+            let mut foreign = candidate.clone();
+            match field {
+                "worktree" => foreign.exact_scope_identity.worktree_identity = "foreign".to_owned(),
+                _ => foreign.exact_scope_identity.branch_identity = "foreign".to_owned(),
+            }
+            let denied = common_admission(foreign, UnknownValidityPolicy::Degrade, None);
+            assert!(denied.admitted.is_empty());
+            assert_eq!(
+                denied.report.denied[0].reason,
+                RecallDenialReason::ScopeMismatch { field: expected }
+            );
+        }
+        for field in [ScopeField::AgentSessionId, ScopeField::ResolvedScopeDigest] {
+            let mut malformed = candidate.clone();
+            match field {
+                ScopeField::AgentSessionId => {
+                    malformed.exact_scope_identity.agent_session_id = "claimed-session".to_owned()
+                }
+                _ => {
+                    malformed.exact_scope_identity.resolved_scope_digest =
+                        "claimed-digest".to_owned()
+                }
+            }
+            let denied = common_admission(malformed, UnknownValidityPolicy::Degrade, None);
+            assert!(denied.admitted.is_empty());
+            assert_eq!(
+                denied.report.denied[0].reason,
+                RecallDenialReason::ForbiddenIdentity { field }
+            );
+        }
     }
 
     #[test]
@@ -2648,6 +2701,25 @@ mod request_context_tests {
                 RecallDenialReason::InvalidSourceAttribution { .. }
             ));
         }
+        let mut checkout_history = historical.clone();
+        checkout_history.exact_scope_identity.scope_binding = ScopeBinding::CheckoutObservations;
+        checkout_history
+            .exact_scope_identity
+            .agent_session_id
+            .clear();
+        checkout_history
+            .exact_scope_identity
+            .resolved_scope_digest
+            .clear();
+        let checkout_history =
+            common_admission(checkout_history, UnknownValidityPolicy::Degrade, None);
+        assert!(checkout_history.admitted.is_empty());
+        assert_eq!(
+            checkout_history.report.denied[0].reason,
+            RecallDenialReason::InvalidSourceAttribution {
+                detail: "original observation requires exact coding scope".to_owned()
+            }
+        );
         let historical = common_admission(historical, UnknownValidityPolicy::Degrade, None);
         assert!(historical.admitted.is_empty());
         assert_eq!(

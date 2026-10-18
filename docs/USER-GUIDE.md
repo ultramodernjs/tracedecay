@@ -23,14 +23,15 @@ deployment.
 3. [Connecting to Your Agent](#connecting-to-your-agent)
 4. [Exploring Your Codebase from the CLI](#exploring-your-codebase-from-the-cli)
 5. [Keeping the Index Fresh](#keeping-the-index-fresh)
-6. [Checking Your Setup with Doctor](#checking-your-setup-with-doctor)
-7. [Finding Affected Tests](#finding-affected-tests)
-8. [MCP Tools for AI Agents](#mcp-tools-for-ai-agents)
-9. [Supported Languages](#supported-languages)
-10. [Privacy and Network](#privacy-and-network)
-11. [Updating TraceDecay](#updating-tracedecay)
-12. [Configuration Files](#configuration-files)
-13. [Troubleshooting](#troubleshooting)
+6. [Running Parallel Work with Synthesis](#running-parallel-work-with-synthesis)
+7. [Checking Your Setup with Doctor](#checking-your-setup-with-doctor)
+8. [Finding Affected Tests](#finding-affected-tests)
+9. [MCP Tools for AI Agents](#mcp-tools-for-ai-agents)
+10. [Supported Languages](#supported-languages)
+11. [Privacy and Network](#privacy-and-network)
+12. [Updating TraceDecay](#updating-tracedecay)
+13. [Configuration Files](#configuration-files)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -226,7 +227,7 @@ The request only queues the reconcile; follow its progress with
 
 TraceDecay never creates files inside your repository's working tree, so
 `init` leaves `git status` untouched and nothing needs a `.gitignore` entry:
-all project data lives under `~/.tracedecay`, and a git repository additionally
+all project data lives under `~/.tracedecay`, and a git repository also
 carries an identity marker inside `.git/` (never committed). If a project was
 enrolled by an older TraceDecay, it may still have a leftover
 `.tracedecay/enrollment.json` in the repository. Nothing reads that file any
@@ -426,7 +427,7 @@ Current Codex limitations: TraceDecay drives `codex plugin add` / `remove` but
 cannot reload an active Codex session or trust plugin command hooks for you
 (use `/hooks` after install or recopy). Uninstall drives `codex plugin remove
 tracedecay@personal` and then removes the staged source. The legacy Codex
-config surfaces are intentionally left alone.
+configuration files are left unchanged.
 
 Kimi's first global install is also two-step: TraceDecay stages source, then
 Kimi Code's `/plugins install <staged-path>` registers it after Kimi's trust
@@ -445,7 +446,7 @@ uninstall --agent kimi` to remove the staged source. TraceDecay never writes
 Kimi's managed plugin directory or `installed.json`; only Kimi's installer
 does.
 
-ChatGPT registers plugins inside its own interactive surfaces. TraceDecay
+ChatGPT registers plugins through its own UI. TraceDecay
 stages the portable bundle and reports the host registration as
 `unverifiable`, with informational guidance rather than a standing pending
 action. Successful `install`, `update-plugin`, and `update` exit 0; `doctor`
@@ -690,6 +691,125 @@ Use `tracedecay sync` only as an explicit administrative refresh request when a
 diagnostic says the selected generation is stale; routine freshness remains a
 daemon-owned background journey.
 
+## Running Parallel Work with Synthesis
+
+Work runs provider attempts for you: several tasks implemented in parallel,
+then one synthesis attempt that reviews their outputs. The guided path,
+`tracedecay work advance-job`, runs that whole job from one request. Agents
+call the same operation as the `tracedecay_work_advance_job` MCP tool.
+
+### Before you start
+
+Work starts attempts only through a provider route you configured, so set
+`work.executable_bindings.v1` for the project first. The default topology
+admits one active attempt per repository. A job still finishes under that
+default, but its sources run one at a time. To run them at the same time, raise
+`concurrency.maximum_active_per_repository` and
+`concurrency.maximum_global_active` in `work.topology_policy.v1`. That key is
+protected, so change it with a protected preview and apply, then restart the
+daemon.
+
+### Describe the job
+
+Write the job to a file. Each task names its instructions and its placement.
+The synthesis names the task whose run it uses, its output name, and its
+instructions.
+
+```json
+{
+  "job": "parser-rewrite",
+  "title": "Rewrite the parser",
+  "base": { "reference": "refs/heads/main", "commit": "<full commit id>" },
+  "effect_state": "observational",
+  "tasks": [
+    {
+      "key": "alpha",
+      "title": "Recursive-descent parser",
+      "instructions": "Rewrite src/parse.rs as a recursive-descent parser.",
+      "placement": {
+        "kind": "linked_worktree",
+        "root": "/abs/path/to/worktree-alpha",
+        "network_free": true,
+        "in_place_acknowledged": false
+      }
+    },
+    {
+      "key": "beta",
+      "title": "Pratt parser",
+      "instructions": "Rewrite src/parse.rs as a Pratt parser.",
+      "placement": {
+        "kind": "linked_worktree",
+        "root": "/abs/path/to/worktree-beta",
+        "network_free": true,
+        "in_place_acknowledged": false
+      }
+    }
+  ],
+  "synthesis": {
+    "task": "alpha",
+    "output_name": "output.parser-rewrite.review",
+    "instructions": "Compare both rewrites and synthesize the better parser."
+  }
+}
+```
+
+The `job` name and each task `key` use 1 to 48 lowercase letters, digits, or
+hyphens. A job names 1 to 16 tasks. Every Work identity comes from these two
+names, so the job above owns `task.parser-rewrite.alpha`,
+`run.parser-rewrite.alpha`, the source attempt
+`attempt.parser-rewrite.alpha.source`, and the synthesis attempt
+`attempt.parser-rewrite.alpha.synthesis`. The response repeats these
+identities under `job`.
+
+### Run it
+
+```bash
+tracedecay work advance-job --request-file job.json --until-settled
+```
+
+Each call creates every task, accepts its allowed proposal, admits execution,
+admits the placement, and starts the source attempt. It then waits for the
+sources, synthesizes them, waits for the synthesis, and releases each
+placement. Every step is the same Work operation you could call yourself,
+with that operation's own receipt. The output prints one line per step.
+`--until-settled` calls again until the job completes or is refused. Without
+it, one call runs every step it can and returns. Add `--json` to print each
+call's result envelope on its own line.
+
+A call ends in one of four states:
+
+- `advancing`: the call reached its deadline with steps left. Call again.
+- `waiting`: attempts are still running, the proposal route is warming, or the
+  topology has no free attempt slot. Call again later.
+- `refused`: the chain stopped at the named step with a typed problem. The
+  problem is the step operation's own refusal or one of the guided refusals
+  below.
+- `completed`: the response carries the source attempts and the synthesis
+  attempt.
+
+The job keeps no state of its own. Each call reads what the Work authorities
+hold and runs only the steps that are still missing. Sending the same request
+again is always safe, including after a daemon restart.
+
+### When the job is refused
+
+- `application.work-guided.job-conflict`: an object the job owns already
+  exists with different content, such as a changed title, placement, or
+  instructions. Name a new job to run the changed request.
+- `application.work-guided.proposal-withheld`: a task's proposal was not
+  decided `allow`. Review it with `generate-proposal` and `review-proposal`.
+- `application.work-guided.needs-operator`: an attempt failed, timed out, was
+  cancelled, or needs recovery, or a placement is quarantined. Recover it with
+  `resume-attempts`, `retry-attempt`, or `release-placement`.
+- `application.work-guided.invalid-job`: the request itself is malformed.
+
+Pause, resume, cancel, retry, and adjudication stay separate operations. For
+example, while you pause a job's run with `tracedecay work pause-run`, the
+next call refuses synthesis with `application.work-run-control.paused`. After
+`resume-run`, the same request continues. Each source attempt runs in the root
+its own placement admitted, and the synthesis runs in its task's placement
+root. A placement without a root runs in the project checkout.
+
 ## Checking Your Setup with Doctor
 
 The `doctor` command runs a read-only health check:
@@ -860,7 +980,7 @@ When running as an MCP server, tracedecay exposes typed operations that AI agent
 
 | Tool | What it does |
 |------|-------------|
-| `tracedecay_health` | Composite quality signal (0–10000) from five structural dimensions (acyclicity, depth, equality, redundancy, modularity) with a low-weight penalty for `/// skip-test-coverage` overuse. The single number to track over time. |
+| `tracedecay_health` | Health panel: the measured dimensions (acyclicity, depth, equality, redundancy, modularity, coverage_discipline), worst first, then the dimensions the scope gave nothing to measure under `no evidence:` with the reason. `quality_signal` (0–10000) is the geometric mean of the five structural dimensions with a low-weight penalty for `/// skip-test-coverage` overuse. Dimensions without evidence enter it at their formula value, so an empty scope reads 10000 and one file reads 0; read `panel` before the number. |
 | `tracedecay_gini` | Gini inequality coefficient for any metric (complexity, lines, fan-in, fan-out, members). Finds god files and uneven distributions. |
 | `tracedecay_dependency_depth` | Longest file-level dependency chains, the critical paths where upstream changes ripple through the most layers. |
 | `tracedecay_dsm` | Design Structure Matrix showing file dependencies as clusters, density stats, or an NxN grid. Reveals hidden coupling patterns. |
@@ -885,7 +1005,7 @@ Marked functions are excluded from `tracedecay_test_risk` attribution calculatio
 
 | Tool | What it does |
 |------|-------------|
-| `tracedecay_module_api` | Public API surface of a file or directory. |
+| `tracedecay_module_api` | Public API of a file or directory. |
 | `tracedecay_coupling` | Rank files by coupling (fan-in or fan-out). |
 | `tracedecay_inheritance_depth` | Find the deepest class inheritance hierarchies. |
 | `tracedecay_type_hierarchy` | Recursive type hierarchy tree for traits, interfaces, and classes. |
@@ -920,7 +1040,7 @@ The holographic memory tools store durable facts linked to entities:
 | `tracedecay_fact_feedback` | Record `helpful` or `unhelpful` feedback for a numeric `fact_id` so the fact's computed trust score changes over time. |
 | `tracedecay_memory_status` | Read-only report of project/profile fact and entity counts, trust-score buckets, feedback counts, coverage, and missing-vector state. It never repairs or mutates storage. |
 
-Entity recall surfaces facts by named entity and includes why each fact was recalled: matching entities, reason text, related fact IDs, contradiction links, and the current trust score. Update old prompts and permissions to use the exact `tracedecay_fact_store_*` tools, `tracedecay_fact_feedback`, and `tracedecay_memory_status`.
+Entity recall finds facts by named entity and includes why each fact was recalled: matching entities, reason text, related fact IDs, contradiction links, and the current trust score. Update old prompts and permissions to use the exact `tracedecay_fact_store_*` tools, `tracedecay_fact_feedback`, and `tracedecay_memory_status`.
 
 Common exact fact-tool payloads (in add/search/probe order):
 
@@ -1012,7 +1132,8 @@ counter payload. The counter service still receives ordinary transport metadata
 such as the source IP and may derive aggregate geography from it; submitting an
 aggregate count is not an anonymity guarantee.
 
-This powers the "Worldwide" counter shown in `tracedecay status` only when the counter is enabled.
+`tracedecay status` does not display the counter. When you opt in, `tracedecay doctor`
+reads the public total only to report whether the counter service is reachable.
 
 **To opt in:**
 
@@ -1214,7 +1335,7 @@ user-preference writes here; projectless Codex and Cursor hooks recall from it.
 
 Projects enroll one daemon-owned project authority. Profile-backed storage
 keeps the final Grafeo/SQLite stores under the private profile root
-(`~/.tracedecay/projects/<project-id>`); a git repository additionally carries
+(`~/.tracedecay/projects/<project-id>`); a git repository also carries
 its identity in `.git/tracedecay-project.json`. Nothing is written into the
 visible working tree. Project facts, sessions, and lossless LCM are
 project-wide across branches and linked worktrees. Code graphs are indexed as
@@ -1249,7 +1370,7 @@ tracedecay memory status --path /path/to/project --json
 
 Created in your home directory. Contains:
 
-- `config.toml`, user preferences (upload opt-in/out, cached version info, pending upload count)
+- `config.toml`, user preferences (cached version info, pending upload count)
 - `global.db`, daemon-owned registry/usage metadata for enrolled projects; it is
   not a fact authority and clients never open it directly
 - `projects/<project_id>/`, daemon-owned project authority data when profile storage is enabled
@@ -1257,12 +1378,12 @@ Created in your home directory. Contains:
 The `config.toml` is plain TOML and fully transparent:
 
 ```toml
-upload_enabled = false      # set to true to opt in to counter upload/read
 pending_upload = 4823       # tokens waiting to be uploaded
 last_upload_at = 1711375200 # last successful upload timestamp
-last_worldwide_total = 1000000
-last_worldwide_fetch_at = 1711375200
 ```
+
+The upload opt-in is the `user.upload_enabled.v1` setting, not a key in this
+file.
 
 #### Mandatory structured sanitization of ingested transcripts
 

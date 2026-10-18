@@ -9,13 +9,13 @@
 <p align="center">
   <a href="https://github.com/ScriptedAlchemy/tracedecay/releases/latest"><img src="https://img.shields.io/github/v/release/ScriptedAlchemy/tracedecay" alt="GitHub release"></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.99.0-orange.svg" alt="Rust 1.99.0"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-nightly-orange.svg" alt="Rust nightly"></a>
   <img src="https://img.shields.io/badge/macOS-supported-blue.svg" alt="macOS">
   <img src="https://img.shields.io/badge/Linux-supported-blue.svg" alt="Linux">
   <img src="https://img.shields.io/badge/Windows-supported-blue.svg" alt="Windows">
 </p>
 
-TraceDecay builds a local semantic graph of your repository so AI coding agents can ask for the right symbols, call relationships, impact radius, docs, and source snippets without scanning the tree.
+TraceDecay builds a local semantic graph of your repository. AI coding agents query it for symbols, call relationships, affected callers, docs, and source snippets.
 
 Instead of repeated `grep`, `glob`, and file reads, agents use MCP tools such as `tracedecay_context`, `tracedecay_search`, `tracedecay_callers`, and `tracedecay_impact`.
 
@@ -55,7 +55,7 @@ only its exact persisted shape: an incompatible store returns `ResetRequired`
 and requires explicit reset or recreation, never conversion. See [the V2
 operating model](docs/V2-OPERATING-MODEL.md).
 
-## Quick Start
+## Quick start
 
 ```bash
 cd /path/to/your/project
@@ -196,7 +196,7 @@ authorized, sanitized, classified records under their remote policy.
 Network-capable effects are separate from core retrieval:
 
 - Worldwide counter: when opted in, sends the pending aggregate token-savings
-  amount and may fetch the public total/country display data.
+  amount, and `tracedecay doctor` reads the public total to check reachability.
 - GitHub release checks and updates: contact GitHub release endpoints. An
   explicitly configured private GitHub review source can use a read-only
   credential from the operating-system keyring; missing, ambiguous,
@@ -308,4 +308,4 @@ TraceDecay is a Rust port of the original [CodeGraph](https://github.com/colbymc
 
 ## License
 
-MIT License -- see [LICENSE](LICENSE).
+See [LICENSE](LICENSE) for the MIT License.

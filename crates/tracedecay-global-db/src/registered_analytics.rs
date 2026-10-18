@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
 
 use tracedecay_runtime_core::db::engine::{Value, opt_text};
 
@@ -7,8 +9,9 @@ use super::{
     AnalyticsEventInsert, AnalyticsEventQuery, AnalyticsEventRecord, AnalyticsHintCounts,
     AnalyticsToolCounts, ObservabilityEmissionClaimV1, ObservabilityEmissionOutboxRecordV1,
     ObservabilityOwnerEmissionWriteOutcomeV1, ObservabilityOwnerEmissionWriteV1,
-    PreparedObservabilityEmissionV1, RegisteredGlobalDb, RegisteredGlobalDbWriteTransaction,
-    analytics_scope_query, row_to_analytics_event,
+    ObservabilityRollupRetentionReceiptV1, PreparedObservabilityEmissionV1, RegisteredGlobalDb,
+    RegisteredGlobalDbWriteTransaction, analytics_scope_query,
+    observability_rollup::expire_observability_rollups, row_to_analytics_event,
 };
 
 const OBSERVABILITY_DETAIL_RETENTION_SECONDS: i64 = 30 * 86_400;
@@ -16,6 +19,15 @@ const OBSERVABILITY_ROLLUP_RETENTION_SECONDS: i64 = 395 * 86_400;
 const MAX_OBSERVABILITY_OUTBOX_JSON_BYTES: usize = 1_048_576;
 const OBSERVABILITY_RETENTION_ROWS_PER_CLASS: usize = 512;
 pub(crate) const ANALYTICS_INSERT_ROWS_PER_STATEMENT: usize = 500;
+// The provider is a literal so `idx_observability_event_idempotency` stays
+// usable; the planner does not match a bound value against an index predicate.
+pub(crate) const OBSERVABILITY_EVENT_BY_IDEMPOTENCY_KEY_SQL: &str =
+    "SELECT id, provider, project_id, session_id, timestamp, event_kind,
+            hook_name, tool_name, tool_category, skill_name, hint_category,
+            hint_id, outcome, metadata_json
+     FROM analytics_events
+     WHERE provider = 'tracedecay-observability' AND project_id = ?1 AND hint_id = ?2
+     LIMIT 1";
 
 #[derive(Clone, Copy)]
 enum AnalyticsAppendKind {
@@ -50,6 +62,7 @@ pub struct ObservabilityRetentionReceiptV1 {
     pub expired_detail: u64,
     pub expired_rollup: u64,
     pub expired_settled_outbox: u64,
+    pub expired_rollups: ObservabilityRollupRetentionReceiptV1,
     /// A bounded page remains and maintenance should use its retry cadence.
     pub has_more: bool,
 }
@@ -252,24 +265,33 @@ impl RegisteredGlobalDb {
         project_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<AnalyticsEventRecord>, String> {
-        let snapshot = self
-            .read_snapshot()
+        let opened: Pin<
+            Box<
+                dyn Future<
+                        Output = tracedecay_domain::errors::Result<
+                            tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(self.read_snapshot());
+        let snapshot = opened
             .await
             .map_err(|error| format!("failed to begin observability event snapshot: {error}"))?;
-        let mut rows = snapshot
-            .query(
-                "SELECT id, provider, project_id, session_id, timestamp, event_kind,
-                        hook_name, tool_name, tool_category, skill_name, hint_category,
-                        hint_id, outcome, metadata_json
-                 FROM analytics_events
-                 WHERE provider = ?1 AND project_id = ?2 AND hint_id = ?3
-                 LIMIT 1",
-                tracedecay_runtime_core::db::engine::params![
-                    "tracedecay-observability",
-                    project_id,
-                    idempotency_key,
-                ],
-            )
+        let queried: Pin<
+            Box<
+                dyn Future<
+                        Output = tracedecay_runtime_core::db::engine::Result<
+                            tracedecay_runtime_core::db::engine::Rows,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(snapshot.query(
+            OBSERVABILITY_EVENT_BY_IDEMPOTENCY_KEY_SQL,
+            tracedecay_runtime_core::db::engine::params![project_id, idempotency_key],
+        ));
+        let mut rows = queried
             .await
             .map_err(|error| format!("failed to read observability event: {error}"))?;
         rows.next()
@@ -593,8 +615,9 @@ impl RegisteredGlobalDb {
         Ok(pending)
     }
 
-    /// Expires only optional observability detail and rollup rows through the
-    /// registered writer. Product receipts retain their owning lifecycle.
+    /// Expires only optional observability detail and rollup rows, plus the
+    /// daily rollup generations past the same horizon, through the registered
+    /// writer. Product receipts retain their owning lifecycle.
     #[tracing::instrument(
         name = "global_db.registered.analytics.prune",
         level = "trace",
@@ -611,6 +634,10 @@ impl RegisteredGlobalDb {
             .begin_write_transaction()
             .await
             .map_err(|error| format!("failed to begin observability retention: {error}"))?;
+        // Expired dirty-day markers go first: they protect their source rows
+        // from the analytics pass below, and a day past the horizon has no
+        // generation left to rebuild.
+        let expired_rollups = expire_observability_rollups(&transaction, now_seconds).await?;
         let (expired_detail_outbox, expired_detail) = prune_observability_retention_class(
             &transaction,
             now_seconds.saturating_sub(OBSERVABILITY_DETAIL_RETENTION_SECONDS),
@@ -637,6 +664,7 @@ impl RegisteredGlobalDb {
             expired_detail,
             expired_rollup,
             expired_settled_outbox: expired_detail_outbox.saturating_add(expired_rollup_outbox),
+            expired_rollups,
             has_more,
         })
     }
@@ -1492,14 +1520,8 @@ async fn append_observability_event_in_existing_tx(
     validate_observability_event(event).map_err(ObservabilityAppendError::Failed)?;
     let mut rows = transaction
         .query(
-            "SELECT id, provider, project_id, session_id, timestamp, event_kind,
-                    hook_name, tool_name, tool_category, skill_name, hint_category,
-                    hint_id, outcome, metadata_json
-             FROM analytics_events
-             WHERE provider = ?1 AND project_id = ?2 AND hint_id = ?3
-             LIMIT 1",
+            OBSERVABILITY_EVENT_BY_IDEMPOTENCY_KEY_SQL,
             tracedecay_runtime_core::db::engine::params![
-                event.provider.as_str(),
                 event.project_id.as_str(),
                 event.hint_id.as_deref()
             ],

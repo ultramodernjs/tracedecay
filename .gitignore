@@ -64,3 +64,4 @@ MODULE.bazel.lock
 .codex/plans/pm-*/**/source/
 .codex/plans/pm-*/**/original/
 .codex/plans/pm-*/**/baseline/
+/.bazelrc.local

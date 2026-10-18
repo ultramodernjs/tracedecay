@@ -1,10 +1,11 @@
 use super::{
-    AnalyticsAction, AsyncRuntimeFlavor, Cli, CommandFamily, Commands, DAEMON_CPU_THREADS_ENV,
+    AnalyticsAction, Cli, CommandFamily, CommandRuntime, Commands, DAEMON_CPU_THREADS_ENV,
     DEFAULT_MAX_DAEMON_CPU_THREADS, HostBundleCliOptions, PackageHookAction, RAYON_NUM_THREADS_ENV,
-    ScoopPackageHookAction, StderrTracingDefault, async_runtime_flavor, command_profile_label,
-    daemon_cpu_threads_from, is_one_shot_daemon_client, normalize_tool_reserved_global_flags,
-    runs_worldwide_counter_flush, should_skip_agent_install_check, should_skip_startup_maintenance,
-    stderr_tracing_default, try_print_cli_version, validate_host_bundle_options,
+    ScoopPackageHookAction, StderrTracingDefault, async_worker_threads, command_profile_label,
+    command_runtime, daemon_cpu_threads_from, is_one_shot_daemon_client,
+    normalize_tool_reserved_global_flags, runs_worldwide_counter_flush,
+    should_skip_agent_install_check, should_skip_startup_maintenance, stderr_tracing_default,
+    try_print_cli_version, validate_host_bundle_options,
 };
 use clap::{CommandFactory, Parser};
 use std::iter;
@@ -148,6 +149,22 @@ fn default_component_set_adoption_requires_confirmation() {
             .expect("confirmed default component-set adoption must pass validation");
         assert!(options.component.is_none() && options.yes && options.adopt);
     }
+}
+
+/// Help offers one MCP component; scripts that spell the retired one still
+/// parse.
+#[test]
+fn component_help_lists_one_mcp_choice_and_keeps_the_retired_spelling() {
+    let help = Cli::command().render_long_help().to_string();
+    assert!(help.contains("context-mcp"), "{help}");
+    assert!(!help.contains("operator-mcp"), "{help}");
+
+    let cli = Cli::try_parse_from(["tracedecay", "update-plugin", "--component", "operator-mcp"])
+        .expect("the retired component spelling still parses");
+    assert_eq!(
+        cli.component,
+        Some(super::HostBundleComponentArg::OperatorMcp)
+    );
 }
 
 #[test]
@@ -314,6 +331,7 @@ fn explicit_agent_config_commands_skip_startup_maintenance() {
         no_dashboard: false,
         automation: false,
         git_hook: false,
+        catalog_profile: None,
     }));
     assert!(should_skip_startup_maintenance(&Commands::Reinstall {
         local: false,
@@ -357,10 +375,7 @@ fn tool_fallback_skips_network_and_agent_startup_maintenance() {
     assert!(should_skip_startup_maintenance(&command));
     assert!(should_skip_agent_install_check(&command));
     assert!(is_one_shot_daemon_client(Some(&command)));
-    assert_eq!(
-        async_runtime_flavor(Some(&command)),
-        AsyncRuntimeFlavor::CurrentThread
-    );
+    assert_eq!(command_runtime(Some(&command)), CommandRuntime::Native);
 }
 
 #[test]
@@ -369,17 +384,68 @@ fn status_is_a_one_shot_daemon_client() {
     assert!(should_skip_startup_maintenance(&command));
     assert!(should_skip_agent_install_check(&command));
     assert!(is_one_shot_daemon_client(Some(&command)));
-    assert_eq!(
-        async_runtime_flavor(Some(&command)),
-        AsyncRuntimeFlavor::CurrentThread
-    );
+    assert_eq!(command_runtime(Some(&command)), CommandRuntime::Native);
     assert!(!is_one_shot_daemon_client(Some(&parse_command(&[
         "init",
         "/tmp/project"
     ]))));
+}
+
+#[test]
+fn long_lived_commands_run_at_least_two_native_workers() {
+    for args in [&["daemon", "run"][..], &["serve"]] {
+        assert!(
+            async_worker_threads(Some(&parse_command(args))) >= 2,
+            "{args:?}"
+        );
+    }
+    for args in [&["status"][..], &["tool", "tracedecay_status"]] {
+        assert_eq!(
+            async_worker_threads(Some(&parse_command(args))),
+            1,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn only_the_foreground_daemon_owns_a_tokio_runtime() {
+    for args in [
+        &["hook-stop"][..],
+        &["current-counter"],
+        &["channel"],
+        &["update"],
+        &["install"],
+        &["feedback-rollback", "dry-run", "--agent", "claude"],
+        &["doctor"],
+        &["gain"],
+        &["git", "status"],
+        &["sessions", "search", "query"],
+        &["analytics", "sync"],
+        &["automation", "skills", "list"],
+        &["init", "/tmp/project"],
+        &["sync"],
+        &["projects", "list"],
+        &["storage", "report"],
+        &["wipe", "--stale"],
+        &["list"],
+        &["serve"],
+        &["lsp", "bridge", "--stdio"],
+        &["dashboard"],
+        &["remote", "status"],
+        &["daemon", "status"],
+        &["daemon", "stop"],
+    ] {
+        assert_eq!(
+            command_runtime(Some(&parse_command(args))),
+            CommandRuntime::Native,
+            "{args:?}"
+        );
+    }
+    assert_eq!(command_runtime(None), CommandRuntime::Native);
     assert_eq!(
-        async_runtime_flavor(Some(&parse_command(&["init", "/tmp/project"]))),
-        AsyncRuntimeFlavor::MultiThread
+        command_runtime(Some(&parse_command(&["daemon", "run"]))),
+        CommandRuntime::NativeWithTokio
     );
 }
 
@@ -525,6 +591,7 @@ fn agent_install_health_check_is_selective() {
         path: None,
         timings: false,
         full_tool_list: false,
+        catalog_profile: None,
     }));
     assert!(should_skip_agent_install_check(&Commands::Install {
         agent: Some("cursor".to_string()),
@@ -532,6 +599,7 @@ fn agent_install_health_check_is_selective() {
         no_dashboard: false,
         automation: false,
         git_hook: false,
+        catalog_profile: None,
     }));
     assert!(should_skip_agent_install_check(&Commands::Reinstall {
         local: false,
@@ -653,14 +721,30 @@ fn claude_and_kiro_hooks_skip_startup_maintenance() {
 }
 
 #[test]
-fn pressure_hooks_skip_interactive_startup_maintenance() {
-    for command in [
-        Commands::HookClaudePostCompact,
-        Commands::HookCodexPostCompact,
-    ] {
-        assert!(should_skip_startup_maintenance(&command));
-        assert!(should_skip_agent_install_check(&command));
+fn every_hook_subcommand_skips_startup_maintenance() {
+    // Hooks run on the host's hot path and their stderr reaches the host. A
+    // hook outside the native-capture table (the PostCompact pressure probes)
+    // must still skip the counter flush, first-run note and install check.
+    let hooks: Vec<String> = Cli::command()
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().to_owned())
+        .filter(|name| name.starts_with("hook-"))
+        .collect();
+    assert!(
+        hooks.len() > 30,
+        "hook subcommands were not enumerated: {hooks:?}"
+    );
+    for hook in &hooks {
+        let command = parse_command(&[hook.as_str()]);
         assert!(!runs_worldwide_counter_flush(&command));
+        assert!(
+            should_skip_startup_maintenance(&command),
+            "{hook} runs startup maintenance"
+        );
+        assert!(
+            should_skip_agent_install_check(&command),
+            "{hook} runs the agent install check"
+        );
     }
 }
 
@@ -760,6 +844,62 @@ fn the_beta_83_claude_plugin_flag_serves_the_full_tool_list() {
                 })
             ),
             "{flag} must select the full tool list"
+        );
+    }
+}
+
+#[test]
+fn serve_selects_a_catalog_profile_by_its_short_name() {
+    for args in [
+        &["tracedecay", "serve", "--catalog-profile=compact"][..],
+        &["tracedecay", "serve", "--catalog-profile", "compact"][..],
+    ] {
+        let cli = Cli::try_parse_from(args)
+            .unwrap_or_else(|error| panic!("{args:?} must parse: {error}"));
+        let Some(Commands::Serve {
+            catalog_profile: Some(profile),
+            ..
+        }) = cli.command
+        else {
+            panic!("{args:?} must select a catalog profile");
+        };
+        assert_eq!(profile.name(), "compact");
+    }
+    let error = Cli::try_parse_from(["tracedecay", "serve", "--catalog-profile=profile.compact"])
+        .err()
+        .expect("a catalog profile ID is not its short name");
+    assert!(
+        error
+            .to_string()
+            .contains(r#"unknown catalog profile "profile.compact""#),
+        "{error}"
+    );
+}
+
+#[test]
+fn every_launch_an_install_writes_parses_as_that_serve_profile() {
+    let catalog =
+        tracedecay_daemon_service::application_surface::application_surface_binding_catalog_ref()
+            .expect("binding catalog");
+    for name in ["default", "compact", "administrative", "host-limited"] {
+        let profile =
+            tracedecay_contracts::catalog_composition::CatalogProfileName::parse(catalog, name)
+                .expect("catalog profile");
+        let written =
+            tracedecay_agent_hosts::agents::serve_args::ServeArgs::from(profile).to_vec(&[]);
+        let cli = Cli::try_parse_from(iter::once("tracedecay".to_owned()).chain(written.clone()))
+            .unwrap_or_else(|error| panic!("{written:?} must parse: {error}"));
+        let Some(Commands::Serve {
+            catalog_profile, ..
+        }) = cli.command
+        else {
+            panic!("{written:?} must be a serve command");
+        };
+        let expected = (name != "default").then_some(name);
+        assert_eq!(
+            catalog_profile.as_ref().map(|profile| profile.name()),
+            expected,
+            "{written:?}"
         );
     }
 }

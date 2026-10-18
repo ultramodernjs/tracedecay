@@ -16,9 +16,8 @@ use gix::{
     object::tree::diff::{Action as TreeDiffAction, Change as TreeDiffChange},
 };
 use thiserror::Error;
-use tracedecay_application::code_index::{
-    DaemonCodeIndexControlV1, ProductionCodeIndexOwnerV1, open_production_code_index_owner_v1,
-};
+use tracedecay_application::code_index::DaemonCodeIndexControlV1;
+use tracedecay_code_index::production::CodeIndexProductionOwnerV1;
 use tracedecay_code_index_retention::code_index_generations::{
     CodeIndexScopeStoreResetV1, DurablePublicationPointerV1, DurableSealedCodeGenerationIdentityV1,
 };
@@ -45,7 +44,7 @@ use tracedecay_runtime_core::resident_memory::{
     detected_process_resident_memory_limit_v1,
 };
 
-use crate::code_index::{
+use tracedecay_code_index::{
     graph_projection::CodeGraphProjectionError,
     languages::StaticLanguageRegistry,
     production::{
@@ -69,7 +68,7 @@ use super::{
     CodeGraphActivationStateV1, CodeGraphReplayBindingV1, CodeIndexBuildProgressSlotStateV1,
     CodeIndexBuildProgressSlotV1, CodeIndexBuildProgressStateV1, CodeIndexHintPolicyV1,
     CodeIndexIgnoredDependencyRefusalV1, CodeTextProjectionStateV1,
-    DaemonCodeIndexPublicationStoreV1, DaemonCodeTextArtifactStoreV1, DaemonProjectionSinkV1,
+    DaemonCodeIndexPublicationStoreV1, DaemonCodeTextArtifactStoreV1,
     DurableActiveSealedGenerationBindingV1, GenerationDecodeAdmissionV1, GenerationServingCachesV1,
     GenerationTextControlV1, LatestCodeTextGenerationV1, LatestCompleteCodeIndexV1,
     SharedCodeIndexBytePoolV1, branch_generations, classification, file_occurrence_id,
@@ -85,8 +84,7 @@ const MAX_SUPERSEDED_RECONCILE_RETRIES: usize = 4;
 pub(super) const CODE_INDEX_WORKER_RESIDENT_COMPONENT_V1: &str = "code-index-build-workers-v1";
 
 const SUPERSEDED_RECONCILE_RETRY_BACKOFF: Duration = Duration::from_millis(75);
-type ProductionOwner =
-    ProductionCodeIndexOwnerV1<DaemonCodeIndexPublicationStoreV1, DaemonProjectionSinkV1>;
+type ProductionOwner = CodeIndexProductionOwnerV1<DaemonCodeIndexPublicationStoreV1>;
 
 #[derive(Default)]
 pub(super) struct PendingHintsV1 {
@@ -349,7 +347,7 @@ impl CodeIndexSchedulerErrorV1 {
     /// it as superseded instead of reporting the served generation stale.
     pub fn reconcile_interruption(
         &self,
-    ) -> Option<crate::code_index::production::CodeIndexInterruptionV1> {
+    ) -> Option<tracedecay_code_index::production::CodeIndexInterruptionV1> {
         match self {
             Self::Production(CodeIndexProductionErrorV1::Interrupted(interruption)) => {
                 Some(*interruption)
@@ -591,12 +589,16 @@ impl SourceFreshnessFenceV1 {
             .clone()
     }
 
+    /// `source_epoch` is the epoch the verification began under, not the
+    /// epoch now: a hint that lands while the source is being verified is not
+    /// covered by that verification.
     fn mark_reconciled(
         &self,
         git_metadata: identity::GitMetadataFingerprintV1,
         source_witness: Option<ReconciledSourceWitnessV1>,
         source_roster: &[CodeIndexIgnoredSourceAdmissionV1],
         reconciled_without_generation: bool,
+        source_epoch: u64,
     ) {
         let micros = now_micros().0;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -606,7 +608,7 @@ impl SourceFreshnessFenceV1 {
         state.last_reconciled_at = Instant::now();
         state.verified_against_source = true;
         state.reconciled_without_generation = reconciled_without_generation;
-        state.reconciled_source_epoch = self.source_epoch.load(Ordering::Acquire);
+        state.reconciled_source_epoch = source_epoch;
         state.successor_build_in_flight = false;
         self.last_reconciled_at_micros
             .store(micros, Ordering::Release);
@@ -920,7 +922,7 @@ pub(super) enum FreshnessProbeVerdictV1 {
 
 pub(super) enum RetainedTextGenerationRestoreV1 {
     Servable(LatestCodeTextGenerationV1),
-    Refused(VerifiedSealedTextGenerationMetadataV1),
+    Refused(Box<VerifiedSealedTextGenerationMetadataV1>),
     Failed(CodeIndexPublicationStoreErrorV1),
 }
 
@@ -950,6 +952,10 @@ pub struct CodeIndexWorktreeSchedulerV1 {
     /// tests; production never installs one.
     #[cfg(test)]
     reconcile_fault: Option<Arc<reconcile_panic_guard::ReconcileFaultInjectionV1>>,
+    /// Test-only: runs once a retained reconcile has verified the sealed bytes,
+    /// before it accepts them, so a test can land a hint inside that window.
+    #[cfg(test)]
+    after_retained_source_check: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Process resident-memory authority artifact builds and readers reserve
     /// through. Standalone opens get a private default-limit authority; the
     /// registry rebinds its shared process authority at mount.
@@ -1041,7 +1047,7 @@ impl HistoricalCodeIndexGenerationOwnerV1 {
         let generation_id = metadata.manifest().generation_id.clone();
         let mut progress_slot = CodeIndexBuildProgressSlotStateV1::default();
         let text_progress_owner_epoch = progress_slot.replace_generation(generation_id);
-        LatestCodeTextGenerationV1 {
+        LatestCodeTextGenerationV1::from_shared(super::serving::CodeTextGenerationSharedV1 {
             metadata: Arc::new(metadata),
             sealed_format_revision,
             query_owners: Arc::new(RwLock::new(None)),
@@ -1066,11 +1072,10 @@ impl HistoricalCodeIndexGenerationOwnerV1 {
             ),
             preopened_source: Arc::new(Mutex::new(None)),
             publication_binding: None,
-            graph_predecessor: Arc::default(),
             catalog_warm_settled: Arc::new(tokio::sync::Notify::new()),
             park_release_after_catalog_warm_armed: Arc::new(AtomicBool::new(false)),
             parked_graph_release: Arc::new(RwLock::new(None)),
-        }
+        })
     }
 
     pub(super) fn bind_complete(
@@ -1195,22 +1200,6 @@ impl HistoricalCodeIndexGenerationOwnerV1 {
         Ok(Some(metadata))
     }
 
-    /// Load an exact durable code generation even after a newer capture has
-    /// superseded every process-local retained slot.
-    #[tracing::instrument(
-        name = "daemon.code_index.historical.published_generation",
-        level = "trace",
-        skip_all
-    )]
-    pub(crate) fn published_generation(
-        &self,
-        generation_id: &CodeGenerationId,
-    ) -> Result<Option<Arc<CodeIndexPublishedGenerationV1>>, CodeIndexSchedulerErrorV1> {
-        self.publication
-            .load_generation(generation_id)
-            .map_err(|error| CodeIndexProductionErrorV1::Publication(error).into())
-    }
-
     /// Resolve the sealed replay binding for one already-published generation
     /// through the retained publication clone. A sealed binding is an
     /// immutable pointer-file read, so it stays answerable while a reconcile
@@ -1306,13 +1295,9 @@ impl CodeIndexWorktreeSchedulerV1 {
             privacy_key_epoch: 1,
             max_snapshot_age_micros: None,
         };
-        let owner = open_production_code_index_owner_v1(
-            production_config.clone(),
-            publication.clone(),
-            DaemonProjectionSinkV1,
-        )
-        .map_err(|error| CodeIndexSchedulerErrorV1::ProductionOpen(error.to_string()))?
-        .with_physical_artifact_pool(byte_pool.physical_artifacts.clone());
+        let owner = CodeIndexProductionOwnerV1::new(production_config.clone(), publication.clone())
+            .map_err(|error| CodeIndexSchedulerErrorV1::ProductionOpen(error.to_string()))?
+            .with_physical_artifact_pool(byte_pool.physical_artifacts.clone());
         let latest_content_identity = None;
         let hints = Arc::new(Mutex::new(PendingHintsV1::default()));
         let wake = Arc::new(tokio::sync::Notify::new());
@@ -1335,6 +1320,8 @@ impl CodeIndexWorktreeSchedulerV1 {
             byte_pool,
             #[cfg(test)]
             reconcile_fault: None,
+            #[cfg(test)]
+            after_retained_source_check: None,
             resident_memory: Arc::new(ProcessResidentMemoryV1::new(
                 detected_process_resident_memory_limit_v1(),
             )),
@@ -1845,6 +1832,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(cancelled_code_index_reconcile());
         }
+        let began_under = self.epoch.load(Ordering::Acquire);
         {
             let hints = self
                 .hints
@@ -1934,7 +1922,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         }
         let snapshot_content_identity = generation.snapshot().content_identity.clone();
         self.latest_content_identity = Some(snapshot_content_identity.clone());
-        self.mark_reconciled(source_manifest);
+        self.mark_reconciled(source_manifest, began_under);
         Ok(Some(CodeIndexReconcileOutcomeV1::Noop(
             CodeIndexNoopEvidenceV1 {
                 snapshot_content_identity,
@@ -2119,6 +2107,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             return Ok(None);
         }
         let scope = CodeIndexGenerationScopeV1::for_snapshot(pending.snapshot());
+        let began_under = control.expected_epoch();
         let mut publication = self
             .publication
             .for_undecoded_active_rebuild(&pointer)
@@ -2133,6 +2122,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             stat_signature
                 .clone()
                 .map(|signature| ReconciledSourceWitnessV1::new(signature, generation.snapshot())),
+            began_under,
         );
         self.persist_published_witness(generation.metadata(), &git_metadata, stat_signature)?;
         let outcome = CodeIndexReconcileOutcomeV1::Published(self.publish_evidence(
@@ -2156,6 +2146,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         stat_signature: String,
         source_manifest: SourceContentManifestV1,
         prior_witness: Option<&RestoreFreshnessWitnessV1>,
+        began_under: u64,
     ) -> CodeIndexReconcileOutcomeV1 {
         let snapshot_content_identity = metadata.snapshot().content_identity.clone();
         self.latest_content_identity = Some(snapshot_content_identity.clone());
@@ -2165,6 +2156,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 stat_signature: stat_signature.clone(),
                 content_manifest: source_manifest,
             }),
+            began_under,
         );
         if let Some(prior) = prior_witness {
             RestoreFreshnessWitnessV1 {
@@ -2191,6 +2183,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(cancelled_code_index_reconcile());
         }
+        let began_under = self.epoch.load(Ordering::Acquire);
         if let Some(outcome) = self.republish_unpublished_retained_generation()? {
             return Ok(Some(outcome));
         }
@@ -2240,6 +2233,10 @@ impl CodeIndexWorktreeSchedulerV1 {
         let source_manifest = SourceContentManifestV1::for_snapshot(metadata.snapshot());
         let sealed_bytes_match =
             retained_is_reusable && !has_hints && self.sources_match_manifest(&source_manifest);
+        #[cfg(test)]
+        if let Some(hook) = self.after_retained_source_check.clone() {
+            hook();
+        }
         let quiet_witness = sealed_bytes_match
             && witness.as_ref().is_some_and(|witness| {
                 witness.git_metadata_signature == sampled_metadata.stable_signature()
@@ -2275,6 +2272,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 sampled_sweep.signature,
                 source_manifest,
                 witness.as_ref(),
+                began_under,
             )));
         }
 
@@ -2421,13 +2419,12 @@ impl CodeIndexWorktreeSchedulerV1 {
                     .map_err(CodeIndexProductionErrorV1::Publication)?;
                 CodeIndexPublishedBuildV1::new(pending, manifest_bytes)?
             } else {
-                let mut owner = open_production_code_index_owner_v1(
-                    self.production_config.clone(),
-                    publication,
-                    DaemonProjectionSinkV1,
-                )
-                .map_err(|error| CodeIndexSchedulerErrorV1::ProductionOpen(error.to_string()))?
-                .with_physical_artifact_pool(self.byte_pool.physical_artifacts.clone());
+                let mut owner =
+                    CodeIndexProductionOwnerV1::new(self.production_config.clone(), publication)
+                        .map_err(|error| {
+                            CodeIndexSchedulerErrorV1::ProductionOpen(error.to_string())
+                        })?
+                        .with_physical_artifact_pool(self.byte_pool.physical_artifacts.clone());
                 owner
                     .build_and_publish(
                         CodeIndexBuildRequestV1 {
@@ -2451,6 +2448,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 stat_signature.clone().map(|signature| {
                     ReconciledSourceWitnessV1::new(signature, generation.snapshot())
                 }),
+                control.expected_epoch(),
             );
             self.persist_published_witness(generation.metadata(), &git_metadata, stat_signature)?;
             let outcome = CodeIndexReconcileOutcomeV1::Published(self.publish_evidence(
@@ -2467,7 +2465,11 @@ impl CodeIndexWorktreeSchedulerV1 {
             .map(|signature| ReconciledSourceWitnessV1::new(signature, &captured.snapshot));
         let snapshot_content_identity = captured.snapshot.content_identity;
         self.latest_content_identity = Some(snapshot_content_identity.clone());
-        self.mark_reconciled_retained_generation_state(git_metadata.clone(), source_witness);
+        self.mark_reconciled_retained_generation_state(
+            git_metadata.clone(),
+            source_witness,
+            control.expected_epoch(),
+        );
         if let (Some(witness), Some(stat_signature)) = (witness, stat_signature) {
             RestoreFreshnessWitnessV1 {
                 generation_id: witness.generation_id,
@@ -2693,7 +2695,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         if !compatibility.may_serve_while_rebuilding() {
             text_control.retire();
             self.request_background_reconcile();
-            return Some(RetainedTextGenerationRestoreV1::Refused(metadata));
+            return Some(RetainedTextGenerationRestoreV1::Refused(Box::new(metadata)));
         }
         if !compatibility.is_reusable() {
             self.request_background_reconcile();
@@ -2715,7 +2717,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         }
         let metadata = Arc::new(metadata);
         Some(RetainedTextGenerationRestoreV1::Servable(
-            LatestCodeTextGenerationV1 {
+            LatestCodeTextGenerationV1::from_shared(super::serving::CodeTextGenerationSharedV1 {
                 metadata,
                 sealed_format_revision,
                 query_owners: Arc::new(RwLock::new(None)),
@@ -2736,11 +2738,10 @@ impl CodeIndexWorktreeSchedulerV1 {
                     generation_file: pointer.generation_file,
                     state_digest: ManifestDigest::new(pointer.state_digest).ok()?,
                 })),
-                graph_predecessor: Arc::default(),
                 catalog_warm_settled: Arc::new(tokio::sync::Notify::new()),
                 park_release_after_catalog_warm_armed: Arc::new(AtomicBool::new(false)),
                 parked_graph_release: Arc::new(RwLock::new(None)),
-            },
+            }),
         ))
     }
 
@@ -2764,6 +2765,14 @@ impl CodeIndexWorktreeSchedulerV1 {
             .ok()
             .flatten()
             .map(|pointer| pointer.generation_id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_after_retained_source_check_for_test(
+        &mut self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.after_retained_source_check = Some(hook);
     }
 
     /// Install a deterministic reconcile fault for one mounted worktree so a
@@ -2898,11 +2907,20 @@ impl CodeIndexWorktreeSchedulerV1 {
         let mut overflow_reconciled = false;
         for retry in 0..=MAX_SUPERSEDED_RECONCILE_RETRIES {
             let control = self.reconcile_control();
+            // Every earlier attempt was cancelled by a newer source epoch. A
+            // source that changes faster than a pass lasts would cancel this
+            // one too, so it seals what it captured; the epoch that
+            // superseded it stays owed to the follow-up pass.
+            let control = if retry == MAX_SUPERSEDED_RECONCILE_RETRIES {
+                control.ignoring_source_epoch()
+            } else {
+                control
+            };
             let mut captured = match capture(self, &control) {
                 Ok(captured) => captured,
                 Err(CodeIndexSchedulerErrorV1::Production(
                     CodeIndexProductionErrorV1::Interrupted(
-                        crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+                        tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
                     ),
                 )) if retry < MAX_SUPERSEDED_RECONCILE_RETRIES
                     && !self.shutting_down.load(Ordering::Acquire) =>
@@ -2920,7 +2938,15 @@ impl CodeIndexWorktreeSchedulerV1 {
                     .hints
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (!control.is_cancelled()).then(|| hints.take())
+                (!control.is_cancelled()).then(|| {
+                    if control.source_superseded() {
+                        // The arrival that superseded this capture is not in
+                        // it: leave its marker for the follow-up pass.
+                        PendingHintsV1::default()
+                    } else {
+                        hints.take()
+                    }
+                })
             };
             let Some(hints) = hints else {
                 stop_if_resident_memory(&control)?;
@@ -2974,7 +3000,10 @@ impl CodeIndexWorktreeSchedulerV1 {
                 }
                 drop(std::mem::take(&mut captured.captured_files));
                 self.latest_content_identity = Some(captured.snapshot.content_identity.clone());
-                self.mark_reconciled(SourceContentManifestV1::for_snapshot(&captured.snapshot));
+                self.mark_reconciled(
+                    SourceContentManifestV1::for_snapshot(&captured.snapshot),
+                    control.expected_epoch(),
+                );
                 return Ok(CodeIndexReconcileOutcomeV1::Noop(CodeIndexNoopEvidenceV1 {
                     snapshot_content_identity: captured.snapshot.content_identity,
                     overflow_reconciled,
@@ -3033,7 +3062,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             let generation = match generation {
                 Ok(generation) => generation,
                 Err(CodeIndexProductionErrorV1::Interrupted(
-                    crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+                    tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
                 )) if retry < MAX_SUPERSEDED_RECONCILE_RETRIES
                     && !self.shutting_down.load(Ordering::Acquire) =>
                 {
@@ -3048,7 +3077,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                     CodeIndexInputErrorV1::NoExtractableFiles,
                 )) => {
                     self.latest_content_identity = Some(snapshot_content_identity.clone());
-                    self.mark_reconciled(source_manifest);
+                    self.mark_reconciled(source_manifest, control.expected_epoch());
                     return Ok(CodeIndexReconcileOutcomeV1::Noop(CodeIndexNoopEvidenceV1 {
                         snapshot_content_identity,
                         overflow_reconciled,
@@ -3058,7 +3087,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             };
             self.require_reusable_publication(&generation)?;
             self.latest_content_identity = Some(snapshot_content_identity);
-            self.mark_reconciled(source_manifest);
+            self.mark_reconciled(source_manifest, control.expected_epoch());
             return Ok(CodeIndexReconcileOutcomeV1::Published(
                 self.publish_evidence(&generation, reextracted_files, overflow_reconciled),
             ));
@@ -3068,7 +3097,14 @@ impl CodeIndexWorktreeSchedulerV1 {
 
     /// Record that the worktree was just reconciled against `source_manifest`,
     /// the per-file digests of the snapshot this pass captured or verified.
-    pub(super) fn mark_reconciled(&mut self, source_manifest: SourceContentManifestV1) {
+    /// `source_epoch` is the epoch that pass began under. A pass that sealed
+    /// or verified past a newer epoch proves only that one, so freshness keeps
+    /// reporting the source as moved until the follow-up pass.
+    pub(super) fn mark_reconciled(
+        &mut self,
+        source_manifest: SourceContentManifestV1,
+        source_epoch: u64,
+    ) {
         let metadata = identity::GitMetadataFingerprintV1::capture(&self.project_root);
         let source_witness =
             self.worktree_stat_signature()
@@ -3077,7 +3113,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                     stat_signature,
                     content_manifest: source_manifest,
                 });
-        self.mark_reconciled_state(metadata, source_witness);
+        self.mark_reconciled_state(metadata, source_witness, source_epoch);
         self.persist_freshness_witness();
     }
 
@@ -3085,6 +3121,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         &mut self,
         metadata: identity::GitMetadataFingerprintV1,
         source_witness: Option<ReconciledSourceWitnessV1>,
+        source_epoch: u64,
     ) {
         let reconciled_without_generation = self
             .publication
@@ -3095,6 +3132,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             source_witness,
             &self.ignored_source_admissions,
             reconciled_without_generation,
+            source_epoch,
         );
     }
 
@@ -3102,12 +3140,14 @@ impl CodeIndexWorktreeSchedulerV1 {
         &mut self,
         metadata: identity::GitMetadataFingerprintV1,
         source_witness: Option<ReconciledSourceWitnessV1>,
+        source_epoch: u64,
     ) {
         self.freshness_fence.mark_reconciled(
             metadata,
             source_witness,
             &self.ignored_source_admissions,
             false,
+            source_epoch,
         );
     }
 
@@ -3479,6 +3519,11 @@ impl CodeIndexWorktreeSchedulerV1 {
         self.freshness_fence.verified_against_source()
     }
 
+    #[cfg(test)]
+    pub(super) fn source_change_pending_for_test(&self) -> bool {
+        self.freshness_fence.source_change_pending()
+    }
+
     /// True when reconciliation has verified the live worktree against source
     /// truth and that verified source publishes no code generation at all,
     /// the typed state of a project whose files are all unsupported,
@@ -3687,9 +3732,8 @@ impl CodeIndexWorktreeSchedulerV1 {
         let metadata = Arc::new(
             VerifiedSealedTextGenerationMetadataV1::from_published_generation(&generation),
         );
-        let text = retained_text
-            .cloned()
-            .unwrap_or_else(|| LatestCodeTextGenerationV1 {
+        let text = retained_text.cloned().unwrap_or_else(|| {
+            LatestCodeTextGenerationV1::from_shared(super::serving::CodeTextGenerationSharedV1 {
                 metadata,
                 sealed_format_revision:
                     tracedecay_code_index::production::SEALED_GENERATION_FORMAT_REVISION_V1,
@@ -3715,11 +3759,11 @@ impl CodeIndexWorktreeSchedulerV1 {
                 ),
                 preopened_source: Arc::new(Mutex::new(None)),
                 publication_binding: None,
-                graph_predecessor: Arc::default(),
                 catalog_warm_settled: Arc::new(tokio::sync::Notify::new()),
                 park_release_after_catalog_warm_armed: Arc::new(AtomicBool::new(false)),
                 parked_graph_release: Arc::new(RwLock::new(None)),
-            });
+            })
+        });
         LatestCompleteCodeIndexV1 {
             generation,
             text,
@@ -3840,7 +3884,9 @@ impl CodeIndexWorktreeSchedulerV1 {
         match absolute.metadata() {
             Ok(metadata) if !metadata.is_file() => return Ok(CapturedFileOutcomeV1::Absent),
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A symlink the checkout cannot follow (dangling, looping, or
+            // through a file) has no bytes to capture, like a missing path.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound || absolute.is_symlink() => {
                 return Ok(CapturedFileOutcomeV1::Absent);
             }
             Err(error) => return Err(error.into()),
@@ -4000,7 +4046,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 self.identity.head_tree(),
             )
         {
-            match self.capture_exact_git_tree_snapshot(
+            match self.capture_clean_head_tree_snapshot(
                     &git_tree_capture::ExactGitTreeSourceV1 {
                         reference: reference.clone(),
                         revision: revision.clone(),
@@ -4075,22 +4121,18 @@ impl CodeIndexWorktreeSchedulerV1 {
                 })
                 .flatten()
         });
-        let active_files = reusable_active
-            .as_ref()
-            .map(|active| {
-                active
-                    .snapshot()
-                    .files
-                    .iter()
-                    .filter(|file| {
-                        remembered_dirty_paths
-                            .is_none_or(|paths| !paths.contains(&file.logical_path))
-                            && self.row_follows_path_policy(file)
-                    })
-                    .map(|file| (file.logical_path.as_str(), file))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let active_files = reusable_active.as_ref().map_or_default(|active| {
+            active
+                .snapshot()
+                .files
+                .iter()
+                .filter(|file| {
+                    remembered_dirty_paths.is_none_or(|paths| !paths.contains(&file.logical_path))
+                        && self.row_follows_path_policy(file)
+                })
+                .map(|file| (file.logical_path.as_str(), file))
+                .collect::<BTreeMap<_, _>>()
+        });
         let files = candidate_paths
             .iter()
             .filter(|logical_path| !changed_paths.contains(*logical_path))
@@ -4111,12 +4153,12 @@ impl CodeIndexWorktreeSchedulerV1 {
             .collect::<Vec<_>>();
         let admitted_paths = self.ignored_admission_paths();
         let _scan_batch = tracedecay_privacy::code_source_scan_batch();
-        let outcomes = crate::code_index::parallelism::install(|| {
+        let outcomes = tracedecay_code_index::parallelism::install(|| {
             use rayon::prelude::*;
             candidates
                 .par_iter()
                 .map(|logical_path| {
-                    crate::code_index::parallelism::with_background_cpu_permit(|| {
+                    tracedecay_code_index::parallelism::with_background_cpu_permit(|| {
                         if self.shutting_down.load(Ordering::Acquire) {
                             return Err(cancelled_code_index_reconcile());
                         }
@@ -4310,7 +4352,7 @@ fn changed_paths_between_trees(
                 }
                 _ => {}
             }
-            Ok::<_, std::convert::Infallible>(TreeDiffAction::Continue(()))
+            Ok(TreeDiffAction::Continue(()))
         })
         .ok()?;
     (!invalid_path).then_some(paths)
@@ -4330,7 +4372,7 @@ pub(crate) fn retained_empty_seat_settles_source(
 
 pub(super) fn cancelled_code_index_reconcile() -> CodeIndexSchedulerErrorV1 {
     CodeIndexProductionErrorV1::Interrupted(
-        crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+        tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
     )
     .into()
 }
@@ -4369,22 +4411,6 @@ fn stop_if_resident_memory(
 impl Drop for CodeIndexWorktreeSchedulerV1 {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
-    }
-}
-
-#[cfg(test)]
-mod retained_empty_seat_tests {
-    use super::retained_empty_seat_settles_source;
-
-    #[test]
-    fn equal_metadata_without_a_decoded_generation_does_not_settle_the_seat() {
-        assert!(
-            !retained_empty_seat_settles_source(false, true),
-            "a matching stat sweep is not a content proof"
-        );
-        assert!(!retained_empty_seat_settles_source(true, false));
-        assert!(!retained_empty_seat_settles_source(false, false));
-        assert!(retained_empty_seat_settles_source(true, true));
     }
 }
 
@@ -4439,5 +4465,21 @@ impl SchedulerWorkerRuntimeV1 {
             let _ = resident_memory;
             Err(CodeIndexSchedulerErrorV1::WorkerPlanNotInstalled)
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_empty_seat_tests {
+    use super::retained_empty_seat_settles_source;
+
+    #[test]
+    fn equal_metadata_without_a_decoded_generation_does_not_settle_the_seat() {
+        assert!(
+            !retained_empty_seat_settles_source(false, true),
+            "a matching stat sweep is not a content proof"
+        );
+        assert!(!retained_empty_seat_settles_source(true, false));
+        assert!(!retained_empty_seat_settles_source(false, false));
+        assert!(retained_empty_seat_settles_source(true, true));
     }
 }

@@ -48,7 +48,8 @@ async fn project_code_index_freshness(
             let payload = CodeIndexFreshnessPayloadV1::from_read_failure(failure);
             let reason = payload.note.clone();
             return match failure {
-                CodeIndexFreshnessReadFailureV1::ReadFailed => {
+                CodeIndexFreshnessReadFailureV1::ReadFailed
+                | CodeIndexFreshnessReadFailureV1::LinkedWorktreeDisabled => {
                     DashboardEnvelopeV1::unavailable(scope_from_state(state), payload, reason)
                 }
                 CodeIndexFreshnessReadFailureV1::MountFailed => {
@@ -81,8 +82,7 @@ async fn project_code_index_freshness(
             let reason = worktree
                 .parked
                 .as_ref()
-                .map(|parked| parked.reason.clone())
-                .unwrap_or_default();
+                .map_or_default(|parked| parked.reason.clone());
             DashboardEnvelopeV1::new(
                 scope_from_state(state),
                 DashboardDomainStateV1::Error,

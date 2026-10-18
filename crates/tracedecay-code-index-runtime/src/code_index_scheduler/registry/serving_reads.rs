@@ -9,7 +9,6 @@ use std::{
 };
 
 use super::owner_signals::CodeIndexOwnerSignalsV1;
-use tracedecay_code_index::production::CodeIndexPublishedGenerationV1;
 use tracedecay_contracts::code_index_freshness::CodeIndexConvergenceParkedV1;
 use tracedecay_domain::{CodeGenerationId, ProviderEvaluationStateV1};
 use tracedecay_runtime_core::cancellation::CancellationToken;
@@ -27,6 +26,7 @@ use super::{
     dashboard_terminal_status, dashboard_text_freshness_identity, project_graph_publication_phase,
     unique_mounted_for_scope,
 };
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 impl CodeIndexSchedulerRegistryV1 {
@@ -86,7 +86,7 @@ impl CodeIndexSchedulerRegistryV1 {
         if pending_wake.has_pending_arrival() || reconcile_in_progress.running() {
             return Some(epoch.load(Ordering::Acquire));
         }
-        tokio::task::spawn_blocking(move || {
+        native_runtime::spawn_blocking(move || {
             let mut scheduler = scheduler
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -161,34 +161,25 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         generation: &CodeGenerationId,
     ) -> Option<Result<super::super::CodeGraphReplayBindingV1, CodeIndexSchedulerErrorV1>> {
-        let project_root = canonical_existing_identity(project_root).ok()?;
-        let historical = {
-            let mounted = self.mounted.lock().await;
-            mounted
-                .get(&project_root)?
-                .historical_generation_owner
-                .clone()
-        };
         let generation = generation.clone();
-        Some(
-            tokio::task::spawn_blocking(move || historical.sealed_replay_binding(&generation))
-                .await
-                .unwrap_or_else(|error| {
-                    Err(CodeIndexSchedulerErrorV1::Identity(format!(
-                        "sealed replay-binding read task failed: {error}"
-                    )))
-                }),
-        )
+        self.historical_owner_read(project_root, "sealed replay-binding", move |owner| {
+            owner.sealed_replay_binding(&generation)
+        })
+        .await
     }
 
-    /// Load one exact code generation through its durable publication store,
-    /// including a source generation superseded in process-local retention.
-    pub async fn published_generation(
+    /// Run one blocking read on the mounted worktree's retained historical
+    /// owner off the async runtime; `None` while `project_root` is not mounted.
+    pub(super) async fn historical_owner_read<T: Send + 'static>(
         &self,
         project_root: &Path,
-        generation_id: &CodeGenerationId,
-    ) -> Option<Result<Option<Arc<CodeIndexPublishedGenerationV1>>, CodeIndexSchedulerErrorV1>>
-    {
+        read_name: &'static str,
+        read: impl FnOnce(
+            &super::super::HistoricalCodeIndexGenerationOwnerV1,
+        ) -> Result<T, CodeIndexSchedulerErrorV1>
+        + Send
+        + 'static,
+    ) -> Option<Result<T, CodeIndexSchedulerErrorV1>> {
         let project_root = canonical_existing_identity(project_root).ok()?;
         let owner = {
             let mounted = self.mounted.lock().await;
@@ -197,13 +188,12 @@ impl CodeIndexSchedulerRegistryV1 {
                 .historical_generation_owner
                 .clone()
         };
-        let generation_id = generation_id.clone();
         Some(
-            tokio::task::spawn_blocking(move || owner.published_generation(&generation_id))
+            native_runtime::spawn_blocking(move || read(&owner))
                 .await
                 .unwrap_or_else(|error| {
                     Err(CodeIndexSchedulerErrorV1::Identity(format!(
-                        "published-generation read task failed: {error}"
+                        "{read_name} read task failed: {error}"
                     )))
                 }),
         )
@@ -310,7 +300,7 @@ impl CodeIndexSchedulerRegistryV1 {
                 worktree.graph_activation.policy().is_enabled(),
             )
         };
-        tokio::task::spawn_blocking(move || {
+        native_runtime::spawn_blocking(move || {
             let mut progress = {
                 let _span = tracing::trace_span!("daemon.code_index.dashboard.progress").entered();
                 build_progress
@@ -611,7 +601,7 @@ impl CodeIndexSchedulerRegistryV1 {
         // last complete immutable generation instead of joining its work.
         let authority_root = project_root.clone();
         let freshness_root = project_root.clone();
-        let latest = crate::ports::park_admission(tokio::task::spawn_blocking(move || {
+        let latest = crate::ports::park_admission(native_runtime::spawn_blocking(move || {
             let scheduler = match scheduler.try_lock() {
                 Ok(scheduler) => scheduler,
                 Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
@@ -774,7 +764,7 @@ impl CodeIndexSchedulerRegistryV1 {
             )
         };
         let freshness_root = project_root.clone();
-        let (request_reconcile, latest) = tokio::task::spawn_blocking(move || {
+        let (request_reconcile, latest) = native_runtime::spawn_blocking(move || {
             let serving = serving_generation
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -935,7 +925,7 @@ impl CodeIndexSchedulerRegistryV1 {
     pub async fn latest_complete_fresh_for_scope_awaiting_seat(
         &self,
         scope: &tracedecay_contracts::ResolvedScope,
-        deadline: tokio::time::Instant,
+        deadline: std::time::Instant,
     ) -> Option<LatestCompleteCodeIndexV1> {
         let root = {
             let mounted = self.mounted.lock().await;
@@ -1221,7 +1211,7 @@ impl CodeIndexSchedulerRegistryV1 {
         };
         let scope = scope.clone();
         let probe_root = project_root.clone();
-        let probe = tokio::task::spawn_blocking(move || {
+        let probe = native_runtime::spawn_blocking(move || {
             let _span =
                 tracing::trace_span!("daemon.code_index.query.latest_ready_decoded.execution")
                     .entered();

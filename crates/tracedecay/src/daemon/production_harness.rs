@@ -18,6 +18,7 @@ use super::bootstrap::set_owner_only_permissions;
 // `use super::*` cannot carry it into a `test-transport` build.
 use super::project_server_lifecycle::{detach_project_servers, shutdown_detached_project_servers};
 use super::*;
+use tokio::time::timeout;
 #[cfg(unix)]
 use tracedecay_application::pr_tracking::acquire_manual_branch_lifecycle;
 use tracedecay_code_index_runtime::CodeIndexSchedulerRegistryV1;
@@ -118,6 +119,12 @@ type ProductionHarnessOpenFuture =
 /// available or installed worker width by 24 therefore admits only the
 /// measured four-wide load before worker-plan installation and preserves more
 /// than 2x headroom under the unchanged 20 s per-composition wait.
+///
+/// Narrower hosts still admit four. One admitted composition keeps only about
+/// one core busy: pinned to 8 CPUs, the `mcp_suite` `graph_analysis_test` used
+/// 1.1 to 1.3 cores on average and took 80 to 106 s when admitted one at a
+/// time, and 29 to 34 s when admitted four at a time, with the same
+/// instruction count.
 const PRODUCTION_COMPOSITION_CPU_DIVISOR: usize = 24;
 
 struct ProductionCompositionAdmissionGateV1 {
@@ -238,7 +245,7 @@ fn production_composition_admission_capacity() -> usize {
         || std::thread::available_parallelism().map_or(1, usize::from),
         |status| usize::from(status.effective_workers),
     );
-    (worker_width / PRODUCTION_COMPOSITION_CPU_DIVISOR).max(1)
+    (worker_width / PRODUCTION_COMPOSITION_CPU_DIVISOR).max(4)
 }
 
 fn production_composition_admission_gate() -> &'static ProductionCompositionAdmissionGateV1 {
@@ -1069,7 +1076,7 @@ impl ProductionProjectCompositionHarnessV1 {
         .await
     }
 
-    async fn call_tool_with_params(
+    pub(crate) async fn call_tool_with_params(
         &self,
         project_root: impl AsRef<Path>,
         tool_name: &str,
@@ -1280,31 +1287,33 @@ impl Drop for ProductionProjectCompositionHarnessV1 {
         let Some(resources) = self.resources.take() else {
             return;
         };
-        // Run the shutdown to completion on its own runtime. The caller's
-        // runtime is usually a test's, which ends right after this drop and
-        // would cancel a shutdown spawned onto it midway; the store owners it
-        // never reached then kept their SQLite worker threads, files, and
-        // runtimes alive for the rest of the process (macOS refused every
-        // later spawn once descriptors passed OPEN_MAX). Not joined: a
-        // current-thread caller could not drive its own tasks while blocked
-        // here, and those tasks resolve as cancelled once it ends.
-        let shutdown = tracing::Instrument::instrument(
-            shutdown_production_project_harness(resources),
-            tracing::trace_span!("daemon.harness.shutdown"),
-        );
-        let spawned = std::thread::Builder::new()
+        // A test drops its harness as its runtime stops, and that runtime
+        // cancels anything spawned on it. Unshut, the composition's native
+        // tasks keep every store and its threads alive for the whole process,
+        // so the shutdown runs to completion on a thread of its own.
+        let shutdown = move || match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(tracing::Instrument::instrument(
+                Box::pin(shutdown_production_project_harness(resources)),
+                tracing::trace_span!("daemon.harness.shutdown"),
+            )),
+            Err(error) => tracing::warn!(
+                event = "production_harness_drop_shutdown_unavailable",
+                %error,
+                "production-composition harness dropped without a shutdown runtime"
+            ),
+        };
+        if let Err(error) = std::thread::Builder::new()
             .name("tracedecay-harness-shutdown".to_owned())
-            .spawn(move || {
-                match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(shutdown),
-                    Err(error) => tracing::warn!(%error, "harness shutdown runtime unavailable"),
-                }
-            });
-        if let Err(error) = spawned {
-            tracing::warn!(%error, "harness shutdown thread unavailable");
+            .spawn(shutdown)
+        {
+            tracing::warn!(
+                event = "production_harness_drop_shutdown_unavailable",
+                %error,
+                "production-composition harness dropped without a shutdown thread"
+            );
         }
     }
 }
@@ -1337,7 +1346,11 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
         tracing::trace_span!("daemon.harness.detach"),
     )
     .await;
-    resources.servers.clear();
+    let handed_out = resources
+        .servers
+        .drain()
+        .map(|(_, server)| Arc::downgrade(&server))
+        .collect::<Vec<_>>();
     for server in &servers {
         server.ledger_writes_settled().await;
         server.shutdown_background_tasks().await;
@@ -1363,7 +1376,7 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
     )
     .await;
     tracing::Instrument::instrument(
-        resources.invocation.shutdown(),
+        resources.invocation.shutdown(None),
         tracing::trace_span!("daemon.harness.shutdown_invocation"),
     )
     .await;
@@ -1404,8 +1417,18 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
         .store_administration
         .shutdown_retirement_reapers()
         .await;
+    // A server its caller still holds keeps its stores leased, and the caller
+    // cannot drop it while it awaits this shutdown, so waiting would only
+    // spend the budget. Close what is idle in one pass instead.
+    let store_close_deadline = if handed_out.iter().any(|server| server.strong_count() != 0) {
+        std::time::Instant::now()
+    } else {
+        std::time::Instant::now() + tracedecay_daemon_service::shutdown::DAEMON_STORE_CLOSE_RESERVE
+    };
     if let Err(error) = tracing::Instrument::instrument(
-        resources.store_administration.close_stores_for_shutdown(),
+        resources
+            .store_administration
+            .close_stores_for_shutdown(store_close_deadline),
         tracing::trace_span!("daemon.harness.shutdown_graph"),
     )
     .await
@@ -1528,53 +1551,7 @@ mod code_index_activation_test {
             tracedecay_domain::configuration::CodeIndexWorkerSelectionV1::Automatic {},
             "a fresh harness must install the profile-scoped default selection"
         );
-        let query = timeout(Duration::from_secs(20), async {
-            loop {
-                let response = harness
-                    .call_tool(
-                        &project,
-                        "tracedecay_search",
-                        json!({
-                            "query": "indexed_symbol",
-                            "limit": 1,
-                            "format": "json",
-                        }),
-                    )
-                    .await
-                    .expect("fresh-profile production search response");
-                let payload = super::journey_test_support::tool_payload(&response);
-                let served_symbol = payload["results"].as_array().is_some_and(|results| {
-                    results
-                        .iter()
-                        .any(|result| result["display"]["name"] == json!("indexed_symbol"))
-                });
-                if served_symbol {
-                    break payload;
-                }
-                if payload["status"] == json!("unavailable") {
-                    let retryable = matches!(
-                        payload["reason"].as_str(),
-                        Some(
-                            "authority_unavailable"
-                                | "generation_unavailable"
-                                | "generation_unverified"
-                                | "search_capacity_unavailable"
-                        )
-                    );
-                    assert!(
-                        retryable,
-                        "fresh-profile production search failed terminally: {payload}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-                panic!(
-                    "fresh-profile production search completed without indexed_symbol: {payload}"
-                );
-            }
-        })
-        .await
-        .expect("fresh-profile query authority becomes ready within the existing bound");
+        let query = search_until_indexed_symbol_serves(&harness, &project).await;
         assert!(
             query["results"].as_array().is_some_and(|results| {
                 results
@@ -1589,7 +1566,10 @@ mod code_index_activation_test {
     /// A linked worktree mounted without the `sync.watch_linked_worktrees`
     /// opt-in is the typed `linked_worktree_disabled` route: the composition
     /// must open on it (the daemon does), not exhaust the publication wait
-    /// for a generation that admission forbids.
+    /// for a generation that admission forbids. Until an operator indexes it,
+    /// status and readiness waits name the same policy refusal search does;
+    /// once `tracedecay_admin_sync` seats a generation, status and search
+    /// both serve it.
     #[tokio::test(flavor = "multi_thread")]
     async fn linked_worktree_without_opt_in_mounts_as_the_typed_disabled_route() {
         let isolation = TempDir::new().expect("production harness isolation");
@@ -1670,7 +1650,119 @@ mod code_index_activation_test {
             json!("linked_worktree_disabled"),
             "{payload}"
         );
+
+        let status = super::journey_test_support::tool_payload(
+            &harness
+                .call_tool(&linked, "tracedecay_status", json!({ "format": "json" }))
+                .await
+                .expect("linked-route status response"),
+        );
+        assert_eq!(
+            status["retrieval_serving"],
+            json!({ "status": "unavailable", "reason": "linked_worktree_disabled" }),
+            "{status}"
+        );
+        let warning = status["code_index_freshness_warning"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the policy refusal names its remediation: {status}"));
+        assert!(warning.contains("tracedecay sync"), "{warning}");
+        assert!(warning.contains("sync.watch_linked_worktrees"), "{warning}");
+        let waited = super::journey_test_support::tool_payload(
+            &harness
+                .call_tool(
+                    &linked,
+                    "tracedecay_status",
+                    json!({ "wait_for": { "state": "fresh", "timeout_ms": 20_000 }, "format": "json" }),
+                )
+                .await
+                .expect("linked-route readiness wait response"),
+        );
+        assert_eq!(
+            waited["wait"],
+            json!({ "outcome": "unavailable", "reason": "linked_worktree_disabled" }),
+            "{waited}"
+        );
+
+        let receipt = super::journey_test_support::tool_payload(
+            &harness
+                .call_tool(
+                    &linked,
+                    "tracedecay_admin_sync",
+                    json!({ "format": "json" }),
+                )
+                .await
+                .expect("linked-route operator sync response"),
+        );
+        assert_eq!(receipt["status"], json!("queued"), "{receipt}");
+        let seated = super::journey_test_support::tool_payload(
+            &harness
+                .call_tool(
+                    &linked,
+                    "tracedecay_status",
+                    json!({ "wait_for": { "state": "fresh", "timeout_ms": 20_000 }, "format": "json" }),
+                )
+                .await
+                .expect("linked-route seat wait response"),
+        );
+        assert_eq!(seated["wait"]["outcome"], json!("reached"), "{seated}");
+        assert_eq!(
+            seated["retrieval_serving"]["status"],
+            json!("serving"),
+            "{seated}"
+        );
+        search_until_indexed_symbol_serves(&harness, &linked).await;
         harness.shutdown().await;
+    }
+
+    /// Search `project` for `indexed_symbol` until a result names it, retrying
+    /// only the transient refusals a route reports while its query authority
+    /// installs; any other refusal fails the test with its payload.
+    async fn search_until_indexed_symbol_serves(
+        harness: &ProductionProjectCompositionHarnessV1,
+        project: &Path,
+    ) -> serde_json::Value {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let response = harness
+                    .call_tool(
+                        project,
+                        "tracedecay_search",
+                        json!({
+                            "query": "indexed_symbol",
+                            "limit": 1,
+                            "format": "json",
+                        }),
+                    )
+                    .await
+                    .expect("production search response");
+                let payload = super::journey_test_support::tool_payload(&response);
+                let served_symbol = payload["results"].as_array().is_some_and(|results| {
+                    results
+                        .iter()
+                        .any(|result| result["display"]["name"] == json!("indexed_symbol"))
+                });
+                if served_symbol {
+                    break payload;
+                }
+                if payload["status"] == json!("unavailable") {
+                    let retryable = matches!(
+                        payload["reason"].as_str(),
+                        Some(
+                            "authority_unavailable"
+                                | "generation_unavailable"
+                                | "generation_unverified"
+                                | "search_capacity_unavailable"
+                        )
+                    );
+                    assert!(retryable, "production search failed terminally: {payload}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
+                panic!("production search completed without indexed_symbol: {payload}");
+            }
+        })
+        .await
+        .expect("query authority becomes ready within the existing bound")
     }
 
     #[cfg(unix)]
@@ -1780,3 +1872,6 @@ mod idle_history_reads_journey_test;
 
 #[cfg(test)]
 mod source_body_readiness_journey_test;
+
+#[cfg(test)]
+mod drop_shutdown_journey_test;

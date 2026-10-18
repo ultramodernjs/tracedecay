@@ -21,7 +21,7 @@ pub enum ExactSqlValue {
 }
 
 impl ExactSqlValue {
-    pub(super) fn into_rusqlite(self) -> Value {
+    pub(crate) fn into_rusqlite(self) -> Value {
         match self {
             Self::Null => Value::Null,
             Self::Integer(value) => Value::Integer(value),
@@ -240,6 +240,23 @@ pub(crate) enum ExecutionPolicy {
     AuthorityRevalidated,
 }
 
+/// How long one read-snapshot statement may run.
+///
+/// `Request` carries the ordinary per-statement deadline, which keeps one
+/// caller from holding a pooled reader indefinitely. `Convergence` removes it
+/// for schema-convergence audits whose single statements scan a whole table:
+/// on a large store such a scan cannot fit any fixed request deadline, and an
+/// audit interrupted at the same statement on every open never converges.
+/// Reader shutdown still interrupts a convergence statement. `Until` replaces
+/// the per-statement deadline with one instant shared by every statement, so
+/// a diagnostic audit made of many statements is bounded as a whole.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExactSqlStatementBudget {
+    Request,
+    Convergence,
+    Until(std::time::Instant),
+}
+
 pub trait ExactSqlWriteAuthority: Send + Sync {
     fn verify(&self, intent: ExactSqlWriteIntent) -> Result<(), ExactSqlError>;
 }
@@ -340,6 +357,9 @@ pub enum ExactSqlError {
     ReaderUnavailable(String),
     TransactionClosed,
     TransactionExpired,
+    /// A job body awaited something other than its own statements, so it was
+    /// rolled back rather than hold the writer across the wait.
+    JobAwaitedForeignFuture,
     Sqlite {
         operation: &'static str,
         code: Option<i32>,
@@ -386,6 +406,9 @@ impl fmt::Display for ExactSqlError {
                 formatter.write_str("exact SQL transaction is already closed")
             }
             Self::TransactionExpired => formatter.write_str("exact SQL transaction lease expired"),
+            Self::JobAwaitedForeignFuture => {
+                formatter.write_str("exact SQL job awaited a future other than its own statements")
+            }
             Self::Sqlite {
                 operation, message, ..
             } => {

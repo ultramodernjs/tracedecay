@@ -31,7 +31,7 @@ const STORY_SCOPE = {
   repository_id: 'repository.tracedecay',
   worktree_id: 'worktree.primary',
   reference: null,
-  scope_digest: 'sha256:e174c69787e410a452c13540b131bf291d25017a21e37aebf7f26eeb8e77fbe5',
+  scope_digest: 'sha256:c389a5d7c281c1f305fffa361a7e8bc78da0769253afc3c7724bdfaa70c72671',
 };
 
 const PLAN26_OBSERVATORY_METRICS = [
@@ -2258,7 +2258,7 @@ function analyticsSubagentTreePayload(): Record<string, unknown> {
  * Select it with `?fixture=dense-fanout` on the route, or through
  * `subagentTreeFixture('dense-fanout')`; the default tree never changes.
  */
-export type SubagentTreeScenario = 'default' | 'dense-fanout';
+type SubagentTreeScenario = 'default' | 'dense-fanout';
 
 const DENSE_WORKSTREAMS = [
   'ingest',
@@ -2623,18 +2623,17 @@ function automationOutcomesPayload(): Record<string, unknown> {
 /** `FactStoreCurateResultV1`: the admitted run's receipt; its terminal is the
  * run-ledger row for `run_id`. */
 function automaticCuratorReceiptPayload(): Record<string, unknown> {
-  return curatorReceiptEnvelope({
-    binding: 'binding.http.fact_store_curate.v1',
-    schema: 'schema.application.retained.fact-store-curate.result',
-    request: 'request.story.fact-store-curate',
-    outcome: 'effect',
-    payload: {
-      run_id: 'run-story-memory-curator',
+  const requestId = 'request.story.fact-store-curate';
+  return applicationSuccess(
+    'operation.application.fact_store_curate',
+    {
+      run_id: requestId,
       task: 'memory_curator',
       request_digest: 'sha256:a566bcd0eee410d55c935f0e4b1964d052603493ef9fbbd4295747aa351f6571',
       state: 'started',
     },
-  });
+    { scope: STORY_SCOPE, requestId, pendingEffect: true },
+  );
 }
 
 const SKILL_ROWS: ReadonlyArray<readonly [string, string, string, string]> = [
@@ -4573,7 +4572,7 @@ const COST_DESCRIPTOR = 'accounting-cost.v1';
  * superseded-generation read without inventing query parameters the API does
  * not accept.
  */
-export const CODE_INDEX_FRESHNESS_FIXTURES = {
+const CODE_INDEX_FRESHNESS_FIXTURES = {
   active: codeIndexFreshnessEnvelope(codeIndexBuildProgressFixture()),
   unavailable_rate: codeIndexFreshnessEnvelope(
     codeIndexBuildProgressFixture({
@@ -5001,25 +5000,6 @@ function listTaskHandoffsPayload(): Record<string, unknown> {
         consumed_at: null,
       },
     ],
-  };
-}
-
-function curatorReceiptEnvelope(spec: {
-  binding: string;
-  schema: string;
-  request: string;
-  outcome: 'evidence' | 'effect';
-  payload: unknown;
-}): Record<string, unknown> {
-  return {
-    kind: 'success',
-    value: {
-      binding_id: spec.binding,
-      contract: { schema_id: spec.schema, schema_revision: 1 },
-      request_id: spec.request,
-      scope: STORY_SCOPE,
-      outcome: { outcome: spec.outcome, value: { payload: spec.payload } },
-    },
   };
 }
 
@@ -5816,7 +5796,7 @@ function memoryStatusPayload(): Record<string, unknown> {
     path: '/fast/projects/tracedecay/.tracedecay/memory.db',
     memory: {
       algebra: {
-        name: 'amari_fhrr',
+        name: 'map_c',
         hrr_dim: 2048,
         estimated_capacity: 354_304,
       },

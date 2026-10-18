@@ -1989,51 +1989,159 @@ fn has_exact_fields(
 /// Decodes the adapter's delivery capsule. The operation identity is retained
 /// for receipt evidence while the idempotency key is checked by the caller
 /// against the page key or a historical item-delivery compatibility shape.
-fn decode_replay_delivery_capsule(capsule: &Value) -> Result<(String, String), ()> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyReplayDelivery {
+    operation_id: String,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckoutReplayDelivery {
+    operation_id: String,
+    idempotency_key: String,
+    caller_binding: CheckoutCallerBinding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckoutCallerBinding {
+    version: u64,
+    exact_scope: ReplayCallerScope,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayCallerScope {
+    profile_id: String,
+    project_id: String,
+    repository_identity: String,
+    worktree_identity: String,
+    branch_identity: String,
+    agent_session_id: String,
+    resolved_scope_digest: String,
+}
+
+fn replay_delivery_bytes(capsule: &Value) -> Result<Vec<u8>, ()> {
     let object = capsule.as_object().ok_or(())?;
     if !has_exact_fields(object, &["version", "bytes", "sha256"], &[]) || capsule["version"] != 1 {
         return Err(());
     }
     super::util::validate_common_capsule(&json!({"common_capsule": capsule})).map_err(|_| ())?;
-    let bytes = bytes(&capsule["bytes"]).ok_or(())?;
-    let delivery: Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
-    let delivery_object = delivery.as_object().ok_or(())?;
-    if !has_exact_fields(delivery_object, &["operation_id", "idempotency_key"], &[]) {
-        return Err(());
-    }
-    let operation_id = delivery["operation_id"]
-        .as_str()
-        .filter(|value| !value.is_empty() && value.len() <= MAX_IDEMPOTENCY_KEY_BYTES)
-        .ok_or(())?;
-    if operation_id.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(());
-    }
-    let idempotency_key = delivery["idempotency_key"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .ok_or(())?;
-    super::util::validate_idempotency_key(idempotency_key).map_err(|_| ())?;
-    if idempotency_key.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(());
-    }
-    Ok((operation_id.to_owned(), idempotency_key.to_owned()))
+    bytes(&capsule["bytes"]).ok_or(())
 }
 
-/// Binds a current delivery capsule to the page idempotency key. The SHA-256
-/// fallback keeps direct runtime callers compatible with the pre-adapter test
-/// surface; provider calls use the namespace-bound opaque id that the adapter
-/// supplies.
+fn validate_delivery_parts(operation_id: &str, key: &str) -> Result<(), ()> {
+    if operation_id.is_empty()
+        || operation_id.len() > MAX_IDEMPOTENCY_KEY_BYTES
+        || operation_id.bytes().any(|byte| byte.is_ascii_control())
+        || key.is_empty()
+        || key.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(());
+    }
+    super::util::validate_idempotency_key(key).map_err(|_| ())
+}
+
+fn decode_replay_delivery_capsule(capsule: &Value) -> Result<(String, String), ()> {
+    // This decoder remains strictly legacy. A framed capsule must never enter
+    // the raw/SHA/old opaque-key or historical item-capsule compatibility paths.
+    let delivery: LegacyReplayDelivery =
+        serde_json::from_slice(&replay_delivery_bytes(capsule)?).map_err(|_| ())?;
+    validate_delivery_parts(&delivery.operation_id, &delivery.idempotency_key)?;
+    Ok((delivery.operation_id, delivery.idempotency_key))
+}
+
+fn replay_caller_namespace(scope: &ReplayCallerScope, checkout: bool) -> Result<String, ()> {
+    use sha2::{Digest, Sha256};
+    // Apply the public boundary's validation before hashing any claimed scope.
+    tracedecay_memory_provider_api::OwnedExactScope::new(
+        &scope.profile_id,
+        &scope.project_id,
+        &scope.repository_identity,
+        &scope.worktree_identity,
+        &scope.branch_identity,
+        &scope.agent_session_id,
+        &scope.resolved_scope_digest,
+    )
+    .map_err(|_| ())?;
+    let mut digest = Sha256::new();
+    digest.update(if checkout {
+        b"tracedecay.ncm.checkout.v1\0".as_slice()
+    } else {
+        b"tracedecay.ncm.scope.v1\0".as_slice()
+    });
+    let mut fields = vec![
+        scope.profile_id.as_str(),
+        scope.project_id.as_str(),
+        scope.repository_identity.as_str(),
+        scope.worktree_identity.as_str(),
+        scope.branch_identity.as_str(),
+    ];
+    if !checkout {
+        fields.extend([
+            scope.agent_session_id.as_str(),
+            scope.resolved_scope_digest.as_str(),
+        ]);
+    }
+    for field in fields {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Binds a delivery capsule to its page key. Legacy bodies retain their exact
+/// accepted shapes. Checkout bodies prove the namespace and all seven caller
+/// identities before their additional exact-caller framing is accepted.
 fn validate_replay_delivery_capsule(
     namespace: &str,
     page_key: &str,
     capsule: &Value,
 ) -> Result<(), ()> {
-    let (_, idempotency_key) = decode_replay_delivery_capsule(capsule)?;
-    let bound = idempotency_key == page_key
-        || sha256_hex(idempotency_key.as_bytes()) == page_key
-        || crate::source_binding::opaque_id(namespace, b"idempotency-key", &idempotency_key)
-            == page_key;
-    if !bound {
+    if let Ok((_, idempotency_key)) = decode_replay_delivery_capsule(capsule) {
+        return if idempotency_key == page_key
+            || sha256_hex(idempotency_key.as_bytes()) == page_key
+            || crate::source_binding::opaque_id(namespace, b"idempotency-key", &idempotency_key)
+                == page_key
+        {
+            Ok(())
+        } else {
+            Err(())
+        };
+    }
+    let delivery: CheckoutReplayDelivery =
+        serde_json::from_slice(&replay_delivery_bytes(capsule)?).map_err(|_| ())?;
+    validate_delivery_parts(&delivery.operation_id, &delivery.idempotency_key)?;
+    if delivery.caller_binding.version != 1
+        || replay_caller_namespace(&delivery.caller_binding.exact_scope, true)? != namespace
+    {
+        return Err(());
+    }
+    let exact = replay_caller_namespace(&delivery.caller_binding.exact_scope, false)?;
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"tracedecay.ncm.opaque-id.v1\0");
+    for field in [
+        namespace,
+        "idempotency-key",
+        &exact,
+        &delivery.idempotency_key,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    let expected: String = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if expected != page_key {
         return Err(());
     }
     Ok(())
@@ -2509,4 +2617,149 @@ fn lookup_page_replay(
         return lookup_replay(handle, &page.key, &legacy_digest);
     }
     lookup_replay(handle, &page.key, digest)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod checkout_delivery_binding_tests {
+    use super::*;
+
+    const CHECKOUT: &str = "6938addeefe9807080133a599de15b680a5b60374369241587b945256786a8e4";
+    const PAGE_KEY: &str = "875a9718dd42d619d03023e9a54b4698395934d11f41cbda34eb59d112e0afbc";
+
+    fn body() -> Value {
+        json!({"operation_id":"public-operation","idempotency_key":"caller-key",
+            "caller_binding":{"version":1,"exact_scope":{
+                "profile_id":"profile","project_id":"project","repository_identity":"repository",
+                "worktree_identity":"worktree","branch_identity":"master","agent_session_id":"session",
+                "resolved_scope_digest":format!("sha256:{}", "ab".repeat(32))}}})
+    }
+
+    fn capsule_bytes(bytes: Vec<u8>) -> Value {
+        json!({"version":1,"sha256":sha256_hex(&bytes),"bytes":bytes})
+    }
+
+    fn capsule(body: &Value) -> Value {
+        capsule_bytes(serde_json::to_vec(body).unwrap())
+    }
+
+    #[test]
+    fn checkout_page_binding_uses_all_caller_fields_and_preserves_legacy_key_shapes() {
+        let body = body();
+        let scope: ReplayCallerScope =
+            serde_json::from_value(body["caller_binding"]["exact_scope"].clone()).unwrap();
+        assert_eq!(replay_caller_namespace(&scope, true).unwrap(), CHECKOUT);
+        assert_eq!(
+            replay_caller_namespace(&scope, false).unwrap(),
+            "d3edecaca5ee5a69ae69f74669c509b38d71a10831583941baef6f9ae88bb64b"
+        );
+        assert!(validate_replay_delivery_capsule(CHECKOUT, PAGE_KEY, &capsule(&body)).is_ok());
+        let old_keys = [
+            "caller-key".to_owned(),
+            sha256_hex(b"caller-key"),
+            crate::source_binding::opaque_id(CHECKOUT, b"idempotency-key", "caller-key"),
+        ];
+        for key in old_keys {
+            assert!(validate_replay_delivery_capsule(CHECKOUT, &key, &capsule(&body)).is_err());
+            let legacy = json!({"operation_id":"public-operation","idempotency_key":"caller-key"});
+            assert!(validate_replay_delivery_capsule(CHECKOUT, &key, &capsule(&legacy)).is_ok());
+        }
+        for (field, replacement) in [
+            ("agent_session_id", json!("another-session")),
+            (
+                "resolved_scope_digest",
+                json!(format!("sha256:{}", "cd".repeat(32))),
+            ),
+            ("branch_identity", json!("another-branch")),
+            ("worktree_identity", json!("another-worktree")),
+        ] {
+            let mut changed = body.clone();
+            changed["caller_binding"]["exact_scope"][field] = replacement;
+            assert!(
+                validate_replay_delivery_capsule(CHECKOUT, PAGE_KEY, &capsule(&changed)).is_err(),
+                "{field}"
+            );
+        }
+        assert!(
+            validate_replay_delivery_capsule(&"ab".repeat(32), PAGE_KEY, &capsule(&body)).is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_checkout_bindings_cannot_fall_back_to_legacy_delivery_validation() {
+        let body = body();
+        let mut variants = Vec::new();
+        let mut changed = body.clone();
+        changed["caller_binding"]["version"] = json!(2);
+        variants.push(changed);
+        let mut changed = body.clone();
+        changed["caller_binding"]["extra"] = json!(true);
+        variants.push(changed);
+        let mut changed = body.clone();
+        changed["caller_binding"]["exact_scope"]["extra"] = json!(true);
+        variants.push(changed);
+        let mut changed = body.clone();
+        changed["caller_binding"]["exact_scope"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_session_id");
+        variants.push(changed);
+        let mut changed = body.clone();
+        changed["caller_binding"] = Value::Null;
+        variants.push(changed);
+        let mut changed = body.clone();
+        changed["extra"] = json!(true);
+        variants.push(changed);
+        for changed in variants {
+            let capsule = capsule(&changed);
+            for key in [
+                PAGE_KEY.to_owned(),
+                "caller-key".to_owned(),
+                sha256_hex(b"caller-key"),
+                crate::source_binding::opaque_id(CHECKOUT, b"idempotency-key", "caller-key"),
+            ] {
+                assert!(validate_replay_delivery_capsule(CHECKOUT, &key, &capsule).is_err());
+            }
+            assert!(decode_replay_delivery_capsule(&capsule).is_err());
+        }
+        let encoded = serde_json::to_string(&body).unwrap();
+        for duplicate in [
+            encoded.replacen(
+                "\"operation_id\":",
+                "\"operation_id\":\"duplicate\",\"operation_id\":",
+                1,
+            ),
+            encoded.replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+            encoded.replacen(
+                "\"agent_session_id\":\"session\"",
+                "\"agent_session_id\":\"session\",\"agent_session_id\":\"session\"",
+                1,
+            ),
+        ] {
+            assert_ne!(duplicate, encoded);
+            assert!(
+                validate_replay_delivery_capsule(
+                    CHECKOUT,
+                    PAGE_KEY,
+                    &capsule_bytes(duplicate.into_bytes())
+                )
+                .is_err()
+            );
+        }
+        let framed = capsule(&body);
+        let item = ReplayItem {
+            sequence: 1,
+            receipt_digest: "ab".repeat(32),
+            delivery_key: "caller-key".to_owned(),
+            source: "cd".repeat(32),
+            legacy_source: None,
+            admitted: true,
+            blocked: false,
+            observation: json!({"provenance":{"delivery_capsule":capsule(&json!({"operation_id":"old-item","idempotency_key":"caller-key"}))}}),
+        };
+        assert!(!legacy_page_delivery_capsule_matches_items(
+            &framed,
+            &[item]
+        ));
+    }
 }

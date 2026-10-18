@@ -100,8 +100,7 @@ impl DashboardProcess {
                 self.base_url,
                 self.diagnostics
                     .lock()
-                    .map(|captured| captured.clone())
-                    .unwrap_or_default()
+                    .map_or_default(|captured| captured.clone())
             );
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -297,8 +296,8 @@ pub(super) fn restart_and_wait_for_task_session(
         .expect("physically restart daemon before the TaskSession availability sweep");
     let restarted_daemon = spawn_project_daemon(home, project);
     let restarted_client = sdk_client(home, project_id.as_str());
-    let _ = wait_for_application_mount(&restarted_client);
-    wait_for_work_mount(&restarted_client);
+    let _ = wait_for_application_mount(home, &restarted_client);
+    wait_for_work_mount(home, &restarted_client);
     let restarted_receipt = assert_restored_provider_session_receipt(
         &restarted_client,
         scope.selection,

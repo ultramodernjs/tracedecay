@@ -12,7 +12,7 @@ use serde_json::json;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, timeout};
+use tokio::time::Duration;
 use tokio_stream::StreamExt;
 use tracedecay_lsp::{AdmittedRoot, AuthorizedLspWorkspace};
 
@@ -32,18 +32,15 @@ use scheduler::{
 use tracedecay_contracts::project_open::{
     ProjectOpenStatusReasonV1, ProjectOpenStatusStateV1, ProjectOpenStatusV1,
 };
+#[cfg(unix)]
+pub(crate) use tracedecay_daemon_protocol::ensure_private_socket_parent;
 #[allow(unused_imports)]
 pub(crate) use tracedecay_daemon_protocol::{
-    BrokerListener, BrokerStream, DAEMON_INVOCATION_PROTOCOL, DAEMON_INVOCATION_REVISION,
-    DaemonAuthPreface, DaemonEndpoint, DaemonInvocationOutcome, DaemonInvocationRequest,
-    DaemonInvocationResponse, default_loopback_endpoint, parse_daemon_invocation_request,
+    BrokerListener, BrokerStream, DaemonAuthPreface, DaemonEndpoint, DaemonInvocationOutcome,
+    DaemonInvocationRequest, DaemonInvocationResponse, default_loopback_endpoint,
+    parse_daemon_invocation_request,
 };
 pub(crate) use tracedecay_daemon_protocol::{DaemonClientIdentity, DaemonHandshake};
-#[cfg(unix)]
-#[allow(unused_imports)]
-pub(crate) use tracedecay_daemon_protocol::{
-    ensure_private_socket_parent, unix_socket_path_within_limit,
-};
 use tracedecay_domain::errors::{ProjectOpenFailureKind, Result, TraceDecayError};
 use tracedecay_mcp::tools::catalog_discovery::{
     catalog_discovery_tools_list_payload, default_catalog_discovery_authority,
@@ -154,7 +151,7 @@ const PROJECT_OPEN_REQUEST_DEADLINE: Duration = Duration::from_millis(500);
 /// recorded `reset_required`: the connection spent the budget before it joined
 /// the watch, so the publication wait returned immediately and never read the
 /// refusal.
-fn project_open_publication_deadline(claimed_at: tokio::time::Instant) -> tokio::time::Instant {
+fn project_open_publication_deadline(claimed_at: Instant) -> Instant {
     claimed_at + PROJECT_OPEN_REQUEST_DEADLINE
 }
 /// One budget for every blocking repository probe a route resolution runs.
@@ -287,15 +284,17 @@ pub fn tool_call_transport_error_is_retryable(error: &TraceDecayError) -> bool {
     )
 }
 
-/// True when a daemon client missed its read deadline.
-///
-/// Keys only on [`tracedecay_daemon_protocol::DAEMON_RESPONSE_STALLED`]. English
-/// detail, including the stalled wait phrase, is not a second classifier.
-pub fn error_is_read_deadline(error: &TraceDecayError) -> bool {
-    matches!(
-        error.project_route_context(),
-        Some((tracedecay_daemon_protocol::DAEMON_RESPONSE_STALLED, _, _))
-    )
+/// Aborts its tasks when dropped. A shutdown join holds one so that the
+/// coordinator dropping the join at its phase deadline aborts the tasks the
+/// join was waiting on. Aborting a task that already finished does nothing.
+pub(crate) struct AbortTasksOnDrop(pub(crate) Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 mod bootstrap;
@@ -410,11 +409,19 @@ pub use production_harness::capture_exact_git_snapshot_for_test;
 mod profile_configuration;
 mod profile_owner;
 mod profile_retained;
+#[cfg(unix)]
+mod profile_watch;
 mod projectless;
 mod remote_deletion;
+mod remote_drain;
+mod remote_join;
+mod remote_revocation;
 #[cfg(test)]
 use projectless::projectless_tools_call_response;
 use projectless::{projectless_first_request, projectless_tool_call, serve_projectless_client};
+pub use remote_drain::{RemoteNodeDrainReceiptV1, live_remote_drain};
+pub use remote_join::{RemoteNodeJoinRequestV1, live_remote_join};
+pub use remote_revocation::{RemoteNodeRevocationV1, live_remote_node_revocation};
 mod project_composition;
 mod project_delivery_mount;
 pub(crate) use project_composition::daemon_transcript_source_profile;
@@ -444,7 +451,14 @@ use project_open_handshake::{
 };
 mod project_open_orchestration;
 mod project_routing;
+// ambient-tokio: its Tokio timers run on Tokio tasks or inside the
+// native_runtime::on_tokio hops in project_server_lifecycle_hops.
 mod project_server_lifecycle;
+#[cfg(unix)]
+use project_open_orchestration::{
+    await_claimed_project_open, spawn_lifecycle_automation_scheduler_activation,
+    start_lifecycle_project_open,
+};
 use project_open_orchestration::{
     durable_enrollment_resolves_existing_store, ensure_registered_project_route,
 };
@@ -453,11 +467,6 @@ use project_open_orchestration::{
     portable_cached_project_open_failure, portable_cached_project_server,
     portable_project_server_for_request, schedule_portable_project_server_warmup,
 };
-#[cfg(unix)]
-use project_open_orchestration::{
-    spawn_lifecycle_automation_scheduler_activation, start_lifecycle_project_open,
-    wait_for_project_open_publication,
-};
 // The portable reconciler only exists off-unix (or under test transports), so
 // its import carries the same gate as its definition.
 #[cfg(any(not(unix), test, feature = "test-transport"))]
@@ -465,20 +474,20 @@ use project_routing::portable_database_owner_reconciler;
 #[cfg(unix)]
 use project_routing::{CatalogRefreshClientKey, maintenance_transition_gate};
 use project_routing::{
-    bind_authenticated_profile_identity, bounded_repository_probe,
-    cached_or_bind_ready_project_server, ensure_checkout_topology_before_admission,
-    prefer_recorded_open_failure, project_open_cancellation_checkpoint,
-    project_open_cancellation_error, project_open_capacity_gate, project_open_gate,
-    project_open_task_capacity_error, project_open_tasks, project_route_for_handshake,
-    project_server_capacity_error, project_server_retirement_blocked_error, project_warming_error,
-    resolved_project_server_key,
+    bind_authenticated_profile_identity, cached_or_bind_ready_project_server,
+    ensure_checkout_topology_before_admission, prefer_recorded_open_failure,
+    project_open_cancellation_checkpoint, project_open_cancellation_error,
+    project_open_capacity_gate, project_open_gate, project_open_task_capacity_error,
+    project_open_tasks, project_route_for_handshake, project_server_capacity_error,
+    project_server_retirement_blocked_error, project_warming_error, resolved_project_server_key,
 };
 #[cfg(test)]
 use project_server_lifecycle::replay_user_profile_host_admission_for_identity;
-use project_server_lifecycle::{
+use project_server_lifecycle::{schedule_project_server_retirement, shutdown_project_servers};
+mod project_server_lifecycle_hops;
+use project_server_lifecycle_hops::{
     await_user_profile_host_admission_replay_for_identity, cancel_retained_session_history,
-    schedule_project_server_retirement, schedule_user_profile_host_admission_replay_for_identity,
-    shutdown_project_servers,
+    schedule_user_profile_host_admission_replay_for_identity,
 };
 #[cfg(unix)]
 mod scheduler;
@@ -494,11 +503,9 @@ mod tool_surface;
 mod wire_io;
 #[cfg(test)]
 mod work_evidence_retrieval_tests;
-use wire_io::{
-    read_line_handling_wire_oversized, write_daemon_invocation_response, write_json_rpc_response,
-};
+use wire_io::{read_line_handling_wire_oversized, write_daemon_response};
 
-pub use bootstrap::run_foreground;
+pub use bootstrap::{DaemonRunEnd, PROFILE_LOST_EXIT_CODE, run_foreground};
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

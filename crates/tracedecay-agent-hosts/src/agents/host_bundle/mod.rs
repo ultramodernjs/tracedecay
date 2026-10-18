@@ -49,7 +49,10 @@ mod writer;
 
 pub use capability_admission::{require_capability, require_component_capabilities};
 pub use component_set::HostComponentSetTransactionV1;
-pub use control::{latest_host_component_receipt_at, latest_host_component_set_receipt_at};
+pub use control::{
+    canonical_component, host_component_owned_paths_at, latest_host_component_receipt_at,
+    latest_host_component_set_receipt_at,
+};
 pub use doctor::{
     HostBundleArtifactDoctorResultV1, HostBundleComponentDoctorResultV1,
     HostBundleComponentDoctorStateV1, HostBundleDoctorReportV1, HostBundleRegistrationInspectorV1,
@@ -64,8 +67,7 @@ pub use model::{
 pub use planner::{
     HOST_BUNDLE_STAGE_ROOT_RELATIVE, HostArtifactActionV1, HostArtifactMutationV1,
     HostBundleLifecycleRequestV1, HostBundleMutationPlanV1, ObservedArtifactKindV1,
-    ObservedHostArtifactV1, dry_run_host_bundle_lifecycle_at,
-    dry_run_host_bundle_lifecycle_with_lifecycle_root_at,
+    ObservedHostArtifactV1, dry_run_host_bundle_lifecycle_with_lifecycle_root_at,
     dry_run_host_component_set_lifecycle_with_lifecycle_root_at, inspect_install_target,
     plan_complete_lifecycle_mutation, plan_lifecycle_mutation,
     plan_verified_complete_lifecycle_mutation,

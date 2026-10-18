@@ -15,8 +15,9 @@ use tracedecay_host_integration::host_bundle_storage_failure;
 
 use super::control::{
     HOST_BUNDLE_CONTROL_DIR, HOST_BUNDLE_LOCK_FILE, MAX_CONTROL_FILE_BYTES,
-    component_set_receipt_file, is_safe_component, latest_host_component_set_receipt_at,
-    parse_receipt, receipt_file, receipt_identity_from_file_name, receipt_schema_probe,
+    component_set_receipt_file, component_slug, is_safe_component,
+    latest_host_component_set_receipt_at, parse_receipt, receipt_file,
+    receipt_identity_from_file_name, receipt_schema_probe, superseded_identities,
     validate_component_set_receipt, validate_receipt, writer_lock_file,
 };
 use super::model::{HostBundleExecutionRequestV1, HostBundleLifecycleStorageV1};
@@ -157,6 +158,23 @@ impl HostBundleWriterV1 {
             } else {
                 Err(HostBundleError::ReceiptCorrupted)
             };
+        }
+        // Only the component-set transaction can retire another identity's
+        // receipt inside its rollback boundary; writing here would leave two
+        // owners of one route.
+        for identity in superseded_identities(manifest.component) {
+            if self
+                .load_receipt(manifest.host, identity)?
+                .is_some_and(|receipt| receipt.operation != HostBundleLifecycleOpV1::Uninstall)
+            {
+                return Err(HostBundleError::OwnershipConflict(format!(
+                    "a {} receipt owns the {} route; run `tracedecay update --agent {}` to \
+                     migrate it",
+                    component_slug(identity),
+                    component_slug(manifest.component),
+                    manifest.host.descriptor().cli_id(),
+                )));
+            }
         }
         let owned_receipt = previous_receipt
             .as_ref()
@@ -721,14 +739,11 @@ impl HostBundleWriterV1 {
         )?;
         let mut component_manifests = previous
             .as_ref()
-            .map(|receipt| receipt.component_manifests.clone())
-            .unwrap_or_default();
+            .map_or_default(|receipt| receipt.component_manifests.clone());
         component_manifests.retain(|previous| previous.component != manifest.component);
         component_manifests.push(manifest.clone());
         component_manifests.sort_by_key(|manifest| manifest.component);
-        let mut component_receipts = previous
-            .map(|receipt| receipt.component_receipts)
-            .unwrap_or_default();
+        let mut component_receipts = previous.map_or_default(|receipt| receipt.component_receipts);
         component_receipts.retain(|previous| previous.component != component_receipt.component);
         component_receipts.push(component_receipt.clone());
         component_receipts.sort_by_key(|receipt| receipt.component);

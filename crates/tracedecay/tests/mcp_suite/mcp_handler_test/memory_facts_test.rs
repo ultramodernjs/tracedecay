@@ -178,7 +178,7 @@ pub(super) async fn fact_store_cross_project_fixture() -> FactStoreCrossProjectF
     let target_root = isolation.path().join("target");
     initialize_production_fact_project(&active_root);
     initialize_production_fact_project(&target_root);
-    let harness = tracedecay::daemon::ProductionProjectCompositionHarnessV1::open(
+    let harness = crate::support::seeded_composition::open(
         isolation.path(),
         vec![active_root.clone(), target_root.clone()],
     )
@@ -1112,7 +1112,7 @@ async fn memory_status_reports_canonical_similarity_projection_shape() {
         "status must include the stored fact: {status}"
     );
     assert_eq!(
-        status["memory"]["algebra"]["name"], "amari_fhrr",
+        status["memory"]["algebra"]["name"], "map_c",
         "status must name the canonical similarity algebra: {status}"
     );
     assert_eq!(status["memory"]["algebra"]["hrr_dim"].as_u64(), Some(2048));

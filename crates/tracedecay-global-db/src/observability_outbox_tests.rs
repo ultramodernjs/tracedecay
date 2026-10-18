@@ -1,3 +1,4 @@
+use crate::registered_analytics::OBSERVABILITY_EVENT_BY_IDEMPOTENCY_KEY_SQL;
 use crate::tests::harness::RegisteredGlobalDbHarness;
 use crate::{
     AnalyticsEventInsert, CoverageStateV1, ObservabilityEmissionClaimV1,
@@ -5,7 +6,29 @@ use crate::{
     ObservabilityRollupRebuildV1, PreparedObservabilityEmissionV1,
 };
 
-#[tokio::test]
+#[asupersync::test]
+async fn idempotency_lookup_searches_its_partial_index() {
+    let harness = RegisteredGlobalDbHarness::open("observability-idempotency-plan").await;
+    let snapshot = harness.registered.read_snapshot().await.unwrap();
+    let mut rows = snapshot
+        .query(
+            &format!("EXPLAIN QUERY PLAN {OBSERVABILITY_EVENT_BY_IDEMPOTENCY_KEY_SQL}"),
+            ["scope:fixture", "idempotency:fixture"],
+        )
+        .await
+        .unwrap();
+    let mut plan = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        plan.push(row.get::<String>(3).unwrap());
+    }
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_observability_event_idempotency")),
+        "the idempotency lookup must search its partial index: {plan:?}"
+    );
+}
+
+#[asupersync::test]
 async fn observability_append_is_idempotent_and_rejects_changed_input() {
     let harness = RegisteredGlobalDbHarness::open("observability-idempotency").await;
     let event = AnalyticsEventInsert {
@@ -71,7 +94,7 @@ async fn observability_append_is_idempotent_and_rejects_changed_input() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn observability_batch_appends_every_event() {
     const APPENDS: usize = 8;
 
@@ -128,7 +151,7 @@ fn ordinary_batch_event(index: usize) -> AnalyticsEventInsert {
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn ordinary_observability_batch_matches_single_appends_across_chunks_and_replays() {
     let batch = RegisteredGlobalDbHarness::open("ordinary-batch-equivalence").await;
     let singles = RegisteredGlobalDbHarness::open("ordinary-single-equivalence").await;
@@ -188,7 +211,7 @@ async fn ordinary_observability_batch_matches_single_appends_across_chunks_and_r
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn ordinary_observability_batch_conflicts_roll_back_all_chunks() {
     let harness = RegisteredGlobalDbHarness::open("ordinary-batch-rollback").await;
     let seeded = ordinary_batch_event(0);
@@ -257,7 +280,7 @@ async fn ordinary_observability_batch_conflicts_roll_back_all_chunks() {
     assert!(error.contains("idempotency conflict"), "{error}");
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn observability_outbox_replay_reuses_exact_delivery_and_settles_atomically() {
     let harness = RegisteredGlobalDbHarness::open("observability-outbox-replay").await;
     let project = "scope:outbox";
@@ -322,7 +345,7 @@ async fn observability_outbox_replay_reuses_exact_delivery_and_settles_atomicall
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn observability_outbox_refuses_changed_owner_and_preserves_pending_on_failed_settle() {
     let harness = RegisteredGlobalDbHarness::open("observability-outbox-atomicity").await;
     let project = "scope:outbox-atomic";
@@ -384,7 +407,7 @@ async fn observability_outbox_refuses_changed_owner_and_preserves_pending_on_fai
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn observability_retention_expires_settled_transport_but_preserves_pending_and_product_receipts_across_restart()
  {
     let harness = RegisteredGlobalDbHarness::open("observability-outbox-retention").await;
@@ -490,7 +513,7 @@ async fn observability_retention_expires_settled_transport_but_preserves_pending
     ));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn observability_retention_is_bounded_and_cancelled_waits_do_not_mutate() {
     let harness = RegisteredGlobalDbHarness::open("observability-retention-bounds").await;
     let events = (0..=512)
@@ -540,11 +563,12 @@ async fn observability_retention_is_bounded_and_cancelled_waits_do_not_mutate() 
         .begin_write_transaction()
         .await
         .expect("hold registered writer");
-    let database = harness.registered.clone();
-    let prune = tokio::spawn(async move { database.prune_observability_events(31 * 86_400).await });
-    tokio::task::yield_now().await;
-    prune.abort();
-    let _ = prune.await;
+    {
+        // Asupersync aborts cooperatively; dropping the queued prune is the
+        // cancellation Tokio's abort delivered.
+        let mut prune = std::pin::pin!(harness.registered.prune_observability_events(31 * 86_400));
+        let _ = futures_util::poll!(&mut prune);
+    }
     blocker.commit().await.expect("release registered writer");
     assert_eq!(
         harness
@@ -556,7 +580,7 @@ async fn observability_retention_is_bounded_and_cancelled_waits_do_not_mutate() 
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn observability_retention_preserves_dirty_sources_until_rollup_publication() {
     let harness = RegisteredGlobalDbHarness::open("observability-retention-dirty-source").await;
     let scope = "scope:retention-dirty";
@@ -681,7 +705,7 @@ fn prepared_delivery(
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn owner_fact_run_preserves_siblings_when_an_owner_fact_conflicts() {
     let harness = RegisteredGlobalDbHarness::open("observability-owner-run").await;
     let project = "scope:owner-run";
@@ -794,7 +818,7 @@ async fn owner_fact_run_preserves_siblings_when_an_owner_fact_conflicts() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn owner_fact_storage_failure_rolls_back_the_entire_transaction() {
     let harness = RegisteredGlobalDbHarness::open("observability-owner-storage-failure").await;
     let project = "scope:owner-storage-failure";
@@ -854,7 +878,7 @@ async fn owner_fact_storage_failure_rolls_back_the_entire_transaction() {
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn owner_fact_run_resolves_repeats_claims_and_stored_events_within_one_write() {
     let harness = RegisteredGlobalDbHarness::open("observability-owner-run-resolution").await;
     let project = "scope:owner-run-resolution";

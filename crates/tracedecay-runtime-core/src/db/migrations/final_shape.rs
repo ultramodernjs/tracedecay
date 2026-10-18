@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::LazyLock;
 
 use crate::db::engine::QueryExecutor;
@@ -23,6 +24,60 @@ type SchemaInventory = BTreeMap<String, SchemaObject>;
 
 static EXPECTED_FINAL_SHAPE: LazyLock<std::result::Result<SchemaInventory, String>> =
     LazyLock::new(build_expected_final_shape);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphStoreSchemaAdmissionV1 {
+    pub schema_version: i64,
+    pub exact_final_shape: bool,
+}
+
+pub fn inspect_graph_store_schema(path: &Path) -> Result<GraphStoreSchemaAdmissionV1> {
+    let has_header = crate::storage::has_sqlite_database_header(path).map_err(|error| {
+        TraceDecayError::Config {
+            message: format!(
+                "could not verify the store header at {}: {error}",
+                path.display()
+            ),
+        }
+    })?;
+    if !has_header {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "{} is not a SQLite database; the scoped reset covers only stores refused \
+                 for an incompatible schema version",
+                path.display()
+            ),
+        });
+    }
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| TraceDecayError::Database {
+                operation: "open project graph store for schema inspection".to_owned(),
+                message: error.to_string(),
+            })?;
+    let schema_version = crate::db::schema_version::read_version_sync(
+        &connection,
+        crate::db::schema_version::GRAPH_COMPONENT,
+    )
+    .map_err(|error| TraceDecayError::Database {
+        operation: "inspect project graph store schema version".to_owned(),
+        message: error.to_string(),
+    })?
+    .unwrap_or(0);
+    let exact_final_shape = if schema_version != i64::from(super::SCHEMA_VERSION) {
+        false
+    } else {
+        match require_admissible_final_shape_rusqlite(&connection) {
+            Ok(()) => true,
+            Err(TraceDecayError::ResetRequired { .. }) => false,
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(GraphStoreSchemaAdmissionV1 {
+        schema_version,
+        exact_final_shape,
+    })
+}
 
 fn build_expected_final_shape() -> std::result::Result<SchemaInventory, String> {
     let connection = rusqlite::Connection::open_in_memory()
@@ -52,6 +107,7 @@ fn build_expected_final_shape() -> std::result::Result<SchemaInventory, String> 
         tracedecay_rusqlite_runtime::repository::EXTERNAL_SOURCE_SCHEMA_V1,
         tracedecay_rusqlite_runtime::repository::GRAPH_PUBLICATION_SCHEMA_V1,
         tracedecay_rusqlite_runtime::runtime_ledger::RUNTIME_LEDGER_SCHEMA,
+        super::RETIRED_RUNTIME_EFFECTS_SCHEMA_V39,
     ] {
         connection
             .execute_batch(schema)
@@ -86,6 +142,9 @@ fn read_rusqlite_inventory(
     for row in rows {
         let (object_type, name, table, sql) =
             row.map_err(|error| format!("failed to read canonical schema object: {error}"))?;
+        if is_store_version_ledger(&name) {
+            continue;
+        }
         if inventory
             .insert(
                 name.clone(),
@@ -103,13 +162,19 @@ fn read_rusqlite_inventory(
     Ok(inventory)
 }
 
+/// The ledger is the stamp, not a relational object, so a file at the pragma
+/// and a file that already adopted the ledger are one shape.
+fn is_store_version_ledger(name: &str) -> bool {
+    name == tracedecay_rusqlite_runtime::schema_version::TABLE
+}
+
 /// Deterministic fingerprint of a schema-object set (`name` + `sql`, sorted).
 ///
 /// Two inventories that differ in any object's name or DDL produce different
 /// keys; permutation of the same pairs does not. This is the cache identity
 /// for fixtures that must not reuse a store template after the final shape
 /// changes without a `SCHEMA_VERSION` bump.
-pub fn fingerprint_schema_objects<'a, I>(objects: I) -> String
+fn fingerprint_schema_objects<'a, I>(objects: I) -> String
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
@@ -188,9 +253,24 @@ pub fn expected_final_schema_fingerprint() -> Result<String> {
     let inventory = EXPECTED_FINAL_SHAPE
         .as_ref()
         .map_err(|error| database_error(error.clone()))?;
-    Ok(fingerprint_schema_objects(inventory.iter().map(
-        |(name, object)| (name.as_str(), object.sql.as_str()),
-    )))
+    Ok(fingerprint_inventory(inventory))
+}
+
+/// Fingerprint of a store's shape, read the way admission reads it.
+pub fn schema_fingerprint(path: &Path) -> Result<String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| database_error(format!("failed to open schema inventory: {error}")))?;
+    let inventory = read_rusqlite_inventory(&connection).map_err(database_error)?;
+    Ok(fingerprint_inventory(&inventory))
+}
+
+fn fingerprint_inventory(inventory: &SchemaInventory) -> String {
+    fingerprint_schema_objects(
+        inventory
+            .iter()
+            .map(|(name, object)| (name.as_str(), object.sql.as_str())),
+    )
 }
 
 pub(super) fn require_admissible_final_shape_rusqlite(
@@ -230,6 +310,9 @@ async fn read_inventory(conn: &impl QueryExecutor) -> Result<SchemaInventory> {
         let sql = row
             .get::<String>(3)
             .map_err(|error| database_error(format!("failed to decode object SQL: {error}")))?;
+        if is_store_version_ledger(&name) {
+            continue;
+        }
         if inventory
             .insert(
                 name.clone(),

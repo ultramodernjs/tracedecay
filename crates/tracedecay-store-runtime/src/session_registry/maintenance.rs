@@ -12,14 +12,15 @@ use tracedecay_contracts::storage::{
     SchemaConvergenceFindingV1, SchemaConvergenceStageV1, SchemaConvergenceStateV1,
 };
 use tracedecay_domain::errors::{
-    PROFILE_RESET_COMMAND, ResettableStoreV1, STALE_STORE_RESET_COMMAND, StoreResetRequiredV1,
-    TraceDecayError,
+    DAEMON_RESTART_COMMAND, PROFILE_RESET_COMMAND, ResettableStoreV1, STALE_STORE_RESET_COMMAND,
+    StoreResetRequiredV1, TraceDecayError,
 };
 use tracedecay_global_db::schema_stages::RegisteredSchemaConvergence;
+use tracedecay_runtime_core::native_runtime::{self, NativeTask};
 use tracedecay_runtime_core::storage::profile_root_of_sharded_data_root;
 use tracedecay_store::{StoreRuntimeBindingV1, StoreShardIdV1, StoreShardScopeV1};
 
-use super::retained_hook_tasks::RetainedHookTaskJoin;
+use super::retained_hook_tasks::join_result;
 
 use super::{
     DaemonSessionRuntimeRegistryV1, Database, DatabaseAccessMode, RegisteredGlobalDbLeaseV1,
@@ -69,7 +70,7 @@ pub(super) struct RegisteredSchemaConvergenceMaintenance {
     concurrency: Arc<Semaphore>,
     statuses: Arc<StdMutex<RegisteredSchemaConvergenceStatuses>>,
     metadata: Arc<StdMutex<RegisteredSchemaConvergenceMetadata>>,
-    tasks: StdMutex<BTreeMap<StoreShardIdV1, Arc<RetainedHookTaskJoin>>>,
+    tasks: StdMutex<BTreeMap<StoreShardIdV1, Arc<NativeTask<()>>>>,
     #[cfg(any(test, feature = "test-helpers"))]
     schedule_count: std::sync::atomic::AtomicUsize,
     #[cfg(any(test, feature = "test-helpers"))]
@@ -358,7 +359,9 @@ impl RegisteredSchemaConvergenceMaintenance {
                     ],
                 );
             }
-            let _ = release_process_allocator_memory_v1();
+            // `malloc_trim` walks every glibc arena: up to 0.8 s of CPU on a
+            // large heap, which would stall this native worker's I/O.
+            let _ = native_runtime::spawn_blocking(release_process_allocator_memory_v1).await;
             drop(permit);
             let status = match result {
                 Ok(()) => {
@@ -389,11 +392,22 @@ impl RegisteredSchemaConvergenceMaintenance {
             drop(target);
             lock_registered_schema_convergence_statuses(&statuses).insert(task_shard_id, status);
         });
-        let task = tokio::spawn(tracing::Instrument::instrument(
+        match NativeTask::spawn(tracing::Instrument::instrument(
             work,
             tracing::trace_span!("daemon.session_registry.schema_converge"),
-        ));
-        tasks.insert(shard_id, Arc::new(RetainedHookTaskJoin::new(task)));
+        )) {
+            Ok(task) => {
+                tasks.insert(shard_id, Arc::new(task));
+            }
+            Err(error) => {
+                lock_registered_schema_convergence_statuses(&self.statuses).insert(
+                    shard_id,
+                    RegisteredSchemaConvergenceStatus::Degraded {
+                        message: format!("registered schema convergence did not start: {error}"),
+                    },
+                );
+            }
+        }
     }
 
     /// Keep an aborted worker tracked until its future has dropped every client.
@@ -416,7 +430,7 @@ impl RegisteredSchemaConvergenceMaintenance {
             Arc::clone(task)
         };
         task.abort();
-        task.wait().await.map_err(|error| {
+        join_result(task.wait().await).map_err(|error| {
             format!("registered schema convergence task {shard_id:?} join failed: {error}")
         })?;
         let mut tasks = self
@@ -459,7 +473,7 @@ impl RegisteredSchemaConvergenceMaintenance {
         // Shared joins remain in the owner while any shutdown waiter can be
         // cancelled. Keep failed joins so subsequent shutdown reports them too.
         for (shard_id, task) in tasks {
-            if let Err(error) = task.wait().await {
+            if let Err(error) = join_result(task.wait().await) {
                 failures.push(format!(
                     "registered schema convergence task {shard_id:?} join failed: {error}"
                 ));
@@ -620,10 +634,39 @@ impl DaemonSessionRuntimeRegistryV1 {
         }
     }
 
+    /// Hold a store file that was deleted or replaced on disk while mounted in
+    /// the reset-required state until the daemon restarts and remounts its
+    /// owners. Returns whether the loss is new.
+    pub fn record_store_identity_lost(&self, path: &Path) -> bool {
+        let mut lost = self
+            .lost_store_files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lost.contains_key(path) {
+            return false;
+        }
+        lost.insert(
+            path.to_path_buf(),
+            StoreResetRequiredV1 {
+                store: path.display().to_string(),
+                authority: "store file identity".to_owned(),
+                found_version: None,
+                required_version: None,
+                reason: "the store file was deleted or replaced while the daemon held it open; \
+                         its runtime closed the file, and its owners serve it again after a \
+                         restart"
+                    .to_owned(),
+                remedy: DAEMON_RESTART_COMMAND.to_owned(),
+            },
+        );
+        true
+    }
+
     /// Stores in this profile currently held in their typed reset-required
     /// state, each with the exact command that resets it: registered stores
-    /// refused at attach, then Hook V2 admission state on disk in a shape this
-    /// binary refuses, in the profile or any of its project shards.
+    /// refused at attach, store files lost while open, then Hook V2 admission
+    /// state on disk in a shape this binary refuses, in the profile or any of
+    /// its project shards.
     #[must_use]
     pub fn reset_required_stores(&self) -> Vec<StoreResetRequiredV1> {
         let mut stores: Vec<_> = self
@@ -633,6 +676,13 @@ impl DaemonSessionRuntimeRegistryV1 {
             .values()
             .cloned()
             .collect();
+        stores.extend(
+            self.lost_store_files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .cloned(),
+        );
         let profile_root = self.identity.profile_root();
         let project_shards = std::fs::read_dir(
             tracedecay_runtime_core::storage::profile_shards_root(profile_root),
@@ -660,23 +710,37 @@ impl DaemonSessionRuntimeRegistryV1 {
         runtime: StoreRuntimeClientLease,
     ) -> Pin<Box<dyn Future<Output = Result<RegisteredGlobalDbOwnerV1>> + Send + '_>> {
         Box::pin(async move {
-            let database =
-                Database::publish_runtime(runtime, DatabaseAccessMode::ReadWrite).await?;
+            let published: Pin<
+                Box<
+                    dyn Future<Output = Result<tracedecay_runtime_core::db::DatabaseOwnerV1>>
+                        + Send,
+                >,
+            > = Box::pin(Database::publish_runtime(
+                runtime,
+                DatabaseAccessMode::ReadWrite,
+            ));
+            let database = published.await?;
             // Only long-lived daemons defer schema convergence to resumable
             // maintenance. A store refused for reset is never converged: its
             // reset deletes it.
             let long_lived = self.long_lived_session_maintenance;
             let (database, convergence) = if long_lived {
-                RegisteredGlobalDbOwnerV1::admit_and_attach_for_daemon(
-                    database,
-                    self.registry.open_cancellation(),
-                )
-                .await?
+                let admitted = tracedecay_runtime_core::erase_send!(
+                    RegisteredGlobalDbOwnerV1::admit_and_attach_for_daemon(
+                        database,
+                        self.registry.open_cancellation(),
+                    ),
+                    Result<(
+                        RegisteredGlobalDbOwnerV1,
+                        Option<RegisteredSchemaConvergence>,
+                    )>
+                );
+                admitted.await?
             } else {
-                (
-                    RegisteredGlobalDbOwnerV1::admit_and_attach(database).await?,
-                    None,
-                )
+                let admitted: Pin<
+                    Box<dyn Future<Output = Result<RegisteredGlobalDbOwnerV1>> + Send>,
+                > = Box::pin(RegisteredGlobalDbOwnerV1::admit_and_attach(database));
+                (admitted.await?, None)
             };
             if convergence.is_some() {
                 let lease = database.issue_lease().map_err(|error| {
@@ -794,14 +858,9 @@ mod tests {
 
     use super::*;
 
-    // The held destructor below parks one worker thread for the whole test, and
-    // `begin_shutdown` injects both aborts at once. A worker drains
-    // `inject.len() / worker_threads + 1` notifications in one batch, so with two
-    // workers the one that blocks can also capture the second shard's abort into
-    // its local queue, where the surviving worker never gets notified to steal it
-    // and the second retirement hangs instead of running slowly. Four workers keep
-    // that batch at one task each and leave spare capacity for the blocked one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // The held destructor below parks one worker thread for the whole test, so
+    // the second shard's abort needs a spare worker to run on.
+    #[asupersync::test(flavor = "multi_thread", workers = 4)]
     async fn cancelled_shutdown_retains_incomplete_future_drop_and_independent_retirement() {
         struct HeldDrop {
             started: Arc<Notify>,
@@ -847,24 +906,23 @@ mod tests {
             release,
             dropped: Arc::clone(&dropped),
         };
-        let worker = tokio::spawn({
+        let worker = NativeTask::spawn({
             let started = Arc::clone(&started);
             async move {
                 let _guard = guard;
                 started.notify_one();
                 std::future::pending::<()>().await;
             }
-        });
+        })
+        .expect("native worker");
         maintenance
             .tasks
             .lock()
             .unwrap()
-            .insert(first.clone(), Arc::new(RetainedHookTaskJoin::new(worker)));
+            .insert(first.clone(), Arc::new(worker));
         maintenance.tasks.lock().unwrap().insert(
             second.clone(),
-            Arc::new(RetainedHookTaskJoin::new(tokio::spawn(
-                std::future::pending::<()>(),
-            ))),
+            Arc::new(NativeTask::spawn(std::future::pending::<()>()).expect("native worker")),
         );
         started.notified().await;
         let mut shutdown = Box::pin(maintenance.shutdown());
@@ -885,7 +943,8 @@ mod tests {
         })
         .await;
         assert!(!dropped.load(Ordering::Acquire));
-        tokio::time::timeout(
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
             std::time::Duration::from_secs(2),
             maintenance.retire(&second),
         )
@@ -898,7 +957,7 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn shutdown_and_exact_retirement_preserve_failed_join() {
         let maintenance = RegisteredSchemaConvergenceMaintenance::new();
         let shard = StoreShardIdV1::profile_sessions(
@@ -906,18 +965,19 @@ mod tests {
             UserProfileId::try_from("profile.failed".to_owned()).unwrap(),
         );
         let started = Arc::new(Notify::new());
-        let worker = tokio::spawn({
+        let worker = NativeTask::spawn({
             let started = Arc::clone(&started);
             async move {
                 started.notify_one();
                 panic!("convergence task failure");
             }
-        });
+        })
+        .expect("native worker");
         maintenance
             .tasks
             .lock()
             .unwrap()
-            .insert(shard.clone(), Arc::new(RetainedHookTaskJoin::new(worker)));
+            .insert(shard.clone(), Arc::new(worker));
         started.notified().await;
         let failure = maintenance
             .retire(&shard)
@@ -952,6 +1012,52 @@ mod tests {
         assert_eq!(
             maintenance.status(&shard_id),
             Some(RegisteredSchemaConvergenceStatus::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_file_lost_while_open_requires_a_daemon_restart() {
+        let temp = tempfile::TempDir::new().expect("registry fixture root");
+        let profile_root = temp.path().join("profile");
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("profile identity");
+        let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
+            &profile_root,
+            43,
+            "store file identity reset",
+        )
+        .expect("daemon database scope");
+        let registry = DaemonSessionRuntimeRegistryV1::open(identity)
+            .await
+            .expect("daemon session runtime registry");
+        let lost = profile_root.join("global.db");
+        assert!(
+            registry
+                .reset_required_stores()
+                .iter()
+                .all(|store| store.store != lost.display().to_string()),
+            "nothing is reset-required before the loss"
+        );
+
+        assert!(registry.record_store_identity_lost(&lost));
+        assert!(
+            !registry.record_store_identity_lost(&lost),
+            "a loss already held is not new"
+        );
+
+        let recorded: Vec<_> = registry
+            .reset_required_stores()
+            .into_iter()
+            .filter(|store| store.store == lost.display().to_string())
+            .collect();
+        assert_eq!(recorded.len(), 1, "one entry per lost store file");
+        assert_eq!(recorded[0].authority, "store file identity");
+        assert_eq!(recorded[0].remedy, DAEMON_RESTART_COMMAND);
+        assert_eq!(recorded[0].found_version, None);
+        assert_eq!(
+            ResettableStoreV1::from_label(&recorded[0].store),
+            None,
+            "wipe --stale must refuse the store and name the restart instead"
         );
     }
 }

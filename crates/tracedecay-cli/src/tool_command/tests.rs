@@ -5,8 +5,7 @@ use tracedecay_contracts::{
     ResultContractRef, SafeDiagnostic,
 };
 use tracedecay_daemon_protocol::{
-    BindingResolution, BindingResolver, CatalogBindingResolver, ResolvedBinding,
-    decode_retained_request,
+    BindingResolution, CatalogBindingResolver, ResolvedBinding, decode_retained_request,
 };
 use tracedecay_daemon_service::application_surface::{
     application_surface_catalog_ref, parse_http_application_surface_request,
@@ -1736,4 +1735,44 @@ fn tool_status_exit_follows_the_wait_outcome() {
     );
     tool_result_process_outcome(&status(json!({"outcome": "reached"})), "tracedecay_status")
         .expect("a reached wait exits 0");
+}
+
+#[test]
+fn tool_listing_has_no_catch_all_group() {
+    let listing = render_tool_list(&defs());
+    let mut groups: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut current = None;
+    for line in listing.lines() {
+        if let Some(group) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            current = Some(group);
+        } else if line.starts_with("  ")
+            && let Some(group) = current
+        {
+            *groups.entry(group).or_default() += 1;
+        }
+    }
+    let listed: usize = groups.values().sum();
+    assert_eq!(
+        listed,
+        defs().len(),
+        "every tool is listed once: {groups:?}"
+    );
+    let ceiling = listed / 3;
+    for (group, count) in &groups {
+        assert!(
+            *count <= ceiling,
+            "group [{group}] holds {count} of {listed} tools, more than a third: {groups:?}"
+        );
+    }
+}
+
+#[test]
+fn first_line_truncates_on_a_char_boundary() {
+    let description = format!(
+        "{}é tail that pushes the line past the width",
+        "a".repeat(88)
+    );
+    let line = first_line(&description);
+    assert!(line.chars().count() <= 90, "{line}");
+    assert!(line.ends_with('…'), "{line}");
 }

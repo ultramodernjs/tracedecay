@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::future::Future;
+use std::str::FromStr;
 
 use sha2::{Digest, Sha256};
 use tracedecay_domain::{
@@ -398,10 +399,10 @@ impl UnknownObservationCoverageReason {
     }
 }
 
-impl TryFrom<&str> for ObservationCoverageReason {
-    type Error = UnknownObservationCoverageReason;
+impl FromStr for ObservationCoverageReason {
+    type Err = UnknownObservationCoverageReason;
 
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "blank_frame" => Ok(Self::BlankFrame),
             "out_of_scope" => Ok(Self::OutOfScope),
@@ -531,7 +532,7 @@ impl CursorAdvanceLedgerIdentityV1 {
         authority_receipt: Option<&SanitizationReceiptV1>,
     ) -> Self {
         Self {
-            reason: match ObservationCoverageReason::try_from(reason) {
+            reason: match reason.parse::<ObservationCoverageReason>() {
                 Ok(reason) => CursorAdvanceLedgerReasonV1::Known(reason),
                 Err(_) => CursorAdvanceLedgerReasonV1::Opaque {
                     fingerprint: CursorAdvanceLedgerOpaqueValueHashV1::for_raw_value(reason),
@@ -1140,6 +1141,14 @@ pub enum ObservationStoreError {
     InvalidReplayLimit { limit: usize, max: usize },
     #[error("observation contract validation failed")]
     Contract(#[source] ObservationContractError),
+    /// Every reader was leased for the whole admission wait. Nothing failed;
+    /// the same operation can succeed once a reader returns.
+    #[error("observation storage operation {operation} found every reader leased")]
+    ReaderSaturated { operation: &'static str },
+    /// The shard writer's admission queue was full. Nothing was written; the
+    /// same command can commit once queued writes drain.
+    #[error("observation storage operation {operation} found the writer queue full")]
+    WriterSaturated { operation: &'static str },
     #[error("observation storage operation {operation} failed")]
     Storage {
         operation: &'static str,

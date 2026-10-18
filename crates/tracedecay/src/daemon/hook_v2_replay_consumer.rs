@@ -224,7 +224,7 @@ impl HookReplaySweepV1 {
 
 #[tracing::instrument(name = "daemon.hook_replay.sweep", level = "trace", skip_all)]
 async fn drain_all_hosts(
-    graph: &tracedecay_project::project::TraceDecay,
+    graph: &Arc<tracedecay_project::project::TraceDecay>,
     data_root: &Path,
     delivery_settlements: &tracedecay_application::observability::DeliverySettlementAuthorityV1,
     project_sessions: &tracedecay_global_db::RegisteredGlobalDb,
@@ -232,7 +232,7 @@ async fn drain_all_hosts(
     deferred_hosts: &mut BTreeMap<NativeHostIdentityV1, DeferredHostReplay>,
 ) -> HookReplaySweepV1 {
     let mut sweep = HookReplaySweepV1::default();
-    renew_replay_bindings(graph, &mut sweep);
+    renew_replay_bindings(graph, &mut sweep).await;
     let project_id =
         tracedecay_agent_hosts::hooks::hook_project_id_for_layout(graph.hook_store_layout());
     // Worktree identity needs only the hook runtime's scope resolver; the
@@ -333,11 +333,17 @@ async fn drain_all_hosts(
     sweep
 }
 
-fn renew_replay_bindings(
-    graph: &tracedecay_project::project::TraceDecay,
+async fn renew_replay_bindings(
+    graph: &Arc<tracedecay_project::project::TraceDecay>,
     sweep: &mut HookReplaySweepV1,
 ) {
-    match graph.renew_hook_bindings(hook_replay_now()) {
+    let graph = Arc::clone(graph);
+    let renewed = tracedecay_runtime_core::native_runtime::spawn_owned_blocking(move || {
+        graph.renew_hook_bindings(hook_replay_now())
+    })
+    .await
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    match renewed {
         Ok(failures) => {
             for (host, cause) in failures {
                 sweep.fail(
@@ -617,7 +623,7 @@ struct RegisteredReplayConsumer {
     delivery_settlements:
         Weak<tracedecay_application::observability::DeliverySettlementAuthorityV1>,
     wake: Arc<tokio::sync::Notify>,
-    task: Option<tokio::task::JoinHandle<()>>,
+    task: Option<tracedecay_runtime_core::native_runtime::NativeTask<()>>,
     /// The failures of the last finished sweep; `None` while batches remain.
     last_sweep: Option<Vec<StatusHookReplayFailureV1>>,
 }
@@ -738,9 +744,9 @@ pub(crate) fn hook_v2_replay_consumer_registered(data_root: &Path) -> bool {
 
 /// Consume wakes at batch boundaries too, so a continuously busy healthy lane
 /// cannot postpone a retained lane beyond its ordinary retry interval.
-fn deferred_retry_due(wake: &tokio::sync::Notify, retry_at: &mut tokio::time::Instant) -> bool {
-    if tokio::time::Instant::now() >= *retry_at || wake.notified().now_or_never().is_some() {
-        *retry_at = tokio::time::Instant::now() + REPLAY_INTERVAL;
+fn deferred_retry_due(wake: &tokio::sync::Notify, retry_at: &mut std::time::Instant) -> bool {
+    if std::time::Instant::now() >= *retry_at || wake.notified().now_or_never().is_some() {
+        *retry_at = std::time::Instant::now() + REPLAY_INTERVAL;
         true
     } else {
         false
@@ -748,15 +754,15 @@ fn deferred_retry_due(wake: &tokio::sync::Notify, retry_at: &mut tokio::time::In
 }
 
 /// Start one consumer per exact project/worktree open, replacing only its
-/// predecessor. Returns `false` when this same graph is already registered.
+/// predecessor. Runtime refusal leaves that predecessor running.
 pub(crate) fn register_hook_v2_replay_consumer(
     graph: Arc<tracedecay_project::project::TraceDecay>,
     delivery_settlements: Arc<tracedecay_application::observability::DeliverySettlementAuthorityV1>,
     project_sessions: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     background_cpu: Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
-) -> bool {
+) -> ReplayConsumerStart {
     let Ok(mut roots) = registered_replay_roots().lock() else {
-        return false;
+        return ReplayConsumerStart::RegistryPoisoned;
     };
     install_hook_v2_replay_consumer(
         &mut roots,
@@ -801,12 +807,15 @@ pub(crate) fn transfer_hook_v2_replay_consumer(
     let Some(delivery_settlements) = consumer.delivery_settlements.upgrade() else {
         return false;
     };
-    install_hook_v2_replay_consumer(
-        &mut roots,
-        successor,
-        delivery_settlements,
-        project_sessions,
-        background_cpu,
+    matches!(
+        install_hook_v2_replay_consumer(
+            &mut roots,
+            successor,
+            delivery_settlements,
+            project_sessions,
+            background_cpu,
+        ),
+        ReplayConsumerStart::Started
     )
 }
 
@@ -816,7 +825,7 @@ fn install_hook_v2_replay_consumer(
     delivery_settlements: Arc<tracedecay_application::observability::DeliverySettlementAuthorityV1>,
     project_sessions: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     background_cpu: Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
-) -> bool {
+) -> ReplayConsumerStart {
     let data_root = graph.hook_store_layout().data_root.clone();
     let project_root = graph.project_root().to_path_buf();
     let scope = (data_root.clone(), project_root.clone());
@@ -827,36 +836,23 @@ fn install_hook_v2_replay_consumer(
             && consumer.graph.upgrade().is_some()
             && consumer.delivery_settlements.upgrade().is_some()
     }) {
-        return false;
-    }
-    if let Some(previous) = roots.remove(&scope) {
-        if let Some(task) = previous.task {
-            task.abort();
-        }
-        spool_watch::detach_consumer(&data_root, &project_root, &previous.wake);
+        return ReplayConsumerStart::AlreadyRunning;
     }
     let wake = Arc::new(tokio::sync::Notify::new());
-    // Keep registry ownership, the watch target, and the task installation in
-    // one handoff. A concurrent reopen cannot attach an obsolete wake target.
-    spool_watch::attach_consumer(&data_root, &project_root, Arc::clone(&wake));
-    roots.insert(
-        scope.clone(),
-        RegisteredReplayConsumer {
-            graph: graph.clone(),
-            delivery_settlements: delivery_settlements.clone(),
-            wake: Arc::clone(&wake),
-            task: None,
-            last_sweep: None,
-        },
-    );
+    let task_wake = Arc::clone(&wake);
+    let (start, started) = tokio::sync::oneshot::channel::<()>();
     let task_scope = scope.clone();
     let task_graph = graph.clone();
     let task_delivery_settlements = delivery_settlements.clone();
     let task_project_sessions = project_sessions;
     let task_background_cpu = background_cpu;
-    let task = tokio::spawn(async move {
+    let consumer = async move {
+        if started.await.is_err() {
+            return;
+        }
+        let wake = task_wake;
         let mut deferred_hosts = BTreeMap::new();
-        let mut retry_at = tokio::time::Instant::now() + REPLAY_INTERVAL;
+        let mut retry_at = std::time::Instant::now() + REPLAY_INTERVAL;
         loop {
             if deferred_retry_due(&wake, &mut retry_at) {
                 deferred_hosts.clear();
@@ -891,18 +887,22 @@ fn install_hook_v2_replay_consumer(
             // Retained records and failed spools wait at most this interval
             // for their next attempt; a hook append wakes the drain sooner. Keep
             // the pacing WAIT separate from sweep WORK.
-            tracing::Instrument::instrument(
+            let timer = tracing::Instrument::instrument(
                 async {
                     tokio::select! {
-                        () = tokio::time::sleep_until(retry_at) => {}
-                        () = wake.notified() => {}
+                        slept = tracedecay_runtime_core::native_runtime::sleep_until(retry_at) => slept,
+                        () = wake.notified() => Ok(()),
                     }
                 },
                 tracing::trace_span!("daemon.hook_replay.interval_wait"),
             )
             .await;
+            if let Err(error) = timer {
+                tracing::error!(event = "hook_replay_timer_unavailable", %error);
+                break;
+            }
             deferred_hosts.clear();
-            retry_at = tokio::time::Instant::now() + REPLAY_INTERVAL;
+            retry_at = std::time::Instant::now() + REPLAY_INTERVAL;
         }
         if let Ok(mut roots) = registered_replay_roots().lock()
             && roots
@@ -912,12 +912,41 @@ fn install_hook_v2_replay_consumer(
             spool_watch::detach_consumer(&task_scope.0, &task_scope.1, &wake);
             roots.remove(&task_scope);
         }
-    });
-    if let Some(registered) = roots.get_mut(&scope) {
-        registered.task = Some(task);
+    };
+    let task = match tracedecay_runtime_core::native_runtime::NativeTask::spawn(consumer) {
+        Ok(task) => task,
+        Err(error) => {
+            tracing::warn!(%error, data_root = %data_root.display(), "hook replay consumer not admitted");
+            return ReplayConsumerStart::RuntimeUnavailable;
+        }
+    };
+    if let Some(previous) = roots.remove(&scope) {
+        if let Some(task) = previous.task {
+            task.abort();
+        }
+        spool_watch::detach_consumer(&data_root, &project_root, &previous.wake);
     }
+    spool_watch::attach_consumer(&data_root, &project_root, Arc::clone(&wake));
+    roots.insert(
+        scope,
+        RegisteredReplayConsumer {
+            graph,
+            delivery_settlements,
+            wake,
+            task: Some(task),
+            last_sweep: None,
+        },
+    );
+    let _ = start.send(());
+    ReplayConsumerStart::Started
+}
 
-    true
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayConsumerStart {
+    Started,
+    AlreadyRunning,
+    RuntimeUnavailable,
+    RegistryPoisoned,
 }
 
 /// Stop and join the exact project replay consumer before releasing its graph.
@@ -979,28 +1008,42 @@ pub(crate) async fn shutdown_hook_v2_replay_consumer_for_graph(
     }
 }
 
+/// Join only the retired graph's registration; a reopened successor and its
+/// sibling worktrees keep their own wakes and session clients.
+pub(crate) async fn retire_hook_v2_replay_consumer(
+    data_root: &Path,
+    owner: &Weak<tracedecay_project::project::TraceDecay>,
+) {
+    let retired = {
+        let mut roots = registered_replay_roots()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let scope = roots.iter().find_map(|(scope, consumer)| {
+            (scope.0 == data_root && Weak::ptr_eq(&consumer.graph, owner)).then(|| scope.clone())
+        });
+        scope.and_then(|scope| roots.remove(&scope).map(|consumer| (scope, consumer)))
+    };
+    if let Some((scope, consumer)) = retired {
+        spool_watch::detach_consumer(&scope.0, &scope.1, &consumer.wake);
+        if let Some(task) = consumer.task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn retained_lanes_retry_during_continuous_peer_batches_and_consume_fresh_wakes() {
+    #[test]
+    fn retained_lanes_retry_during_continuous_peer_batches_and_consume_fresh_wakes() {
         let wake = tokio::sync::Notify::new();
-        let mut retry_at = tokio::time::Instant::now() + REPLAY_INTERVAL;
-        let mut healthy_batches = 0;
-        let mut retained_attempts = 1;
-        // Healthy batches never exhaust their backlog and keep yielding the
-        // runtime. The failed lane recovers before its retry deadline.
-        for _ in 0..31 {
-            if deferred_retry_due(&wake, &mut retry_at) {
-                retained_attempts += 1;
-            }
-            healthy_batches += 1;
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(healthy_batches, 31);
-        assert_eq!(retained_attempts, 2);
+        let mut retry_at = std::time::Instant::now() + REPLAY_INTERVAL;
+        assert!(!deferred_retry_due(&wake, &mut retry_at));
+        retry_at = std::time::Instant::now();
+        assert!(deferred_retry_due(&wake, &mut retry_at));
+        assert!(!deferred_retry_due(&wake, &mut retry_at));
         wake.notify_one();
         assert!(deferred_retry_due(&wake, &mut retry_at));
         assert!(!deferred_retry_due(&wake, &mut retry_at));
@@ -1146,12 +1189,15 @@ mod tests {
                 std::num::NonZeroUsize::new(1).unwrap(),
             ),
         );
-        assert!(register_hook_v2_replay_consumer(
-            Arc::clone(&first),
-            Arc::clone(&authority),
-            sessions.clone(),
-            Arc::clone(&cpu)
-        ));
+        assert_eq!(
+            ReplayConsumerStart::Started,
+            register_hook_v2_replay_consumer(
+                Arc::clone(&first),
+                Arc::clone(&authority),
+                sessions.clone(),
+                Arc::clone(&cpu)
+            )
+        );
         let scope = (first.hook_store_layout().data_root.clone(), project.clone());
         let first_publication = {
             let worktree = tracedecay_agent_hosts::hooks::hook_worktree_id_for_layout(
@@ -1178,22 +1224,28 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        assert!(register_hook_v2_replay_consumer(
-            Arc::clone(&successor),
-            Arc::clone(&authority),
-            sessions.clone(),
-            cpu
-        ));
-        assert!(!register_hook_v2_replay_consumer(
-            Arc::clone(&successor),
-            Arc::clone(&authority),
-            sessions,
-            Arc::new(
-                tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1::new(
-                    std::num::NonZeroUsize::new(1).unwrap()
+        assert_eq!(
+            ReplayConsumerStart::Started,
+            register_hook_v2_replay_consumer(
+                Arc::clone(&successor),
+                Arc::clone(&authority),
+                sessions.clone(),
+                cpu
+            )
+        );
+        assert_eq!(
+            ReplayConsumerStart::AlreadyRunning,
+            register_hook_v2_replay_consumer(
+                Arc::clone(&successor),
+                Arc::clone(&authority),
+                sessions,
+                Arc::new(
+                    tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1::new(
+                        std::num::NonZeroUsize::new(1).unwrap()
+                    )
                 )
             )
-        ));
+        );
         let later = UtcMicros(first_publication.expires_at.0 + 1);
         assert_eq!(
             first.renew_hook_bindings(later).unwrap().len(),
@@ -1527,5 +1579,193 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         assert_eq!(spool_root_absent(&file), Ok(false));
         assert!(spool_root_absent(&file.join("child")).is_err());
+    }
+
+    struct ReplayOwnerFixture {
+        _temp: tempfile::TempDir,
+        _settlement_runtime: tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime,
+        project_sessions: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+        settlements: Arc<tracedecay_application::observability::DeliverySettlementAuthorityV1>,
+        background_cpu: Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
+    }
+
+    type ProjectGraph = Arc<tracedecay_project::project::TraceDecay>;
+
+    /// Two owners of one project, so both resolve the same hook data root.
+    async fn replay_owner_fixture() -> (ReplayOwnerFixture, ProjectGraph, ProjectGraph) {
+        let temp = tempfile::tempdir().expect("replay owner fixture");
+        let project = temp.path().join("project");
+        let profile = temp.path().join("profile");
+        std::fs::create_dir_all(project.join("src")).expect("project source directory");
+        std::fs::write(project.join("src/lib.rs"), "pub fn fixture() {}\n").expect("source");
+        let options = tracedecay_project::project::TraceDecayOpenOptions {
+            profile_root: Some(profile.clone()),
+            global_db_path: Some(profile.join("global.db")),
+        };
+        let older = Arc::new(
+            tracedecay_project::project::TraceDecay::init_with_options_for_test(
+                &project,
+                options.clone(),
+            )
+            .await
+            .expect("older project owner"),
+        );
+        let newer = Arc::new(
+            tracedecay_project::project::TraceDecay::open_with_options_for_test(&project, options)
+                .await
+                .expect("newer project owner"),
+        );
+        let project_id = tracedecay_domain::ProjectId::new("project.replay.owner").expect("id");
+        let settlement_runtime =
+            tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::project(
+                &temp.path().join("settlement-profile"),
+                &project,
+                project_id.clone(),
+            )
+            .await
+            .expect("settlement runtime");
+        let project_sessions = settlement_runtime
+            .project_database_arc()
+            .expect("project sessions database");
+        let identity = tracedecay_application::observability::ObservabilityProducerIdentityV1 {
+            authorized_scope_ref: project_id.as_str().to_owned(),
+            process_boot_id: "boot:replay-owner".to_owned(),
+            producer_revision: "replay-owner-producer.v1".to_owned(),
+            configuration_revision: "replay-owner-config.v1".to_owned(),
+            policy_revision: "replay-owner-policy.v1".to_owned(),
+        };
+        let producer = Arc::new(
+            tracedecay_application::observability::BoundedObservabilityProducerV1::start(
+                project_sessions.clone(),
+                identity.clone(),
+                8,
+            )
+            .expect("producer"),
+        );
+        let settlements = Arc::new(
+            tracedecay_application::observability::DeliverySettlementAuthorityV1::new(
+                project_sessions.clone(),
+                producer,
+                identity,
+            )
+            .expect("settlement authority"),
+        );
+        let fixture = ReplayOwnerFixture {
+            _temp: temp,
+            _settlement_runtime: settlement_runtime,
+            project_sessions,
+            settlements,
+            background_cpu: Arc::new(
+                tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1::new(
+                    std::num::NonZeroUsize::MIN,
+                ),
+            ),
+        };
+        (fixture, older, newer)
+    }
+
+    impl ReplayOwnerFixture {
+        fn register(&self, graph: &ProjectGraph) -> ReplayConsumerStart {
+            register_hook_v2_replay_consumer(
+                Arc::clone(graph),
+                Arc::clone(&self.settlements),
+                self.project_sessions.clone(),
+                Arc::clone(&self.background_cpu),
+            )
+        }
+    }
+
+    async fn assert_owner_keeps_replay(data_root: &Path, owner: &ProjectGraph) {
+        let owner_task_running = registered_replay_roots()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(data_root.to_path_buf(), owner.project_root().to_path_buf()))
+            .is_some_and(|registered| {
+                Weak::ptr_eq(&registered.graph, &Arc::downgrade(owner))
+                    && registered
+                        .task
+                        .as_ref()
+                        .is_some_and(|task| !task.is_finished())
+            });
+        assert!(
+            owner_task_running,
+            "the owner must keep the data root's running replay consumer"
+        );
+        assert!(hook_v2_replay_consumer_registered(data_root));
+        assert!(
+            spool_watch::consumer_attached(data_root, owner.project_root()),
+            "the owner's consumer must keep the spool wake"
+        );
+        shutdown_hook_v2_replay_consumer(data_root).await;
+        assert!(!hook_v2_replay_consumer_registered(data_root));
+    }
+
+    /// The older owner's graph is gone by the time the project reopens, so
+    /// the newer owner registers; the older owner's retirement then arrives.
+    #[tokio::test]
+    async fn a_late_retirement_leaves_the_newer_owners_replay_consumer_running() {
+        let (fixture, older, newer) = replay_owner_fixture().await;
+        let data_root = older.hook_store_layout().data_root.clone();
+        assert_eq!(data_root, newer.hook_store_layout().data_root);
+        assert_eq!(
+            fixture.register(&older),
+            ReplayConsumerStart::Started,
+            "the older owner starts replay"
+        );
+        let older_owner = Arc::downgrade(&older);
+        drop(older);
+        assert_eq!(
+            fixture.register(&newer),
+            ReplayConsumerStart::Started,
+            "the reopened owner starts replay"
+        );
+
+        retire_hook_v2_replay_consumer(&data_root, &older_owner).await;
+
+        assert_owner_keeps_replay(&data_root, &newer).await;
+    }
+
+    /// The project reopens while its retiring owner's server still holds the
+    /// older graph. The reopened owner must take over the data root, or the
+    /// older graph's release leaves the project with no consumer at all.
+    #[tokio::test]
+    async fn a_reopen_takes_over_replay_from_an_owner_still_retiring() {
+        let (fixture, older, newer) = replay_owner_fixture().await;
+        let data_root = older.hook_store_layout().data_root.clone();
+        assert_eq!(
+            fixture.register(&older),
+            ReplayConsumerStart::Started,
+            "the older owner starts replay"
+        );
+        let newer_registered = fixture.register(&newer);
+
+        retire_hook_v2_replay_consumer(&data_root, &Arc::downgrade(&older)).await;
+        drop(older);
+
+        assert_eq!(
+            newer_registered,
+            ReplayConsumerStart::Started,
+            "the reopened owner's registration must be accepted"
+        );
+        assert_owner_keeps_replay(&data_root, &newer).await;
+    }
+
+    /// Project opens register from native workers, which have no Tokio
+    /// runtime; the reopened owner must still take the data root over.
+    #[tokio::test]
+    async fn a_registration_off_tokio_takes_over_replay() {
+        let (fixture, older, newer) = replay_owner_fixture().await;
+        let data_root = older.hook_store_layout().data_root.clone();
+        assert_eq!(fixture.register(&older), ReplayConsumerStart::Started);
+
+        let registered = std::thread::scope(|scope| {
+            scope
+                .spawn(|| fixture.register(&newer))
+                .join()
+                .expect("registration thread")
+        });
+
+        assert_eq!(registered, ReplayConsumerStart::Started);
+        assert_owner_keeps_replay(&data_root, &newer).await;
     }
 }

@@ -7,22 +7,7 @@ load("@rules_rust//rust:defs.bzl", "rust_clippy_aspect", _rust_test = "rust_test
 _POSIX_LAUNCHER = """#!/bin/sh
 set -eu
 : "${{TEST_TMPDIR:?Bazel did not provide TEST_TMPDIR}}"
-export RUSTUP_HOME="${{RUSTUP_HOME:-$HOME/.rustup}}"
-# The directory holding the rustup proxies (rust-analyzer among them), which
-# the LSP acceptance puts on the daemon's PATH. CARGO_HOME/bin is the usual
-# place; a CARGO_HOME holding just a registry (a shared build cache) has no
-# proxies there, so the directories that can hold them are probed for the
-# proxy itself. A rustup found elsewhere (a package manager stub) does not
-# name the proxy directory, so it is only the last candidate.
-export TRACEDECAY_TEST_RUSTUP_BIN="${{CARGO_HOME:-$HOME/.cargo}}/bin"
-if [ ! -x "$TRACEDECAY_TEST_RUSTUP_BIN/rust-analyzer" ]; then
-  for proxy_dir in "$HOME/.cargo/bin" "$(dirname "$(command -v rust-analyzer 2>/dev/null || echo /nonexistent/x)")" "$(dirname "$(command -v rustup 2>/dev/null || echo /nonexistent/x)")"; do
-    if [ -x "$proxy_dir/rust-analyzer" ]; then
-      export TRACEDECAY_TEST_RUSTUP_BIN="$proxy_dir"
-      break
-    fi
-  done
-fi
+export RUSTUP_HOME="$TEST_TMPDIR/rustup-home"
 export CARGO_HOME="$TEST_TMPDIR/cargo-home"
 export HOME="$TEST_TMPDIR/home"
 mkdir -p "$HOME"
@@ -42,6 +27,7 @@ export PATH="{toolchain_path}:$PATH"
 # Names such as CARGO_BIN_EXE_<bin> may carry `-`, which no shell variable
 # can, so each assignment goes through env as its own argument: a runfiles
 # path with spaces stays one word.
+{test_filter}
 exec env {runfiles_env} "$TEST_SRCDIR/$TEST_WORKSPACE/{binary}" "$@"
 """
 
@@ -51,15 +37,8 @@ if not defined TEST_TMPDIR (
   echo Bazel did not provide TEST_TMPDIR 1>&2
   exit /b 1
 )
-if not defined RUSTUP_HOME set "RUSTUP_HOME=%USERPROFILE%/.rustup"
-if not defined CARGO_HOME set "CARGO_HOME=%USERPROFILE%/.cargo"
 set "TEST_TMPDIR=%TEST_TMPDIR:/=\\%"
-set "TRACEDECAY_TEST_RUSTUP_BIN=%CARGO_HOME%/bin"
-rem The directory holding the rust-analyzer proxy is the authority; see the
-rem POSIX launcher. %%~dp$PATH:i resolves a name through PATH.
-if not exist "%TRACEDECAY_TEST_RUSTUP_BIN%\rust-analyzer.exe" (
-  for %%i in (rust-analyzer.exe) do if not "%%~dp$PATH:i"=="" set "TRACEDECAY_TEST_RUSTUP_BIN=%%~dp$PATH:i"
-)
+set "RUSTUP_HOME=%TEST_TMPDIR%\\rustup-home"
 set "CARGO_HOME=%TEST_TMPDIR%\\cargo-home"
 set "HOME=%TEST_TMPDIR%\\home"
 set "USERPROFILE=%HOME%"
@@ -80,7 +59,7 @@ if not exist "%TEST_BINARY%" (
   dir /s /b "%TEST_SRCDIR%" 1>&2
   exit /b 1
 )
-"%TEST_BINARY%" %*
+{test_filter}
 exit /b %ERRORLEVEL%
 """
 
@@ -94,6 +73,8 @@ def _runfiles_path(file, workspace):
 def _isolated_rust_test_impl(ctx):
     test_binary = ctx.executable.test_binary
     toolchain = ctx.toolchains["@rules_rust//rust:toolchain_type"]
+    analyzer = ctx.toolchains["@rules_rust//rust/rust_analyzer:toolchain_type"]
+    node = ctx.toolchains["@rules_nodejs//nodejs:runtime_toolchain_type"].nodeinfo.node
     windows = ctx.target_platform_has_constraint(
         ctx.attr._windows[platform_common.ConstraintValueInfo],
     )
@@ -116,6 +97,15 @@ def _isolated_rust_test_impl(ctx):
     }
     for variable, file in {"CARGO": toolchain.cargo, "RUSTC": toolchain.rustc, "RUSTDOC": toolchain.rust_doc}.items():
         paths[variable] = _runfiles_path(file, workspace)
+    for variable, file in {"RUST_ANALYZER": analyzer.rust_analyzer, "NODE": node}.items():
+        paths[variable] = _runfiles_path(file, workspace)
+    analyzer_sources = analyzer.rustc_srcs[DefaultInfo].files.to_list()
+    source_repository = _runfiles_path(analyzer_sources[0], workspace).split("/")[0]
+    paths["RUST_SRC_PATH"] = "/".join([
+        source_repository,
+        analyzer.rustc_srcs.label.package,
+        analyzer.rustc_srcs_path,
+    ])
     # Distribution acceptance explicitly supplies its extracted CLI through
     # --test_env. Every other runfile, and the default CLI, stays declared here.
     if windows:
@@ -134,8 +124,18 @@ def _isolated_rust_test_impl(ctx):
     # Production test runners invoke literal `cargo` and feedback fixtures
     # invoke literal `rustc`. Those must use the same declared toolchain as
     # CARGO/RUSTC, even after a child isolates HOME or changes directory.
-    toolchain_bin = paths["RUSTC"].rsplit("/", 1)[0]
-    toolchain_path = ("%TEST_SRCDIR%/" if windows else "$TEST_SRCDIR/") + toolchain_bin
+    runfiles_root = "%TEST_SRCDIR%/" if windows else "$TEST_SRCDIR/"
+    toolchain_path = (";" if windows else ":").join([
+        runfiles_root + paths[variable].rsplit("/", 1)[0]
+        for variable in ["RUSTC", "RUST_ANALYZER", "NODE"]
+    ])
+    test_filter = ""
+    if windows:
+        test_filter = '"%TEST_BINARY%" %*'
+        if ctx.attr.use_libtest_harness:
+            test_filter = 'if defined TESTBRIDGE_TEST_ONLY (\n  "%TEST_BINARY%" "%TESTBRIDGE_TEST_ONLY%" %*\n) else (\n  "%TEST_BINARY%" %*\n)'
+    elif ctx.attr.use_libtest_harness:
+        test_filter = 'if [ -n "${TESTBRIDGE_TEST_ONLY:-}" ]; then\n  set -- "$TESTBRIDGE_TEST_ONLY" "$@"\nfi'
     ctx.actions.write(
         output = executable,
         content = template.format(
@@ -143,11 +143,13 @@ def _isolated_rust_test_impl(ctx):
             package = ctx.label.package,
             runfiles_env = runfiles_env,
             toolchain_path = toolchain_path,
+            test_filter = test_filter,
         ),
         is_executable = True,
     )
     runfiles = ctx.runfiles(
-        files = [test_binary] + runfiles_env_files,
+        files = [test_binary, node, analyzer.rust_analyzer, analyzer.rustc, analyzer.proc_macro_srv] +
+                runfiles_env_files + analyzer_sources + ctx.files._analyzer_runtime,
         transitive_files = toolchain.all_files,
     ).merge(
         ctx.attr.test_binary[DefaultInfo].default_runfiles,
@@ -156,9 +158,14 @@ def _isolated_rust_test_impl(ctx):
         runfiles = runfiles.merge(target[DefaultInfo].default_runfiles)
     test_environment = ctx.attr.test_binary[RunEnvironmentInfo]
     environment = dict(test_environment.environment)
-    environment["RUSTUP_TOOLCHAIN"] = toolchain.version
+    # Child fixtures retain the declared compiler's channel identity while
+    # executables and standard sources come from runfiles, without rustup.
+    environment["RUSTUP_TOOLCHAIN"] = (
+        "{}-{}".format(toolchain.channel, toolchain.iso_date) if toolchain.iso_date else toolchain.version
+    )
     environment["RUSTC_WRAPPER"] = ""
     environment["RUSTC_WORKSPACE_WRAPPER"] = ""
+    environment.setdefault("RUST_TEST_THREADS", "4")
     return [
         DefaultInfo(executable = executable, runfiles = runfiles),
         OutputGroupInfo(
@@ -167,7 +174,11 @@ def _isolated_rust_test_impl(ctx):
         ),
         RunEnvironmentInfo(
             environment = environment,
-            inherited_environment = test_environment.inherited_environment,
+            inherited_environment = [
+                variable
+                for variable in test_environment.inherited_environment
+                if variable != "RUSTUP_TOOLCHAIN"
+            ],
         ),
     ]
 
@@ -182,9 +193,19 @@ _isolated_rust_test = rule(
             cfg = "target",
             mandatory = True,
         ),
+        "use_libtest_harness": attr.bool(default = True),
         "_windows": attr.label(default = "@platforms//os:windows"),
+        "_analyzer_runtime": attr.label(
+            default = "@rust_analyzer_tools//:rustc_lib",
+            allow_files = True,
+            cfg = "exec",
+        ),
     },
-    toolchains = ["@rules_rust//rust:toolchain_type"],
+    toolchains = [
+        "@rules_rust//rust:toolchain_type",
+        "@rules_rust//rust/rust_analyzer:toolchain_type",
+        "@rules_nodejs//nodejs:runtime_toolchain_type",
+    ],
     test = True,
 )
 
@@ -223,7 +244,7 @@ def rust_test(name, tags = [], runfiles_env = {}, partitions = {}, **kwargs):
     visibility = kwargs.pop("visibility", None)
     test_attributes = {
         attribute: kwargs.pop(attribute)
-        for attribute in ["args", "size", "timeout", "flaky", "local", "shard_count"]
+        for attribute in ["args", "size", "timeout", "flaky", "local", "shard_count", "exec_properties"]
         if attribute in kwargs
     }
     binary_name = name + "__binary"
@@ -231,13 +252,12 @@ def rust_test(name, tags = [], runfiles_env = {}, partitions = {}, **kwargs):
         "TRACEDECAY_DATA_DIR": "/dev/null",
         "TRACEDECAY_DISABLE_GLOBAL_DB": "1",
     }
-    data = list(kwargs.pop("data", []))
-    present = [native.package_relative_label(entry) for entry in data]
-    for label in runfiles_env.values():
-        resolved = native.package_relative_label(label)
-        if resolved not in present:
-            present.append(resolved)
-            data.append(label)
+    # Owned resource globs can overlap a suite's explicit data declarations.
+    # Normalize relative labels before deduplication, including runtime tools.
+    data = depset([
+        native.package_relative_label(entry)
+        for entry in list(kwargs.pop("data", [])) + runfiles_env.values()
+    ]).to_list()
     if "crate" not in kwargs:
         kwargs.setdefault("crate_name", name.replace("-", "_"))
     _rust_test(
@@ -252,6 +272,7 @@ def rust_test(name, tags = [], runfiles_env = {}, partitions = {}, **kwargs):
         "name": name,
         "tags": tags,
         "test_binary": ":" + binary_name,
+        "use_libtest_harness": kwargs.get("use_libtest_harness", True),
         "runfiles_env": {
             variable: str(native.package_relative_label(label))
             for variable, label in runfiles_env.items()
@@ -262,6 +283,9 @@ def rust_test(name, tags = [], runfiles_env = {}, partitions = {}, **kwargs):
         }.keys()),
     }
     wrapper_args.update(test_attributes)
+    exec_properties = {"cpu_count": "4"}
+    exec_properties.update(wrapper_args.get("exec_properties", {}))
+    wrapper_args["exec_properties"] = exec_properties
     if visibility != None:
         wrapper_args["visibility"] = visibility
     base_args = wrapper_args.get("args", [])

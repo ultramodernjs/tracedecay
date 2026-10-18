@@ -29,6 +29,7 @@ use tower::ServiceExt;
 use tracedecay_application::http_agent::http_agent;
 use tracedecay_contracts::remote::auth::RemoteEnrollmentAdmissionEvidenceV1;
 use tracedecay_contracts::remote::capture::RemoteWriterAuthorityV1;
+use tracedecay_contracts::remote::query::RemoteQueryPolicyRecordV1;
 use tracedecay_contracts::remote::replay::RemoteReplayPolicyEvidenceV1;
 use tracedecay_contracts::remote::status::RemoteOperationalStatusReadV1;
 use tracedecay_contracts::{
@@ -39,10 +40,14 @@ use tracedecay_daemon_service::logging::unavailable_error;
 use tracedecay_daemon_service::remote_http_transport::RemoteBrainTlsListener;
 #[cfg(test)]
 use tracedecay_daemon_service::remote_http_transport::{
-    RemoteBrainTlsEgressObserver, RemoteBrainTlsEgressSnapshot, RemoteBrainTlsIngressSnapshot,
+    RemoteBrainTlsDeadlines, RemoteBrainTlsEgressObserver, RemoteBrainTlsEgressSnapshot,
+    RemoteBrainTlsIngressSnapshot,
 };
+use tracedecay_dashboard_api::{ConnectionExecutor, serve_loopback};
 use tracedecay_domain::{BrainNodeId, EnrollmentGrantV1, ProjectId};
+use tracedecay_runtime_core::native_runtime::{self, TimeoutError};
 use tracedecay_rusqlite_runtime::remote::RemoteWriterPublicationErrorV1;
+use tracedecay_store_runtime::RemoteNodeOperatorErrorV1;
 
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_domain::errors::{Result, TraceDecayError};
@@ -139,6 +144,7 @@ struct RemoteWriterAuthorityPublicationRequestV1 {
     node_id: BrainNodeId,
     writer: RemoteWriterAuthorityV1,
     replay_policy: RemoteReplayPolicyEvidenceV1,
+    query_policy: RemoteQueryPolicyRecordV1,
 }
 
 #[derive(Clone)]
@@ -146,6 +152,7 @@ pub(super) struct DaemonHttpApplicationRegistry {
     routers: Arc<Mutex<ProjectRouterCache>>,
     resolver: Arc<SyncRwLock<Option<ProjectRouterResolver>>>,
     resolver_admission: Arc<Semaphore>,
+    cold_resolution_deadline: Duration,
     remote: Arc<SyncRwLock<Option<RemoteHttpApplicationMount>>>,
     active: Arc<AtomicBool>,
     remote_deletion_runtime_owners:
@@ -158,6 +165,7 @@ impl Default for DaemonHttpApplicationRegistry {
             routers: Arc::new(Mutex::new(ProjectRouterCache::default())),
             resolver: Arc::new(SyncRwLock::new(None)),
             resolver_admission: Arc::new(Semaphore::new(MAX_HTTP_APPLICATION_COLD_RESOLUTIONS)),
+            cold_resolution_deadline: HTTP_APPLICATION_COLD_RESOLUTION_DEADLINE,
             remote: Arc::new(SyncRwLock::new(None)),
             active: Arc::new(AtomicBool::new(false)),
             remote_deletion_runtime_owners: Arc::new(SyncRwLock::new(None)),
@@ -166,6 +174,12 @@ impl Default for DaemonHttpApplicationRegistry {
 }
 
 impl DaemonHttpApplicationRegistry {
+    #[cfg(test)]
+    pub(super) fn with_cold_resolution_deadline(mut self, deadline: Duration) -> Self {
+        self.cold_resolution_deadline = deadline;
+        self
+    }
+
     pub(super) async fn mount(&self, project_id: &str, router: Router) -> Result<()> {
         let project_id =
             ProjectId::new(project_id.to_owned()).map_err(|error| TraceDecayError::Config {
@@ -191,16 +205,9 @@ impl DaemonHttpApplicationRegistry {
         F: Fn(ProjectId) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Option<Router>>> + Send + 'static,
     {
-        let mut slot = self.resolver.write().map_err(|_| TraceDecayError::Config {
-            message: "daemon HTTP project resolver lock is poisoned".to_owned(),
-        })?;
-        if slot.is_some() {
-            return Err(TraceDecayError::Config {
-                message: "daemon HTTP project resolver is already installed".to_owned(),
-            });
-        }
-        *slot = Some(Arc::new(move |project_id| Box::pin(resolver(project_id))));
-        Ok(())
+        let resolver: ProjectRouterResolver =
+            Arc::new(move |project_id| Box::pin(resolver(project_id)));
+        install_once(&self.resolver, resolver, "daemon HTTP project resolver")
     }
 
     pub(super) fn install_remote(
@@ -209,39 +216,26 @@ impl DaemonHttpApplicationRegistry {
         credentials: Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>,
         runtime: Option<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>>,
     ) -> Result<()> {
-        let mut slot = self.remote.write().map_err(|_| TraceDecayError::Config {
-            message: "daemon HTTP Remote Brain router lock is poisoned".to_owned(),
-        })?;
-        if slot.is_some() {
-            return Err(TraceDecayError::Config {
-                message: "daemon HTTP Remote Brain router is already installed".to_owned(),
-            });
-        }
-        *slot = Some(RemoteHttpApplicationMount {
-            router,
-            credentials,
-            runtime,
-        });
-        Ok(())
+        install_once(
+            &self.remote,
+            RemoteHttpApplicationMount {
+                router,
+                credentials,
+                runtime,
+            },
+            "daemon HTTP Remote Brain router",
+        )
     }
 
     pub(super) fn install_remote_deletion_runtime_owners(
         &self,
         owners: super::remote_deletion::RemoteDeletionRuntimeOwners,
     ) -> Result<()> {
-        let mut slot =
-            self.remote_deletion_runtime_owners
-                .write()
-                .map_err(|_| TraceDecayError::Config {
-                    message: "daemon remote deletion executor lock is poisoned".to_owned(),
-                })?;
-        if slot.is_some() {
-            return Err(TraceDecayError::Config {
-                message: "daemon remote deletion executor is already installed".to_owned(),
-            });
-        }
-        *slot = Some(owners);
-        Ok(())
+        install_once(
+            &self.remote_deletion_runtime_owners,
+            owners,
+            "daemon remote deletion executor",
+        )
     }
 
     pub(super) fn remote_deletion_runtime_owners(
@@ -297,14 +291,14 @@ impl DaemonHttpApplicationRegistry {
         // A cold project route resolution can park on daemon project-open
         // work; bound it so an HTTP caller never waits unboundedly.
         let resolved = tracing::Instrument::instrument(
-            tokio::time::timeout(
-                HTTP_APPLICATION_COLD_RESOLUTION_DEADLINE,
-                resolver(project_id.clone()),
-            ),
+            native_runtime::timeout(self.cold_resolution_deadline, resolver(project_id.clone())),
             tracing::trace_span!("daemon.http.application.router_resolve"),
         )
         .await
-        .map_err(|_| ProjectRouterResolutionError::TimedOut)?
+        .map_err(|error| match error {
+            TimeoutError::Elapsed => ProjectRouterResolutionError::TimedOut,
+            TimeoutError::TimerUnavailable(_) => ProjectRouterResolutionError::Unavailable,
+        })?
         .map_err(|_| ProjectRouterResolutionError::Unavailable)?;
         let Some(router) = resolved else {
             return Ok(None);
@@ -335,8 +329,20 @@ impl DaemonHttpApplicationRegistry {
             )
             .route("/remote-nodes/provision", post(provision_remote_node))
             .route(
+                "/remote-nodes/join",
+                post(super::remote_join::join_remote_node),
+            )
+            .route(
+                "/remote-nodes/drain",
+                post(super::remote_drain::drain_remote_node),
+            )
+            .route(
                 "/remote-nodes/writer-authority",
                 post(publish_remote_writer_authority),
+            )
+            .route(
+                "/remote-nodes/revoke",
+                post(super::remote_revocation::revoke_remote_node),
             )
             .route("/remote-status", get(remote_operational_status))
             // Deletion lifecycle intake. The upstream lanes mounted this at
@@ -391,7 +397,7 @@ impl DaemonHttpApplicationRegistry {
         self.active.load(Ordering::Acquire)
     }
 
-    fn remote_runtime(
+    pub(super) fn remote_runtime(
         &self,
     ) -> Option<Arc<tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1>> {
         self.remote.read().ok().and_then(|remote| {
@@ -402,6 +408,20 @@ impl DaemonHttpApplicationRegistry {
     }
 }
 
+/// Fills a write-once registry slot; a second install is a typed error.
+fn install_once<T>(slot: &SyncRwLock<Option<T>>, value: T, name: &str) -> Result<()> {
+    let mut slot = slot.write().map_err(|_| TraceDecayError::Config {
+        message: format!("{name} lock is poisoned"),
+    })?;
+    if slot.is_some() {
+        return Err(TraceDecayError::Config {
+            message: format!("{name} is already installed"),
+        });
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 async fn provision_remote_node(
     State(registry): State<DaemonHttpApplicationRegistry>,
     Json(request): Json<RemoteNodeProvisionRequestV1>,
@@ -409,18 +429,48 @@ async fn provision_remote_node(
     let Some(runtime) = registry.remote_runtime() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match tracing::Instrument::instrument(
-        runtime.provision_remote_node(request.grant, request.admission),
-        tracing::trace_span!("daemon.http.application.remote_node_provision"),
-    )
-    .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => {
-            tracing::error!(%error, "remote node provision failed");
-            (StatusCode::CONFLICT, error.to_string()).into_response()
+    // This listener serves on Tokio workers, and provisioning writes the node
+    // store through synchronous storage ports that park their thread on the
+    // writer, so it runs on a blocking-pool thread.
+    let provision =
+        native_runtime::NativeTask::spawn_off_native_thread(tracing::Instrument::instrument(
+            async move {
+                runtime
+                    .provision_remote_node(request.grant, request.admission)
+                    .await
+            },
+            tracing::trace_span!("daemon.http.application.remote_node_provision"),
+        ));
+    let Ok(provision) = provision else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match provision.wait().await {
+        native_runtime::NativeTaskOutcome::Completed(Ok(())) => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        native_runtime::NativeTaskOutcome::Completed(Err(error)) => {
+            remote_node_operator_refusal(error)
+        }
+        native_runtime::NativeTaskOutcome::Cancelled
+        | native_runtime::NativeTaskOutcome::Panicked(_) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
+}
+
+pub(super) fn remote_node_operator_refusal(error: RemoteNodeOperatorErrorV1) -> Response {
+    tracing::warn!(%error, "remote node operator request refused");
+    let status = match error {
+        RemoteNodeOperatorErrorV1::InvalidRequest => StatusCode::BAD_REQUEST,
+        RemoteNodeOperatorErrorV1::BrainIdentityConflict | RemoteNodeOperatorErrorV1::Conflict => {
+            StatusCode::CONFLICT
+        }
+        RemoteNodeOperatorErrorV1::CapacityExceeded => StatusCode::TOO_MANY_REQUESTS,
+        RemoteNodeOperatorErrorV1::AuthorityUnavailable
+        | RemoteNodeOperatorErrorV1::AuthorityUnreachable => StatusCode::BAD_GATEWAY,
+        RemoteNodeOperatorErrorV1::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(serde_json::json!({ "code": error }))).into_response()
 }
 
 async fn publish_remote_writer_authority(
@@ -435,6 +485,7 @@ async fn publish_remote_writer_authority(
             &request.node_id,
             request.writer,
             request.replay_policy,
+            request.query_policy,
         ),
         tracing::trace_span!("daemon.http.application.remote_writer_authority_publish"),
     )
@@ -489,27 +540,14 @@ const REMOTE_STATUS_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn live_remote_operational_status(
     profile: &tracedecay_runtime_core::config::ProfileRoot,
 ) -> Result<RemoteOperationalStatusReadV1> {
-    let connection = super::current_profile_daemon_connection(profile)?;
-    let Some(endpoint) = connection.http_application_endpoint() else {
-        return Err(TraceDecayError::Config {
-            message: "TraceDecay daemon HTTP application endpoint is not published. Start or restart the daemon.".to_owned(),
-        });
-    };
-    let auth_token = connection.auth_token();
-    let origin = format!("http://{endpoint}");
-    let url = format!("http://{endpoint}/remote-status");
-    let agent = http_agent(
-        ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(REMOTE_STATUS_HTTP_TIMEOUT))
-            .build(),
-    );
+    let (origin, auth_token, agent) = live_local_http(profile)?;
+    let url = format!("{origin}/remote-status");
     let mut response = agent
         .get(&url)
         .header("Authorization", format!("Bearer {auth_token}"))
         .header("Origin", origin)
         .call()
-        .map_err(|_| remote_status_daemon_unavailable(profile))?;
+        .map_err(|_| live_daemon_unavailable(profile))?;
     if response.status().as_u16() != 200 {
         return Err(TraceDecayError::Config {
             message: format!(
@@ -533,7 +571,31 @@ pub fn live_remote_operational_status(
     }
 }
 
-fn remote_status_daemon_unavailable(
+/// Origin, bearer token and agent for an operator call to the running
+/// daemon's authenticated loopback HTTP application.
+pub(super) fn live_local_http(
+    profile: &tracedecay_runtime_core::config::ProfileRoot,
+) -> Result<(String, String, ureq::Agent)> {
+    let connection = super::current_profile_daemon_connection(profile)?;
+    let Some(endpoint) = connection.http_application_endpoint() else {
+        return Err(TraceDecayError::Config {
+            message: "TraceDecay daemon HTTP application endpoint is not published. Start or restart the daemon.".to_owned(),
+        });
+    };
+    let agent = http_agent(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(REMOTE_STATUS_HTTP_TIMEOUT))
+            .build(),
+    );
+    Ok((
+        format!("http://{endpoint}"),
+        connection.auth_token().to_owned(),
+        agent,
+    ))
+}
+
+pub(super) fn live_daemon_unavailable(
     profile: &tracedecay_runtime_core::config::ProfileRoot,
 ) -> TraceDecayError {
     match tracedecay_daemon_control::default_socket_path(profile.data_dir()) {
@@ -736,9 +798,9 @@ pub(super) struct DaemonHttpApplicationService {
     active: Arc<AtomicBool>,
     remote_credentials: Option<Arc<tracedecay_store_runtime::DaemonRemoteCredentialAuthorityV1>>,
     shutdown: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<Result<()>>>,
+    task: Option<JoinHandle<()>>,
     remote_tls_shutdown: Option<oneshot::Sender<()>>,
-    remote_tls_task: Option<JoinHandle<Result<()>>>,
+    remote_tls_task: Option<native_runtime::NativeTask<std::result::Result<(), String>>>,
     #[cfg(test)]
     remote_tls_admission: Option<Arc<Semaphore>>,
     #[cfg(test)]
@@ -805,7 +867,27 @@ impl DaemonHttpApplicationService {
             Some(config) => Some(bind_remote_brain_tls_server(&registry, config).await?),
             None => None,
         };
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        Self::bind_serving_remote_tls(registry, auth_token, remote_tls_server).await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn bind_with_remote_tls_deadlines(
+        registry: DaemonHttpApplicationRegistry,
+        auth_token: &str,
+        remote_tls: &RemoteBrainTlsConfig,
+        deadlines: RemoteBrainTlsDeadlines,
+    ) -> Result<Self> {
+        let mut server = bind_remote_brain_tls_server(&registry, remote_tls).await?;
+        server.listener = server.listener.with_deadlines(deadlines);
+        Self::bind_serving_remote_tls(registry, auth_token, Some(server)).await
+    }
+
+    async fn bind_serving_remote_tls(
+        registry: DaemonHttpApplicationRegistry,
+        auth_token: &str,
+        remote_tls_server: Option<RemoteBrainTlsServer>,
+    ) -> Result<Self> {
+        let listener = asupersync::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|error| TraceDecayError::Config {
                 message: format!("failed to bind daemon HTTP loopback listener: {error}"),
@@ -823,23 +905,30 @@ impl DaemonHttpApplicationService {
             .map_err(|_| TraceDecayError::Config {
                 message: "daemon HTTP loopback origin is not text".to_owned(),
             })?;
+        // `/remote-deletions` reaches `project_server_lifecycle` inside its
+        // connection task, so the listener serves from Tokio.
+        let runtime = native_runtime::tokio_handle("daemon.http_application.loopback_listener")
+            .ok_or_else(|| TraceDecayError::Config {
+                message: "daemon HTTP loopback listener found no Tokio runtime".to_owned(),
+            })?;
         let active = Arc::clone(&registry.active);
         let (app, remote_credentials) = registry.router(admission.clone())?;
         active.store(true, Ordering::Release);
         let (shutdown, shutdown_requested) = oneshot::channel();
         let task_active = Arc::clone(&active);
-        let task = tokio::spawn(tracing::Instrument::instrument(
+        let serve_runtime = runtime.clone();
+        let task = runtime.spawn(tracing::Instrument::instrument(
             async move {
-                let result = axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
+                serve_loopback(
+                    ConnectionExecutor::Tokio(serve_runtime),
+                    listener,
+                    app,
+                    async {
                         let _ = shutdown_requested.await;
-                    })
-                    .await
-                    .map_err(|error| TraceDecayError::Config {
-                        message: format!("daemon HTTP application service failed: {error}"),
-                    });
+                    },
+                )
+                .await;
                 task_active.store(false, Ordering::Release);
-                result
             },
             tracing::trace_span!("daemon.http.application.listener"),
         ));
@@ -860,7 +949,8 @@ impl DaemonHttpApplicationService {
                 remote_tls_egress = Some(server.egress);
             }
             let listener_state = server.credentials;
-            remote_tls_task = Some(tokio::spawn(tracing::Instrument::instrument(
+            // A `NativeTask` output must be `Clone`, so the error travels as text.
+            let task = native_runtime::NativeTask::spawn(tracing::Instrument::instrument(
                 async move {
                     let result = server
                         .listener
@@ -870,10 +960,14 @@ impl DaemonHttpApplicationService {
                         Ok(()) => listener_state.publish_listener_stopped(),
                         Err(_) => listener_state.publish_listener_degraded(),
                     }
-                    result
+                    result.map_err(|error| error.to_string())
                 },
                 tracing::trace_span!("daemon.http.application.remote_tls_listener"),
-            )));
+            ))
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("Remote Brain TLS listener task could not start: {error}"),
+            })?;
+            remote_tls_task = Some(task);
         }
         Ok(Self {
             endpoint,
@@ -943,18 +1037,27 @@ impl DaemonHttpApplicationService {
         if let Some(shutdown) = self.remote_tls_shutdown.take() {
             let _ = shutdown.send(());
         }
-        let Some(task) = self.task.take() else {
+        let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
         task.await.map_err(|error| TraceDecayError::Config {
             message: format!("daemon HTTP application service task failed: {error}"),
-        })??;
-        let Some(task) = self.remote_tls_task.take() else {
+        })?;
+        let Some(task) = self.remote_tls_task.as_ref() else {
             return Ok(());
         };
-        task.await.map_err(|error| TraceDecayError::Config {
-            message: format!("Remote Brain TLS application service task failed: {error}"),
-        })?
+        let failure = match task.wait().await {
+            native_runtime::NativeTaskOutcome::Completed(result) => result.err(),
+            native_runtime::NativeTaskOutcome::Cancelled => Some("task cancelled".to_owned()),
+            native_runtime::NativeTaskOutcome::Panicked(panic) => {
+                Some(format!("task panicked: {panic}"))
+            }
+        };
+        failure.map_or(Ok(()), |failure| {
+            Err(TraceDecayError::Config {
+                message: format!("Remote Brain TLS application service task failed: {failure}"),
+            })
+        })
     }
 }
 

@@ -6,6 +6,7 @@ import type {
   DeliveryInboxPullRequestV1,
   DeliveryInboxPullRequestStateV1,
 } from '../../contracts/generated.ts';
+import { useScope } from '../../data/scope/store.ts';
 import { StateChip, type DomainStateKind } from '../../ui/StateChip.tsx';
 import { Panel } from '../../ui/instrument.tsx';
 import { cn } from '../../ui/cn.ts';
@@ -16,9 +17,9 @@ import {
   IdentityRow,
   ProviderStateChip,
   ReadOnlyProviderBadge,
-  microsToIso,
   shortSha,
 } from './deliveryChrome.tsx';
+import { formatMicrosUtc } from '../../ui/format.ts';
 import {
   coverageKind,
   membershipBasisDetail,
@@ -51,6 +52,7 @@ export function PullRequestInspector({
   className?: string;
 }) {
   const { inbox, location, navigate } = context;
+  const scope = useScope((state) => state.scope);
   const project = projectFor(inbox, row.project_id);
   const edges = edgesFor(inbox, row);
   const umbrellas = umbrellasFor(context.umbrellas, row.id);
@@ -128,7 +130,7 @@ export function PullRequestInspector({
                     ) : (
                       <StateChip
                         kind={providerOutcomeKind(snapshot.outcome)}
-                        detail={`${operation.last_complete === null ? 'attempt' : 'complete'} · ${microsToIso(snapshot.fetched_at_micros).slice(0, 16)}Z`}
+                        detail={`${operation.last_complete === null ? 'attempt' : 'complete'} · ${formatMicrosUtc(snapshot.fetched_at_micros).slice(0, 16)}Z`}
                       />
                     )}
                   </li>
@@ -147,7 +149,7 @@ export function PullRequestInspector({
               <span className="flex items-center gap-2">
                 <StateChip kind={coverageKind(item.coverage)} />
                 <span className="font-mono text-3xs text-text-muted">
-                  {microsToIso(item.observed_at_micros)}
+                  {formatMicrosUtc(item.observed_at_micros, { nullAs: 'not observed' })}
                 </span>
               </span>
             </div>
@@ -199,7 +201,7 @@ export function PullRequestInspector({
         ) : (
           <ul className="divide-y divide-edge-subtle">
             {edges.map((edge) => {
-              const href = membershipHref(edge.basis);
+              const href = membershipHref(edge.basis, scope);
               return (
                 <li key={edge.id} className="px-3 py-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -305,7 +307,7 @@ export function attentionSourceLabel(source: DeliveryAttentionSourceV1): string 
   }
 }
 
-export function attentionStateKind(state: DeliveryAttentionStateV1): DomainStateKind {
+function attentionStateKind(state: DeliveryAttentionStateV1): DomainStateKind {
   switch (state) {
     case 'active':
       return 'partial';

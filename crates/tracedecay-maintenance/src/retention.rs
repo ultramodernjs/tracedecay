@@ -6,7 +6,7 @@
 //! * `analytics_events`, hook/tool/skill telemetry. Derived, reconstructable
 //!   signal, so it carries a **safe default retention of 180 days**.
 //! * `lcm_raw_messages`, the stored session messages, retained for a
-//!   six-month recovery horizon. Current session stores additionally use
+//!   six-month recovery horizon. Current session stores also use
 //!   projection-durability-aware retention in `tracedecay_lcm::retention`.
 //!
 //! Every window is expressed in whole days. Rows are pruned only when their
@@ -32,6 +32,8 @@ use tracedecay_runtime_core::db::engine::{Executor, params};
 pub mod cold_store;
 /// Read-only diagnostics over retention-owned state.
 pub mod diagnostics;
+/// Bounded metadata census of every store family under a profile root.
+pub mod footprint;
 /// Exact-liveness mark-and-sweep for immutable derived code generations.
 /// Detection and deletion of corruption/recovery artifacts found beside live
 /// databases (plan 38, §5).
@@ -348,7 +350,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn disabled_retention_never_acquires_the_registered_writer() {
         let harness = RegisteredGlobalDbHarness::open("retention-disabled-no-writer").await;
         let database = harness.registered.as_ref();
@@ -357,7 +359,8 @@ mod tests {
         // Any writer acquisition would park behind this open transaction.
         let held_writer = database.begin_write_transaction().await.unwrap();
 
-        let reports = tokio::time::timeout(
+        let reports = asupersync::time::timeout(
+            asupersync::time::wall_now(),
             Duration::from_secs(2),
             prune_global_retention(database, &config_days(None), now),
         )
@@ -376,7 +379,7 @@ mod tests {
         assert_eq!(registered_analytics_count(database).await, 4);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn backlog_drains_in_bounded_commits_and_interruption_keeps_committed_slices() {
         let harness = RegisteredGlobalDbHarness::open("retention-bounded-slices").await;
         let database = harness.registered.as_ref();
@@ -457,7 +460,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn slice_deletes_only_rows_older_than_window_and_keeps_null_timestamps() {
         let directory = tempfile::tempdir().unwrap();
         let conn = test_conn(&directory);
@@ -489,7 +492,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn session_windows_require_durable_summary_lineage() {
         let directory = tempfile::tempdir().unwrap();
         let conn = test_conn(&directory);

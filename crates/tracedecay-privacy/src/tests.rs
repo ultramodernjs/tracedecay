@@ -10,18 +10,17 @@ use tracedecay_domain::{
 };
 
 use super::detect::{
-    DetectionError, SanitizationDetectorOriginV1, SanitizationDetectorRevisionV1,
-    SanitizationRemediationClassV1, SanitizationScanBoundaryV1, SanitizationScannedCoverageV1,
+    SanitizationDetectorOriginV1, SanitizationDetectorRevisionV1, SanitizationRemediationClassV1,
+    SanitizationScanBoundaryV1, SanitizationScannedCoverageV1,
 };
 use super::sanitize::OBSERVATION_SANITIZER_VERSION_V1;
 use super::{
     CODE_SOURCE_SANITIZER_VERSION_V1, ClaudeSanitizerPolicyV1, CodeSourceShapeV1,
-    DetectionConfidenceV1, LcmSensitiveRedactionPolicyV1, MEMORY_FACT_SANITIZER_VERSION_V1,
-    MemoryFactSanitizationV1, ObservationRecordParseErrorV1, ObservationSanitizationOutcomeV1,
-    PrivacyDetectorV1, PrivacySanitizerError, RecordSanitizerV1, SanitizationActionV1,
-    SanitizationFindingV1, SanitizedPayloadVerificationError,
-    parse_normalized_observation_record_v1, parse_observation_record_v1,
-    redact_lcm_sensitive_payload, sanitize_code_source_bytes, sanitize_memory_fact_payload,
+    DetectionConfidenceV1, MEMORY_FACT_SANITIZER_VERSION_V1, MemoryFactSanitizationV1,
+    ObservationRecordParseErrorV1, ObservationSanitizationOutcomeV1, PrivacyDetectorV1,
+    PrivacySanitizerError, RecordSanitizerV1, SanitizationActionV1, SanitizationFindingV1,
+    SanitizedPayloadVerificationError, parse_normalized_observation_record_v1,
+    parse_observation_record_v1, sanitize_code_source_bytes, sanitize_memory_fact_payload,
     sanitize_provider_metadata_json, verify_memory_fact_sanitization,
     verify_sanitized_json_payload,
 };
@@ -379,6 +378,75 @@ fn sanitize_parsed_rejects_ordering_domain_mismatch() {
         error,
         PrivacySanitizerError::OrderingDomainMismatch
     ));
+}
+
+fn sanitize_codex_session_locator(transcript_path: &str) -> Value {
+    let record = serde_json::to_vec(&json!({"type": "session_meta"})).unwrap();
+    let range = ObservationSourceRangeV1::new(0, u64::try_from(record.len()).unwrap()).unwrap();
+    let provider = ProviderId::new("codex").unwrap();
+    let session_id = SessionId::new("session.codex-locator").unwrap();
+    let record_id = ObservationId::new("session.codex-locator.meta").unwrap();
+    let parsed = parse_normalized_observation_record_v1(
+        &record,
+        range,
+        ObservationOrderingDomainV1::FileBytes,
+        |_| {
+            CanonicalObservationEnvelopeV1::new(
+                provider.clone(),
+                "session_meta",
+                record_id.clone(),
+                CanonicalObservationRelationsV1::new(session_id.clone()),
+                vec![CanonicalObservationFactV1::Session {
+                    project_path: Some("/Users/dev/project".to_owned()),
+                    location_path: Some("/Users/dev/project".to_owned()),
+                    transcript_path: Some(transcript_path.to_owned()),
+                    title: None,
+                    started_at: None,
+                    ended_at: None,
+                    source: Some("codex_rollout".to_owned()),
+                    native_source: Some("codex".to_owned()),
+                    profile: None,
+                    location_provenance: Some("rollout_context".to_owned()),
+                }],
+                CanonicalObservationEvidenceV1::new(ObservationOrderingDomainV1::FileBytes, range),
+            )
+            .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed)
+        },
+    )
+    .unwrap();
+    let source = ObservationSourceIdentityV1::for_provider(provider, session_id).unwrap();
+    let identity = ObservationIdentityMaterialV1::for_native_record(
+        source,
+        ObservationScopeV1::Profile,
+        ObservationSourceGenerationV1::new(1).unwrap(),
+        range,
+        ObservationOrderingDomainV1::FileBytes,
+        record_id,
+    )
+    .unwrap();
+    let outcome = RecordSanitizerV1::observation_v1()
+        .unwrap()
+        .sanitize_parsed(parsed, identity, retention_class())
+        .unwrap();
+    outcome.durable_observation().unwrap().payload()["facts"][0]["transcript_path"].clone()
+}
+
+/// The `codex/sessions/<date>/rollout-<uuid>` run of a rollout path reads as
+/// one high-entropy token, so the entropy heuristic replaced it and every
+/// Codex session row stored the redaction marker as its transcript path.
+#[test]
+fn observation_sanitizer_keeps_a_session_transcript_path_a_path() {
+    let path = "/Users/dev/.codex/sessions/2025/10/11/\
+                rollout-2025-10-11T09-41-27-0199d2a8-5c1e-7f32-9a4b-3e8f1c2d7b60.jsonl";
+    assert_eq!(sanitize_codex_session_locator(path), json!(path));
+
+    let credential = "ghp_KsY7QwT2mZ4bV9nR6cX1jH8pL3dG5fA0eUwQ";
+    let leaked = format!("/Users/dev/{credential}/rollout.jsonl");
+    let sanitized = sanitize_codex_session_locator(&leaked);
+    assert!(
+        !sanitized.as_str().unwrap().contains(credential),
+        "a credential inside a locator is still redacted: {sanitized}"
+    );
 }
 
 #[test]
@@ -1482,63 +1550,6 @@ fn custom_policy_behavior_has_a_deterministic_version_fingerprint() {
     assert_eq!(
         outcome.receipt().receipt().sanitizer_version(),
         first.version()
-    );
-}
-
-#[test]
-fn lcm_sensitive_redaction_parses_structured_payload_before_scanning_values() {
-    let policy = LcmSensitiveRedactionPolicyV1::enabled(["api_key"]);
-    let raw = r#"{"nested":{"api_key":"short","password":"owner-kept-value"},"safe":"keep"}"#;
-
-    let outcome =
-        redact_lcm_sensitive_payload(raw, &policy).expect("structured LCM privacy scan succeeds");
-    let sanitized: Value =
-        serde_json::from_str(outcome.text()).expect("structured output remains JSON");
-
-    assert_eq!(
-        sanitized["nested"]["api_key"],
-        "[TraceDecay redacted: sensitive field]"
-    );
-    assert_eq!(sanitized["nested"]["password"], "owner-kept-value");
-    assert_eq!(sanitized["safe"], "keep");
-    assert_eq!(outcome.patterns(), &["api_key".to_string()]);
-}
-
-#[test]
-fn lcm_sensitive_redaction_fails_closed_for_unknown_configured_patterns() {
-    let policy = LcmSensitiveRedactionPolicyV1::enabled(["api_keey"]);
-    let secret = "sk-unknown-policy-1234567890";
-
-    let outcome = redact_lcm_sensitive_payload(&format!("api_key={secret}"), &policy)
-        .expect("fail-closed LCM privacy scan succeeds");
-
-    assert!(!outcome.text().contains(secret));
-    assert_eq!(outcome.patterns(), &["api_key".to_string()]);
-}
-
-#[test]
-fn lcm_sensitive_redaction_rejects_duplicate_json_keys_before_materialization() {
-    let policy = LcmSensitiveRedactionPolicyV1::enabled(["api_key"]);
-    let raw = r#"{"api_key":"unit-test-placeholder-value","api_key":"safe-replacement"}"#;
-
-    assert!(matches!(
-        redact_lcm_sensitive_payload(raw, &policy),
-        Err(DetectionError::StructuredQuarantine)
-    ));
-}
-
-#[test]
-fn lcm_sensitive_redaction_rejects_payloads_above_the_canonical_raw_byte_limit() {
-    let policy = LcmSensitiveRedactionPolicyV1::enabled(["api_key"]);
-    let admitted = redact_lcm_sensitive_payload(r#"{"safe":"kept"}"#, &policy)
-        .expect("a record inside the byte limit is redacted");
-    assert_eq!(admitted.text(), r#"{"safe":"kept"}"#);
-    assert_eq!(admitted.patterns(), &[] as &[String]);
-
-    let raw = format!("{{{}", " ".repeat(1_048_576));
-    assert_eq!(
-        redact_lcm_sensitive_payload(&raw, &policy),
-        Err(DetectionError::ScanLimitExceeded)
     );
 }
 

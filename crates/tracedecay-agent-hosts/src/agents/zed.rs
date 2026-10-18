@@ -20,10 +20,11 @@ use serde_json::json;
 use tracedecay_domain::errors::Result;
 
 use super::host_bundle::{HostBundleRegistrationStateV1, HostComponentV1};
+use super::serve_args::ServeArgs;
 use super::{
     AgentIntegration, DoctorCounters, HealthcheckContext, InstallContext, JsonConfigDialect,
     McpDoctorLabels, install_mcp_server_entry, load_jsonc_file, report_mcp_registration,
-    uninstall_mcp_server_entry,
+    serve_entry_registration_state, uninstall_mcp_server_entry,
 };
 
 pub struct ZedIntegration;
@@ -57,6 +58,7 @@ impl AgentIntegration for ZedIntegration {
         doctor_check_registration(
             dc,
             &zed_settings_path(&ctx.home),
+            &ctx.catalog_profiles.serve_args(self.id()),
             "Zed user configuration",
             "Context server registered",
             "Context server NOT registered",
@@ -66,6 +68,7 @@ impl AgentIntegration for ZedIntegration {
             doctor_check_registration(
                 dc,
                 &project,
+                &ctx.catalog_profiles.serve_args(self.id()),
                 "Zed project configuration",
                 "project context server registered",
                 "project context server NOT registered",
@@ -81,7 +84,11 @@ impl AgentIntegration for ZedIntegration {
         if component != HostComponentV1::ContextMcp {
             return HostBundleRegistrationStateV1::Missing;
         }
-        zed_mcp_registration_state(&zed_settings_path(&ctx.home), None)
+        zed_mcp_registration_state(
+            &zed_settings_path(&ctx.home),
+            None,
+            &ctx.catalog_profiles.serve_args(self.id()),
+        )
     }
 
     fn host_component_registration_for_lifecycle(
@@ -93,7 +100,11 @@ impl AgentIntegration for ZedIntegration {
         if component != HostComponentV1::ContextMcp {
             return HostBundleRegistrationStateV1::Missing;
         }
-        zed_mcp_registration_state(&zed_settings_path(&ctx.home), Some(&install.tracedecay_bin))
+        zed_mcp_registration_state(
+            &zed_settings_path(&ctx.home),
+            Some(&install.tracedecay_bin),
+            &install.serve_args,
+        )
     }
 
     fn is_detected(&self, home: &Path) -> bool {
@@ -188,6 +199,7 @@ fn zed_project_settings_path(project: &Path) -> PathBuf {
 fn zed_mcp_registration_state(
     config: &Path,
     expected_binary: Option<&str>,
+    serve_args: &ServeArgs,
 ) -> HostBundleRegistrationStateV1 {
     let Ok(existing) = std::fs::read_to_string(config) else {
         return HostBundleRegistrationStateV1::Missing;
@@ -195,24 +207,11 @@ fn zed_mcp_registration_state(
     let Ok(settings) = JsonConfigDialect::Jsonc.parse_for_edit(config, &existing) else {
         return HostBundleRegistrationStateV1::Corrupt;
     };
-    let Some(server) = settings.pointer("/context_servers/tracedecay") else {
-        return HostBundleRegistrationStateV1::Missing;
-    };
-    let command_matches = server
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|command| {
-            expected_binary.map_or_else(|| !command.is_empty(), |expected| command == expected)
-        });
-    let serves_tracedecay = server
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|args| args.len() == 1 && args[0].as_str() == Some("serve"));
-    if server.is_object() && command_matches && serves_tracedecay {
-        HostBundleRegistrationStateV1::Current
-    } else {
-        HostBundleRegistrationStateV1::Repairable
-    }
+    settings
+        .pointer("/context_servers/tracedecay")
+        .map_or(HostBundleRegistrationStateV1::Missing, |server| {
+            serve_entry_registration_state(server, expected_binary, serve_args)
+        })
 }
 
 /// A host that is not installed is an informational finding, exactly as the
@@ -223,6 +222,7 @@ fn zed_mcp_registration_state(
 fn doctor_check_registration(
     dc: &mut DoctorCounters,
     config: &Path,
+    serve_args: &ServeArgs,
     product: &'static str,
     registered: &'static str,
     missing: &'static str,
@@ -238,7 +238,8 @@ fn doctor_check_registration(
     report_mcp_registration(
         dc,
         config,
-        zed_mcp_registration_state(config, None) == HostBundleRegistrationStateV1::Current,
+        zed_mcp_registration_state(config, None, serve_args)
+            == HostBundleRegistrationStateV1::Current,
         &McpDoctorLabels {
             agent_id: "zed",
             product,
@@ -261,7 +262,7 @@ fn install_mcp_if_selected(
         "context_servers",
         json!({
             "command": ctx.tracedecay_bin.clone(),
-            "args": ["serve"],
+            "args": ctx.serve_args.json(&[]),
         }),
         "Zed",
         JsonConfigDialect::Jsonc,
@@ -287,6 +288,7 @@ mod tests {
             tracedecay_bin: binary.to_string(),
             project_root: None,
             dashboard: false,
+            serve_args: Default::default(),
         }
     }
 
@@ -328,7 +330,7 @@ mod tests {
             "/tmp/tracedecay"
         );
         assert_eq!(
-            zed_mcp_registration_state(&config, Some("/tmp/tracedecay")),
+            zed_mcp_registration_state(&config, Some("/tmp/tracedecay"), &ServeArgs::default()),
             HostBundleRegistrationStateV1::Current
         );
 
@@ -376,7 +378,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            zed_mcp_registration_state(&config, Some("/tmp/tracedecay")),
+            zed_mcp_registration_state(&config, Some("/tmp/tracedecay"), &ServeArgs::default()),
             HostBundleRegistrationStateV1::Repairable
         );
     }

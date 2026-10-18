@@ -21,7 +21,7 @@ use tracedecay_tool_catalog::{
     OperationId, ProfileId, SchemaId, ScopeDimension,
 };
 
-use crate::{CanonicalInvocationResult, HttpJsonEnvelope, HttpProblemEnvelope};
+use crate::{CanonicalInvocationResult, HttpAdapterError, HttpJsonEnvelope};
 mod application_operation_owner;
 pub use application_operation_owner::http_application_owner_kind;
 
@@ -230,50 +230,12 @@ pub type HttpApplicationInvocationFuture = Pin<
     >,
 >;
 
-/// Concrete application owners mounted behind the HTTP adapter.
+/// The application owner mounted behind the HTTP adapter.
 ///
-/// Each method delegates to the corresponding application owner family. The
-/// adapter performs only extraction, owner selection, and canonical encoding.
+/// The adapter performs only extraction, owner admission, and canonical
+/// encoding; every admitted operation is delegated through [`Self::invoke`].
 pub trait HttpApplicationOwners: Clone + Send + Sync + 'static {
-    fn exposes_operation(
-        &self,
-        operation: ApplicationSurfaceOperation,
-    ) -> Result<bool, ApplicationContractError> {
-        is_http_application_operation_exposed(operation)
-    }
-
-    fn invoke_git(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture;
-
-    fn invoke_feedback(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture;
-
-    fn invoke_callable_code(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture;
-
-    fn invoke_primitive(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture;
-
-    fn invoke_observatory(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture;
-
-    fn invoke_configuration(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture;
-
-    fn invoke_context_scout(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture;
-
-    fn invoke_native_integration(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture;
-
-    fn invoke_retained(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture;
+    fn invoke(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture;
 }
 
 impl<F, Fut> HttpApplicationOwners for F
@@ -283,83 +245,14 @@ where
         + Send
         + 'static,
 {
-    fn invoke_git(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_feedback(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_callable_code(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_primitive(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_observatory(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_configuration(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_context_scout(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_native_integration(
-        &self,
-        request: HttpApplicationRequest,
-    ) -> HttpApplicationInvocationFuture {
-        Box::pin((self)(request))
-    }
-
-    fn invoke_retained(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture {
+    fn invoke(&self, request: HttpApplicationRequest) -> HttpApplicationInvocationFuture {
         Box::pin((self)(request))
     }
 }
 
+/// Axum view of the canonical [`ApplicationProblemKind::http_status`] mapping.
 pub fn application_problem_status(kind: ApplicationProblemKind) -> StatusCode {
-    match kind {
-        ApplicationProblemKind::InvalidRequest => StatusCode::BAD_REQUEST,
-        ApplicationProblemKind::NotFoundOrNotAuthorized => StatusCode::NOT_FOUND,
-        ApplicationProblemKind::Conflict
-        | ApplicationProblemKind::PartialEffect
-        | ApplicationProblemKind::Stale => StatusCode::CONFLICT,
-        ApplicationProblemKind::Unsupported => StatusCode::UNPROCESSABLE_ENTITY,
-        ApplicationProblemKind::ResetRequired | ApplicationProblemKind::Unavailable => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-        ApplicationProblemKind::ExecutionFailed => StatusCode::INTERNAL_SERVER_ERROR,
-        ApplicationProblemKind::Saturated => StatusCode::TOO_MANY_REQUESTS,
-        ApplicationProblemKind::Cancelled => StatusCode::REQUEST_TIMEOUT,
-        ApplicationProblemKind::TimedOut => StatusCode::GATEWAY_TIMEOUT,
-    }
-}
-
-impl<T> CanonicalInvocationResult<T> {
-    fn http_status(&self) -> StatusCode {
-        match &self.result {
-            Ok(_) => StatusCode::OK,
-            Err(problem) => application_problem_status(problem.problem.kind()),
-        }
-    }
+    StatusCode::from_u16(kind.http_status()).expect("canonical problem status is a valid code")
 }
 
 impl<T> CanonicalInvocationResult<T>
@@ -367,27 +260,35 @@ where
     T: Serialize,
 {
     pub fn into_http_response(self) -> Response {
-        let status = self.http_status();
-        if let Err(problem) = &self.result {
-            crate::observe::record_error_class(problem.problem.kind());
-        }
-        let envelope = self.into_http_json();
-        crate::observe::json_response(status, &envelope)
+        self.into_http_json().into_response()
+    }
+}
+
+impl<T: Serialize> IntoResponse for HttpJsonEnvelope<T> {
+    fn into_response(self) -> Response {
+        let status = match &self {
+            Self::Success(_) => StatusCode::OK,
+            Self::Problem(problem) => {
+                crate::observe::record_error_class(problem.application.problem.kind());
+                application_problem_status(problem.application.problem.kind())
+            }
+        };
+        crate::observe::json_response(status, &self)
+    }
+}
+
+impl IntoResponse for HttpAdapterError {
+    fn into_response(self) -> Response {
+        tracing::error!(error = %self, "application response could not be presented");
+        crate::observe::record_contract_error_class();
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
 }
 
 /// Encode a canonical problem for HTTP routes that do not have a catalog
 /// binding, such as operation-event subscription and cancellation.
 pub fn application_problem_response(application: ApplicationProblemEnvelope) -> Response {
-    crate::observe::record_error_class(application.problem.kind());
-    let status = application_problem_status(application.problem.kind());
-    crate::observe::json_response(
-        status,
-        &HttpJsonEnvelope::<Value>::Problem(Box::new(HttpProblemEnvelope {
-            binding_id: None,
-            application,
-        })),
-    )
+    HttpJsonEnvelope::<Value>::from(application).into_response()
 }
 
 /// Report an internal contract violation before a canonical problem envelope
@@ -442,6 +343,48 @@ pub(crate) fn invalid_request_response(
     match invalid_request_problem(request_id, code, message) {
         Ok(problem) => application_problem_response(problem),
         Err(error) => application_contract_error_response(error),
+    }
+}
+
+/// Admission shared by the JSON operation families mounted beside the
+/// application router. An operation this build does not mount is concealed
+/// the same way an unauthorised one is, so probing a path cannot reveal what
+/// exists; an unreadable body is the family's `invalid_body` problem.
+pub(crate) async fn dispatch_json_operation<Operation, Request, Invocation>(
+    operation: Option<Operation>,
+    request_id: RequestId,
+    body: Result<Json<Value>, JsonRejection>,
+    invalid_body: (&'static str, &'static str),
+    admit: impl FnOnce(Operation, RequestId, Value) -> Request,
+    invoke: impl FnOnce(Request) -> Invocation,
+) -> Response
+where
+    Invocation: Future<Output = Response>,
+{
+    let admitted = {
+        let _span = tracing::trace_span!("api.http.admission").entered();
+        match (operation, body) {
+            (None, _) => Err(adapter_problem_response(
+                request_id,
+                ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never),
+            )),
+            (Some(operation), Ok(Json(body))) => Ok(admit(operation, request_id, body)),
+            (Some(_), Err(_)) => Err(invalid_request_response(
+                request_id,
+                invalid_body.0,
+                invalid_body.1,
+            )),
+        }
+    };
+    match admitted {
+        Ok(request) => {
+            tracing::Instrument::instrument(
+                invoke(request),
+                tracing::trace_span!("api.http.handler"),
+            )
+            .await
+        }
+        Err(response) => response,
     }
 }
 
@@ -525,8 +468,16 @@ fn parse_git_read_operation(operation: &str) -> Option<ApplicationSurfaceOperati
     )
 }
 
+/// The closed set of feedback reads the dashboard binds through
+/// [`feedback_application_router`].
 fn parse_feedback_read_operation(operation: &str) -> Option<ApplicationSurfaceOperation> {
-    crate::feedback::feedback_read_operation(operation)
+    match operation {
+        "get" => Some(ApplicationSurfaceOperation::FeedbackGet),
+        "expand" => Some(ApplicationSurfaceOperation::FeedbackExpand),
+        "list" => Some(ApplicationSurfaceOperation::FeedbackList),
+        "proximity" => Some(ApplicationSurfaceOperation::FeedbackProximity),
+        _ => None,
+    }
 }
 
 fn parse_public_feedback_operation(operation: &str) -> Option<ApplicationSurfaceOperation> {
@@ -644,7 +595,7 @@ async fn invoke_route<O>(
 where
     O: HttpApplicationOwners,
 {
-    match owners.exposes_operation(operation) {
+    match is_http_application_operation_exposed(operation) {
         Ok(true) => {}
         Ok(false) => {
             return adapter_problem_response(
@@ -662,23 +613,13 @@ where
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let Some(owner_kind) = http_application_owner_kind(request.operation) else {
+    if http_application_owner_kind(request.operation).is_none() {
         return adapter_problem_response(
             request.request_id,
             ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never),
         );
-    };
-    let invocation = match owner_kind {
-        HttpApplicationOwnerKind::Git => owners.invoke_git(request),
-        HttpApplicationOwnerKind::Feedback => owners.invoke_feedback(request),
-        HttpApplicationOwnerKind::CallableCode => owners.invoke_callable_code(request),
-        HttpApplicationOwnerKind::Primitive => owners.invoke_primitive(request),
-        HttpApplicationOwnerKind::Observatory => owners.invoke_observatory(request),
-        HttpApplicationOwnerKind::Configuration => owners.invoke_configuration(request),
-        HttpApplicationOwnerKind::ContextScout => owners.invoke_context_scout(request),
-        HttpApplicationOwnerKind::NativeIntegration => owners.invoke_native_integration(request),
-        HttpApplicationOwnerKind::Retained => owners.invoke_retained(request),
-    };
+    }
+    let invocation = owners.invoke(request);
     match tracing::Instrument::instrument(invocation, tracing::trace_span!("api.http.handler"))
         .await
     {

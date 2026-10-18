@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use tokio::time::Instant;
+use std::time::Instant;
 
 /// Bounded exponential backoff between reconcile retries after a panicking
 /// pass. The floor keeps a transient panic from hot-looping the pool; the
@@ -142,119 +142,6 @@ impl ReconcilePanicGuardV1 {
         }
 
         self.next_attempt_at.is_some_and(|at| now < at)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn origin() -> Instant {
-        Instant::now()
-    }
-
-    #[test]
-    fn repeated_panics_back_off_and_then_quarantine() {
-        let mut guard = ReconcilePanicGuardV1::new();
-        let now = origin();
-
-        let mut delays = Vec::new();
-        let mut decisions = Vec::new();
-        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
-            let decision = guard.record_panic(now, 7);
-            decisions.push(decision);
-            if let ReconcilePanicDecisionV1::RetryAfter(delay) = decision {
-                delays.push(delay);
-            }
-        }
-
-        assert_eq!(
-            decisions.last(),
-            Some(&ReconcilePanicDecisionV1::Quarantine),
-            "an unchanged panicking input must reach a terminal state, not retry forever"
-        );
-        assert_eq!(
-            delays.len() as u32,
-            MAX_CONSECUTIVE_RECONCILE_PANICS_V1 - 1,
-            "every attempt before the bound is a delayed retry"
-        );
-        assert!(
-            delays.windows(2).all(|pair| pair[1] > pair[0]),
-            "retries must back off, not repeat identically: {delays:?}"
-        );
-        assert!(
-            delays
-                .iter()
-                .all(|delay| *delay >= RECONCILE_PANIC_BACKOFF_FLOOR
-                    && *delay <= RECONCILE_PANIC_BACKOFF_CEILING),
-            "delays stay inside the bounded window: {delays:?}"
-        );
-    }
-
-    #[test]
-    fn a_quarantined_guard_suppresses_further_passes_over_unchanged_input() {
-        let mut guard = ReconcilePanicGuardV1::new();
-        let now = origin();
-        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
-            guard.record_panic(now, 7);
-        }
-
-        let far_future = now + Duration::from_hours(24);
-        assert!(
-            guard.suppresses_pass(far_future, 7),
-            "unchanged input must stay quarantined however long the wait"
-        );
-    }
-
-    #[test]
-    fn changed_input_lifts_the_quarantine() {
-        let mut guard = ReconcilePanicGuardV1::new();
-        let now = origin();
-        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
-            guard.record_panic(now, 7);
-        }
-        assert!(guard.suppresses_pass(now, 7));
-
-        assert!(
-            !guard.suppresses_pass(now, 8),
-            "an advanced control epoch is new input and earns another attempt"
-        );
-        assert_eq!(guard.consecutive_panics(), 0, "accounting restarts");
-    }
-
-    #[test]
-    fn the_backoff_window_suppresses_only_until_it_elapses() {
-        let mut guard = ReconcilePanicGuardV1::new();
-        let now = origin();
-        let ReconcilePanicDecisionV1::RetryAfter(delay) = guard.record_panic(now, 7) else {
-            panic!("the first panic must schedule a retry");
-        };
-
-        assert!(guard.suppresses_pass(now, 7), "window is open");
-        assert!(
-            !guard.suppresses_pass(now + delay, 7),
-            "the pass runs once the window elapses"
-        );
-    }
-
-    #[test]
-    fn a_progressing_pass_clears_the_accounting() {
-        let mut guard = ReconcilePanicGuardV1::new();
-        let now = origin();
-        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
-            guard.record_panic(now, 7);
-        }
-        assert!(guard.suppresses_pass(now, 7));
-
-        guard.record_progress();
-
-        assert!(!guard.suppresses_pass(now, 7), "progress lifts suppression");
-        assert_eq!(guard.consecutive_panics(), 0);
-        assert_eq!(
-            guard.record_panic(now, 7),
-            ReconcilePanicDecisionV1::RetryAfter(RECONCILE_PANIC_BACKOFF_FLOOR),
-            "the next panic restarts at the floor"
-        );
     }
 }
 
@@ -434,7 +321,7 @@ impl ReconcileFaultInjectionV1 {
                 panic!("injected reconcile panic (pass {})", seen + 1)
             }
             ReconcileFaultKindV1::TransientCapacity => Err(super::CodeIndexSchedulerErrorV1::GraphProjection(
-                crate::code_index::graph_projection::CodeGraphProjectionError::BudgetExhausted {
+                tracedecay_code_index::graph_projection::CodeGraphProjectionError::BudgetExhausted {
                     budget: tracedecay_graph_db::GraphBudgetKind::Capacity.as_str().to_owned(),
                     limit: 1_000,
                 },
@@ -461,14 +348,14 @@ impl ReconcileFaultInjectionV1 {
                 ))
             }
             ReconcileFaultKindV1::Cancelled => Err(
-                crate::code_index::production::CodeIndexProductionErrorV1::Interrupted(
-                    crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+                tracedecay_code_index::production::CodeIndexProductionErrorV1::Interrupted(
+                    tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
                 )
                 .into(),
             ),
             ReconcileFaultKindV1::DeadlineExceeded => Err(
-                crate::code_index::production::CodeIndexProductionErrorV1::Interrupted(
-                    crate::code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
+                tracedecay_code_index::production::CodeIndexProductionErrorV1::Interrupted(
+                    tracedecay_code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
                 )
                 .into(),
             ),
@@ -476,13 +363,126 @@ impl ReconcileFaultInjectionV1 {
                 "injected permanent reconcile refusal".to_owned(),
             )),
             ReconcileFaultKindV1::PublicationCorruption => Err(
-                crate::code_index::production::CodeIndexProductionErrorV1::Publication(
-                    crate::code_index::production::CodeIndexPublicationStoreErrorV1::CorruptionResetRequired(
+                tracedecay_code_index::production::CodeIndexProductionErrorV1::Publication(
+                    tracedecay_code_index::production::CodeIndexPublicationStoreErrorV1::CorruptionResetRequired(
                         "injected corrupt publication authority".to_owned(),
                     ),
                 )
                 .into(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin() -> Instant {
+        Instant::now()
+    }
+
+    #[test]
+    fn repeated_panics_back_off_and_then_quarantine() {
+        let mut guard = ReconcilePanicGuardV1::new();
+        let now = origin();
+
+        let mut delays = Vec::new();
+        let mut decisions = Vec::new();
+        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
+            let decision = guard.record_panic(now, 7);
+            decisions.push(decision);
+            if let ReconcilePanicDecisionV1::RetryAfter(delay) = decision {
+                delays.push(delay);
+            }
+        }
+
+        assert_eq!(
+            decisions.last(),
+            Some(&ReconcilePanicDecisionV1::Quarantine),
+            "an unchanged panicking input must reach a terminal state, not retry forever"
+        );
+        assert_eq!(
+            delays.len() as u32,
+            MAX_CONSECUTIVE_RECONCILE_PANICS_V1 - 1,
+            "every attempt before the bound is a delayed retry"
+        );
+        assert!(
+            delays.windows(2).all(|pair| pair[1] > pair[0]),
+            "retries must back off, not repeat identically: {delays:?}"
+        );
+        assert!(
+            delays
+                .iter()
+                .all(|delay| *delay >= RECONCILE_PANIC_BACKOFF_FLOOR
+                    && *delay <= RECONCILE_PANIC_BACKOFF_CEILING),
+            "delays stay inside the bounded window: {delays:?}"
+        );
+    }
+
+    #[test]
+    fn a_quarantined_guard_suppresses_further_passes_over_unchanged_input() {
+        let mut guard = ReconcilePanicGuardV1::new();
+        let now = origin();
+        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
+            guard.record_panic(now, 7);
+        }
+
+        let far_future = now + Duration::from_hours(24);
+        assert!(
+            guard.suppresses_pass(far_future, 7),
+            "unchanged input must stay quarantined however long the wait"
+        );
+    }
+
+    #[test]
+    fn changed_input_lifts_the_quarantine() {
+        let mut guard = ReconcilePanicGuardV1::new();
+        let now = origin();
+        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
+            guard.record_panic(now, 7);
+        }
+        assert!(guard.suppresses_pass(now, 7));
+
+        assert!(
+            !guard.suppresses_pass(now, 8),
+            "an advanced control epoch is new input and earns another attempt"
+        );
+        assert_eq!(guard.consecutive_panics(), 0, "accounting restarts");
+    }
+
+    #[test]
+    fn the_backoff_window_suppresses_only_until_it_elapses() {
+        let mut guard = ReconcilePanicGuardV1::new();
+        let now = origin();
+        let ReconcilePanicDecisionV1::RetryAfter(delay) = guard.record_panic(now, 7) else {
+            panic!("the first panic must schedule a retry");
+        };
+
+        assert!(guard.suppresses_pass(now, 7), "window is open");
+        assert!(
+            !guard.suppresses_pass(now + delay, 7),
+            "the pass runs once the window elapses"
+        );
+    }
+
+    #[test]
+    fn a_progressing_pass_clears_the_accounting() {
+        let mut guard = ReconcilePanicGuardV1::new();
+        let now = origin();
+        for _ in 0..MAX_CONSECUTIVE_RECONCILE_PANICS_V1 {
+            guard.record_panic(now, 7);
+        }
+        assert!(guard.suppresses_pass(now, 7));
+
+        guard.record_progress();
+
+        assert!(!guard.suppresses_pass(now, 7), "progress lifts suppression");
+        assert_eq!(guard.consecutive_panics(), 0);
+        assert_eq!(
+            guard.record_panic(now, 7),
+            ReconcilePanicDecisionV1::RetryAfter(RECONCILE_PANIC_BACKOFF_FLOOR),
+            "the next panic restarts at the floor"
+        );
     }
 }

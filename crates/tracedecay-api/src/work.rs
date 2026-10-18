@@ -3,8 +3,8 @@
 //! Every Work adapter, the daemon's application router, the dashboard's public
 //! `/api/work` mount, the catalog registry, and the generated SDKs, is derived
 //! from the single [`WorkOperation`] descriptor in this module. Adding an
-//! operation is one enum variant plus one row in the `work_operations!` table,
-//! which derives every key, id, segment, and path; there is no second route
+//! operation is one row in the `work_operations!` table, which derives the
+//! variant and every key, id, segment, and path; there is no second route
 //! table to keep in step, and no adapter that can drift from the catalog
 //! without failing to compile.
 //!
@@ -28,9 +28,9 @@ use serde_json::Value;
 use tracedecay_contracts::{
     AcceptWorkProposalRequestV1, AdjudicateWorkLeakCommandV1, AdmitWorkExecutionRequestV1,
     AdmitWorkPlacementCommand, AdmitWorkSynthesisCommand, AdmittedWorkExecutionV1,
-    ApplicationProblem, CancelWorkAttemptCommand, CreateWorkTaskRequestV1,
-    ExecutionTopologyMetricsRequestV1, ExecutionTopologyMetricsV1, ExecutionTopologyViewV1,
-    GenerateProposalRequest, GeneratedWorkProposal, PauseWorkRunCommand,
+    AdvanceWorkJobRequestV1, AdvanceWorkJobResultV1, ApplicationProblem, CancelWorkAttemptCommand,
+    CreateWorkTaskRequestV1, ExecutionTopologyMetricsRequestV1, ExecutionTopologyMetricsV1,
+    ExecutionTopologyViewV1, GenerateProposalRequest, GeneratedWorkProposal, PauseWorkRunCommand,
     PrepareWorkDuplicateAdjudicationRequestV1, PrepareWorkProductMutationRequestV1,
     ReleaseWorkPlacementCommand, RequestId, ResumeWorkAttemptsCommand, ResumeWorkRunCommand,
     RetryDirective, RetryWorkAttemptCommandV1, ReviewWorkProposalRequestV1,
@@ -51,91 +51,35 @@ use tracedecay_domain::{
 
 use crate::http::{
     HttpApplicationControls, MAX_HTTP_APPLICATION_BODY_BYTES, adapter_problem_response,
-    invalid_request_response,
+    dispatch_json_operation, invalid_request_problem,
 };
 
 fn schema_name<T: JsonSchema>() -> Cow<'static, str> {
     T::schema_name()
 }
 
-/// One canonical Work operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum WorkOperation {
-    GenerateProposal,
-    Create,
-    ReviewProposal,
-    AcceptProposal,
-    AdmitExecution,
-    StartAttempt,
-    Synthesize,
-    AttemptStatus,
-    CancelAttempt,
-    ResumeAttempts,
-    RetryAttempt,
-    ListAttempts,
-    ExecutionHistory,
-    HydrateArtifacts,
-    RetrieveEvidence,
-    Views,
-    Experience,
-    CompareProposal,
-    PrepareGraphMutation,
-    MutateGraph,
-    Topology,
-    TopologyMetrics,
-    PrepareDuplicateAdjudication,
-    AdjudicateDuplicate,
-    AdjudicateLeak,
-    PauseRun,
-    ResumeRun,
-    RunControl,
-    PlacementPreflight,
-    AdmitPlacement,
-    PlacementStatus,
-    ReleasePlacement,
-}
-
-/// Derive every Work operation projection from one `(variant, key, segment)`
-/// table.
+/// Derive the Work operation enum and every projection from one
+/// `(variant, key, segment, description)` table.
 ///
 /// The catalog id, router path, catalog path, and dashboard path are all
 /// mechanical compositions of the key and segment, so the table is the single
 /// place an operation is described. A row cannot disagree with itself.
 macro_rules! work_operations {
     ($($variant:ident: $key:literal, $segment:literal, $description:literal;)+) => {
+        mounted_operations! {
+            /// One canonical Work operation.
+            pub enum WorkOperation;
+            with_key,
+            id_prefix = "operation.work.",
+            route_prefix = "work",
+            $($variant: $key, $segment;)+
+        }
+
         impl WorkOperation {
-            /// The catalog operation key, as it appears in `operation.work.{key}`.
-            pub const fn operation_key(self) -> &'static str {
-                match self { $(Self::$variant => $key,)+ }
-            }
-
-            /// The catalog operation id, as a literal the route documents can hold.
-            pub const fn operation_id_str(self) -> &'static str {
-                match self { $(Self::$variant => concat!("operation.work.", $key),)+ }
-            }
-
-            /// The final path segment that names this operation on its router.
-            pub const fn route_segment(self) -> &'static str {
-                match self { $(Self::$variant => $segment,)+ }
-            }
-
             /// Concise discovery text that distinguishes this operation from
             /// the other Work lifecycle controls.
             pub const fn description(self) -> &'static str {
                 match self { $(Self::$variant => $description,)+ }
-            }
-
-            /// The path this operation answers on the application router.
-            pub const fn route_path(self) -> &'static str {
-                match self { $(Self::$variant => concat!("/work/", $segment),)+ }
-            }
-
-            /// The path the catalog advertises, which the executable nests
-            /// under its `/application` prefix.
-            pub const fn application_route_path(self) -> &'static str {
-                match self {
-                    $(Self::$variant => concat!("/application/work/", $segment),)+
-                }
             }
 
             /// The public dashboard path where the dashboard mounts this
@@ -212,45 +156,11 @@ work_operations! {
         "Read the durable or absent placement state for one exact task and run.";
     ReleasePlacement: "release_placement", "release-placement",
         "Release or quarantine one run's placement at the expected authority version without deleting bytes.";
+    AdvanceJob: "advance_job", "advance-job",
+        "Advance a named parallel job with reviewed synthesis through the next Work steps; call again until it settles.";
 }
 
 impl WorkOperation {
-    /// Every mounted Work operation, in mounted order.
-    pub const ALL: [Self; 32] = [
-        Self::GenerateProposal,
-        Self::Create,
-        Self::ReviewProposal,
-        Self::AcceptProposal,
-        Self::AdmitExecution,
-        Self::StartAttempt,
-        Self::Synthesize,
-        Self::AttemptStatus,
-        Self::CancelAttempt,
-        Self::ResumeAttempts,
-        Self::RetryAttempt,
-        Self::ListAttempts,
-        Self::ExecutionHistory,
-        Self::HydrateArtifacts,
-        Self::RetrieveEvidence,
-        Self::Views,
-        Self::Experience,
-        Self::CompareProposal,
-        Self::PrepareGraphMutation,
-        Self::MutateGraph,
-        Self::Topology,
-        Self::TopologyMetrics,
-        Self::PrepareDuplicateAdjudication,
-        Self::AdjudicateDuplicate,
-        Self::AdjudicateLeak,
-        Self::PauseRun,
-        Self::ResumeRun,
-        Self::RunControl,
-        Self::PlacementPreflight,
-        Self::AdmitPlacement,
-        Self::PlacementStatus,
-        Self::ReleasePlacement,
-    ];
-
     /// The catalog operation id.
     pub fn operation_id(self) -> String {
         self.operation_id_str().to_owned()
@@ -316,6 +226,7 @@ impl WorkOperation {
             Self::AdmitPlacement => schema_name::<AdmitWorkPlacementCommand>(),
             Self::PlacementStatus => schema_name::<WorkPlacementStatusRequestV1>(),
             Self::ReleasePlacement => schema_name::<ReleaseWorkPlacementCommand>(),
+            Self::AdvanceJob => schema_name::<AdvanceWorkJobRequestV1>(),
         }
     }
 
@@ -354,26 +265,15 @@ impl WorkOperation {
             Self::PlacementPreflight => schema_name::<WorkPlacementPreflightV1>(),
             Self::AdmitPlacement | Self::ReleasePlacement => schema_name::<WorkPlacementV1>(),
             Self::PlacementStatus => schema_name::<WorkPlacementReadingV1>(),
+            Self::AdvanceJob => schema_name::<AdvanceWorkJobResultV1>(),
         }
     }
 
-    /// Resolve an operation from the final path segment that names it.
-    ///
-    /// The route segment is the one public name a Work operation has, so every
-    /// adapter that accepts an operation by name, the router, the CLI, the
-    /// catalog, resolves it here rather than keeping a second name table.
-    pub fn from_route_segment(segment: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|operation| operation.route_segment() == segment)
-    }
-
     /// Whether the embedded dashboard has a real operator journey for this
-    /// operation. Scheduler-owned attempt start remains available to its owning
-    /// surface but is not a dashboard API.
+    /// operation. Scheduler-owned attempt start and the guided job, which the
+    /// CLI and agents drive, are not dashboard APIs.
     pub const fn is_dashboard_operation(self) -> bool {
-        !matches!(self, Self::StartAttempt)
+        !matches!(self, Self::StartAttempt | Self::AdvanceJob)
     }
 }
 
@@ -490,39 +390,21 @@ async fn dispatch<O>(
 where
     O: WorkApplicationOwner,
 {
-    let match_result = {
-        let _span = tracing::trace_span!("api.http.admission").entered();
-        {
-            // An operation this build does not mount is concealed the same way an
-            // unauthorised one is, so probing a path cannot reveal what exists.
-            match WorkOperation::from_route_segment(&segment) {
-                None => Err(adapter_problem_response(
-                    request_id,
-                    ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never),
-                )),
-                Some(operation) => match body {
-                    Ok(Json(body)) => Ok(WorkHttpRequest {
-                        operation,
-                        request_id,
-                        controls,
-                        body,
-                    }),
-                    Err(_) => Err(invalid_request_response(
-                        request_id,
-                        "work.invalid_body",
-                        "The Work request body is invalid or exceeds the configured limit",
-                    )),
-                },
-            }
-        }
-    };
-    let request = match match_result {
-        Ok(request) => request,
-        Err(response) => return response,
-    };
-    tracing::Instrument::instrument(
-        async move { owner.invoke_work(request).await },
-        tracing::trace_span!("api.http.handler"),
+    dispatch_json_operation(
+        WorkOperation::from_route_segment(&segment),
+        request_id,
+        body,
+        (
+            "work.invalid_body",
+            "The Work request body is invalid or exceeds the configured limit",
+        ),
+        |operation, request_id, body| WorkHttpRequest {
+            operation,
+            request_id,
+            controls,
+            body,
+        },
+        |request| owner.invoke_work(request),
     )
     .await
 }
@@ -532,10 +414,14 @@ where
 /// The owner decodes against the typed contract, so this is the refusal it
 /// returns when that decode fails: the same canonical problem envelope every
 /// other malformed application request produces.
-pub fn work_invalid_request_response(request_id: RequestId) -> Response {
-    invalid_request_response(
+pub fn work_invalid_request(
+    request_id: RequestId,
+) -> Result<crate::HttpJsonEnvelope<Value>, crate::HttpAdapterError> {
+    invalid_request_problem(
         request_id,
         "work.invalid_request",
         "The Work application request is invalid",
     )
+    .map(Into::into)
+    .map_err(Into::into)
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,9 @@ use super::scheduler::{
 };
 use tracedecay_automation::text::truncate_chars_for_prompt;
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::cancellation::CancellationToken;
+use tracedecay_runtime_core::git::{GitCommandBounds, GitCommandError, bounded_command_output};
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_runtime_core::tracedecay::current_timestamp;
 
 pub(crate) mod effect_receipt;
@@ -189,7 +192,8 @@ pub(super) async fn try_acquire_job_task_lock(
 #[tracing::instrument(name = "automation.jobs.load", level = "trace", skip_all)]
 pub async fn load_jobs(dashboard_root: &Path) -> Result<Vec<AutomationJob>> {
     let path = jobs_path(dashboard_root);
-    match tokio::fs::read(&path).await {
+    let read_path = path.clone();
+    match crate::automation::blocking_fs(move || std::fs::read(read_path)).await {
         Ok(bytes) => {
             let file = serde_json::from_slice::<AutomationJobsRawFile>(&bytes).map_err(|e| {
                 TraceDecayError::Config {
@@ -221,7 +225,8 @@ pub async fn load_jobs(dashboard_root: &Path) -> Result<Vec<AutomationJob>> {
 pub async fn save_jobs(dashboard_root: &Path, jobs: &[AutomationJob]) -> Result<()> {
     let path = jobs_path(dashboard_root);
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
+        let directory = parent.to_path_buf();
+        crate::automation::blocking_fs(move || std::fs::create_dir_all(directory))
             .await
             .map_err(|e| TraceDecayError::Config {
                 message: format!(
@@ -237,7 +242,8 @@ pub async fn save_jobs(dashboard_root: &Path, jobs: &[AutomationJob]) -> Result<
     let bytes = serde_json::to_vec_pretty(&file).map_err(|e| TraceDecayError::Config {
         message: format!("failed to serialize automation jobs: {e}"),
     })?;
-    tokio::fs::write(&path, bytes)
+    let write_path = path.clone();
+    crate::automation::blocking_fs(move || std::fs::write(write_path, bytes))
         .await
         .map_err(|e| TraceDecayError::Config {
             message: format!("failed to write automation jobs '{}': {e}", path.display()),
@@ -452,28 +458,8 @@ fn latest_terminal_job_record<'a>(
 }
 
 /// Executes one user job through the automation backend, delivering its
-/// output and recording the run in the shared ledger under
-/// `user_job:<job_id>`.
-#[tracing::instrument(name = "automation.run.user_job", level = "trace", skip_all)]
-pub async fn run_user_job_with_backend(
-    dashboard_root: &Path,
-    config: &AutomationConfig,
-    backend: &dyn AgentTaskBackend,
-    job: &AutomationJob,
-    options: UserJobRunOptions,
-) -> super::AutomationRunResult<UserJobAutomationRun> {
-    run_user_job_with_backend_publication(
-        dashboard_root,
-        config,
-        backend,
-        job,
-        options,
-        AutomationRunLedgerPublication::Immediate,
-        None,
-    )
-    .await
-}
-
+/// output. Its `user_job:<job_id>` ledger terminal is published by the
+/// caller's application settlement.
 pub async fn run_user_job_with_backend_for_retained_settlement(
     dashboard_root: &Path,
     config: &AutomationConfig,
@@ -482,27 +468,25 @@ pub async fn run_user_job_with_backend_for_retained_settlement(
     options: UserJobRunOptions,
 ) -> RetainedAutomationRun<UserJobAutomationRun> {
     let settlement_guard = AutomationRunSettlementGuard::new();
-    let result = run_user_job_with_backend_publication(
+    let result = run_retained_user_job(
         dashboard_root,
         config,
         backend,
         job,
         options,
-        AutomationRunLedgerPublication::DeferredUntilApplicationSettlement,
-        Some(&settlement_guard),
+        &settlement_guard,
     )
     .await;
     RetainedAutomationRun::new(result, settlement_guard)
 }
 
-async fn run_user_job_with_backend_publication(
+async fn run_retained_user_job(
     dashboard_root: &Path,
     config: &AutomationConfig,
     backend: &dyn AgentTaskBackend,
     job: &AutomationJob,
     options: UserJobRunOptions,
-    ledger_publication: AutomationRunLedgerPublication,
-    settlement_guard: Option<&AutomationRunSettlementGuard>,
+    settlement_guard: &AutomationRunSettlementGuard,
 ) -> super::AutomationRunResult<UserJobAutomationRun> {
     validate_job(job)?;
     let UserJobRunOptions {
@@ -523,10 +507,10 @@ async fn run_user_job_with_backend_publication(
         run_id: &run_id,
         trigger,
         started_at: &started_at,
-        ledger_publication,
+        ledger_publication: AutomationRunLedgerPublication::DeferredUntilApplicationSettlement,
     };
     if let Some(reason) = config_skip_reason(config) {
-        return ctx.skipped(reason, None).await.map_err(Into::into);
+        return ctx.skipped(reason).await.map_err(Into::into);
     }
 
     let now_secs = current_timestamp();
@@ -555,14 +539,9 @@ async fn run_user_job_with_backend_publication(
             .await
             .map_err(Into::into);
         }
-        return ctx.skipped(reason, None).await.map_err(Into::into);
+        return ctx.skipped(reason).await.map_err(Into::into);
     };
-    let _run_lock = if let Some(settlement_guard) = settlement_guard {
-        settlement_guard.retain_task_lock(task_lock)?;
-        None
-    } else {
-        Some(task_lock)
-    };
+    settlement_guard.retain_task_lock(task_lock)?;
 
     let scheduler_summary = if trigger == AutomationTrigger::Scheduler {
         Some(
@@ -580,24 +559,18 @@ async fn run_user_job_with_backend_publication(
         let now_secs = current_timestamp();
         let decision = job_schedule_decision(job, scheduler_summary.records(), now_secs);
         if let Some(reason) = decision {
-            return ctx
-                .skipped(reason, Some(scheduler_summary))
-                .await
-                .map_err(Into::into);
+            return ctx.skipped(reason).await.map_err(Into::into);
         }
     } else if !job.enabled {
         return ctx
-            .skipped(AutomationSkipReasonV1::UserJobDisabled, None)
+            .skipped(AutomationSkipReasonV1::UserJobDisabled)
             .await
             .map_err(Into::into);
     }
 
     if job.pre_run_command.is_some() && !config.allow_job_commands {
         return ctx
-            .skipped(
-                AutomationSkipReasonV1::JobCommandsDisabled,
-                scheduler_summary.as_ref(),
-            )
+            .skipped(AutomationSkipReasonV1::JobCommandsDisabled)
             .await
             .map_err(Into::into);
     }
@@ -609,7 +582,13 @@ async fn run_user_job_with_backend_publication(
         attached_skill_sections(&profile_root, &job.skill_ids).await;
 
     let command_output = match &job.pre_run_command {
-        Some(command) => match run_pre_run_command(command, project_root.as_deref()).await {
+        Some(command) => match run_pre_run_command(
+            command,
+            project_root.as_deref(),
+            Duration::from_secs(JOB_COMMAND_TIMEOUT_SECS),
+        )
+        .await
+        {
             Ok(output) => Some(output),
             Err(err) => {
                 let record = ctx
@@ -833,32 +812,10 @@ impl JobRunContext<'_> {
         }
     }
 
-    async fn skipped(
-        &self,
-        reason: AutomationSkipReasonV1,
-        summary: Option<&AutomationRunLedgerTaskSummary>,
-    ) -> Result<UserJobAutomationRun> {
+    async fn skipped(&self, reason: AutomationSkipReasonV1) -> Result<UserJobAutomationRun> {
         let token = reason.as_str();
-        let candidate = self.base_record(AutomationRunStatus::Skipped, Some(token.to_string()))?;
-        // Mirror the fixed-task ledger dedup: scheduler ticks re-evaluate
-        // every job, so a standing skip is persisted only once.
-        let repeated = (self.ledger_publication == AutomationRunLedgerPublication::Immediate
-            && self.trigger == AutomationTrigger::Scheduler)
-            .then(|| {
-                summary?.latest_logical_activity().filter(|prior| {
-                    prior.task_key.as_deref() == Some(&job_task_key(&self.job.id))
-                        && prior.trigger == AutomationTrigger::Scheduler
-                        && prior.status == AutomationRunStatus::Skipped
-                        && prior.error.as_deref() == Some(token)
-                })
-            })
-            .flatten();
-        let record = if let Some(repeated) = repeated {
-            repeated.clone()
-        } else {
-            self.publish_terminal(&candidate).await?;
-            candidate
-        };
+        let record = self.base_record(AutomationRunStatus::Skipped, Some(token.to_string()))?;
+        self.publish_terminal(&record).await?;
         let report = json!({
             "status": "skipped",
             "reason": token,
@@ -1008,6 +965,8 @@ fn build_job_prompt(
 enum PreRunCommandError {
     #[error("command timed out after {JOB_COMMAND_TIMEOUT_SECS}s")]
     TimedOut,
+    #[error("command output exceeded the capture byte limit")]
+    OutputTooLarge,
     #[error("failed to spawn command: {0}")]
     Spawn(std::io::Error),
     #[error("command exited with {status}: {stderr}")]
@@ -1022,40 +981,67 @@ impl PreRunCommandError {
         match self {
             Self::TimedOut => AgentTaskFailureClass::Timeout,
             Self::Spawn(_) => AgentTaskFailureClass::Unavailable,
-            Self::Exited { .. } => AgentTaskFailureClass::Permanent,
+            Self::Exited { .. } | Self::OutputTooLarge => AgentTaskFailureClass::Permanent,
         }
+    }
+}
+
+impl From<GitCommandError> for PreRunCommandError {
+    fn from(error: GitCommandError) -> Self {
+        match error {
+            GitCommandError::DeadlineExceeded => Self::TimedOut,
+            GitCommandError::Unavailable(source)
+            | GitCommandError::Wait(source)
+            | GitCommandError::WriteInput(source)
+            | GitCommandError::ReadOutput { source, .. } => Self::Spawn(source),
+            GitCommandError::OutputLimitExceeded { .. } => Self::OutputTooLarge,
+            error @ GitCommandError::Cancelled => Self::Spawn(std::io::Error::other(error)),
+        }
+    }
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
 async fn run_pre_run_command(
     command: &str,
     project_root: Option<&Path>,
+    timeout: Duration,
 ) -> std::result::Result<String, PreRunCommandError> {
     #[cfg(windows)]
     let mut process = {
-        let mut process = tokio::process::Command::new("cmd");
+        let mut process = std::process::Command::new("cmd");
         process.arg("/C").arg(command);
         process
     };
     #[cfg(not(windows))]
     let mut process = {
-        let mut process = tokio::process::Command::new("sh");
+        let mut process = std::process::Command::new("sh");
         process.arg("-c").arg(command);
         process
     };
     if let Some(project_root) = project_root {
         process.current_dir(project_root);
     }
-    // Scheduler shutdown aborts the owning future. Ensure a pre-run command
-    // does not outlive that future and keep the daemon cgroup alive.
-    process.kill_on_drop(true);
-    let output = tokio::time::timeout(
-        Duration::from_secs(JOB_COMMAND_TIMEOUT_SECS),
-        process.output(),
-    )
-    .await
-    .map_err(|_| PreRunCommandError::TimedOut)?
-    .map_err(PreRunCommandError::Spawn)?;
+    let cancel = CancellationToken::new();
+    let bounds = GitCommandBounds {
+        deadline: Instant::now() + timeout,
+        cancel: Some(cancel.clone()),
+        max_stdout_bytes: JOB_COMMAND_OUTPUT_CAP_CHARS * 4,
+        max_stderr_bytes: JOB_COMMAND_OUTPUT_CAP_CHARS * 4,
+    };
+    // Scheduler shutdown drops the owning future. Cancelling makes the
+    // supervisor kill the command, so it cannot keep the daemon cgroup alive.
+    let _kill_on_drop = CancelOnDrop(cancel);
+    let output =
+        native_runtime::spawn_blocking(move || bounded_command_output(process, None, &bounds))
+            .await
+            .map_err(|error| PreRunCommandError::Spawn(std::io::Error::other(error)))??;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(PreRunCommandError::Exited {
@@ -1070,6 +1056,10 @@ async fn run_pre_run_command(
     ))
 }
 
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[path = "jobs/pre_run_command_tests.rs"]
+mod pre_run_command_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "jobs/scheduler_config_tests.rs"]

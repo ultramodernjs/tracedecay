@@ -23,8 +23,8 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracedecay_domain::{
-    ManifestDigest, WorkAttemptIdentityV1, WorkAttemptStateV1, WorkAttemptV1,
-    WorkTerminalEvidenceV1, WorkflowOutputName, canonical_sha256,
+    ManifestDigest, WorkAttemptIdentityV1, WorkAttemptStateV1, WorkAttemptV1, WorkflowOutputName,
+    canonical_sha256,
 };
 
 use crate::work_attempt::{
@@ -33,9 +33,8 @@ use crate::work_attempt::{
 };
 use crate::workflow_synthesis::WorkflowSynthesisDraft;
 use crate::{
-    ApplicationProblem, RequestContext, SafeDiagnostic, WorkGraphReadPortV1,
-    WorkProductAttemptAdmissionPortV1, WorkProductBindingV1, WorkProductOwnerAuthorizationPortV1,
-    WorkProductRevisionPinsV1,
+    ApplicationProblem, RequestContext, SafeDiagnostic, WorkGraphReadPortV1, WorkProductBindingV1,
+    WorkProductOwnerAuthorizationPortV1, WorkProductRevisionPinsV1,
 };
 
 const WORK_SYNTHESIS_SOURCE_SET_DOMAIN: &str =
@@ -208,8 +207,7 @@ pub fn admit_work_synthesis_against_registered_topology<S, F>(
 where
     S: WorkSynthesisAdmissionStoragePort
         + WorkGraphReadPortV1
-        + WorkProductOwnerAuthorizationPortV1
-        + WorkProductAttemptAdmissionPortV1,
+        + WorkProductOwnerAuthorizationPortV1,
     F: FnOnce(&StartWorkAttemptCommand, &[WorkAttemptV1]) -> Result<String, ApplicationProblem>,
 {
     crate::require_registered_work_topology(
@@ -318,7 +316,7 @@ fn source_outcome(
     let evidence_digest = || {
         attempt
             .terminal()
-            .map(terminal_digest)
+            .map(|terminal| terminal.evidence_digest().clone())
             .ok_or_else(contract_problem)
     };
     Ok(match attempt.state() {
@@ -340,23 +338,6 @@ fn source_outcome(
         },
         state => WorkSynthesisSourceOutcomeV1::Unknown { state },
     })
-}
-
-fn terminal_digest(terminal: &WorkTerminalEvidenceV1) -> ManifestDigest {
-    match terminal {
-        WorkTerminalEvidenceV1::Succeeded {
-            evidence_digest, ..
-        }
-        | WorkTerminalEvidenceV1::Failed {
-            evidence_digest, ..
-        }
-        | WorkTerminalEvidenceV1::TimedOut {
-            evidence_digest, ..
-        }
-        | WorkTerminalEvidenceV1::Cancelled {
-            evidence_digest, ..
-        } => evidence_digest.clone(),
-    }
 }
 
 /// Groups succeeded sources by the exact artifact digest list they produced,

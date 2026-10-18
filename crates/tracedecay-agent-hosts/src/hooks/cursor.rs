@@ -136,22 +136,10 @@ async fn cursor_session_start_response(
     .await
     .into_recorded_guidance(&hook_telemetry)
     .flatten();
+    // Cursor carries the skill mandate in its always-applied rule, which it
+    // loads reliably; its sessionStart context is best-effort.
     let output = cursor_session_start_json(root.as_deref(), guidance.as_deref().unwrap_or(""));
     (root, output)
-}
-
-/// Pure decision logic for Cursor `subagentStart` hook events.
-///
-/// Cursor subagents must be allowed to start.
-///
-/// Earlier versions denied research/explore subagents in favor of tracedecay MCP
-/// tools. In Cursor this can surface as a misleading "bubble creation" timeout,
-/// and it prevents explicit user requests to use agents. Keep this handler
-/// fail-open so stale installs that still register `subagentStart` do not block
-/// subagent creation.
-pub fn evaluate_cursor_subagent_start(event_json: &str) -> Option<String> {
-    let _ = event_json;
-    None
 }
 
 fn format_cursor_post_tool_use_decision(hint: &ToolHint) -> String {
@@ -395,16 +383,8 @@ fn cursor_tool_hint_input(parsed: &Value) -> ToolHintInput {
         tool_name: text_field(parsed, &["tool_name", "toolName", "name"]),
         command: text_field(tool_input, &["command", "cmd"])
             .or_else(|| text_field(parsed, &["command", "cmd"])),
-        prompt: text_field(
-            tool_input,
-            &["prompt", "query", "pattern", "task", "description"],
-        )
-        .or_else(|| {
-            text_field(
-                parsed,
-                &["prompt", "query", "pattern", "task", "description"],
-            )
-        }),
+        prompt: text_field(tool_input, &["prompt", "query", "pattern", "task"])
+            .or_else(|| text_field(parsed, &["prompt", "query", "pattern", "task"])),
         subagent_type: text_field(parsed, &["subagent_type", "subagentType", "agent_type"]),
         file_path: text_field(tool_input, CURSOR_FILE_PATH_FIELDS)
             .or_else(|| text_field(parsed, CURSOR_FILE_PATH_FIELDS)),
@@ -429,6 +409,9 @@ mod tests {
 
     use tracedecay_runtime_core::config::ProfileRoot;
 
+    use super::super::tool_hints::HintCategory;
+    use super::{cursor_tool_hint_input, decide_hint};
+
     #[tokio::test]
     async fn transcript_ingest_forwards_its_byte_budget_to_the_daemon() {
         let daemon = crate::hooks::TestDaemonHookActionGuard::install([
@@ -440,7 +423,7 @@ mod tests {
         let runtime = crate::ports::hook_runtime::crate_test_runtime(ProfileRoot::under_home(
             profile_home.path(),
         ));
-        let outcome = crate::hooks::ingest_transcript_for_event(
+        crate::hooks::ingest_transcript_for_event(
             &runtime,
             "cursor",
             &event,
@@ -451,11 +434,6 @@ mod tests {
         )
         .await;
 
-        assert!(outcome.user_scope);
-        assert_eq!(outcome.messages_upserted, 2);
-        assert!(outcome.should_schedule_user_review());
-        assert!(!outcome.failed);
-        assert!(!outcome.timed_out);
         let calls = daemon.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, None);
@@ -476,29 +454,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn transcript_ingest_types_daemon_failure() {
-        let _daemon = crate::hooks::TestDaemonHookActionGuard::install([]);
-        let event = serde_json::json!({ "session_id": "cursor-fail" }).to_string();
+    fn post_tool_use_category(event: serde_json::Value) -> Option<HintCategory> {
+        decide_hint(&cursor_tool_hint_input(&event)).map(|hint| hint.category)
+    }
 
-        let profile_home = tempfile::tempdir().unwrap();
-        let runtime = crate::ports::hook_runtime::crate_test_runtime(ProfileRoot::under_home(
-            profile_home.path(),
-        ));
-        let outcome = crate::hooks::ingest_transcript_for_event(
-            &runtime,
-            "cursor",
-            &event,
-            None,
-            Some(4_096),
-            Duration::from_millis(250),
-            None,
-        )
-        .await;
+    #[test]
+    fn grep_pattern_text_does_not_override_search_classification() {
+        let category = post_tool_use_category(serde_json::json!({
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "impact", "path": "src" },
+        }));
+        assert_eq!(category, Some(HintCategory::Search));
+    }
 
-        assert!(outcome.failed);
-        assert!(!outcome.timed_out);
-        assert!(!outcome.should_schedule_user_review());
-        assert_eq!(outcome.messages_upserted, 0);
+    #[test]
+    fn shell_description_is_not_classified_as_a_prompt() {
+        let category = post_tool_use_category(serde_json::json!({
+            "tool_name": "Shell",
+            "tool_input": {
+                "command": "cargo test -p tracedecay-agent-hosts",
+                "description": "Run tests to see what breaks",
+            },
+        }));
+        assert_eq!(category, None);
     }
 }

@@ -104,9 +104,11 @@ pub struct WorkRunControlTransitionReceiptV1 {
     pub blocked_intervals: Vec<WorkBlockedIntervalReceiptV1>,
 }
 
-/// The durable run-control rows and the attempt evidence they are derived
-/// from.
-pub trait WorkRunControlStoragePort: Send + Sync {
+/// The reads and the publication one pause or resume transition makes.
+///
+/// It carries no `Send + Sync` bound so a storage scoped to one writer
+/// transaction can implement it and run the whole transition atomically.
+pub trait WorkRunControlTransitionPort {
     /// Reads all mutable evidence needed by a pause or resume from one storage
     /// snapshot. `None` means the run has no durable attempt.
     fn run_control_frontier(
@@ -115,16 +117,6 @@ pub trait WorkRunControlStoragePort: Send + Sync {
         task_id: &TaskId,
         run_id: &RunId,
     ) -> Result<Option<WorkRunControlFrontierV1>, WorkRunControlStorageError>;
-
-    /// The admitted deadline and live attempt frontier for one run, or `None`
-    /// when the run holds no durable attempt at all. Retry-superseded recovery
-    /// records still count toward history, but are absent from the frontier.
-    fn run_admission(
-        &self,
-        authority: &WorkAuthority,
-        task_id: &TaskId,
-        run_id: &RunId,
-    ) -> Result<Option<WorkRunAdmissionV1>, WorkRunControlStorageError>;
 
     /// Resolves the canonical workflow journal binding for every active
     /// attempt of one run. Journal replay happens only while a pause is about
@@ -136,6 +128,22 @@ pub trait WorkRunControlStoragePort: Send + Sync {
         run_id: &RunId,
     ) -> Result<Vec<WorkRunLiveAttemptV1>, WorkRunControlStorageError>;
 
+    /// Publishes only while the complete mutable frontier is still identical
+    /// to `expected`. Implementations must perform the comparison and control
+    /// CAS in the same write transaction.
+    fn publish_run_control_at_frontier(
+        &self,
+        authority: &WorkAuthority,
+        expected: &WorkRunControlFrontierV1,
+        next: &WorkRunControlV1,
+        blocked_intervals: &[WorkBlockedIntervalReceiptV1],
+    ) -> Result<(), WorkRunControlStorageError>;
+}
+
+/// The control read a reservation fence makes. It carries no `Send + Sync`
+/// bound so the reservation can be fenced inside the writer job that admits
+/// the attempt.
+pub trait WorkRunReservationPort {
     /// The published control row for one run, or `None` when the run has never
     /// been controlled.
     fn load_run_control(
@@ -144,6 +152,20 @@ pub trait WorkRunControlStoragePort: Send + Sync {
         task_id: &TaskId,
         run_id: &RunId,
     ) -> Result<Option<WorkRunControlV1>, WorkRunControlStorageError>;
+}
+
+/// The durable run-control rows and the attempt evidence they are derived
+/// from.
+pub trait WorkRunControlStoragePort: WorkRunReservationPort + Send + Sync {
+    /// The admitted deadline and live attempt frontier for one run, or `None`
+    /// when the run holds no durable attempt at all. Retry-superseded recovery
+    /// records still count toward history, but are absent from the frontier.
+    fn run_admission(
+        &self,
+        authority: &WorkAuthority,
+        task_id: &TaskId,
+        run_id: &RunId,
+    ) -> Result<Option<WorkRunAdmissionV1>, WorkRunControlStorageError>;
 
     /// Publishes `next` under a compare-and-swap on the authority version the
     /// caller read. `expected` is `None` only for the first publication.
@@ -151,17 +173,6 @@ pub trait WorkRunControlStoragePort: Send + Sync {
         &self,
         authority: &WorkAuthority,
         expected: Option<WorkRunControlAuthorityV1>,
-        next: &WorkRunControlV1,
-        blocked_intervals: &[WorkBlockedIntervalReceiptV1],
-    ) -> Result<(), WorkRunControlStorageError>;
-
-    /// Publishes only while the complete mutable frontier is still identical
-    /// to `expected`. Implementations must perform the comparison and control
-    /// CAS in the same write transaction.
-    fn publish_run_control_at_frontier(
-        &self,
-        authority: &WorkAuthority,
-        expected: &WorkRunControlFrontierV1,
         next: &WorkRunControlV1,
         blocked_intervals: &[WorkBlockedIntervalReceiptV1],
     ) -> Result<(), WorkRunControlStorageError>;
@@ -274,14 +285,16 @@ pub struct WorkRunControlService<S> {
     storage: S,
 }
 
-impl<S> WorkRunControlService<S>
-where
-    S: WorkRunControlStoragePort,
-{
+impl<S> WorkRunControlService<S> {
     pub const fn new(storage: S) -> Self {
         Self { storage }
     }
+}
 
+impl<S> WorkRunControlService<S>
+where
+    S: WorkRunControlTransitionPort,
+{
     /// Fences new reservations for one run.
     pub fn pause(
         &self,
@@ -294,88 +307,77 @@ where
 
     /// Fences new reservations and returns the exact interval receipts that
     /// committed with the run-control compare-and-swap.
+    #[tracing::instrument(name = "application.work.run_control.pause", level = "trace", skip_all)]
     pub fn pause_with_receipt(
         &self,
         context: &RequestContext,
         command: PauseWorkRunCommand,
     ) -> Result<WorkRunControlTransitionReceiptV1, ApplicationProblem> {
-        {
-            let _span = tracing::trace_span!("application.work.run_control.pause").entered();
-            {
-                ApplicationProblem::ensure_admitted(context, command.occurred_at)?;
-                let authority = work_authority(context)?;
-                let frontier = self
-                    .storage
-                    .run_control_frontier(&authority, &command.task_id, &command.run_id)
-                    .map_err(storage_problem)?
-                    .ok_or_else(not_found_problem)?;
-                check_expected(
-                    frontier.control.as_ref(),
-                    expected_authority(command.expected_authority_version)?,
-                )?;
+        ApplicationProblem::ensure_admitted(context, command.occurred_at)?;
+        let authority = work_authority(context)?;
+        let frontier = self
+            .storage
+            .run_control_frontier(&authority, &command.task_id, &command.run_id)
+            .map_err(ApplicationProblem::from)?
+            .ok_or_else(not_found_problem)?;
+        check_expected(
+            frontier.control.as_ref(),
+            expected_authority(command.expected_authority_version)?,
+        )?;
 
-                // The compare-and-swap expectation is what storage currently holds,
-                // which `check_expected` has just proved is what the caller read.
-                let workflow_attempts = self
-                    .storage
-                    .workflow_bound_live_attempts(&authority, &command.task_id, &command.run_id)
-                    .map_err(storage_problem)?;
-                let workflow_steps = workflow_steps_for_live_attempts(
-                    &frontier.admission.live_attempts,
-                    workflow_attempts,
-                )?;
-                let current = match frontier.control.clone() {
-                    Some(control) => control,
-                    None => WorkRunControlV1::admitted(
+        // The compare-and-swap expectation is what storage currently holds,
+        // which `check_expected` has just proved is what the caller read.
+        let workflow_attempts = self
+            .storage
+            .workflow_bound_live_attempts(&authority, &command.task_id, &command.run_id)
+            .map_err(ApplicationProblem::from)?;
+        let workflow_steps =
+            workflow_steps_for_live_attempts(&frontier.admission.live_attempts, workflow_attempts)?;
+        let current = match frontier.control.clone() {
+            Some(control) => control,
+            None => WorkRunControlV1::admitted(
+                command.task_id.clone(),
+                command.run_id.clone(),
+                frontier.admission.deadline,
+                command.occurred_at,
+            )
+            .map_err(contract_problem)?,
+        };
+        // A run that was never controlled publishes the paused aggregate
+        // directly; writing an intermediate `Running` row first would claim a
+        // transition that never happened.
+        let next = current
+            .pause(
+                command.reason,
+                command.occurred_at,
+                frontier.admission.live_attempts.clone(),
+            )
+            .map_err(contract_problem)?;
+        let cause = WorkBlockedIntervalCauseV1::new(command.reason, next.authority());
+        let blocked_intervals = workflow_steps
+            .into_iter()
+            .filter_map(|attempt| {
+                let step_id = attempt.step_id?;
+                Some(WorkBlockedIntervalReceiptV1::opened(
+                    WorkBlockedIntervalIdentityV1::new(
                         command.task_id.clone(),
                         command.run_id.clone(),
-                        frontier.admission.deadline,
-                        command.occurred_at,
-                    )
-                    .map_err(contract_problem)?,
-                };
-                // A run that was never controlled publishes the paused aggregate
-                // directly; writing an intermediate `Running` row first would claim a
-                // transition that never happened.
-                let next = current
-                    .pause(
-                        command.reason,
-                        command.occurred_at,
-                        frontier.admission.live_attempts.clone(),
-                    )
-                    .map_err(contract_problem)?;
-                let cause = WorkBlockedIntervalCauseV1::new(command.reason, next.authority());
-                let blocked_intervals = workflow_steps
-                    .into_iter()
-                    .filter_map(|attempt| {
-                        let step_id = attempt.step_id?;
-                        Some(WorkBlockedIntervalReceiptV1::opened(
-                            WorkBlockedIntervalIdentityV1::new(
-                                command.task_id.clone(),
-                                command.run_id.clone(),
-                                attempt.attempt_id,
-                                step_id,
-                            ),
-                            cause,
-                            command.occurred_at,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(contract_problem)?;
-                self.storage
-                    .publish_run_control_at_frontier(
-                        &authority,
-                        &frontier,
-                        &next,
-                        &blocked_intervals,
-                    )
-                    .map_err(storage_problem)?;
-                Ok(WorkRunControlTransitionReceiptV1 {
-                    control: next,
-                    blocked_intervals,
-                })
-            }
-        }
+                        attempt.attempt_id,
+                        step_id,
+                    ),
+                    cause,
+                    command.occurred_at,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(contract_problem)?;
+        self.storage
+            .publish_run_control_at_frontier(&authority, &frontier, &next, &blocked_intervals)
+            .map_err(ApplicationProblem::from)?;
+        Ok(WorkRunControlTransitionReceiptV1 {
+            control: next,
+            blocked_intervals,
+        })
     }
 
     /// Readmits reservations for one paused run.
@@ -390,130 +392,127 @@ where
 
     /// Readmits reservations and returns the settled receipts that committed
     /// with the authority transition.
+    #[tracing::instrument(
+        name = "application.work.run_control.resume",
+        level = "trace",
+        skip_all
+    )]
     pub fn resume_with_receipt(
         &self,
         context: &RequestContext,
         command: ResumeWorkRunCommand,
     ) -> Result<WorkRunControlTransitionReceiptV1, ApplicationProblem> {
-        {
-            let _span = tracing::trace_span!("application.work.run_control.resume").entered();
-            {
-                ApplicationProblem::ensure_admitted(context, command.occurred_at)?;
-                let authority = work_authority(context)?;
-                let frontier = self
-                    .storage
-                    .run_control_frontier(&authority, &command.task_id, &command.run_id)
-                    .map_err(storage_problem)?
-                    .ok_or_else(not_found_problem)?;
-                let current = frontier.control.clone().ok_or_else(|| {
-                    // A run that was never paused has nothing to resume, and
-                    // answering "resumed" would be a false receipt.
-                    ApplicationProblem::conflict(
-                        "application.work-run-control.not-paused",
-                        "The Work run has no published control state to resume.",
-                    )
-                })?;
-                let expected = WorkRunControlAuthorityV1::new(command.expected_authority_version)
-                    .map_err(contract_problem)?;
-                if current.authority() != expected {
-                    return Err(authority_conflict_problem());
-                }
-                let next = current
-                    .resume(command.reason, command.occurred_at)
-                    .map_err(contract_problem)?;
-                let blocked_intervals = frontier
-                    .open_blocked_intervals
-                    .iter()
-                    .map(|receipt| {
-                        receipt.close(
-                            command.occurred_at,
-                            WorkBlockedIntervalClosureV1::Resumed {
-                                reason: command.reason,
-                                authority: next.authority(),
-                            },
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(contract_problem)?;
-                self.storage
-                    .publish_run_control_at_frontier(
-                        &authority,
-                        &frontier,
-                        &next,
-                        &blocked_intervals,
-                    )
-                    .map_err(storage_problem)?;
-                Ok(WorkRunControlTransitionReceiptV1 {
-                    control: next,
-                    blocked_intervals,
-                })
-            }
+        ApplicationProblem::ensure_admitted(context, command.occurred_at)?;
+        let authority = work_authority(context)?;
+        let frontier = self
+            .storage
+            .run_control_frontier(&authority, &command.task_id, &command.run_id)
+            .map_err(ApplicationProblem::from)?
+            .ok_or_else(not_found_problem)?;
+        let current = frontier.control.clone().ok_or_else(|| {
+            // A run that was never paused has nothing to resume, and
+            // answering "resumed" would be a false receipt.
+            ApplicationProblem::conflict(
+                "application.work-run-control.not-paused",
+                "The Work run has no published control state to resume.",
+            )
+        })?;
+        let expected = WorkRunControlAuthorityV1::new(command.expected_authority_version)
+            .map_err(contract_problem)?;
+        if current.authority() != expected {
+            return Err(authority_conflict_problem());
         }
-    }
-
-    /// Reads the published control state for one run.
-    pub fn read(
-        &self,
-        context: &RequestContext,
-        request: &WorkRunControlRequestV1,
-    ) -> Result<WorkRunControlReadingV1, ApplicationProblem> {
-        {
-            let _span = tracing::trace_span!("application.work.run_control.read").entered();
-            {
-                let authority = work_authority(context)?;
-                let admission =
-                    self.require_admission(&authority, &request.task_id, &request.run_id)?;
-                let control = self
-                    .storage
-                    .load_run_control(&authority, &request.task_id, &request.run_id)
-                    .map_err(storage_problem)?;
-                Ok(match control {
-                    Some(control) => WorkRunControlReadingV1::Controlled {
-                        control,
-                        live_attempts: admission.live_attempts,
-                        total_attempts: admission.total_attempts,
+        let next = current
+            .resume(command.reason, command.occurred_at)
+            .map_err(contract_problem)?;
+        let blocked_intervals = frontier
+            .open_blocked_intervals
+            .iter()
+            .map(|receipt| {
+                receipt.close(
+                    command.occurred_at,
+                    WorkBlockedIntervalClosureV1::Resumed {
+                        reason: command.reason,
+                        authority: next.authority(),
                     },
-                    None => WorkRunControlReadingV1::Uncontrolled {
-                        deadline: admission.deadline,
-                        live_attempts: admission.live_attempts,
-                        total_attempts: admission.total_attempts,
-                    },
-                })
-            }
-        }
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(contract_problem)?;
+        self.storage
+            .publish_run_control_at_frontier(&authority, &frontier, &next, &blocked_intervals)
+            .map_err(ApplicationProblem::from)?;
+        Ok(WorkRunControlTransitionReceiptV1 {
+            control: next,
+            blocked_intervals,
+        })
     }
+}
 
+impl<S> WorkRunControlService<S>
+where
+    S: WorkRunReservationPort,
+{
     /// Refuses a new attempt reservation while the run is paused.
     ///
     /// This is the fence Plan 32 requires: "pause and cancellation fence new
     /// reservations". A run with no control row has never been paused, so it
     /// admits. The absence of a control row is not a denial.
+    #[tracing::instrument(
+        name = "application.work.run_control.admit_reservation",
+        level = "trace",
+        skip_all
+    )]
     pub fn admit_reservation(
         &self,
         context: &RequestContext,
         task_id: &TaskId,
         run_id: &RunId,
     ) -> Result<(), ApplicationProblem> {
-        {
-            let _span =
-                tracing::trace_span!("application.work.run_control.admit_reservation").entered();
-            {
-                let authority = work_authority(context)?;
-                let control = self
-                    .storage
-                    .load_run_control(&authority, task_id, run_id)
-                    .map_err(storage_problem)?;
-                match control {
-                    Some(control) if !control.admits_reservation() => {
-                        Err(ApplicationProblem::conflict(
-                            "application.work-run-control.paused",
-                            "The Work run is paused, so no new attempt reservation is admitted.",
-                        ))
-                    }
-                    Some(_) | None => Ok(()),
-                }
-            }
+        let authority = work_authority(context)?;
+        let control = self
+            .storage
+            .load_run_control(&authority, task_id, run_id)
+            .map_err(ApplicationProblem::from)?;
+        match control {
+            Some(control) if !control.admits_reservation() => Err(ApplicationProblem::conflict(
+                "application.work-run-control.paused",
+                "The Work run is paused, so no new attempt reservation is admitted.",
+            )),
+            Some(_) | None => Ok(()),
         }
+    }
+}
+
+impl<S> WorkRunControlService<S>
+where
+    S: WorkRunControlStoragePort,
+{
+    /// Reads the published control state for one run.
+    #[tracing::instrument(name = "application.work.run_control.read", level = "trace", skip_all)]
+    pub fn read(
+        &self,
+        context: &RequestContext,
+        request: &WorkRunControlRequestV1,
+    ) -> Result<WorkRunControlReadingV1, ApplicationProblem> {
+        let authority = work_authority(context)?;
+        let admission = self.require_admission(&authority, &request.task_id, &request.run_id)?;
+        let control = self
+            .storage
+            .load_run_control(&authority, &request.task_id, &request.run_id)
+            .map_err(ApplicationProblem::from)?;
+        Ok(match control {
+            Some(control) => WorkRunControlReadingV1::Controlled {
+                control,
+                live_attempts: admission.live_attempts,
+                total_attempts: admission.total_attempts,
+            },
+            None => WorkRunControlReadingV1::Uncontrolled {
+                deadline: admission.deadline,
+                live_attempts: admission.live_attempts,
+                total_attempts: admission.total_attempts,
+            },
+        })
     }
 
     /// Reads the next bounded, cyclic recovery page of settled interval
@@ -535,7 +534,7 @@ where
                 let authority = work_authority(context)?;
                 self.storage
                     .next_settled_blocked_intervals_for_observation(&authority, limit)
-                    .map_err(storage_problem)
+                    .map_err(ApplicationProblem::from)
             }
         }
     }
@@ -557,7 +556,7 @@ where
                 let authority = work_authority(context)?;
                 self.storage
                     .mark_settled_blocked_interval_durable(&authority, receipt)
-                    .map_err(storage_problem)
+                    .map_err(ApplicationProblem::from)
             }
         }
     }
@@ -570,7 +569,7 @@ where
     ) -> Result<WorkRunAdmissionV1, ApplicationProblem> {
         self.storage
             .run_admission(authority, task_id, run_id)
-            .map_err(storage_problem)?
+            .map_err(ApplicationProblem::from)?
             .ok_or_else(not_found_problem)
     }
 }
@@ -596,15 +595,15 @@ fn check_expected(
     }
 }
 
-fn storage_problem(error: WorkRunControlStorageError) -> ApplicationProblem {
-    match error {
-        WorkRunControlStorageError::NotFoundOrNotAuthorized => not_found_problem(),
-        WorkRunControlStorageError::AuthorityConflict => authority_conflict_problem(),
-        WorkRunControlStorageError::Unavailable => {
-            ApplicationProblem::unavailable(SafeDiagnostic {
+impl From<WorkRunControlStorageError> for ApplicationProblem {
+    fn from(error: WorkRunControlStorageError) -> Self {
+        match error {
+            WorkRunControlStorageError::NotFoundOrNotAuthorized => not_found_problem(),
+            WorkRunControlStorageError::AuthorityConflict => authority_conflict_problem(),
+            WorkRunControlStorageError::Unavailable => Self::unavailable(SafeDiagnostic {
                 code: "application.work-run-control.storage-unavailable".to_owned(),
                 message: "The Work run control authority is unavailable.".to_owned(),
-            })
+            }),
         }
     }
 }
@@ -655,15 +654,17 @@ fn workflow_steps_for_live_attempts(
             .insert(attempt.attempt_id.clone(), attempt)
             .is_some()
         {
-            return Err(storage_problem(WorkRunControlStorageError::Unavailable));
+            return Err(ApplicationProblem::from(
+                WorkRunControlStorageError::Unavailable,
+            ));
         }
     }
     live_attempts
         .iter()
         .map(|attempt_id| {
-            by_attempt
-                .remove(attempt_id)
-                .ok_or_else(|| storage_problem(WorkRunControlStorageError::AuthorityConflict))
+            by_attempt.remove(attempt_id).ok_or_else(|| {
+                ApplicationProblem::from(WorkRunControlStorageError::AuthorityConflict)
+            })
         })
         .collect()
 }

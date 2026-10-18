@@ -22,12 +22,12 @@ use tracedecay_privacy::ObservationRecordParseErrorV1;
 
 mod admission;
 
-#[cfg(test)]
-pub use admission::snapshot_cursor_after;
+pub(crate) use admission::capture_snapshot_observations;
+
 pub use admission::{
     SnapshotAdmissionBatch, SnapshotAdmissionRecord, SnapshotAdmissionRunner,
-    SnapshotCaptureOutcome, advance_snapshot_coverage, advance_snapshot_coverage_maybe,
-    capture_snapshot_observations, snapshot_capture_request, snapshot_cursor_covers_range,
+    SnapshotCaptureOutcome, SnapshotSourceRefusal, advance_snapshot_coverage,
+    advance_snapshot_coverage_maybe, snapshot_capture_request, snapshot_cursor_covers_range,
     snapshot_range_was_committed, snapshot_source_identity,
 };
 
@@ -156,6 +156,7 @@ pub fn host_admission_error(
         provider,
         reason,
         retryable: outcome.retryable,
+        status: outcome.status,
         detail: outcome.cause,
     }
 }
@@ -250,11 +251,10 @@ pub fn canonical_snapshot_envelope(
     range: ObservationSourceRangeV1,
 ) -> Result<CanonicalObservationEnvelopeV1, ObservationRecordParseErrorV1> {
     let invalid = || ObservationRecordParseErrorV1::NormalizationFailed;
-    let role = native
-        .get("role")
-        .and_then(Value::as_str)
-        .map(CanonicalMessageRoleV1::from_wire_label)
-        .unwrap_or(CanonicalMessageRoleV1::Unknown);
+    let role = native.get("role").and_then(Value::as_str).map_or(
+        CanonicalMessageRoleV1::Unknown,
+        CanonicalMessageRoleV1::from_wire_label,
+    );
     let timestamp = native.get("timestamp").and_then(Value::as_i64);
     let mut facts = Vec::new();
     let location = native.get("location").filter(|location| {

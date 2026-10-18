@@ -80,13 +80,7 @@ async fn call_production_tool(
     tool: &str,
     arguments: Value,
 ) -> Value {
-    let response = harness
-        .call_tool(project, tool, arguments)
-        .await
-        .unwrap_or_else(|error| panic!("{tool} invocation failed: {error}"));
-    let result = response
-        .result
-        .unwrap_or_else(|| panic!("{tool} returned transport error: {:?}", response.error));
+    let result = call_tool_when_ready(harness, project, tool, arguments).await;
     assert_ne!(
         result["isError"], true,
         "{tool} returned an error: {result}"
@@ -243,7 +237,7 @@ async fn in_place_edit_supersedes_every_read_path(shape: UserRecordShape) {
     let mut records = rollout_records(&project, shape);
     write_rollout(&rollout, &records);
 
-    let harness = ProductionProjectCompositionHarnessV1::open_for_session_retrieval(
+    let harness = crate::support::seeded_composition::open_for_session_retrieval(
         &isolation,
         [project.clone()],
     )

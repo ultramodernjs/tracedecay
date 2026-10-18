@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::runtime::Handle;
 use tracedecay_contracts::NativeIntegrationStatusProjectionV1;
 use tracedecay_lsp::{
     AdmittedRoot, AnalyzerCancellationAdapter, AnalyzerCancellationPort, AuthorizedLspWorkspace,
@@ -19,8 +18,6 @@ use tracedecay_lsp::{
     NativeIntegrationStatusPort, OverlaySnapshot, SemanticProviderOutcome, SemanticProviderPort,
     SemanticRequest, SemanticResponse, UpstreamCapabilities, WorkspaceDiagnosticSnapshotOutcome,
 };
-
-use super::runtime_adapters::runtime_spawner;
 
 /// Supplies exact upstream semantic capabilities when an LSP session is
 /// actually opened.
@@ -50,7 +47,6 @@ impl UpstreamCapabilityInitializationAuthority for StaticUpstreamCapabilities {
 /// Cloneable daemon registration for one admitted project.
 #[derive(Clone)]
 pub struct DaemonLspSessionFactory {
-    runtime: Handle,
     feedback: Arc<FeedbackCycleAdapter>,
     semantics: Arc<dyn SemanticProviderPort + Send + Sync>,
     diagnostics: Arc<dyn CanonicalDiagnosticSnapshotAuthority>,
@@ -63,9 +59,7 @@ pub struct DaemonLspSessionFactory {
 }
 
 impl DaemonLspSessionFactory {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        runtime: Handle,
         feedback: Arc<dyn FeedbackCycleRuntimePort>,
         semantics: Arc<dyn SemanticProviderPort + Send + Sync>,
         diagnostics: Arc<dyn CanonicalDiagnosticSnapshotAuthority>,
@@ -75,11 +69,10 @@ impl DaemonLspSessionFactory {
         upstream_capabilities: UpstreamCapabilities,
     ) -> Self {
         let feedback = Arc::new(FeedbackCycleAdapter::new(
-            runtime_spawner(runtime.clone()),
+            super::native_lsp_runtime(),
             feedback,
         ));
         Self {
-            runtime,
             feedback,
             semantics,
             diagnostics,
@@ -130,16 +123,10 @@ impl DaemonLspSessionFactory {
         DaemonLspProviderBundle::from_shared(
             self.feedback.clone() as Arc<dyn FeedbackCyclePort + Send + Sync>,
             self.semantics.clone(),
-            Arc::new(DiagnosticSnapshotAdapter::new(
-                runtime_spawner(self.runtime.clone()),
-                self.diagnostics.clone(),
-            )) as Arc<dyn DiagnosticSnapshotPort + Send + Sync>,
+            self.diagnostic_port(),
             Arc::new(AnalyzerCancellationAdapter::new(self.cancellation.clone()))
                 as Arc<dyn AnalyzerCancellationPort + Send + Sync>,
-            Arc::new(ContextProjectionAdapter::new(
-                runtime_spawner(self.runtime.clone()),
-                self.context.clone(),
-            )) as Arc<dyn ContextProjectionPort + Send + Sync>,
+            self.context_port(),
             gateway_capabilities,
             upstream_capabilities,
         )
@@ -151,6 +138,20 @@ impl DaemonLspSessionFactory {
         self.upstream_capability_initializer
             .initialize_upstream_capabilities()
             .await
+    }
+
+    fn context_port(&self) -> Arc<dyn ContextProjectionPort + Send + Sync> {
+        Arc::new(ContextProjectionAdapter::new(
+            super::native_lsp_runtime(),
+            self.context.clone(),
+        ))
+    }
+
+    fn diagnostic_port(&self) -> Arc<dyn DiagnosticSnapshotPort + Send + Sync> {
+        Arc::new(DiagnosticSnapshotAdapter::new(
+            super::native_lsp_runtime(),
+            self.diagnostics.clone(),
+        ))
     }
 
     fn current_gateway_capabilities(&self) -> GatewayCapabilities {
@@ -224,26 +225,14 @@ impl DaemonLspSessionFactory {
                 factory.feedback.clone() as Arc<dyn FeedbackCyclePort + Send + Sync>,
             );
             semantics.insert(root_uri.clone(), factory.semantics.clone());
-            diagnostics.insert(
-                root_uri.clone(),
-                Arc::new(DiagnosticSnapshotAdapter::new(
-                    runtime_spawner(factory.runtime.clone()),
-                    factory.diagnostics.clone(),
-                )) as Arc<dyn DiagnosticSnapshotPort + Send + Sync>,
-            );
+            diagnostics.insert(root_uri.clone(), factory.diagnostic_port());
             cancellation.insert(
                 root_uri.clone(),
                 Arc::new(AnalyzerCancellationAdapter::new(
                     factory.cancellation.clone(),
                 )) as Arc<dyn AnalyzerCancellationPort + Send + Sync>,
             );
-            context.insert(
-                root_uri,
-                Arc::new(ContextProjectionAdapter::new(
-                    runtime_spawner(factory.runtime.clone()),
-                    factory.context.clone(),
-                )) as Arc<dyn ContextProjectionPort + Send + Sync>,
-            );
+            context.insert(root_uri, factory.context_port());
             if let Some(port) = factory.native_integration_status.as_ref() {
                 native_integration_status.push(Arc::clone(port));
             }
@@ -697,7 +686,6 @@ mod tests {
         upstream_capability_initializer: Arc<dyn UpstreamCapabilityInitializationAuthority>,
     ) -> DaemonLspSessionFactory {
         DaemonLspSessionFactory::new(
-            Handle::current(),
             Arc::new(RuntimeFeedback),
             Arc::new(UnavailableSemanticProvider),
             Arc::new(ToggleWorkspaceDiagnostics(Arc::new(AtomicBool::new(false)))),
@@ -927,7 +915,6 @@ mod tests {
     {
         let ready = Arc::new(AtomicBool::new(false));
         let factory = DaemonLspSessionFactory::new(
-            Handle::current(),
             Arc::new(RuntimeFeedback),
             Arc::new(UnavailableSemanticProvider),
             Arc::new(ToggleWorkspaceDiagnostics(Arc::clone(&ready))),
@@ -973,6 +960,119 @@ mod tests {
         assert_eq!(
             response["result"]["capabilities"]["diagnosticProvider"]["workspaceDiagnostics"],
             true
+        );
+    }
+
+    #[test]
+    fn context_projection_settles_without_a_tokio_runtime() {
+        let factory = DaemonLspSessionFactory::new(
+            Arc::new(RuntimeFeedback),
+            Arc::new(UnavailableSemanticProvider),
+            Arc::new(ToggleWorkspaceDiagnostics(Arc::new(AtomicBool::new(false)))),
+            Arc::new(RuntimeCancellation),
+            Arc::new(RuntimeContext),
+            GatewayCapabilities::default(),
+            UpstreamCapabilities::default(),
+        );
+        let context = factory.context_port();
+        let root = AdmittedRoot::new("file:///workspace");
+        let request_id = LspRequestId::Number(1);
+        let request = ContextProjectionRequest::new(
+            tracedecay_lsp::ContextProjectionKind::diagnostics(),
+            Some("file:///workspace/src/lib.rs".to_owned()),
+        );
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        assert_eq!(
+            context.snapshot(&root, &request_id, &request),
+            ContextProjectionOutcome::Pending
+        );
+        let hang_guard = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let outcome = loop {
+            if let Some(outcome) = context.poll_snapshot(&root, &request_id) {
+                break outcome;
+            }
+            assert!(
+                std::time::Instant::now() < hang_guard,
+                "the context projection never settled"
+            );
+            std::thread::yield_now();
+        };
+
+        assert_eq!(outcome, ContextProjectionOutcome::Unsupported);
+    }
+
+    /// Reports whether each feedback cycle ran on a Tokio worker.
+    struct SignalFeedback(std::sync::Mutex<std::sync::mpsc::Sender<bool>>);
+
+    impl FeedbackCycleRuntimePort for SignalFeedback {
+        fn execute(
+            &self,
+            _request: FeedbackCycleRequest,
+        ) -> LspRuntimeFuture<Result<(), LspRuntimeFailure>> {
+            let ran = self.0.lock().expect("feedback signal").clone();
+            Box::pin(async move {
+                let _ = ran.send(tokio::runtime::Handle::try_current().is_ok());
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn feedback_cycles_and_document_diagnostics_settle_without_a_tokio_runtime() {
+        let (ran, cycles) = std::sync::mpsc::channel();
+        let factory = DaemonLspSessionFactory::new(
+            Arc::new(SignalFeedback(std::sync::Mutex::new(ran))),
+            Arc::new(UnavailableSemanticProvider),
+            Arc::new(ToggleWorkspaceDiagnostics(Arc::new(AtomicBool::new(false)))),
+            Arc::new(RuntimeCancellation),
+            Arc::new(RuntimeContext),
+            GatewayCapabilities::default(),
+            UpstreamCapabilities::default(),
+        );
+        let root = AdmittedRoot::new("file:///workspace");
+        let document = "file:///workspace/src/lib.rs";
+
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        assert_eq!(
+            factory
+                .feedback
+                .request_feedback_cycle(FeedbackCycleRequest {
+                    root_uri: root.uri().to_owned(),
+                    document_uri: document.to_owned(),
+                    trigger: tracedecay_lsp::DiagnosticTrigger::DocumentSave,
+                }),
+            FeedbackCycleResponse::Accepted
+        );
+        let on_tokio = cycles
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the accepted feedback cycle ran");
+        assert!(!on_tokio, "the feedback cycle ran on a Tokio worker");
+
+        let diagnostics = factory.diagnostic_port();
+        assert!(matches!(
+            diagnostics.request_document_refresh(&root, document, None, None),
+            DiagnosticRefreshAdmission::Started(_)
+        ));
+        let hang_guard = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let outcome = loop {
+            match diagnostics.document_diagnostics(&root, document, None) {
+                DiagnosticSnapshotOutcome::Refreshing(_) => {}
+                outcome => break outcome,
+            }
+            assert!(
+                std::time::Instant::now() < hang_guard,
+                "the diagnostic refresh never settled"
+            );
+            std::thread::yield_now();
+        };
+
+        assert_eq!(
+            outcome,
+            DiagnosticSnapshotOutcome::Failed {
+                source_generation: None,
+                failure_class: "diagnostics-unavailable".to_owned(),
+            }
         );
     }
 }

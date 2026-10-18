@@ -7,12 +7,13 @@ use std::sync::{Arc, Mutex};
 
 use tracedecay_daemon_service::retained_owner::NcmLifecycleOwner;
 use tracedecay_domain::UserProfileId;
+use tracedecay_domain::configuration::MemoryProviderNcmNamespaceBindingV1;
 #[cfg(feature = "test-transport")]
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 use tracedecay_memory_provider_ncm::{
-    NcmCognitiveSurface, NcmProviderAdapter, RustNcmConfig, RustNcmSurface, RustNcmWorkerOwner,
-    StateRoot, WorkerOptions,
+    NcmCognitiveSurface, NcmNamespaceBinding, NcmProviderAdapter, RustNcmConfig, RustNcmSurface,
+    RustNcmWorkerOwner, StateRoot, WorkerOptions,
 };
 use tracedecay_memory_provider_registry::{
     EnabledProviderMode, ObservationInstanceProofV1, ObservationProviderMountV1,
@@ -240,6 +241,7 @@ pub(in crate::daemon) fn construct_ncm_registration_with_authority(
     state_root: PathBuf,
     registration_revision: u64,
     mode: EnabledProviderMode,
+    namespace_binding: MemoryProviderNcmNamespaceBindingV1,
     authority: Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
 ) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
     let worker = owners.acquire(profile_id, &worker_binary, &state_root)?;
@@ -251,7 +253,13 @@ pub(in crate::daemon) fn construct_ncm_registration_with_authority(
     let instance_proof = Some(
         Arc::new(NcmInstanceProof(Arc::clone(&surface))) as Arc<dyn ObservationInstanceProofV1>
     );
-    let provider = NcmProviderAdapter::new(surface)?;
+    let namespace_binding = match namespace_binding {
+        MemoryProviderNcmNamespaceBindingV1::ExactSessionV1 => NcmNamespaceBinding::ExactSessionV1,
+        MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1 => {
+            NcmNamespaceBinding::CheckoutObservationsV1
+        }
+    };
+    let provider = NcmProviderAdapter::new(surface)?.with_namespace_binding(namespace_binding);
     #[cfg(feature = "test-transport")]
     let provider = attach_recall_diagnostic_sink(provider)?;
     let provider = Arc::new(match authority {
@@ -278,9 +286,7 @@ pub(in crate::daemon) fn construct_ncm_registration_with_authority(
             // thread; its model process is separately owned and cancellable below it.
             execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
             recall_scope_bindings: RecallScopeBindingsV1::from_wire(
-                tracedecay_memory_provider_ncm::NCM_RECALL_SCOPE_BINDINGS
-                    .iter()
-                    .copied(),
+                namespace_binding.recall_scope_bindings().iter().copied(),
             )
             .map_err(|error| NcmObserverConstructionError::Registration(error.to_string()))?,
             lifecycle,
@@ -310,6 +316,7 @@ mod tests {
             state_root,
             1,
             EnabledProviderMode::Observer,
+            MemoryProviderNcmNamespaceBindingV1::ExactSessionV1,
             None,
         )
         .map(|(_, mount)| mount)
@@ -394,6 +401,51 @@ mod tests {
             "lazy owner teardown is bounded"
         );
         assert!(witness.upgrade().is_none());
+    }
+
+    #[test]
+    fn configured_namespace_binding_controls_registration_scope_without_starting_a_child() {
+        use tracedecay_memory_provider_registry::ScopeBinding;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let worker = temp.path().join("absent-worker");
+        let root = temp.path().join("state");
+        let profile = UserProfileId::new("profile.namespace-binding").unwrap();
+        let slot = NcmWorkerOwnerSlot::default();
+        for binding in [
+            MemoryProviderNcmNamespaceBindingV1::ExactSessionV1,
+            MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1,
+        ] {
+            let (registration, mount) = construct_ncm_registration_with_authority(
+                &slot,
+                &profile,
+                worker.clone(),
+                root.clone(),
+                1,
+                EnabledProviderMode::Observer,
+                binding,
+                None,
+            )
+            .unwrap();
+            assert!(
+                registration
+                    .recall_scope_bindings
+                    .authorizes(ScopeBinding::ExactCodingScope)
+            );
+            assert_eq!(
+                registration
+                    .recall_scope_bindings
+                    .authorizes(ScopeBinding::CheckoutObservations),
+                binding == MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1,
+            );
+            assert_eq!(mount.state_root, root.join("namespaces"));
+            assert!(
+                slot.acquire(&profile, &worker, &root)
+                    .unwrap()
+                    .worker_pid()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

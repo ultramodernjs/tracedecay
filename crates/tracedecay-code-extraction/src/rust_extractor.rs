@@ -316,8 +316,8 @@ impl RustExtractor {
             "trait_item" => Self::visit_trait(state, node),
             "impl_item" => Self::visit_impl(state, node),
             "use_declaration" => Self::visit_use(state, node),
-            "const_item" => Self::visit_const(state, node),
-            "static_item" => Self::visit_static(state, node),
+            "const_item" => Self::visit_const_or_static(state, node, NodeKind::Const),
+            "static_item" => Self::visit_const_or_static(state, node, NodeKind::Static),
             "type_item" => Self::visit_type_alias(state, node),
             "mod_item" => Self::visit_module(state, node),
             "macro_invocation" => Self::visit_macro_invocation(state, node),
@@ -348,8 +348,10 @@ impl RustExtractor {
                 .parent_node_id()
                 .and_then(|parent_id| state.nodes.iter().rev().find(|node| node.id == parent_id))
                 .filter(|parent| parent.kind == NodeKind::Trait)
-                .map(|parent| parent.visibility.clone())
-                .unwrap_or_else(|| Self::extract_visibility(node, state))
+                .map_or_else(
+                    || Self::extract_visibility(node, state),
+                    |parent| parent.visibility.clone(),
+                )
         } else {
             Self::extract_visibility(node, state)
         };
@@ -1188,8 +1190,8 @@ impl RustExtractor {
         }
     }
 
-    /// Extract a const item node.
-    fn visit_const(state: &mut ExtractionState<'_>, node: TsNode<'_>) {
+    /// Extract a const (`NodeKind::Const`) or static (`NodeKind::Static`) item node.
+    fn visit_const_or_static(state: &mut ExtractionState<'_>, node: TsNode<'_>, kind: NodeKind) {
         let name = Self::extract_name(state, node).unwrap_or_else(|| "<anonymous>".to_string());
         let visibility = Self::extract_visibility(node, state);
         let docstring = Self::extract_docstring(state, node);
@@ -1200,17 +1202,11 @@ impl RustExtractor {
         let start_column = node.start_position().column as u32;
         let end_column = node.end_position().column as u32;
         let qualified_name = format!("{}::{}", state.qualified_prefix(), name);
-        let id = local_node_id(
-            &state.file_path,
-            state.source,
-            &NodeKind::Const,
-            &name,
-            node,
-        );
+        let id = local_node_id(&state.file_path, state.source, &kind, &name, node);
 
         let graph_node = Node {
             id: id.clone(),
-            kind: NodeKind::Const,
+            kind,
             name,
             qualified_name,
             file_path: state.file_path.clone(),
@@ -1246,65 +1242,6 @@ impl RustExtractor {
         }
         // A `const`/`static` initializer (`LazyLock::new(|| build())`) is
         // evaluated as the item; the item owns its calls.
-        Self::extract_call_sites(state, node, &id, &ReceiverTypes::default());
-    }
-
-    /// Extract a static item node.
-    fn visit_static(state: &mut ExtractionState<'_>, node: TsNode<'_>) {
-        let name = Self::extract_name(state, node).unwrap_or_else(|| "<anonymous>".to_string());
-        let visibility = Self::extract_visibility(node, state);
-        let docstring = Self::extract_docstring(state, node);
-        let text = state.node_text(node);
-        let signature = Some(text.lines().next().unwrap_or("").to_string());
-        let start_line = node.start_position().row as u32;
-        let end_line = node.end_position().row as u32;
-        let start_column = node.start_position().column as u32;
-        let end_column = node.end_position().column as u32;
-        let qualified_name = format!("{}::{}", state.qualified_prefix(), name);
-        let id = local_node_id(
-            &state.file_path,
-            state.source,
-            &NodeKind::Static,
-            &name,
-            node,
-        );
-
-        let graph_node = Node {
-            id: id.clone(),
-            kind: NodeKind::Static,
-            name,
-            qualified_name,
-            file_path: state.file_path.clone(),
-            start_line,
-            attrs_start_line: Self::compute_attrs_start_line(node),
-            end_line,
-            start_column,
-            end_column,
-            signature,
-            docstring,
-            visibility,
-            is_async: false,
-            branches: 0,
-            loops: 0,
-            returns: 0,
-            max_nesting: 0,
-            unsafe_blocks: 0,
-            unchecked_calls: 0,
-            assertions: 0,
-            complexity_analysis: ComplexityAnalysisV1::Complete,
-            updated_at: state.timestamp,
-            parent_id: None,
-        };
-        state.nodes.push(graph_node);
-
-        if let Some(parent_id) = state.parent_node_id() {
-            state.edges.push(Edge {
-                source: parent_id.to_string(),
-                target: id.clone(),
-                kind: EdgeKind::Contains,
-                line: Some(start_line),
-            });
-        }
         Self::extract_call_sites(state, node, &id, &ReceiverTypes::default());
     }
 
@@ -1475,9 +1412,7 @@ impl RustExtractor {
     /// original source positions, so node ids, spans, and text of the items
     /// found there are exactly those of the enclosing file.
     fn parse_macro_item_body(state: &mut ExtractionState<'_>, body: TsNode<'_>) -> MacroItemBody {
-        let last = u32::try_from(body.child_count())
-            .ok()
-            .and_then(|count| count.checked_sub(1));
+        let last = body.child_count().checked_sub(1);
         let (Some(open), Some(close)) = (body.child(0), last.and_then(|index| body.child(index)))
         else {
             return MacroItemBody::Unparsed;

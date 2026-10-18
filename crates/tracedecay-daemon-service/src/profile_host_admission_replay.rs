@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 #[cfg(test)]
 use tokio::task::JoinSet;
 
@@ -21,7 +20,9 @@ use tracedecay_host_admission::{
     REPLAY_BACKOFF_SHIFT_CAP, ReplayPassDecision, SharedHostAdmissionBroker, classify_replay_pass,
     replay_backoff,
 };
+use tracedecay_runtime_core::native_runtime::{self, NativeTask};
 use tracedecay_sessions::admission::HostAdmissionOutcome;
+use tracing::instrument::WithSubscriber as _;
 
 const IDLE_EVICTION_AFTER: Duration = Duration::from_secs(30);
 const BOOTSTRAP_RUNNING: u8 = 0;
@@ -111,12 +112,26 @@ pub struct ProfileHostAdmissionReplayRegistry {
 
 struct ReplayWorkerEntry {
     worker: Arc<ProfileHostAdmissionReplayWorker>,
-    task: JoinHandle<()>,
+    task: NativeTask<()>,
+}
+
+/// A dropped entry aborts its worker, so a shutdown owner timed out while
+/// joining the registry leaves no replay task running.
+impl Drop for ReplayWorkerEntry {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 struct ProfileHostAdmissionBootstrapEntry {
     worker: Arc<ProfileHostAdmissionBootstrapWorker>,
-    task: JoinHandle<()>,
+    task: NativeTask<()>,
+}
+
+impl Drop for ProfileHostAdmissionBootstrapEntry {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 struct ProfileHostAdmissionBootstrapWorker {
@@ -151,7 +166,6 @@ struct ProfileHostAdmissionReplayWorker {
     pass_count: AtomicUsize,
     backoff_count: AtomicUsize,
     idle: Notify,
-    wake: Notify,
     cancellation: Arc<ProfileHostAdmissionCancellation>,
     replay_pass: Option<ProfileHostAdmissionReplayPass>,
     #[cfg(test)]
@@ -226,12 +240,21 @@ impl ProfileHostAdmissionReplayRegistry {
             self.bootstrap_retry_budget,
         ));
         let task_worker = Arc::clone(&worker);
-        let task = tokio::spawn(tracing::Instrument::instrument(
+        let run = tracing::Instrument::instrument(
             async move {
                 task_worker.run(operation).await;
             },
             tracing::trace_span!("daemon.authority.host_admission.bootstrap.run"),
-        ));
+        );
+        // The worker's events go to the caller's subscriber, the one its span
+        // was created under, whichever native thread polls it.
+        let task = match NativeTask::spawn(run.with_current_subscriber()) {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::error!(%error, "profile host-admission bootstrap worker was not started");
+                return;
+            }
+        };
         workers.insert(
             profile_root,
             ProfileHostAdmissionBootstrapEntry { worker, task },
@@ -309,7 +332,7 @@ impl ProfileHostAdmissionReplayRegistry {
         let worker_path = broker_path.to_path_buf();
         let workers_weak = Arc::downgrade(&self.workers);
         let idle_eviction_after = self.idle_eviction_after;
-        let task = tokio::spawn(tracing::Instrument::instrument(
+        let task = NativeTask::spawn(tracing::Instrument::instrument(
             async move {
                 worker.run(idle_eviction_after).await;
                 let Some(workers) = workers_weak.upgrade() else {
@@ -325,6 +348,13 @@ impl ProfileHostAdmissionReplayRegistry {
             },
             tracing::trace_span!("daemon.authority.host_admission.replay.run"),
         ));
+        let task = match task {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::error!(%error, "profile host-admission replay worker was not started");
+                return;
+            }
+        };
         workers.insert(
             broker_path.to_path_buf(),
             ReplayWorkerEntry {
@@ -356,10 +386,10 @@ impl ProfileHostAdmissionReplayRegistry {
         };
         self.cancellation.cancel();
         for entry in replay_entries {
-            let _ = entry.task.await;
+            entry.task.wait().await;
         }
         for entry in bootstrap_entries {
-            let _ = entry.task.await;
+            entry.task.wait().await;
         }
     }
 
@@ -379,9 +409,9 @@ impl ProfileHostAdmissionReplayRegistry {
             return !self.shutting_down.load(Ordering::Acquire)
                 && !self.cancellation.cancelled.load(Ordering::Acquire);
         };
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return false;
             }
             let idle_notified = worker.idle.notified();
@@ -389,7 +419,7 @@ impl ProfileHostAdmissionReplayRegistry {
             idle_notified.as_mut().enable();
             let idle = tokio::select! {
                 () = self.cancellation.wait() => return false,
-                () = tokio::time::sleep_until(deadline) => return false,
+                _ = native_runtime::sleep_until(deadline) => return false,
                 () = idle_notified.as_mut() => continue,
                 idle = worker.is_idle() => idle,
             };
@@ -400,7 +430,7 @@ impl ProfileHostAdmissionReplayRegistry {
             tokio::select! {
                 () = self.cancellation.wait() => return false,
                 () = idle_notified.as_mut() => {}
-                () = tokio::time::sleep_until(deadline) => return false,
+                _ = native_runtime::sleep_until(deadline) => return false,
             }
         }
     }
@@ -457,7 +487,7 @@ impl ProfileHostAdmissionReplayRegistry {
     pub async fn wait_bootstrap_completed(
         &self,
         profile_root: &Path,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> BootstrapCompletion {
         let worker = {
             let workers = self.bootstrap_workers.lock().await;
@@ -468,28 +498,24 @@ impl ProfileHostAdmissionReplayRegistry {
         let Some(worker) = worker else {
             return BootstrapCompletion::Missing;
         };
-        let settled = |worker: &ProfileHostAdmissionBootstrapWorker| {
-            if worker.state.load(Ordering::Acquire) == BOOTSTRAP_RUNNING {
-                BootstrapCompletion::TimedOut
-            } else {
-                BootstrapCompletion::Completed
+        let completed = async {
+            loop {
+                let completed = worker.completed.notified();
+                if worker.state.load(Ordering::Acquire) != BOOTSTRAP_RUNNING {
+                    return;
+                }
+                completed.await;
             }
         };
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let completed = worker.completed.notified();
-            if worker.state.load(Ordering::Acquire) != BOOTSTRAP_RUNNING {
-                return BootstrapCompletion::Completed;
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return BootstrapCompletion::TimedOut;
-            }
-            tokio::select! {
-                () = completed => {}
-                () = tokio::time::sleep(remaining) => {
-                    return settled(&worker);
-                }
+        match timeout {
+            Some(timeout) => native_runtime::timeout(timeout, completed)
+                .await
+                .map_or(BootstrapCompletion::TimedOut, |()| {
+                    BootstrapCompletion::Completed
+                }),
+            None => {
+                completed.await;
+                BootstrapCompletion::Completed
             }
         }
     }
@@ -644,7 +670,21 @@ impl ProfileHostAdmissionBootstrapWorker {
                             self.finish(BOOTSTRAP_CANCELLED);
                             return;
                         }
-                        () = tokio::time::sleep(profile_replay_backoff(consecutive_retryable)) => {}
+                        slept = native_runtime::sleep_until(
+                            Instant::now() + profile_replay_backoff(consecutive_retryable),
+                        ) => {
+                            // Retrying without the delay would spin; give up
+                            // like a spent budget instead.
+                            if let Err(timer_error) = slept {
+                                tracing::warn!(
+                                    event = "profile_host_admission_bootstrap_timer_unavailable",
+                                    reason_code,
+                                    %timer_error,
+                                );
+                                self.finish_terminal(error);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -706,7 +746,6 @@ impl ProfileHostAdmissionReplayWorker {
             pass_count: AtomicUsize::new(0),
             backoff_count: AtomicUsize::new(0),
             idle: Notify::new(),
-            wake: Notify::new(),
             cancellation,
             replay_pass,
             #[cfg(test)]
@@ -718,7 +757,7 @@ impl ProfileHostAdmissionReplayWorker {
 
     fn kick(&self) {
         self.dirty.store(true, Ordering::Release);
-        self.wake.notify_one();
+        self.broker.request_replay();
     }
 
     async fn is_idle(&self) -> bool {
@@ -782,6 +821,7 @@ impl ProfileHostAdmissionReplayWorker {
                 }
                 self.busy.store(true, Ordering::Release);
                 let _ = self.dirty.swap(false, Ordering::AcqRel);
+                self.broker.clear_replay_request();
                 self.pass_count.fetch_add(1, Ordering::AcqRel);
                 let Some(pending_before) = self.pending_replay_count_or_cancelled().await else {
                     self.mark_idle();
@@ -812,7 +852,14 @@ impl ProfileHostAdmissionReplayWorker {
                                 self.mark_idle();
                                 return;
                             },
-                            () = tokio::time::sleep(profile_replay_backoff(consecutive_retryable)) => {}
+                            slept = native_runtime::sleep_until(
+                                Instant::now() + profile_replay_backoff(consecutive_retryable),
+                            ) => if slept.is_err() {
+                                // Retrying without the delay would spin; the
+                                // next kick starts a fresh worker.
+                                self.mark_idle();
+                                return;
+                            },
                         }
                     }
                     ReplayPassDecision::Stop => {
@@ -838,9 +885,13 @@ impl ProfileHostAdmissionReplayWorker {
             self.mark_idle();
             tokio::select! {
                 () = self.wait_for_cancellation() => return,
-                () = self.wake.notified() => {}
                 () = self.broker.wait_for_replay_request() => {}
-                () = tokio::time::sleep(idle_eviction_after) => {
+                slept = native_runtime::sleep_until(Instant::now() + idle_eviction_after) => {
+                    // Without a timer the idle wait cannot be bounded; exit so
+                    // the next kick starts a fresh worker.
+                    if slept.is_err() {
+                        return;
+                    }
                     let Some(has_pending) = self.has_pending_replay_or_cancelled().await else {
                         return;
                     };
@@ -887,7 +938,9 @@ mod tests {
             let attempts = Arc::clone(&operation_attempts);
             Box::pin(async move {
                 attempts.fetch_add(1, Ordering::AcqRel);
-                tokio::time::sleep(Duration::from_millis(40)).await;
+                native_runtime::sleep_until(Instant::now() + Duration::from_millis(40))
+                    .await
+                    .expect("native timer");
                 Ok(())
             })
         });
@@ -903,9 +956,7 @@ mod tests {
         }
         while tasks.join_next().await.is_some() {}
         assert_eq!(
-            registry
-                .wait_bootstrap_completed(&profile_root, Duration::from_secs(2))
-                .await,
+            registry.wait_bootstrap_completed(&profile_root, None).await,
             BootstrapCompletion::Completed,
             "coalesced bootstrap must complete"
         );
@@ -926,8 +977,8 @@ mod tests {
         let profile_root = temp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
         let registry = ProfileHostAdmissionReplayRegistry::with_bootstrap_cache_for(
-            Duration::from_millis(20),
-            Duration::from_millis(20),
+            Duration::ZERO,
+            Duration::ZERO,
         );
         let attempts = Arc::new(AtomicUsize::new(0));
         let operation_attempts = Arc::clone(&attempts);
@@ -943,17 +994,12 @@ mod tests {
             .ensure_bootstrap(&profile_root, Arc::clone(&operation))
             .await;
         assert_eq!(
-            registry
-                .wait_bootstrap_completed(&profile_root, Duration::from_secs(1))
-                .await,
+            registry.wait_bootstrap_completed(&profile_root, None).await,
             BootstrapCompletion::Completed,
         );
-        tokio::time::sleep(Duration::from_millis(30)).await;
         registry.ensure_bootstrap(&profile_root, operation).await;
         assert_eq!(
-            registry
-                .wait_bootstrap_completed(&profile_root, Duration::from_secs(1))
-                .await,
+            registry.wait_bootstrap_completed(&profile_root, None).await,
             BootstrapCompletion::Completed,
         );
         assert_eq!(attempts.load(Ordering::Acquire), 2);
@@ -966,9 +1012,9 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let profile_root = temp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        let registry = ProfileHostAdmissionReplayRegistry::with_bootstrap_cache_for(
-            Duration::from_secs(1),
-            Duration::from_millis(20),
+        let mut registry = ProfileHostAdmissionReplayRegistry::with_bootstrap_cache_for(
+            Duration::MAX,
+            Duration::MAX,
         );
         let attempts = Arc::new(AtomicUsize::new(0));
         let operation_attempts = Arc::clone(&attempts);
@@ -988,9 +1034,7 @@ mod tests {
             .ensure_bootstrap(&profile_root, Arc::clone(&operation))
             .await;
         assert_eq!(
-            registry
-                .wait_bootstrap_completed(&profile_root, Duration::from_secs(1))
-                .await,
+            registry.wait_bootstrap_completed(&profile_root, None).await,
             BootstrapCompletion::Completed,
         );
         registry
@@ -998,12 +1042,10 @@ mod tests {
             .await;
         assert_eq!(attempts.load(Ordering::Acquire), 1);
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        registry.bootstrap_terminal_cache_for = Duration::ZERO;
         registry.ensure_bootstrap(&profile_root, operation).await;
         assert_eq!(
-            registry
-                .wait_bootstrap_completed(&profile_root, Duration::from_secs(1))
-                .await,
+            registry.wait_bootstrap_completed(&profile_root, None).await,
             BootstrapCompletion::Completed,
         );
         assert_eq!(attempts.load(Ordering::Acquire), 2);
@@ -1031,9 +1073,7 @@ mod tests {
 
         registry.ensure_bootstrap(&profile_root, operation).await;
         assert_eq!(
-            registry
-                .wait_bootstrap_completed(&profile_root, Duration::from_secs(1))
-                .await,
+            registry.wait_bootstrap_completed(&profile_root, None).await,
             BootstrapCompletion::Completed,
         );
 
@@ -1086,7 +1126,7 @@ mod tests {
             .await;
         assert_eq!(
             registry
-                .wait_bootstrap_completed(&retryable_profile, Duration::from_secs(1))
+                .wait_bootstrap_completed(&retryable_profile, None)
                 .await,
             BootstrapCompletion::Completed,
         );
@@ -1114,7 +1154,7 @@ mod tests {
             .await;
         assert_eq!(
             registry
-                .wait_bootstrap_completed(&terminal_profile, Duration::from_secs(1))
+                .wait_bootstrap_completed(&terminal_profile, None)
                 .await,
             BootstrapCompletion::Completed,
         );
@@ -1161,9 +1201,7 @@ mod tests {
 
         registry.ensure_bootstrap(&profile_root, operation).await;
         assert_eq!(
-            registry
-                .wait_bootstrap_completed(&profile_root, Duration::from_secs(5))
-                .await,
+            registry.wait_bootstrap_completed(&profile_root, None).await,
             BootstrapCompletion::Completed,
             "a permanently retryable bootstrap must still terminate"
         );
@@ -1182,7 +1220,17 @@ mod tests {
         );
         let observed = attempts.load(Ordering::Acquire);
         assert!(observed >= 2, "the budget must allow real retries first");
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        while !registry
+            .bootstrap_workers
+            .lock()
+            .await
+            .get(&bootstrap_key(&profile_root))
+            .expect("bootstrap worker")
+            .task
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             attempts.load(Ordering::Acquire),
             observed,
@@ -1236,7 +1284,10 @@ mod tests {
             let passes = Arc::clone(&passes_for_override);
             Box::pin(async move {
                 passes.fetch_add(1, Ordering::AcqRel);
-                tokio::time::sleep(Duration::from_millis(40)).await;
+                // The worker runs on the native runtime, where Tokio timers
+                // have no driver.
+                let _ =
+                    native_runtime::sleep_until(Instant::now() + Duration::from_millis(40)).await;
                 HostAdmissionOutcome::accepted_for_replay()
             })
         });
@@ -1257,10 +1308,7 @@ mod tests {
             });
         }
         while kick_tasks.join_next().await.is_some() {}
-        assert!(
-            registry.wait_idle(&db_path, Duration::from_secs(2)).await,
-            "coalesced worker must become idle"
-        );
+        settled(&registry, &db_path).await;
         let observed = registry.pass_count(&db_path).await;
         assert!(
             observed <= 3,
@@ -1292,10 +1340,7 @@ mod tests {
         ));
 
         registry.ensure(&db_path, &profile_root, &broker).await;
-        assert!(
-            registry.wait_idle(&db_path, Duration::from_secs(2)).await,
-            "installed pass must complete a replay worker"
-        );
+        settled(&registry, &db_path).await;
         assert_eq!(passes.load(Ordering::Acquire), 1);
         registry.shutdown().await;
     }
@@ -1329,14 +1374,11 @@ mod tests {
             })
         });
 
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         registry
             .ensure_with_pass_override(&db_path, &profile_root, &broker, pass_override)
             .await;
-        assert!(
-            registry.wait_idle(&db_path, Duration::from_secs(2)).await,
-            "retryable worker must become idle after success"
-        );
+        settled(&registry, &db_path).await;
         let elapsed = started.elapsed();
         assert!(
             registry.backoff_count(&db_path).await >= 2,
@@ -1368,14 +1410,19 @@ mod tests {
         registry
             .ensure_with_pass_override(&db_path, &profile_root, &broker, pass_override)
             .await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while registry.backoff_count(&db_path).await < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("pending no-progress replay must back off instead of spinning");
-        assert!(registry.pass_count(&db_path).await <= 3);
+        let worker = worker(&registry, &db_path).await;
+        while worker.backoff_count.load(Ordering::Acquire) < 2
+            && worker.pass_count.load(Ordering::Acquire) <= 3
+        {
+            tokio::task::yield_now().await;
+        }
+        let passes = worker.pass_count.load(Ordering::Acquire);
+        let backoffs = worker.backoff_count.load(Ordering::Acquire);
+        assert!(
+            backoffs >= 2 && passes <= backoffs + 1,
+            "pending no-progress replay must back off before every retry instead of spinning; \
+             passes={passes} backoffs={backoffs}"
+        );
         registry.shutdown().await;
     }
 
@@ -1390,29 +1437,46 @@ mod tests {
         let broker = Arc::new(tracedecay_host_admission::HostAdmissionBroker::new(runtime));
         broker.admit("test:pending", b"pending").await.unwrap();
         let registry = ProfileHostAdmissionReplayRegistry::default();
-        let pass_override = Arc::new(|| {
-            Box::pin(async { HostAdmissionOutcome::not_applicable("code_index_not_applicable") })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = HostAdmissionOutcome> + Send>>
-        });
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let pass_override: ReplayPassOverride = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    HostAdmissionOutcome::not_applicable("code_index_not_applicable")
+                })
+            })
+        };
 
         registry
             .ensure_with_pass_override(&db_path, &profile_root, &broker, pass_override)
             .await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while registry.pass_count(&db_path).await == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("profile replay must attempt the not-applicable record");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        let passes = registry.pass_count(&db_path).await;
-        assert!(passes >= 1);
-        assert_eq!(registry.backoff_count(&db_path).await, 0);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        started.notified().await;
+        // The admission and the ensure each raised a replay request before
+        // this pass began. One left pending wakes the idle worker into a
+        // second pass over the same not-applicable record.
+        let stale_request = std::pin::pin!(broker.wait_for_replay_request())
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_ready();
+        assert!(
+            !stale_request,
+            "a running pass must answer every replay request raised before it began"
+        );
+        release.notify_one();
 
-        assert_eq!(registry.pass_count(&db_path).await, passes);
-        assert_eq!(registry.backoff_count(&db_path).await, 0);
+        let worker = worker(&registry, &db_path).await;
+        while worker.busy.load(Ordering::Acquire)
+            && worker.backoff_count.load(Ordering::Acquire) == 0
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(worker.backoff_count.load(Ordering::Acquire), 0);
+        assert_eq!(worker.pass_count.load(Ordering::Acquire), 1);
         registry.shutdown().await;
     }
 
@@ -1449,6 +1513,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_shutdown_owner_aborts_the_replay_task_it_was_joining() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let profile_root = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_root).unwrap();
+        let db_path = tracedecay_sessions::runtime::user_sessions_db_path(&profile_root);
+        let (runtime, _) =
+            tracedecay_host_admission::HostAdmissionRuntime::open_for_database(&db_path).unwrap();
+        let broker = Arc::new(tracedecay_host_admission::HostAdmissionBroker::new(runtime));
+        let registry = Arc::new(ProfileHostAdmissionReplayRegistry::default());
+        let worker = Arc::new(ProfileHostAdmissionReplayWorker::new(
+            &broker,
+            &profile_root,
+            Arc::clone(&registry.cancellation),
+            None,
+            None,
+            None,
+        ));
+        let (alive, task_dropped) = std::sync::mpsc::channel::<()>();
+        let task = NativeTask::spawn(async move {
+            let _alive = alive;
+            std::future::pending::<()>().await;
+        })
+        .expect("native replay task");
+        registry
+            .workers
+            .lock()
+            .await
+            .insert(db_path, ReplayWorkerEntry { worker, task });
+
+        let join_registry = Arc::clone(&registry);
+        let receipt = crate::shutdown::join_shutdown_owners(
+            Instant::now() + Duration::from_millis(100),
+            vec![crate::shutdown::ShutdownOwner::new(
+                "host_admission_replay",
+                || {},
+                async move { join_registry.shutdown().await },
+            )],
+        )
+        .await;
+
+        assert_eq!(
+            receipt.owners[0].status,
+            crate::shutdown::ShutdownStatus::TimedOut
+        );
+        assert_eq!(
+            task_dropped.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+            "a timed-out owner must not leave the replay task it was joining running"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_probe_deadline_and_shutdown_are_cancellable() {
         let temp = tempfile::TempDir::new().unwrap();
         let profile_root = temp.path().join("profile");
@@ -1476,9 +1592,10 @@ mod tests {
             Some(pending_count_override),
         ));
         let task_worker = Arc::clone(&worker);
-        let task = tokio::spawn(async move {
+        let task = NativeTask::spawn(async move {
             task_worker.run(Duration::from_secs(30)).await;
-        });
+        })
+        .expect("native replay task");
         registry.workers.lock().await.insert(
             db_path.clone(),
             ReplayWorkerEntry {
@@ -1488,20 +1605,15 @@ mod tests {
         );
         probe_started.notified().await;
 
-        let started = Instant::now();
+        // The probe never answers and nothing cancels before shutdown, so
+        // only the caller's grace can end this wait.
         assert!(
             !registry
                 .wait_idle(&db_path, Duration::from_millis(20))
                 .await,
             "blocked pending probe must respect the caller's replay grace"
         );
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "blocked pending probe exceeded its bounded grace"
-        );
-        tokio::time::timeout(Duration::from_secs(1), registry.shutdown())
-            .await
-            .expect("shutdown must cancel and join a blocked pending probe");
+        registry.shutdown().await;
         assert_eq!(registry.worker_count().await, 0);
     }
 
@@ -1546,9 +1658,10 @@ mod tests {
             Some(pending_count_override),
         ));
         let cancellation = Arc::clone(&registry.cancellation);
-        let task = tokio::spawn(async move {
+        let task = NativeTask::spawn(async move {
             cancellation.wait().await;
-        });
+        })
+        .expect("native replay task");
         registry.workers.lock().await.insert(
             db_path.clone(),
             ReplayWorkerEntry {
@@ -1559,9 +1672,11 @@ mod tests {
 
         let wait_registry = Arc::clone(&registry);
         let wait_db_path = db_path.clone();
+        // The grace never ends this wait: a lost idle notification leaves it
+        // parked until the harness timeout.
         let wait = tokio::spawn(async move {
             wait_registry
-                .wait_idle(&wait_db_path, Duration::from_secs(1))
+                .wait_idle(&wait_db_path, Duration::from_hours(1))
                 .await
         });
         probe_started.notified().await;
@@ -1569,10 +1684,7 @@ mod tests {
         release_probe.notify_one();
 
         assert!(
-            tokio::time::timeout(Duration::from_millis(250), wait)
-                .await
-                .expect("idle notification must avoid the full grace")
-                .expect("wait task"),
+            wait.await.expect("wait task"),
             "a fresh idle probe must observe the completed replay"
         );
         registry.shutdown().await;
@@ -1659,12 +1771,268 @@ mod tests {
         registry
             .ensure_with_pass_override(&db_path, &profile_root, &broker, pass_override)
             .await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while registry.worker_count().await != 0 {
-                tokio::task::yield_now().await;
+        while registry.worker_count().await != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn worker(
+        registry: &ProfileHostAdmissionReplayRegistry,
+        broker_path: &Path,
+    ) -> Arc<ProfileHostAdmissionReplayWorker> {
+        let workers = registry.workers.lock().await;
+        Arc::clone(&workers.get(broker_path).expect("replay worker").worker)
+    }
+
+    /// `wait_idle` without its grace: the worker's idle transition is the
+    /// signal, and a worker that never settles fails at the harness timeout.
+    async fn settled(registry: &ProfileHostAdmissionReplayRegistry, broker_path: &Path) {
+        let worker = worker(registry, broker_path).await;
+        loop {
+            let idle = worker.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if worker.is_idle().await {
+                return;
             }
+            idle.await;
+        }
+    }
+
+    fn open_test_broker(profile_root: &Path) -> (PathBuf, SharedHostAdmissionBroker) {
+        let db_path = tracedecay_sessions::runtime::user_sessions_db_path(profile_root);
+        let (runtime, _) =
+            tracedecay_host_admission::HostAdmissionRuntime::open_for_database(&db_path).unwrap();
+        let broker = Arc::new(tracedecay_host_admission::HostAdmissionBroker::new(runtime));
+        (db_path, broker)
+    }
+
+    /// A replay worker ensured by a caller with no Tokio runtime runs its
+    /// passes on the native runtime, and shutdown joins it there.
+    #[test]
+    fn a_worker_ensured_off_tokio_replays_and_joins() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let profile_root = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_root).unwrap();
+        let (db_path, broker) = open_test_broker(&profile_root);
+        let registry = ProfileHostAdmissionReplayRegistry::default();
+        let replayed = Arc::new(Notify::new());
+        let pass_override: ReplayPassOverride = {
+            let replayed = Arc::clone(&replayed);
+            Arc::new(move || {
+                let replayed = Arc::clone(&replayed);
+                Box::pin(async move {
+                    replayed.notify_one();
+                    HostAdmissionOutcome::accepted_for_replay()
+                })
+            })
+        };
+        let writer_waits = tracedecay_rusqlite_runtime::exact_sql::native_thread_writer_waits();
+
+        native_runtime::block_on(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            registry
+                .ensure_with_pass_override(&db_path, &profile_root, &broker, pass_override)
+                .await;
+            native_runtime::timeout(Duration::from_secs(10), replayed.notified())
+                .await
+                .expect("the native worker runs a replay pass");
+            native_runtime::timeout(Duration::from_secs(10), registry.shutdown())
+                .await
+                .expect("shutdown cancels and joins the native worker");
+            assert_eq!(registry.worker_count().await, 0);
         })
-        .await
-        .expect("idle replay worker must be evicted");
+        .expect("native runtime");
+        assert_eq!(
+            tracedecay_rusqlite_runtime::exact_sql::native_thread_writer_waits(),
+            writer_waits
+        );
+    }
+
+    /// A bootstrap ensured by a caller with no Tokio runtime runs its
+    /// operation on the native runtime, and shutdown joins it there.
+    #[test]
+    fn a_bootstrap_ensured_off_tokio_completes_and_joins() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let profile_root = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_root).unwrap();
+        let registry = ProfileHostAdmissionReplayRegistry::default();
+        let ran_on_tokio = Arc::new(AtomicBool::new(true));
+        let operation_ran_on_tokio = Arc::clone(&ran_on_tokio);
+        let operation: ProfileHostAdmissionBootstrapOperation = Arc::new(move || {
+            let ran_on_tokio = Arc::clone(&operation_ran_on_tokio);
+            Box::pin(async move {
+                ran_on_tokio.store(
+                    tokio::runtime::Handle::try_current().is_ok(),
+                    Ordering::Release,
+                );
+                Ok(())
+            })
+        });
+
+        native_runtime::block_on(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            registry.ensure_bootstrap(&profile_root, operation).await;
+            assert_eq!(
+                registry.wait_bootstrap_completed(&profile_root, None).await,
+                BootstrapCompletion::Completed
+            );
+            assert!(matches!(
+                registry.bootstrap_status(&profile_root).await,
+                Some(ProfileHostAdmissionBootstrapStatus::Ready)
+            ));
+            native_runtime::timeout(Duration::from_secs(10), registry.shutdown())
+                .await
+                .expect("shutdown joins the native bootstrap worker");
+        })
+        .expect("native runtime");
+        assert!(!ran_on_tokio.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn workers_back_off_and_evict_with_no_tokio_runtime_entered() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let temp = tempfile::TempDir::new().unwrap();
+        let profile_root = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_root).unwrap();
+        let (_, broker) = open_test_broker(&profile_root);
+        let cancellation = Arc::new(ProfileHostAdmissionCancellation::new());
+        let passes = Arc::new(AtomicUsize::new(0));
+        let pass_override: ReplayPassOverride = {
+            let passes = Arc::clone(&passes);
+            Arc::new(move || {
+                let passes = Arc::clone(&passes);
+                Box::pin(async move {
+                    if passes.fetch_add(1, Ordering::AcqRel) < 2 {
+                        HostAdmissionOutcome::retained_unavailable("test_retryable")
+                    } else {
+                        HostAdmissionOutcome::accepted_for_replay()
+                    }
+                })
+            })
+        };
+        let replay = ProfileHostAdmissionReplayWorker::new(
+            &broker,
+            &profile_root,
+            Arc::clone(&cancellation),
+            None,
+            Some(pass_override),
+            None,
+        );
+        replay.kick();
+        let idle_eviction_after = Duration::from_millis(20);
+
+        let started = Instant::now();
+        native_runtime::block_on(native_runtime::timeout(
+            Duration::from_secs(5),
+            replay.run(idle_eviction_after),
+        ))
+        .expect("native runtime")
+        .expect("an idle replay worker must evict itself on its native timer");
+        let elapsed = started.elapsed();
+        assert_eq!(passes.load(Ordering::Acquire), 3);
+        assert_eq!(replay.backoff_count.load(Ordering::Acquire), 2);
+        let floor = profile_replay_backoff(1) + profile_replay_backoff(2) + idle_eviction_after;
+        assert!(
+            elapsed >= floor,
+            "two backoffs and the idle bound must all wait; elapsed={elapsed:?} floor={floor:?}"
+        );
+
+        let bootstrap =
+            ProfileHostAdmissionBootstrapWorker::new(cancellation, Duration::from_millis(60));
+        let operation: ProfileHostAdmissionBootstrapOperation = Arc::new(|| {
+            Box::pin(async {
+                Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                    "test_bootstrap_unavailable",
+                    true,
+                    "permanently retryable test failure",
+                ))
+            })
+        });
+        native_runtime::block_on(native_runtime::timeout(
+            Duration::from_secs(5),
+            bootstrap.run(operation),
+        ))
+        .expect("native runtime")
+        .expect("a retryable bootstrap must spend its budget on native backoff timers");
+        let attempts = bootstrap.attempt_count.load(Ordering::Acquire);
+        assert!(
+            (2..=3).contains(&attempts),
+            "backoff must space retries across the 60 ms budget; attempts={attempts}"
+        );
+        assert!(matches!(
+            bootstrap.status(),
+            Some(ProfileHostAdmissionBootstrapStatus::Terminal(_))
+        ));
+    }
+
+    #[test]
+    fn registry_deadlines_fire_with_no_tokio_runtime_entered() {
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempfile::TempDir::new().unwrap();
+        let profile_root = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_root).unwrap();
+        let (db_path, broker) = open_test_broker(&profile_root);
+        let registry = ProfileHostAdmissionReplayRegistry::default();
+        let probe_started = Arc::new(Notify::new());
+        let pending_count_override: PendingReplayCountOverride = {
+            let probe_started = Arc::clone(&probe_started);
+            Arc::new(move || {
+                let probe_started = Arc::clone(&probe_started);
+                Box::pin(async move {
+                    probe_started.notify_one();
+                    std::future::pending::<usize>().await
+                })
+            })
+        };
+        let worker = Arc::new(ProfileHostAdmissionReplayWorker::new(
+            &broker,
+            &profile_root,
+            Arc::clone(&registry.cancellation),
+            None,
+            None,
+            Some(pending_count_override),
+        ));
+        let task_worker = Arc::clone(&worker);
+        let task = NativeTask::spawn(async move {
+            task_worker.run(Duration::from_secs(30)).await;
+        })
+        .expect("native replay task");
+        registry
+            .workers
+            .try_lock()
+            .unwrap()
+            .insert(db_path.clone(), ReplayWorkerEntry { worker, task });
+        let operation: ProfileHostAdmissionBootstrapOperation =
+            Arc::new(|| Box::pin(std::future::pending()));
+        tokio_runtime.block_on(registry.ensure_bootstrap(&profile_root, operation));
+        assert!(tokio::runtime::Handle::try_current().is_err());
+
+        native_runtime::block_on(async {
+            probe_started.notified().await;
+            let grace = Duration::from_millis(20);
+            let started = Instant::now();
+            assert!(
+                !registry.wait_idle(&db_path, grace).await,
+                "a blocked pending probe must end at the caller's deadline"
+            );
+            assert_eq!(
+                registry
+                    .wait_bootstrap_completed(&profile_root, Some(grace))
+                    .await,
+                BootstrapCompletion::TimedOut
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= grace && elapsed < Duration::from_secs(1),
+                "both deadlines must fire on time; elapsed={elapsed:?}"
+            );
+        })
+        .expect("native runtime");
+        tokio_runtime.block_on(registry.shutdown());
     }
 }

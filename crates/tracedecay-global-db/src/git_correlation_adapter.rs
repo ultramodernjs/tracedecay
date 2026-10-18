@@ -7,6 +7,10 @@
 
 use std::borrow::Borrow;
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
+
+use futures_util::future::BoxFuture;
 
 use tracedecay_runtime_core::db::DatabaseEngineReadSnapshot;
 use tracedecay_store::StoreShardScopeV1;
@@ -52,9 +56,9 @@ impl RegisteredGlobalDb {
     /// Concrete registered-database entry point for callers with a scoped
     /// borrow. The registered authority implements the session-store port
     /// directly, so host-admission futures retain their original lifetime.
-    pub async fn converge_session_git_evidence<G: GitReflogSource + ?Sized>(
+    pub async fn converge_session_git_evidence(
         &self,
-        git: &G,
+        git: std::sync::Arc<dyn GitReflogSource>,
         project_root: Option<&std::path::Path>,
     ) -> Result<GitEvidencePassOutcome, GitCorrelationError> {
         converge_git_evidence_pass(self, git, project_root).await
@@ -188,19 +192,14 @@ where
     /// and appends it, with the commit attribution it enables, in one
     /// transaction.
     #[tracing::instrument(name = "global_db.git_correlation.converge", level = "trace", skip_all)]
-    pub async fn converge_session_git_evidence<G: GitReflogSource + ?Sized>(
+    pub async fn converge_session_git_evidence(
         &self,
-        git: &G,
+        git: std::sync::Arc<dyn GitReflogSource>,
         project_root: Option<&std::path::Path>,
     ) -> Result<GitEvidencePassOutcome, GitCorrelationError> {
         converge_git_evidence_pass(self, git, project_root).await
     }
 
-    #[tracing::instrument(
-        name = "global_db.git_correlation.bounded_history",
-        level = "trace",
-        skip_all
-    )]
     pub async fn run_bounded_history_index_page(
         &self,
         opts: &BackfillOptions,
@@ -246,12 +245,39 @@ where
     ) -> Result<(Vec<SessionGitCorrelationHit>, CorrelationIndexPresence), GitCorrelationError>
     {
         self.require_project_sessions_authority()?;
-        let snapshot = self.read_snapshot().await?;
+        let opened: Pin<
+            Box<
+                dyn Future<Output = Result<DatabaseEngineReadSnapshot, GitCorrelationError>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(self.read_snapshot());
+        let snapshot = opened.await?;
         let backfill_watermark =
             read_meta_value(&snapshot, GIT_HISTORY_SEQUENCE_FRONTIER_KEY).await?;
-        Ok(match open_git_evidence_view(&snapshot).await? {
+        let viewed: BoxFuture<
+            '_,
+            Result<
+                Option<
+                    tracedecay_sessions::runtime::git_correlation::GitEvidenceView<
+                        '_,
+                        DatabaseEngineReadSnapshot,
+                    >,
+                >,
+                GitCorrelationError,
+            >,
+        > = Box::pin(open_git_evidence_view(&snapshot));
+        Ok(match viewed.await? {
             Some(view) => {
-                let results = view.sessions_for(query, relation).await?;
+                let matched: Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<Vec<SessionGitCorrelationHit>, GitCorrelationError>,
+                            > + Send
+                            + '_,
+                    >,
+                > = Box::pin(view.sessions_for(query, relation));
+                let results = matched.await?;
                 (results, view.presence(backfill_watermark))
             }
             None => (
@@ -381,7 +407,7 @@ mod tests {
     /// Hook-route observations land in the project store's own rows, and
     /// every read (health, presence, sessions_for, scope, session evidence)
     /// answers from the same generation.
-    #[tokio::test]
+    #[asupersync::test]
     async fn recorded_spans_are_read_back_through_every_facade() {
         let root = tempfile::tempdir().unwrap();
         let registered = RegisteredGlobalDbTestRuntime::project(
@@ -489,13 +515,13 @@ mod tests {
         assert_eq!(evidence.commits, Vec::new());
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn profile_sessions_authority_cannot_record_project_git_evidence() {
         let harness = RegisteredGlobalDbHarness::open("git-correlation-profile-isolation").await;
         let store = GlobalDbGitCorrelationStore::new(harness.registered.clone());
 
         assert!(matches!(
-            store.converge_session_git_evidence(&SystemGit, None).await,
+            store.converge_session_git_evidence(std::sync::Arc::new(SystemGit), None).await,
             Err(GitCorrelationError::Db(message))
                 if message.contains("ProjectSessions")
         ));

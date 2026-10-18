@@ -1,7 +1,5 @@
 use std::fs;
 use std::num::NonZeroU64;
-use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -13,27 +11,17 @@ use tracedecay_runtime_core::resident_memory::{
     ResidentMemoryComponentIdV1, ResidentMemoryPressureV1,
 };
 
-use crate::code_index::production::{CodeIndexProductionErrorV1, CodeIndexPublicationStoreErrorV1};
+use tracedecay_code_index::production::{
+    CodeIndexProductionErrorV1, CodeIndexPublicationStoreErrorV1,
+};
 
 use super::publication_store::ActiveGenerationDecodeChargeV1;
 use super::tests::OwnerSignals;
+use super::tests::git;
 use super::{
     CodeIndexReconcileOutcomeV1, CodeIndexSchedulerErrorV1, CodeIndexSchedulerRegistryV1,
     CodeIndexWorktreeSchedulerV1, SharedCodeIndexBytePoolV1,
 };
-
-fn git(root: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .current_dir(root)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
 fn fixture() -> TempDir {
     let root = TempDir::new().expect("fixture root");
@@ -749,7 +737,18 @@ fn a_released_generation_decodes_again_only_once_its_bytes_fit_the_budget() {
     )
     .expect("open scheduler");
     let limit = NonZeroU64::new(16 * GIB).expect("limit");
-    let pressure = Arc::new(ResidentMemoryPressureV1::new(limit));
+    // This tests ledger admission independently of unrelated process allocations.
+    let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
+        limit,
+        Arc::new(|| {
+            Some(ProcessResidentSampleV1 {
+                resident_bytes: 0,
+                unreclaimable_bytes: 0,
+                swapped_bytes: 0,
+                cgroup_committed_bytes: None,
+            })
+        }),
+    ));
     let high_watermark = pressure.high_watermark_bytes();
     let authority = Arc::new(ProcessResidentMemoryV1::with_pressure(limit, pressure));
     scheduler.bind_resident_memory(Arc::clone(&authority));

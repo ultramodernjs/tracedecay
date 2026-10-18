@@ -1,9 +1,9 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::time::Instant;
+use std::time::Instant;
 use tracedecay_contracts::graph_tool::GraphToolResultV1;
 use tracedecay_contracts::retrieval::{
-    AdminCliResultV1, AdminCliScopeV1, AdminCliSurfaceRequestV1,
+    AdminCliRegistryContextV1, AdminCliResultV1, AdminCliScopeV1, AdminCliSurfaceRequestV1,
 };
 use tracedecay_contracts::{ApplicationEnvelope, ApplicationOutcome, ApplicationProblemEnvelope};
 use tracedecay_runtime_core::config::ProfileRoot;
@@ -119,11 +119,7 @@ pub(crate) async fn admin_cli_result(
     project_path: Option<&std::path::Path>,
     request: AdminCliSurfaceRequestV1,
 ) -> tracedecay_domain::errors::Result<AdminCliResultV1> {
-    let deadline = Instant::now()
-        .checked_add(crate::tool_command::tool_command_deadline()?)
-        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
-            message: "the CLI tool deadline exceeds the supported monotonic range".to_owned(),
-        })?;
+    let deadline = crate::tool_command::tool_command_deadline()?;
     let result = crate::tool_command::owner_operation_result(
         profile,
         client_handshake(profile, project_path)?,
@@ -135,6 +131,21 @@ pub(crate) async fn admin_cli_result(
     match result {
         GraphToolResultV1::AdminCli(result) => Ok(*result),
         _ => Err(admin_cli_result_mismatch("tracedecay_admin_cli")),
+    }
+}
+
+/// The profile registry's context for one project selector: a project id, a
+/// root path, or a registered alias.
+pub(crate) async fn registry_context(
+    profile: &ProfileRoot,
+    selector: std::path::PathBuf,
+) -> tracedecay_domain::errors::Result<AdminCliRegistryContextV1> {
+    let request = AdminCliSurfaceRequestV1::RegistryContext {
+        project_arg: Some(selector),
+    };
+    match admin_cli_result(profile, None, request).await? {
+        AdminCliResultV1::RegistryContext(context) => Ok(context),
+        _ => Err(admin_cli_result_mismatch("registry_context")),
     }
 }
 
@@ -168,13 +179,23 @@ pub(crate) async fn daemon_tool_json(
 ) -> tracedecay_domain::errors::Result<serde_json::Value> {
     tracing::trace!(name: "cli.daemon.tool", value = ?tool_name);
     let handshake = client_handshake(profile, project_path)?;
+    // Both calls are erased so every command's `Send` proof stops here
+    // (rust-lang/rust#159228).
     let result = tracing::Instrument::instrument(
-        tracedecay::daemon::call_default_tool(profile, &handshake, tool_name, arguments),
+        tracedecay_runtime_core::erase_send!(
+            tracedecay::daemon::call_default_tool(profile, &handshake, tool_name, arguments),
+            tracedecay_domain::errors::Result<serde_json::Value>
+        ),
         tracing::trace_span!("cli.daemon.request"),
     )
     .await?;
-    tracedecay::daemon::recover_truncated_tool_payload(profile, &handshake, tool_name, result, None)
-        .await
+    tracedecay_runtime_core::erase_send!(
+        tracedecay::daemon::recover_truncated_tool_payload(
+            profile, &handshake, tool_name, result, None
+        ),
+        tracedecay_domain::errors::Result<serde_json::Value>
+    )
+    .await
 }
 
 /// Deadline-carrying variant for CLI journeys that deliberately trigger a cold
@@ -252,7 +273,7 @@ pub(crate) fn reject_truncation_envelope(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeSet;
 
     use serde_json::json;
@@ -274,7 +295,7 @@ mod tests {
         ResultContractRef::new(SchemaId::new("schema.cli.fixture.result").unwrap(), 1).unwrap()
     }
 
-    fn scope() -> ResolvedScope {
+    pub(crate) fn scope() -> ResolvedScope {
         ResolvedScope::new(
             ProjectId::new("project.cli.fixture").unwrap(),
             RepositoryId::new("repository.cli.fixture").unwrap(),
@@ -286,16 +307,21 @@ mod tests {
 
     use tracedecay_domain::test_fixtures::digest;
 
-    fn context() -> RequestContext {
-        let capability = CapabilityId::new("capability.cli.fixture").unwrap();
-        let use_case = UseCaseId::new("use-case.cli.fixture").unwrap();
+    /// A request whose grant covers `capability` and `use_case` until
+    /// `grant_expires_at`, due by `deadline`.
+    pub(crate) fn request_context(
+        capability: CapabilityId,
+        use_case: UseCaseId,
+        grant_expires_at: UtcMicros,
+        deadline: UtcMicros,
+    ) -> RequestContext {
         let grant = CapabilityGrantSnapshot::new(
             "grant.cli.fixture".to_owned().try_into().unwrap(),
             1,
             digest('a'),
             ActorId::new("actor.issuer").unwrap(),
             UtcMicros(1),
-            UtcMicros(1_000),
+            grant_expires_at,
             scope(),
             BTreeSet::from([capability]),
             BTreeSet::from([use_case]),
@@ -307,7 +333,7 @@ mod tests {
             scope(),
             grant,
             RequestId::new("request.cli.fixture").unwrap(),
-            Deadline::new(UtcMicros(500)).unwrap(),
+            Deadline::new(deadline).unwrap(),
             CancellationContext::active("cancel.cli.fixture").unwrap(),
         )
         .unwrap()
@@ -315,10 +341,13 @@ mod tests {
 
     /// A daemon reply as retained tools actually send it: the typed payload
     /// nested inside a full evidence envelope.
-    fn evidence_reply(payload: serde_json::Value) -> serde_json::Value {
-        let context = context();
+    pub(crate) fn evidence_reply(
+        context: &RequestContext,
+        contract: ResultContractRef,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
         let authority = AuthorityReceipt::from_context(
-            &context,
+            context,
             PolicyDecisionRef::new(
                 "policy.cli.fixture",
                 1,
@@ -358,7 +387,7 @@ mod tests {
         };
         let packet = EvidencePacket::from_retrieval(evidence, authority, receipt).unwrap();
         serde_json::to_value(tracedecay_contracts::ApplicationEnvelope::evidence(
-            contract(),
+            contract,
             context.request_id().clone(),
             scope(),
             packet,
@@ -377,7 +406,13 @@ mod tests {
             answer: i64,
         }
 
-        let reply = evidence_reply(json!({ "answer": 42 }));
+        let context = request_context(
+            CapabilityId::new("capability.cli.fixture").unwrap(),
+            UseCaseId::new("use-case.cli.fixture").unwrap(),
+            UtcMicros(1_000),
+            UtcMicros(500),
+        );
+        let reply = evidence_reply(&context, contract(), json!({ "answer": 42 }));
         assert!(
             serde_json::from_value::<StrictResult>(reply.clone()).is_err(),
             "the fixture must reproduce the raw-envelope decode crash"

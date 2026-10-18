@@ -263,7 +263,7 @@ pub async fn run_cargo_tests(
     timeout: Duration,
     control: TestRunControl,
 ) -> Result<TestRunOutput, TestRunFailure> {
-    tokio::task::spawn_blocking(move || {
+    tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         run_selected_cargo_tests(&project_root, profile, &test_names, timeout, &control)
     })
     .await
@@ -1361,7 +1361,7 @@ mod tests {
             return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER);
         }
         let mut exit_code = 0_u32;
-        let read = unsafe { get_exit_code_process(process, &mut exit_code) };
+        let read = unsafe { get_exit_code_process(process, &raw mut exit_code) };
         let _ = unsafe { close_handle(process) };
         read == 0 || exit_code == STILL_ACTIVE
     }

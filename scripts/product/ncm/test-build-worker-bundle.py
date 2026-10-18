@@ -9,7 +9,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import stat
 import sys
 import tempfile
@@ -196,11 +196,21 @@ class BuildWorkerBundleTest(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(
                 captured.getvalue().strip(),
-                f"TRACEDECAY_NCM_WORKER_MANIFEST={output}",
+                f"TRACEDECAY_NCM_WORKER_MANIFEST={output.as_posix()}",
             )
             merged = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(len(merged["targets"]), 2)
             self.assertEqual(MODULE.main(["--merge", inputs[0], inputs[0], "-o", str(output)]), 2)
+
+    def test_printed_paths_use_forward_slashes_on_windows(self) -> None:
+        manifest = PureWindowsPath(
+            r"D:\a\repo\ncm-bundle\x86_64-pc-windows-msvc\worker-manifest.json"
+        )
+        self.assertEqual(
+            MODULE.assignment("TRACEDECAY_NCM_WORKER_MANIFEST", manifest),
+            "TRACEDECAY_NCM_WORKER_MANIFEST="
+            "D:/a/repo/ncm-bundle/x86_64-pc-windows-msvc/worker-manifest.json",
+        )
 
     def test_package_cli_pins_declared_worker_and_manifest_inputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ncm-package-") as directory:
@@ -235,7 +245,7 @@ class BuildWorkerBundleTest(unittest.TestCase):
             )
             self.assertEqual(
                 captured.getvalue().strip(),
-                f"TRACEDECAY_NCM_WORKER_MANIFEST={output / 'worker-manifest.json'}",
+                f"TRACEDECAY_NCM_WORKER_MANIFEST={(output / 'worker-manifest.json').as_posix()}",
             )
 
     def test_package_cli_refuses_missing_inputs_without_publishing_output(self) -> None:

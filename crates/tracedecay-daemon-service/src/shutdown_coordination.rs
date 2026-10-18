@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tracedecay_runtime_core::native_runtime::{NativeTask, NativeTaskOutcome};
 use tracedecay_store_runtime::ShutdownStatus;
 
 pub struct ShutdownCoordinatorV1 {
@@ -13,7 +14,7 @@ pub struct ShutdownCoordinatorV1 {
 struct ShutdownCoordinatorState {
     running: AtomicBool,
     terminal: std::sync::Mutex<Option<ShutdownStatus>>,
-    coordinator_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    coordinator_task: tokio::sync::Mutex<Option<NativeTask<()>>>,
     changed: tokio::sync::Notify,
 }
 
@@ -21,6 +22,12 @@ struct ShutdownCoordinatorCompletion(Arc<ShutdownCoordinatorState>);
 
 impl Drop for ShutdownCoordinatorCompletion {
     fn drop(&mut self) {
+        // Work that panicked unwinds through here without a receipt.
+        if std::thread::panicking() {
+            self.0.finish(ShutdownStatus::Failed(
+                "MCP shutdown work panicked".to_owned(),
+            ));
+        }
         self.0.changed.notify_waiters();
     }
 }
@@ -36,7 +43,7 @@ impl Default for ShutdownCoordinatorV1 {
 impl ShutdownCoordinatorV1 {
     pub async fn coordinate_until<Work>(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: std::time::Instant,
         work: Work,
     ) -> ShutdownStatus
     where
@@ -79,26 +86,24 @@ impl ShutdownCoordinatorV1 {
                 return status;
             }
 
-            let Some(work) = work.take() else {
-                self.state.finish(ShutdownStatus::Failed(
-                    "MCP shutdown coordinator lost its work future".to_owned(),
-                ));
-                drop(coordinator_task);
-                return ShutdownStatus::Failed(
-                    "MCP shutdown coordinator lost its work future".to_owned(),
-                );
-            };
-            let state = Arc::clone(&self.state);
-            let task = tokio::spawn(async move {
-                let _completion = ShutdownCoordinatorCompletion(Arc::clone(&state));
-                let runner = tokio::spawn(work);
-                let status = match runner.await {
-                    Ok(status) => status,
-                    Err(error) => ShutdownStatus::Failed(error.to_string()),
-                };
-                state.finish(status);
-            });
-            *coordinator_task = Some(task);
+            let started = work
+                .take()
+                .ok_or_else(|| "MCP shutdown coordinator lost its work future".to_owned())
+                .and_then(|work| {
+                    let state = Arc::clone(&self.state);
+                    NativeTask::spawn(async move {
+                        let _completion = ShutdownCoordinatorCompletion(Arc::clone(&state));
+                        state.finish(work.await);
+                    })
+                    .map_err(|error| format!("MCP shutdown coordinator was not started: {error}"))
+                });
+            match started {
+                Ok(task) => *coordinator_task = Some(task),
+                Err(error) => {
+                    self.state.finish(ShutdownStatus::Failed(error.clone()));
+                    return ShutdownStatus::Failed(error);
+                }
+            }
             drop(coordinator_task);
             return self.wait_for_terminal_status_until(deadline).await;
         }
@@ -112,13 +117,9 @@ impl ShutdownCoordinatorV1 {
     async fn reap_completed_coordinator(&self) {
         let result = {
             let mut coordinator_task = self.state.coordinator_task.lock().await;
-            let Some(task) = coordinator_task.as_mut() else {
+            let Some(result) = coordinator_task.as_ref().and_then(NativeTask::try_finished) else {
                 return;
             };
-            if !task.is_finished() {
-                return;
-            }
-            let result = task.await;
             coordinator_task.take();
             result
         };
@@ -127,12 +128,12 @@ impl ShutdownCoordinatorV1 {
 
     /// Waits for the coordinator task to finish, then reaps it.
     ///
-    /// This awaits the `JoinHandle` rather than re-checking `is_finished()`
-    /// behind `changed`, because no notification ever follows the task becoming
+    /// This awaits the task rather than re-checking `is_finished()` behind
+    /// `changed`, because no notification ever follows the task becoming
     /// finished. Both notifications a coordinator sends, `finish` and
     /// `ShutdownCoordinatorCompletion::drop`, run while its future is still
-    /// being polled, and tokio marks the task complete only after that poll
-    /// returns. A waiter that registered on `changed` after the last
+    /// being polled, and the runtime marks the task complete only after that
+    /// poll returns. A waiter that registered on `changed` after the last
     /// notification and observed `is_finished() == false` therefore had nothing
     /// left to wake it, and this wait has no deadline of its own to escape on.
     ///
@@ -142,20 +143,24 @@ impl ShutdownCoordinatorV1 {
     async fn join_coordinator(&self) {
         let result = {
             let mut coordinator_task = self.state.coordinator_task.lock().await;
-            let Some(task) = coordinator_task.as_mut() else {
+            let Some(task) = coordinator_task.as_ref() else {
                 return;
             };
-            let result = task.await;
+            let result = task.wait().await;
             coordinator_task.take();
             result
         };
         self.observe_coordinator_result(result);
     }
 
-    fn observe_coordinator_result(&self, result: Result<(), tokio::task::JoinError>) {
-        if let Err(error) = result {
-            tracing::error!(%error, "MCP shutdown coordinator task failed after receipt");
-            self.state.finish(ShutdownStatus::Failed(error.to_string()));
+    fn observe_coordinator_result(&self, outcome: NativeTaskOutcome<()>) {
+        if !matches!(outcome, NativeTaskOutcome::Completed(())) {
+            tracing::error!(
+                ?outcome,
+                "MCP shutdown coordinator task failed after receipt"
+            );
+            self.state
+                .finish(ShutdownStatus::Failed(format!("{outcome:?}")));
         }
     }
 
@@ -167,10 +172,7 @@ impl ShutdownCoordinatorV1 {
             .clone()
     }
 
-    async fn wait_for_terminal_status_until(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> ShutdownStatus {
+    async fn wait_for_terminal_status_until(&self, deadline: std::time::Instant) -> ShutdownStatus {
         loop {
             if let Some(status) = self.terminal_status() {
                 self.join_coordinator().await;
@@ -191,7 +193,11 @@ impl ShutdownCoordinatorV1 {
                 self.join_coordinator().await;
                 return ShutdownStatus::TimedOut;
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            // An unavailable timer reads as elapsed.
+            if tracedecay_runtime_core::native_runtime::timeout_at(deadline, notified)
+                .await
+                .is_err()
+            {
                 return ShutdownStatus::TimedOut;
             }
         }
@@ -214,6 +220,77 @@ impl ShutdownCoordinatorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    use tracedecay_runtime_core::native_runtime;
+
+    /// The bounded wait times out on the native clock, so a waiter driven by
+    /// no Tokio runtime still returns at its deadline, and not before it.
+    #[test]
+    fn a_running_coordinator_wait_times_out_without_a_tokio_runtime() {
+        let coordinator = ShutdownCoordinatorV1::default();
+        coordinator.state.running.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let status = native_runtime::block_on(native_runtime::timeout(
+            Duration::from_secs(10),
+            coordinator.wait_for_terminal_status_until(deadline),
+        ))
+        .expect("native runtime");
+
+        assert_eq!(status, Ok(ShutdownStatus::TimedOut));
+        assert!(
+            Instant::now() >= deadline,
+            "the wait ended before its deadline"
+        );
+    }
+
+    /// The coordinator and the MCP shutdown work it owns both run on the
+    /// native runtime, so a caller with no Tokio runtime gets the work's own
+    /// receipt.
+    #[test]
+    fn coordinating_without_a_tokio_runtime_runs_the_work_on_the_native_runtime() {
+        let coordinator = ShutdownCoordinatorV1::default();
+        let status = native_runtime::block_on(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            coordinator
+                .coordinate_until(Instant::now() + Duration::from_secs(5), async {
+                    if tokio::runtime::Handle::try_current().is_ok() {
+                        return ShutdownStatus::Failed("work ran on Tokio".to_owned());
+                    }
+                    native_runtime::sleep_until(Instant::now() + Duration::from_millis(1))
+                        .await
+                        .map_or_else(ShutdownStatus::Failed, |()| ShutdownStatus::Clean)
+                })
+                .await
+        })
+        .expect("native runtime");
+
+        assert_eq!(status, ShutdownStatus::Clean);
+    }
+
+    /// Work that panics reports a failure at once instead of holding its
+    /// caller until the deadline.
+    #[test]
+    fn panicking_work_fails_before_the_deadline() {
+        let coordinator = ShutdownCoordinatorV1::default();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let fail = true;
+        let status = native_runtime::block_on(coordinator.coordinate_until(deadline, async move {
+            assert!(!fail, "shutdown work failed on purpose");
+            ShutdownStatus::Clean
+        }))
+        .expect("native runtime");
+
+        assert_eq!(
+            status,
+            ShutdownStatus::Failed("MCP shutdown work panicked".to_owned())
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the panic must not wait out the deadline"
+        );
+    }
 
     /// The ordering that stalled the daemon's RMCP shutdown for a full test
     /// bound: a waiter begins waiting for the coordinator task after the
@@ -221,35 +298,43 @@ mod tests {
     /// marked complete afterwards.
     ///
     /// A real coordinator always passes through this state, because both of its
-    /// notifications run while its future is still being polled and tokio marks
-    /// the task complete only once that poll returns. Installing the handle
-    /// directly makes the window a fact instead of a race: the task cannot
-    /// complete until `release` is sent, and `release` is sent from a task
-    /// queued behind the waiter on the runtime's only worker, so the waiter has
-    /// provably observed an unfinished handle first. Waiting on `changed` for a
-    /// finished handle sleeps forever here; awaiting the handle cannot.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn a_coordinator_that_sends_no_further_notification_is_still_joined() {
-        let coordinator = Arc::new(ShutdownCoordinatorV1::default());
+    /// notifications run while its future is still being polled and the runtime
+    /// marks the task complete only once that poll returns. Installing the task
+    /// directly makes the window a fact instead of a race: the waiter is polled
+    /// once and observes an unfinished task before `release` lets it finish.
+    /// Waiting on `changed` for a finished task sleeps forever here; awaiting
+    /// the task cannot.
+    #[test]
+    fn a_coordinator_that_sends_no_further_notification_is_still_joined() {
+        let coordinator = ShutdownCoordinatorV1::default();
         let (release, released) = tokio::sync::oneshot::channel::<()>();
-        *coordinator.state.coordinator_task.lock().await = Some(tokio::spawn(async move {
-            let _ = released.await;
-        }));
-        coordinator.state.finish(ShutdownStatus::Clean);
+        native_runtime::block_on(async {
+            *coordinator.state.coordinator_task.lock().await = Some(
+                NativeTask::spawn(async move {
+                    let _ = released.await;
+                })
+                .expect("native coordinator task"),
+            );
+            coordinator.state.finish(ShutdownStatus::Clean);
 
-        let waiter = tokio::spawn({
-            let coordinator = Arc::clone(&coordinator);
-            async move { coordinator.join_coordinator().await }
-        });
-        tokio::spawn(async move { release.send(()).expect("release the coordinator task") });
-
-        tokio::time::timeout(std::time::Duration::from_secs(30), waiter)
-            .await
-            .expect("a coordinator that sends no further notification must still be joined")
-            .expect("join the waiter");
-        assert!(
-            coordinator.state.coordinator_task.lock().await.is_none(),
-            "the joined coordinator handle must be reaped"
-        );
+            let mut join = std::pin::pin!(coordinator.join_coordinator());
+            std::future::poll_fn(|cx| {
+                assert!(
+                    join.as_mut().poll(cx).is_pending(),
+                    "the coordinator task is still running"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            release.send(()).expect("release the coordinator task");
+            native_runtime::timeout(Duration::from_secs(30), join)
+                .await
+                .expect("a coordinator that sends no further notification must still be joined");
+            assert!(
+                coordinator.state.coordinator_task.lock().await.is_none(),
+                "the joined coordinator task must be reaped"
+            );
+        })
+        .expect("native runtime");
     }
 }

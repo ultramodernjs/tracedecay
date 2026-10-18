@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,9 +8,9 @@ use tracedecay_contracts::retained_surfaces::{
     GitScopeV1, HydrationStateResultV1, MessageSearchHitV1, MessageSearchRequestV1,
     MessageSearchResultV1, RetainedNextActionV1, RetainedOutcomeStatusV1, RetainedSurfaceOperation,
     RetainedSurfaceResultV1, SessionMessageV1, SessionRecordV1, SessionRefreshRequestV1,
-    SessionRefreshScopeV1, SessionsForRequestV1, TemporalCoverageOmissionV1, TemporalExplanationV1,
-    TemporalFreshnessV1, TemporalMetadataV1, TemporalOmissionV1, TemporalPopulationCountV1,
-    WorkflowsRequestV1,
+    SessionRefreshScopeV1, SessionsForRequestV1, SessionsForResultV1, TemporalCoverageOmissionV1,
+    TemporalExplanationV1, TemporalFreshnessV1, TemporalMetadataV1, TemporalOmissionV1,
+    TemporalPopulationCountV1, WorkflowsRequestV1, WorkflowsResultV1,
 };
 use tracedecay_contracts::{
     ApplicationOutcome, RequestAdmission, RetainedSessionExecutionPortV1, RetainedSessionRequestV1,
@@ -19,6 +21,7 @@ use tracedecay_domain::{
     ManifestDigest, ProjectId, RetrievalGrainV1, SessionId, TemporalModeV1, UserProfileId,
     canonical_sha256,
 };
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_session_memory::context::{ResolvedSessionIdentity, SessionRootId, SessionStoreId};
 use tracedecay_session_memory::session::{
     SessionDataFreshness, SessionFreshnessPolicy, SessionRetrievalScope, SessionTemporalQuery,
@@ -272,16 +275,18 @@ impl<'a> DirectRetainedSessionPortV1<'a> {
             return Err(RetainedSurfaceExecutionErrorV1::Unsupported);
         };
         ensure_mounted_project_context(context, authorities)?;
+        let queried: Pin<
+            Box<
+                dyn Future<Output = Result<SessionsForResultV1, RetainedSurfaceExecutionErrorV1>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(crate::session_queries::sessions_for(
+            Some(authorities.session_database.as_ref()),
+            request,
+        ));
         let result = self
-            .bounded(context, async {
-                Ok::<_, TraceDecayError>(
-                    crate::session_queries::sessions_for(
-                        Some(authorities.session_database.as_ref()),
-                        request,
-                    )
-                    .await,
-                )
-            })
+            .bounded(context, async { Ok::<_, TraceDecayError>(queried.await) })
             .await??;
         evidence_outcome(
             context,
@@ -304,16 +309,18 @@ impl<'a> DirectRetainedSessionPortV1<'a> {
             return Err(RetainedSurfaceExecutionErrorV1::Unsupported);
         };
         ensure_mounted_project_context(context, authorities)?;
+        let queried: Pin<
+            Box<
+                dyn Future<Output = Result<WorkflowsResultV1, RetainedSurfaceExecutionErrorV1>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(crate::session_queries::workflows(
+            Some(authorities.workflow_index.as_ref()),
+            request,
+        ));
         let result = self
-            .bounded(context, async {
-                Ok::<_, TraceDecayError>(
-                    crate::session_queries::workflows(
-                        Some(authorities.workflow_index.as_ref()),
-                        request,
-                    )
-                    .await,
-                )
-            })
+            .bounded(context, async { Ok::<_, TraceDecayError>(queried.await) })
             .await??;
         if result.status == RetainedOutcomeStatusV1::Unavailable {
             let detail = result.error.as_ref().map_or_else(
@@ -967,6 +974,11 @@ async fn retrieve_bounded(
                 tracedecay_contracts::CancellationStage::BeforeRead,
             ));
         }
+        RequestAdmission::GrantExpired => {
+            return Err(RetainedSurfaceExecutionErrorV1::ApplicationProblem(
+                tracedecay_contracts::ApplicationProblem::grant_expired_before_admission(),
+            ));
+        }
     }
     let remaining = context
         .request_context
@@ -992,8 +1004,8 @@ async fn retrieve_bounded(
         () = context.cancellation_signal.cancelled() => {
             Err(RetainedSurfaceExecutionErrorV1::Cancelled(tracedecay_contracts::CancellationStage::DuringRead))
         }
-        outcome = tokio::time::timeout(remaining, retrieval) => {
-            outcome.map_err(|_| RetainedSurfaceExecutionErrorV1::TimedOut(tracedecay_contracts::CancellationStage::DuringRead))
+        outcome = native_runtime::timeout(remaining, retrieval) => {
+            outcome.map_err(super::read_timeout_error)
         }
     }
 }

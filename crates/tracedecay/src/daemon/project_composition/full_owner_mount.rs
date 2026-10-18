@@ -1,8 +1,7 @@
 use std::future::Future;
 
-use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::Result;
 
-/// Spawn HTTP so its sync router build cannot starve owner polls.
 /// Box both arms so the caller's phase future stays one leaf wide.
 pub(super) fn join_independent_full_owner_mounts<Owners, Http, OwnersMount, HttpMount>(
     owners_mount: OwnersMount,
@@ -10,8 +9,7 @@ pub(super) fn join_independent_full_owner_mounts<Owners, Http, OwnersMount, Http
 ) -> impl Future<Output = Result<(Owners, Http)>>
 where
     OwnersMount: Future<Output = Result<Owners>>,
-    HttpMount: Future<Output = Result<Http>> + Send + 'static,
-    Http: Send + 'static,
+    HttpMount: Future<Output = Result<Http>>,
 {
     let owners_mount = Box::pin(tracing::Instrument::instrument(
         owners_mount,
@@ -22,21 +20,7 @@ where
         tracing::trace_span!("daemon.project.open.http_application"),
     ));
     tracing::Instrument::instrument(
-        async move {
-            let mut http_tasks = tokio::task::JoinSet::new();
-            http_tasks.spawn(http_mount);
-            tokio::try_join!(owners_mount, async {
-                http_tasks
-                    .join_next()
-                    .await
-                    .ok_or_else(|| TraceDecayError::Config {
-                        message: "http application mount task missing".to_owned(),
-                    })?
-                    .map_err(|error| TraceDecayError::Config {
-                        message: format!("http application mount task failed: {error}"),
-                    })?
-            })
-        },
+        async move { tokio::try_join!(owners_mount, http_mount) },
         tracing::trace_span!("daemon.project.compose.join_full_mounts"),
     )
 }
@@ -143,7 +127,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_owner_mount_cancels_spawned_http_mount() {
+    async fn failed_owner_mount_cancels_http_mount() {
         let (entered, http_entered) = oneshot::channel();
         let (dropped, drop_receipt) = oneshot::channel();
         let error = join_independent_full_owner_mounts(
@@ -166,12 +150,12 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(2), drop_receipt)
             .await
-            .expect("owner failure must cancel the spawned HTTP mount")
+            .expect("owner failure must cancel the HTTP mount")
             .expect("HTTP cancellation receipt");
     }
 
     #[tokio::test]
-    async fn cancelling_full_mount_cancels_spawned_http_mount() {
+    async fn cancelling_full_mount_cancels_http_mount() {
         let (entered, http_entered) = oneshot::channel();
         let (dropped, drop_receipt) = oneshot::channel();
         let joined = tokio::spawn(join_independent_full_owner_mounts(
@@ -195,7 +179,27 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(2), drop_receipt)
             .await
-            .expect("full mount cancellation must cancel the spawned HTTP mount")
+            .expect("full mount cancellation must cancel the HTTP mount")
             .expect("HTTP cancellation receipt");
+    }
+
+    #[test]
+    fn independent_full_mounts_join_without_a_tokio_runtime() {
+        let hazards = crate::test_support::native_runtime_hazards();
+        let joined = tracedecay_runtime_core::native_runtime::block_on(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            join_independent_full_owner_mounts(async { Ok("owners-ready") }, async {
+                Ok(tokio::runtime::Handle::try_current().is_err())
+            })
+            .await
+        })
+        .expect("native runtime runs the full mount")
+        .expect("admit both full mounts");
+        assert_eq!(
+            joined,
+            ("owners-ready", true),
+            "the HTTP mount runs off Tokio"
+        );
+        assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
     }
 }

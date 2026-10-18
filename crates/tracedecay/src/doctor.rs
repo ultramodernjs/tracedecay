@@ -74,6 +74,12 @@ impl DoctorTestRuntime {
             .profile_sessions()
             .await
             .expect("mount Doctor test profile session store");
+        // The relation graph opens as background work after the mount
+        // returns; diagnosing before it settles reports it unavailable.
+        registry
+            .settle_profile_session_graph()
+            .await
+            .expect("settle Doctor test profile session relation graph");
         Self {
             database,
             _registry: registry,
@@ -185,15 +191,14 @@ pub async fn run_doctor(
 }
 
 struct IndependentDoctorChecks {
-    daemon_service: tokio::task::JoinHandle<DoctorCounters>,
-    reset_stores: tokio::task::JoinHandle<(DoctorCounters, bool)>,
-    project_files: tokio::task::JoinHandle<DoctorCounters>,
-    daemon_status: tokio::task::JoinHandle<
-        Option<tracedecay_domain::errors::Result<Option<serde_json::Value>>>,
-    >,
-    watcher: tokio::task::JoinHandle<DoctorCounters>,
-    upload: tokio::task::JoinHandle<tracedecay_domain::errors::Result<UploadSetting>>,
-    hosts: tokio::task::JoinHandle<DoctorCounters>,
+    daemon_service: DoctorCheck<DoctorCounters>,
+    reset_stores: DoctorCheck<(DoctorCounters, bool)>,
+    project_files: DoctorCheck<DoctorCounters>,
+    daemon_status:
+        DoctorCheck<Option<tracedecay_domain::errors::Result<Option<serde_json::Value>>>>,
+    watcher: DoctorCheck<DoctorCounters>,
+    upload: DoctorCheck<tracedecay_domain::errors::Result<UploadSetting>>,
+    hosts: DoctorCheck<DoctorCounters>,
     network: DoctorNetworkChecks,
 }
 
@@ -230,11 +235,10 @@ fn launch_independent_doctor_checks(
         project_files: spawn_doctor_check(move || {
             collect_quiet(|dc| {
                 check_inert_project_config(dc, &project_for_files);
-                check_pr_autotrack_state(dc, &profile_root_for_files, &project_for_files);
-                check_automation_effect_resets(dc, &profile_root_for_files, &project_for_files);
+                check_persisted_state_resets(dc, &profile_root_for_files, &project_for_files);
             })
         }),
-        daemon_status: tokio::spawn(async move {
+        daemon_status: spawn_doctor_task(async move {
             if daemon_listening {
                 Some(daemon_project_status(&profile_for_status, &project_for_status).await)
             } else {
@@ -244,7 +248,7 @@ fn launch_independent_doctor_checks(
         watcher: spawn_doctor_check(move || {
             collect_quiet(|dc| check_watcher(dc, &profile_for_watcher))
         }),
-        upload: tokio::spawn(async move {
+        upload: spawn_doctor_task(async move {
             if daemon_listening {
                 configured_upload_enabled(&profile_for_upload)
                     .await
@@ -266,18 +270,42 @@ fn collect_quiet(check: impl FnOnce(&mut DoctorCounters)) -> DoctorCounters {
     counters
 }
 
-fn spawn_doctor_check<T, F>(check: F) -> tokio::task::JoinHandle<T>
+/// A synchronous doctor check running on the native blocking pool.
+type DoctorCheck<T> = futures_util::future::BoxFuture<'static, Result<T, String>>;
+
+fn spawn_doctor_check<T, F>(check: F) -> DoctorCheck<T>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(check)
+    Box::pin(tracedecay_runtime_core::native_runtime::spawn_blocking(
+        check,
+    ))
 }
 
-async fn join_doctor_check<T>(
-    handle: tokio::task::JoinHandle<T>,
+/// A daemon round trip running on the native runtime beside the blocking
+/// checks. The result travels over a channel because a `NativeTask` output
+/// must be `Clone`, and the doctor's error type is not.
+#[track_caller]
+fn spawn_doctor_task<T: Send + 'static>(
+    work: impl Future<Output = T> + Send + 'static,
+) -> DoctorCheck<T> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let started = tracedecay_runtime_core::native_runtime::NativeTask::spawn(async move {
+        let _ = sender.send(work.await);
+    });
+    Box::pin(async move {
+        let _task = started?;
+        receiver
+            .await
+            .map_err(|_| "doctor task ended without a result".to_owned())
+    })
+}
+
+async fn join_doctor_check<T, E: std::fmt::Display>(
+    check: impl Future<Output = Result<T, E>>,
 ) -> tracedecay_domain::errors::Result<T> {
-    handle
+    check
         .await
         .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
             message: format!("doctor check task failed: {error}"),
@@ -669,14 +697,14 @@ async fn daemon_project_status(
         false,
         false,
     )?;
-    let warmup_deadline = tokio::time::Instant::now() + RUNTIME_TELEMETRY_WARMUP;
+    let warmup_deadline = std::time::Instant::now() + RUNTIME_TELEMETRY_WARMUP;
     loop {
         // Diagnostic probe, not a liveness gate. A multi-gigabyte store
         // cold-opening while agents saturate the daemon can take well over 10s
         // for its first integrity read; a warm steady-state read returns in well
         // under a second. Give it headroom so a contended read reports real
         // status instead of failing the post-update with a spurious timeout.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         let result = crate::daemon::call_default_tool_within(
             profile,
             &handshake,
@@ -695,7 +723,7 @@ async fn daemon_project_status(
             Some(deadline),
         )
         .await?;
-        let warmed_up = tokio::time::Instant::now() >= warmup_deadline;
+        let warmed_up = std::time::Instant::now() >= warmup_deadline;
         match daemon_runtime_status(runtime)? {
             // The first Doctor call starts the project open, so a warming
             // owner is polled like missing telemetry until the report lands.
@@ -707,7 +735,11 @@ async fn daemon_project_status(
                 return Ok(Some(status));
             }
             None if warmed_up => return Ok(None),
-            Some(_) | None => tokio::time::sleep(RUNTIME_TELEMETRY_POLL).await,
+            Some(_) | None => tracedecay_runtime_core::native_runtime::sleep_until(
+                std::time::Instant::now() + RUNTIME_TELEMETRY_POLL,
+            )
+            .await
+            .map_err(|message| tracedecay_domain::errors::TraceDecayError::Config { message })?,
         }
     }
 }
@@ -1061,7 +1093,7 @@ fn check_watcher(dc: &mut DoctorCounters, profile: &tracedecay_runtime_core::con
                     degraded += 1;
                     dc.warn(&format!(
                         "{project}: degraded (bounded scheduler-reconciliation fallback){}",
-                        ev.detail.map(|d| format!(", {d}")).unwrap_or_default()
+                        ev.detail.map_or_default(|d| format!(", {d}"))
                     ));
                 }
                 "git_watch_restart" => {
@@ -1136,19 +1168,26 @@ fn pr_autotrack_state_findings(data_root: &Path) -> std::result::Result<Vec<Stri
     }
 }
 
-fn check_pr_autotrack_state(dc: &mut DoctorCounters, profile_root: &Path, project_path: &Path) {
+/// Reports PR auto-tracking state and refused automation effect journals for
+/// the project's persisted layout, when it has one.
+fn check_persisted_state_resets(dc: &mut DoctorCounters, profile_root: &Path, project_path: &Path) {
     let Ok(Some(layout)) =
         tracedecay_runtime_core::storage::resolve_persisted_layout(project_path, profile_root)
     else {
         return;
     };
-    match pr_autotrack_state_findings(&layout.data_root) {
-        Ok(warnings) => {
-            for warning in warnings {
-                dc.warn(&warning);
+    for findings in [
+        pr_autotrack_state_findings(&layout.data_root),
+        automation_effect_reset_findings(&layout.dashboard_root),
+    ] {
+        match findings {
+            Ok(warnings) => {
+                for warning in warnings {
+                    dc.warn(&warning);
+                }
             }
+            Err(failure) => dc.fail(&failure),
         }
-        Err(failure) => dc.fail(&failure),
     }
 }
 
@@ -1175,26 +1214,6 @@ fn automation_effect_reset_findings(
             ),
         })
         .collect())
-}
-
-fn check_automation_effect_resets(
-    dc: &mut DoctorCounters,
-    profile_root: &Path,
-    project_path: &Path,
-) {
-    let Ok(Some(layout)) =
-        tracedecay_runtime_core::storage::resolve_persisted_layout(project_path, profile_root)
-    else {
-        return;
-    };
-    match automation_effect_reset_findings(&layout.dashboard_root) {
-        Ok(warnings) => {
-            for warning in warnings {
-                dc.warn(&warning);
-            }
-        }
-        Err(failure) => dc.fail(&failure),
-    }
 }
 
 #[tracing::instrument(name = "doctor.config.upload", level = "trace", skip_all)]
@@ -1348,6 +1367,10 @@ fn check_host_integrations(
         home: home.to_path_buf(),
         profile: profile.clone(),
         project_path: project_path.to_path_buf(),
+        catalog_profiles: saved_catalog_profiles(profile.data_dir()).unwrap_or_else(|message| {
+            dc.fail(&message);
+            agents::serve_args::HostCatalogProfiles::default()
+        }),
     };
     let tracked = tracked_hosts(dc, profile.data_dir());
     for agent in agents::all_integrations() {
@@ -1406,15 +1429,29 @@ fn warn_detected_unintegrated_host(
     dc.warn(&format!(
         "{} detected{} but tracedecay is not integrated, run `tracedecay install --agent {}`",
         agent.name(),
-        surface
-            .map(|surface| format!(" ({})", surface.display()))
-            .unwrap_or_default(),
+        surface.map_or_default(|surface| format!(" ({})", surface.display())),
         agent.id()
     ));
 }
 
 /// The hosts the profile tracks; an unreadable profile config is a warning,
 /// with no host treated as tracked.
+/// Every agent's saved catalog profile. An unreadable profile config is
+/// reported by [`tracked_hosts`]; a saved name the catalog lacks is an error
+/// naming the reset command.
+fn saved_catalog_profiles(
+    profile_root: &Path,
+) -> Result<agents::serve_args::HostCatalogProfiles, String> {
+    let Ok(config) = tracedecay_session_memory::user_config::UserConfig::load(profile_root) else {
+        return Ok(agents::serve_args::HostCatalogProfiles::default());
+    };
+    let catalog =
+        tracedecay_daemon_service::application_surface::application_surface_binding_catalog_ref()
+            .map_err(|error| format!("Catalog profiles are unavailable: {error}"))?;
+    agents::serve_args::HostCatalogProfiles::parse(&config.agent_catalog_profile, catalog)
+        .map_err(|error| error.to_string())
+}
+
 fn tracked_hosts(dc: &mut DoctorCounters, profile_root: &Path) -> Vec<String> {
     match tracedecay_session_memory::user_config::UserConfig::load(profile_root) {
         Ok(config) => config.installed_agents,
@@ -1426,10 +1463,8 @@ fn tracked_hosts(dc: &mut DoctorCounters, profile_root: &Path) -> Vec<String> {
 }
 
 struct DoctorNetworkChecks {
-    latest: tokio::task::JoinHandle<
-        Result<String, tracedecay_dashboard_api::cloud::ReleaseLookupError>,
-    >,
-    worldwide: Option<tokio::task::JoinHandle<Option<u64>>>,
+    latest: DoctorCheck<Result<String, tracedecay_dashboard_api::cloud::ReleaseLookupError>>,
+    worldwide: Option<DoctorCheck<Option<u64>>>,
     fetch_worldwide_total: fn() -> Option<u64>,
 }
 

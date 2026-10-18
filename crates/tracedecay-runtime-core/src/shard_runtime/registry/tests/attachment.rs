@@ -55,6 +55,8 @@ struct FakeAttachment {
 struct FakeAttachmentControl {
     snapshot: Mutex<PhysicalRuntimeSnapshot>,
     fail_drain: AtomicBool,
+    file_lost: AtomicBool,
+    lost_file_closed: AtomicBool,
     retain_work_after_drain: AtomicBool,
     drain_calls: AtomicUsize,
     close_calls: AtomicUsize,
@@ -80,6 +82,8 @@ impl FakeAttachmentControl {
                 memory_estimate_bytes: Some(8_192),
             }),
             fail_drain: AtomicBool::new(false),
+            file_lost: AtomicBool::new(false),
+            lost_file_closed: AtomicBool::new(true),
             retain_work_after_drain: AtomicBool::new(false),
             drain_calls: AtomicUsize::new(0),
             close_calls: AtomicUsize::new(0),
@@ -97,6 +101,14 @@ impl PhysicalRuntimeAttachment for FakeAttachment {
 
     fn opened_file_identity(&self) -> Result<u64, String> {
         Ok(1)
+    }
+
+    fn file_lost(&self) -> bool {
+        self.control.file_lost.load(Ordering::SeqCst)
+    }
+
+    fn lost_file_closed(&self) -> bool {
+        self.control.lost_file_closed.load(Ordering::SeqCst)
     }
 
     fn drain(&self) -> Result<(), String> {
@@ -168,6 +180,7 @@ impl ShardRuntimePublisher for AttachmentPublisher {
 fn attachment_registry() -> (StoreRuntimeRegistry, Arc<AttachmentPublisher>) {
     let publisher = Arc::new(AttachmentPublisher::default());
     let registry = StoreRuntimeRegistry::with_config(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
         Arc::new(TestResolver::default()),
         publisher.clone(),
         StoreRuntimeRegistryConfig::new(1).unwrap(),
@@ -177,16 +190,20 @@ fn attachment_registry() -> (StoreRuntimeRegistry, Arc<AttachmentPublisher>) {
 }
 
 async fn wait_for_gate(gate: &OperationGate) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !gate.entered.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
+    asupersync::time::timeout(
+        asupersync::Cx::current().unwrap().now(),
+        Duration::from_secs(2),
+        async {
+            while !gate.entered.load(Ordering::SeqCst) {
+                asupersync::runtime::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("eviction reached the blocking attachment operation");
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn publication_and_aliases_share_and_retain_one_physical_attachment() {
     let (registry, publisher) = attachment_registry();
     let pin = profile_pin(&registry).await;
@@ -206,13 +223,33 @@ async fn publication_and_aliases_share_and_retain_one_physical_attachment() {
         .iter()
         .find(|entry| entry.health.binding == *first.binding())
         .unwrap();
-    assert!(observed.health.writer_present);
     assert!(observed.physical.writer.is_some());
     assert_eq!(observed.physical.reader_handles, 2);
-    assert_eq!(observed.health.queued_operations, 3);
-    assert_eq!(observed.health.queued_bytes, 512);
-    assert_eq!(observed.health.wal_bytes, 4_096);
-    assert_eq!(observed.health.memory_estimate_bytes, 8_192);
+    let projected = |inventory: &RuntimeRegistryInventory| {
+        crate::shard_runtime::telemetry::project_runtime_telemetry(inventory)
+            .shards
+            .into_iter()
+            .find(|shard| shard.binding == *first.binding())
+            .unwrap()
+    };
+    let shard = projected(&inventory);
+    assert!(shard.writer_present);
+    assert_eq!((shard.queued_operations, shard.queued_bytes), (3, 512));
+    assert_eq!(
+        (shard.wal_bytes, shard.memory_estimate_bytes),
+        (Some(4_096), Some(8_192))
+    );
+    assert_eq!(
+        shard.health,
+        crate::shard_runtime::telemetry::ShardRuntimeHealth::Unknown
+    );
+    publisher.control(1).snapshot.lock().unwrap().healthy = false;
+    let shard =
+        projected(&registry.inventory(tracedecay_store::AdmissionConfigV1::default(), None));
+    assert_eq!(
+        shard.health,
+        crate::shard_runtime::telemetry::ShardRuntimeHealth::Degraded
+    );
     drop(first);
     drop(alias);
     assert!(
@@ -221,7 +258,43 @@ async fn publication_and_aliases_share_and_retain_one_physical_attachment() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
+async fn a_lost_runtime_stays_mapped_until_its_connections_close() {
+    let (registry, publisher) = attachment_registry();
+    let pin = profile_pin(&registry).await;
+    let request = code_request("worktree.lost-file", &pin);
+    let lost = open_published(&registry, request.clone()).await;
+    let control = publisher.control(1);
+    let published = publisher.calls.load(Ordering::SeqCst);
+    control.lost_file_closed.store(false, Ordering::SeqCst);
+    control.file_lost.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        registry.lookup(lost.binding()),
+        StoreRuntimeLookup::Evicting { .. }
+    ));
+    assert!(matches!(
+        registry.open(request.clone()).await,
+        StoreRuntimeOpenResult::Failed(
+            StoreRuntimeRegistryFailure::RuntimeEvictionInProgress { .. }
+        )
+    ));
+    assert_eq!(
+        publisher.calls.load(Ordering::SeqCst),
+        published,
+        "no successor may publish beside connections still open on the lost file"
+    );
+
+    control.lost_file_closed.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        registry.lookup(lost.binding()),
+        StoreRuntimeLookup::Missing { .. }
+    ));
+    open_published(&registry, request).await;
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), published + 1);
+}
+
+#[asupersync::test]
 async fn eviction_drains_verifies_closes_once_and_drops_database_proxy() {
     let (registry, publisher) = attachment_registry();
     let pin = profile_pin(&registry).await;
@@ -242,7 +315,7 @@ async fn eviction_drains_verifies_closes_once_and_drops_database_proxy() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn drain_failure_is_terminal_and_retains_evicting_attachment() {
     let (registry, publisher) = attachment_registry();
     let pin = profile_pin(&registry).await;
@@ -266,7 +339,7 @@ async fn drain_failure_is_terminal_and_retains_evicting_attachment() {
     ));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn incomplete_drain_is_verified_before_physical_close() {
     let (registry, publisher) = attachment_registry();
     let pin = profile_pin(&registry).await;
@@ -300,7 +373,7 @@ async fn incomplete_drain_is_verified_before_physical_close() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[asupersync::test(flavor = "multi_thread", workers = 2)]
 async fn blocking_join_releases_registry_lock_and_reserves_evicted_and_opening_keys() {
     let (registry, publisher) = attachment_registry();
     let pin = profile_pin(&registry).await;
@@ -314,11 +387,8 @@ async fn blocking_join_releases_registry_lock_and_reserves_evicted_and_opening_k
 
     let eviction_registry = registry.clone();
     let eviction_request = opening_request.clone();
-    let runtime = tokio::runtime::Handle::current();
-    let eviction = std::thread::spawn(move || {
-        let _runtime = runtime.enter();
-        eviction_registry.begin_or_join_open(&eviction_request)
-    });
+    let eviction =
+        std::thread::spawn(move || eviction_registry.begin_or_join_open(&eviction_request));
     wait_for_gate(&control.close_gate).await;
 
     let inventory_registry = registry.clone();
@@ -339,14 +409,14 @@ async fn blocking_join_releases_registry_lock_and_reserves_evicted_and_opening_k
 
         let evicted_open = registry.begin_or_join_open(&evicted_request);
         let duplicate_open = registry.begin_or_join_open(&opening_request);
-        let lease = registry.acquire_lease(active_lease(&binding, "lease.eviction-race"));
-        (evicted_open, duplicate_open, lease)
+        let lookup = registry.lookup(&binding);
+        (evicted_open, duplicate_open, lookup)
     });
 
     control.close_gate.release();
     let initial_open = eviction.join().unwrap();
     inventory_thread.join().unwrap();
-    let Some((evicted_open, duplicate_open, lease)) = observations else {
+    let Some((evicted_open, duplicate_open, lookup)) = observations else {
         panic!("registry lock remained held during close_and_join");
     };
 
@@ -356,10 +426,7 @@ async fn blocking_join_releases_registry_lock_and_reserves_evicted_and_opening_k
             StoreRuntimeRegistryFailure::RuntimeEvictionInProgress { .. }
         )
     ));
-    assert!(matches!(
-        lease,
-        StoreRuntimeLeaseAcquireResult::Evicting { .. }
-    ));
+    assert!(matches!(lookup, StoreRuntimeLookup::Evicting { .. }));
     let initial_join = match initial_open {
         StoreRuntimeOpenBegin::Started(join) => join,
         other => panic!("reserved open did not start after eviction: {other:?}"),
@@ -368,7 +435,7 @@ async fn blocking_join_releases_registry_lock_and_reserves_evicted_and_opening_k
         StoreRuntimeOpenBegin::Joined(join) => join,
         other => panic!("duplicate open did not join the reservation: {other:?}"),
     };
-    let (initial, duplicate) = tokio::join!(initial_join.wait(), duplicate_join.wait());
+    let (initial, duplicate) = asupersync::join!(initial_join.wait(), duplicate_join.wait());
     let (StoreRuntimeOpenResult::Published(initial), StoreRuntimeOpenResult::Published(duplicate)) =
         (initial, duplicate)
     else {
@@ -380,7 +447,7 @@ async fn blocking_join_releases_registry_lock_and_reserves_evicted_and_opening_k
     assert_eq!(publisher.calls.load(Ordering::SeqCst), 3);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[asupersync::test(flavor = "multi_thread", workers = 2)]
 async fn failed_blocking_drain_restores_fault_and_wakes_reserved_open_joiners() {
     let (registry, publisher) = attachment_registry();
     let pin = profile_pin(&registry).await;
@@ -395,11 +462,8 @@ async fn failed_blocking_drain_restores_fault_and_wakes_reserved_open_joiners() 
 
     let eviction_registry = registry.clone();
     let eviction_request = opening_request.clone();
-    let runtime = tokio::runtime::Handle::current();
-    let eviction = std::thread::spawn(move || {
-        let _runtime = runtime.enter();
-        eviction_registry.begin_or_join_open(&eviction_request)
-    });
+    let eviction =
+        std::thread::spawn(move || eviction_registry.begin_or_join_open(&eviction_request));
     wait_for_gate(&control.drain_gate).await;
 
     let probe_registry = registry.clone();
@@ -452,10 +516,11 @@ async fn failed_blocking_drain_restores_fault_and_wakes_reserved_open_joiners() 
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[asupersync::test(flavor = "multi_thread", workers = 2)]
 async fn shutdown_close_drains_every_idle_runtime_concurrently() {
     let publisher = Arc::new(AttachmentPublisher::default());
     let registry = StoreRuntimeRegistry::with_config(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
         Arc::new(TestResolver::default()),
         publisher.clone(),
         StoreRuntimeRegistryConfig::new(2).unwrap(),
@@ -472,7 +537,14 @@ async fn shutdown_close_drains_every_idle_runtime_concurrently() {
     }
 
     let closing = registry.clone();
-    let close = tokio::spawn(async move { closing.close_idle_for_shutdown().await });
+    let mut close = asupersync::Cx::current()
+        .unwrap()
+        .spawn(move |_| async move {
+            closing
+                .close_idle_for_shutdown(std::time::Instant::now())
+                .await
+        })
+        .unwrap();
     // A close that ran one runtime at a time would hold the second runtime's
     // drain behind the first, which stays blocked until both have entered.
     let entered = || {
@@ -481,18 +553,29 @@ async fn shutdown_close_drains_every_idle_runtime_concurrently() {
             .filter(|control| control.drain_gate.entered.load(Ordering::SeqCst))
             .count()
     };
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while entered() < controls.len() {
-            tokio::task::yield_now().await;
-        }
-    })
+    let _ = asupersync::time::timeout(
+        asupersync::Cx::current().unwrap().now(),
+        Duration::from_secs(2),
+        async {
+            while entered() < controls.len() {
+                asupersync::runtime::yield_now().await;
+            }
+        },
+    )
     .await;
     let concurrent_drains = entered();
     for control in &controls {
         control.drain_gate.release();
     }
 
-    assert_eq!(close.await.unwrap().unwrap(), 2);
+    assert_eq!(
+        close
+            .join(&asupersync::Cx::current().unwrap())
+            .await
+            .unwrap()
+            .unwrap(),
+        2
+    );
     assert_eq!(
         concurrent_drains, 2,
         "every idle runtime drains while the others are still draining"

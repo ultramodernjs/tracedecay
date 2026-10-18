@@ -39,6 +39,8 @@ use super::shard::ShardRuntime;
 use super::telemetry::{RuntimeRegistryInventory, RuntimeRegistryInventoryEntry};
 use super::utc_now;
 use crate::cancellation::CancellationToken;
+use crate::operation_task_owner::RuntimeOperationTaskOwnerV1;
+use asupersync::runtime::RuntimeHandle;
 
 #[cfg(test)]
 pub(crate) use attachment::EmptyPhysicalRuntimeAttachment;
@@ -56,8 +58,8 @@ pub use graph::{
     CanonicalGraphStoreOwnerAttachmentV1, CanonicalGraphStoreOwnerRetirementTargetV1,
 };
 pub use leases::{
-    ProfileAuthorityPin, ProfileAuthorityPinResult, StoreRuntimeAccessMode,
-    StoreRuntimeLeaseAcquireResult, StoreRuntimeOpenMode, StoreRuntimeOpenRequest,
+    ProfileAuthorityPin, ProfileAuthorityPinResult, StoreRuntimeAccessMode, StoreRuntimeOpenMode,
+    StoreRuntimeOpenRequest,
 };
 #[cfg(test)]
 pub(crate) use open::StoreRuntimeOpenBegin;
@@ -256,6 +258,14 @@ impl StoreRuntimeLeaseSource {
 
     fn writer_present(&self) -> bool {
         self.physical_snapshot().writer_present
+    }
+
+    fn file_lost(&self) -> bool {
+        self.attachment.file_lost()
+    }
+
+    fn lost_file_closed(&self) -> bool {
+        self.attachment.lost_file_closed()
     }
 
     fn validate_database_write_authority(
@@ -921,6 +931,7 @@ impl StoreRuntimeClientLease {
 
     pub async fn run_bounded_incremental_compaction(
         &self,
+        cx: &asupersync::Cx,
         max_pages: u64,
         authority: crate::db::DatabaseAuthority,
     ) -> Result<(), StoreRuntimeRegistryFailure> {
@@ -947,7 +958,7 @@ impl StoreRuntimeClientLease {
         });
         self.inner
             .attachment
-            .run_bounded_incremental_compaction(max_pages, authority)
+            .run_bounded_incremental_compaction(cx, max_pages, authority)
             .await?;
         self.validate_opened_file_identity("complete registered incremental compaction")?;
         Ok(())
@@ -955,6 +966,7 @@ impl StoreRuntimeClientLease {
 
     pub async fn run_checkpoint(
         &self,
+        cx: &asupersync::Cx,
         request: tracedecay_rusqlite_runtime::CheckpointRequest,
         authority: crate::db::DatabaseAuthority,
     ) -> Result<tracedecay_rusqlite_runtime::CheckpointOutcome, StoreRuntimeRegistryFailure> {
@@ -968,7 +980,7 @@ impl StoreRuntimeClientLease {
         let outcome = self
             .inner
             .attachment
-            .run_checkpoint(request, authority)
+            .run_checkpoint(cx, request, authority)
             .await?;
         self.validate_opened_file_identity("complete registered checkpoint")?;
         Ok(outcome)
@@ -1071,6 +1083,10 @@ impl StoreRuntimeClientLease {
         probe: Arc<dyn tracedecay_store::RuntimeRequestProbeV1>,
         authority: crate::db::DatabaseAuthority,
     ) -> Result<tracedecay_store::RuntimeSubmitOutcomeV1, StoreRuntimeRegistryFailure> {
+        let cx =
+            crate::native_runtime::cx().ok_or(StoreRuntimeRegistryFailure::RuntimeUnavailable {
+                operation: "submit registered runtime write",
+            })?;
         if request.binding() != self.binding() {
             return Err(StoreRuntimeRegistryFailure::RuntimeBindingMismatch {
                 expected: Box::new(self.binding().clone()),
@@ -1086,7 +1102,7 @@ impl StoreRuntimeClientLease {
         });
         self.inner
             .attachment
-            .dispatch_submit(request, probe, authority)
+            .dispatch_submit(&cx, request, probe, authority)
             .await
     }
 
@@ -1106,10 +1122,10 @@ impl StoreRuntimeClientLease {
         self.inner.validate_opened_file_identity(operation)
     }
 
-    pub fn dispatch_read(
+    pub async fn dispatch_read(
         &self,
         request: tracedecay_store::RuntimeReadRequestV1,
-        probe: &dyn tracedecay_store::RuntimeRequestProbeV1,
+        probe: Arc<dyn tracedecay_store::RuntimeRequestProbeV1>,
     ) -> Result<tracedecay_store::RuntimeReadOutcomeV1, StoreRuntimeRegistryFailure> {
         if request.binding() != self.binding() {
             return Err(StoreRuntimeRegistryFailure::RuntimeBindingMismatch {
@@ -1118,7 +1134,7 @@ impl StoreRuntimeClientLease {
             });
         }
         self.validate_opened_file_identity("authorize registered runtime read")?;
-        self.inner.attachment.dispatch_read(request, probe)
+        self.inner.attachment.dispatch_read(request, probe).await
     }
 }
 
@@ -1134,6 +1150,12 @@ impl fmt::Debug for StoreRuntimeClientLease {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreRuntimeRegistryFailure {
+    WaitCancelled {
+        operation: &'static str,
+    },
+    RuntimeUnavailable {
+        operation: &'static str,
+    },
     ResetRequired {
         authority: String,
         reason: String,
@@ -1261,6 +1283,9 @@ pub enum StoreRuntimeRegistryFailure {
         operation: &'static str,
         message: String,
     },
+    /// Every reader was leased for the whole admission wait. Nothing failed;
+    /// the same read can succeed once a reader returns.
+    ReaderSaturated,
     SqliteFileIdentityInspectionFailed {
         operation: &'static str,
         source: crate::db::SqliteFileIdentityError,
@@ -1292,13 +1317,6 @@ pub enum StoreRuntimeRegistryFailure {
     },
     ProfileAuthorityShardIsNotProfile {
         shard_id: Box<StoreShardIdV1>,
-    },
-    InvalidLease {
-        message: String,
-    },
-    LeaseBindingMismatch {
-        expected: Box<StoreRuntimeBindingV1>,
-        actual: Box<StoreRuntimeBindingV1>,
     },
     LeaseRejected {
         message: String,
@@ -1371,7 +1389,7 @@ struct FaultedRuntime {
 struct DestructivePathReservation {
     root: PathBuf,
     database_paths: Vec<PathBuf>,
-    released: tokio::sync::watch::Sender<bool>,
+    released: asupersync::channel::watch::Sender<bool>,
 }
 
 struct RetainedGraphPublication {
@@ -1445,6 +1463,42 @@ struct RegistryState {
     next_profile_pin_token: u64,
 }
 
+impl RegistryState {
+    /// Unmaps a ready runtime whose file was unlinked or replaced, so the next
+    /// open of its key publishes a fresh runtime through the resolver. Leases
+    /// already issued keep the closed runtime and answer `FileLost`.
+    ///
+    /// Returns `true` while the lost runtime's connections are still closing.
+    /// The entry stays mapped until they are, because a successor published
+    /// now would run beside readers still open on the old file.
+    fn evict_lost_runtime(&mut self, key: &StoreRuntimeKey) -> bool {
+        match self.entries.get(key) {
+            Some(RegistryEntry::Ready(ready)) if ready.owner.file_lost() => {
+                if !ready.owner.lost_file_closed() {
+                    return true;
+                }
+            }
+            _ => return false,
+        }
+        let Some(RegistryEntry::Ready(lost)) = self.entries.remove(key) else {
+            return false;
+        };
+        let _ = lost
+            .owner
+            .runtime()
+            .transition(RuntimeMaintenanceStateV1::Faulted);
+        self.profile_pin_tokens.remove(key);
+        if self
+            .profile_authorities
+            .get(key.shard_id())
+            .is_some_and(|binding| binding == lost.owner.binding())
+        {
+            self.profile_authorities.remove(key.shard_id());
+        }
+        false
+    }
+}
+
 struct StoreRuntimeRegistryInner {
     resolver: Arc<dyn StoreRuntimeResolver>,
     publisher: Arc<dyn ShardRuntimePublisher>,
@@ -1455,6 +1509,7 @@ struct StoreRuntimeRegistryInner {
     /// the store runtime and the first place cross-shard queueing shows up.
     state: std::sync::Mutex<RegistryState>,
     open_cancellation: CancellationToken,
+    operations: RuntimeOperationTaskOwnerV1,
 }
 
 #[derive(Clone)]
@@ -1464,35 +1519,49 @@ pub struct StoreRuntimeRegistry {
 
 impl StoreRuntimeRegistry {
     pub fn new(
+        runtime: RuntimeHandle,
         resolver: Arc<dyn StoreRuntimeResolver>,
         publisher: Arc<dyn ShardRuntimePublisher>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(StoreRuntimeRegistryInner {
-                resolver,
-                publisher,
-                config: StoreRuntimeRegistryConfig::default(),
-                state: Mutex::new(RegistryState::default()),
-                open_cancellation: CancellationToken::new(),
-            }),
-        }
+    ) -> Result<Self, StoreRuntimeRegistryFailure> {
+        Self::with_config(
+            runtime,
+            resolver,
+            publisher,
+            StoreRuntimeRegistryConfig::default(),
+        )
     }
 
     pub fn with_config(
+        runtime: RuntimeHandle,
         resolver: Arc<dyn StoreRuntimeResolver>,
         publisher: Arc<dyn ShardRuntimePublisher>,
         config: StoreRuntimeRegistryConfig,
     ) -> Result<Self, StoreRuntimeRegistryFailure> {
-        Self::with_config_and_authority_epoch_floor(resolver, publisher, config, None)
+        Self::with_config_and_authority_epoch_floor(runtime, resolver, publisher, config, None)
     }
 
     pub(crate) fn with_config_and_authority_epoch_floor(
+        runtime: RuntimeHandle,
         resolver: Arc<dyn StoreRuntimeResolver>,
         publisher: Arc<dyn ShardRuntimePublisher>,
         config: StoreRuntimeRegistryConfig,
         authority_epoch_floor: Option<StoreAuthorityEpochV1>,
     ) -> Result<Self, StoreRuntimeRegistryFailure> {
         config.validate()?;
+        let operations = RuntimeOperationTaskOwnerV1::new(runtime).map_err(|error| match error {
+            crate::operation_task_owner::RuntimeOperationAdmissionError::BlockingPoolUnavailable =>
+                StoreRuntimeRegistryFailure::RuntimeUnavailable {
+                    operation: "initialize registered runtime settlement owner with a native blocking pool",
+                },
+            crate::operation_task_owner::RuntimeOperationAdmissionError::Spawn(asupersync::runtime::SpawnError::RuntimeUnavailable) =>
+                StoreRuntimeRegistryFailure::RuntimeUnavailable {
+                    operation: "initialize registered runtime settlement owner",
+                },
+            error => StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
+                operation: "initialize registered runtime settlement owner",
+                message: error.to_string(),
+            },
+        })?;
         if let Some(floor) = authority_epoch_floor {
             open::retain_authority_epoch_floor(floor);
         }
@@ -1503,6 +1572,7 @@ impl StoreRuntimeRegistry {
                 config,
                 state: Mutex::new(RegistryState::default()),
                 open_cancellation: CancellationToken::new(),
+                operations,
             }),
         })
     }
@@ -1523,7 +1593,10 @@ impl StoreRuntimeRegistry {
 
     pub fn lookup(&self, expected: &StoreRuntimeBindingV1) -> StoreRuntimeLookup {
         let key = StoreRuntimeKey::from_binding(expected);
-        let state = self.lock_state();
+        let mut state = self.lock_state();
+        if state.evict_lost_runtime(&key) {
+            return StoreRuntimeLookup::Evicting { key: Box::new(key) };
+        }
         match state.entries.get(&key) {
             Some(RegistryEntry::Ready(ready)) => {
                 let actual = ready.owner.binding();
@@ -1675,31 +1748,12 @@ impl StoreRuntimeRegistry {
         let entries = sources
             .into_iter()
             .map(|source| {
-                let mut observation = source.runtime().observe(self.inner.config.eviction_idle());
-                let physical = source.physical_snapshot();
-                observation.health.writer_present |= physical.writer_present;
-                observation.health.queued_operations = observation
-                    .health
-                    .queued_operations
-                    .saturating_add(physical.queued_operations);
-                observation.health.queued_bytes = observation
-                    .health
-                    .queued_bytes
-                    .saturating_add(physical.queued_bytes);
-                if let Some(wal_bytes) = physical.wal_bytes {
-                    observation.health.wal_bytes = wal_bytes;
+                let observation = source.runtime().observe(self.inner.config.eviction_idle());
+                RuntimeRegistryInventoryEntry {
+                    health: observation.health,
+                    eviction: observation.eviction,
+                    physical: source.physical_snapshot(),
                 }
-                if let Some(memory_estimate_bytes) = physical.memory_estimate_bytes {
-                    observation.health.memory_estimate_bytes = memory_estimate_bytes;
-                }
-                if !physical.healthy
-                    && observation.health.health != super::shard::ShardRuntimeHealth::Faulted
-                {
-                    observation.health.health = super::shard::ShardRuntimeHealth::Degraded;
-                }
-                let mut entry = RuntimeRegistryInventoryEntry::from(observation);
-                entry.physical = physical;
-                entry
             })
             .collect();
         RuntimeRegistryInventory {

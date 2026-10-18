@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_runtime_core::native_runtime::{self, NativeTaskOutcome, NativeTaskSet};
 
 const SETTLEMENT_NOT_STARTED: u8 = 0;
 const SETTLEMENT_SETTLING: u8 = 1;
@@ -154,9 +155,12 @@ impl Drop for DispatchCapacityLease {
     }
 }
 
+type DispatchId = u64;
+
 struct RetainedDispatchState {
-    tasks: tokio::task::JoinSet<Arc<DispatchExecutionSettlement>>,
-    active: HashMap<tokio::task::Id, ActiveDispatch>,
+    tasks: NativeTaskSet<(DispatchId, Arc<DispatchExecutionSettlement>)>,
+    active: HashMap<DispatchId, ActiveDispatch>,
+    next_id: DispatchId,
 }
 
 /// Daemon-owned lifetime authority for admitted MCP handlers.
@@ -185,8 +189,9 @@ impl RetainedDispatchRegistry {
             capacity,
             active_slots: Arc::new(AtomicUsize::new(0)),
             state: tokio::sync::Mutex::new(RetainedDispatchState {
-                tasks: tokio::task::JoinSet::new(),
+                tasks: NativeTaskSet::default(),
                 active: HashMap::new(),
+                next_id: 0,
             }),
             #[cfg(any(test, feature = "test-transport"))]
             retained_spawn_count: AtomicUsize::new(0),
@@ -249,18 +254,26 @@ impl RetainedDispatchRegistry {
         let worker_settlement = Arc::clone(&settlement);
         let settlement_lease = DispatchSettlementLease(Arc::clone(&settlement));
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let id = state.next_id;
+        state.next_id += 1;
+        // Tool dispatches run on the native runtime. Handlers move synchronous
+        // storage-port calls off the worker with `off_native_thread` and reach
+        // Tokio-only work through `native_runtime::tokio_handle`.
+        state
+            .tasks
+            .spawn(async move {
+                let _capacity_lease = capacity_lease;
+                worker_settlement.mark_settling();
+                let output = future.await;
+                drop(settlement_lease);
+                let _ = sender.send(output);
+                (id, worker_settlement)
+            })
+            .map_err(|error| dispatch_runtime_unavailable_error(&error))?;
         #[cfg(any(test, feature = "test-transport"))]
         self.retained_spawn_count.fetch_add(1, Ordering::AcqRel);
-        let task = state.tasks.spawn(async move {
-            let _capacity_lease = capacity_lease;
-            worker_settlement.mark_settling();
-            let output = future.await;
-            drop(settlement_lease);
-            let _ = sender.send(output);
-            worker_settlement
-        });
         state.active.insert(
-            task.id(),
+            id,
             ActiveDispatch {
                 cancellation,
                 live_cancellable,
@@ -287,18 +300,27 @@ impl RetainedDispatchRegistry {
     }
 
     fn reap_finished(state: &mut RetainedDispatchState) {
-        while let Some(joined) = state.tasks.try_join_next_with_id() {
-            match joined {
-                Ok((id, settlement)) => {
-                    settlement.mark_joined();
-                    state.active.remove(&id);
-                }
-                Err(error) => {
-                    if let Some(active) = state.active.remove(&error.id()) {
-                        active.settlement.mark_joined();
-                    }
-                    tracing::error!(error = %error, "retained MCP dispatch task failed");
-                }
+        while let Some(joined) = state.tasks.try_join_next() {
+            Self::settle_joined(state, joined);
+        }
+    }
+
+    fn settle_joined(
+        state: &mut RetainedDispatchState,
+        joined: NativeTaskOutcome<(DispatchId, Arc<DispatchExecutionSettlement>)>,
+    ) {
+        match joined {
+            NativeTaskOutcome::Completed((id, settlement)) => {
+                settlement.mark_joined();
+                state.active.remove(&id);
+            }
+            failed => {
+                // A failed task returns no id. Its dropped settlement lease
+                // already marked it joined, which identifies its entry.
+                state
+                    .active
+                    .retain(|_, active| active.settlement.snapshot() != DispatchSettlement::Joined);
+                tracing::error!(outcome = ?failed, "retained MCP dispatch task failed");
             }
         }
     }
@@ -312,19 +334,8 @@ impl RetainedDispatchRegistry {
                 let _ = active.cancellation.cancel(requested_at);
             }
         }
-        while let Some(joined) = state.tasks.join_next_with_id().await {
-            match joined {
-                Ok((id, settlement)) => {
-                    settlement.mark_joined();
-                    state.active.remove(&id);
-                }
-                Err(error) => {
-                    if let Some(active) = state.active.remove(&error.id()) {
-                        active.settlement.mark_joined();
-                    }
-                    tracing::error!(error = %error, "retained MCP dispatch task failed");
-                }
-            }
+        while let Some(joined) = state.tasks.join_next().await {
+            Self::settle_joined(&mut state, joined);
         }
     }
 }
@@ -420,7 +431,7 @@ pub struct PreparedDispatchControl<'a> {
 pub struct DispatchControl {
     tool_name: Arc<str>,
     deadline: tracedecay_contracts::Deadline,
-    deadline_at: tokio::time::Instant,
+    deadline_at: std::time::Instant,
     cancellation: tracedecay_contracts::CancellationSignal,
     live_cancellable: bool,
     carries_effect: bool,
@@ -545,7 +556,7 @@ impl DispatchControl {
                     policy.carries_effect,
                 )
             })?;
-        let deadline_at = tokio::time::Instant::now()
+        let deadline_at = std::time::Instant::now()
             .checked_add(remaining)
             .ok_or_else(|| TraceDecayError::Config {
                 message: "MCP dispatch deadline cannot be represented by the runtime clock"
@@ -575,7 +586,12 @@ impl DispatchControl {
     /// ignores cancellation must not withhold the typed terminal.
     pub async fn settle_cancelled<T>(&self, outcome: &RetainedDispatchOutcome<T>) {
         if self.cancellation.is_cancelled() {
-            let _ = tokio::time::timeout_at(self.deadline_at, outcome.wait_for_settlement()).await;
+            // An unavailable timer ends the wait as the deadline would.
+            tokio::select! {
+                biased;
+                () = outcome.wait_for_settlement() => {}
+                _ = native_runtime::sleep_until(self.deadline_at) => {}
+            }
         }
     }
 
@@ -604,7 +620,7 @@ impl DispatchControl {
                 self.carries_effect,
             ));
         }
-        if tokio::time::Instant::now() >= self.deadline_at {
+        if std::time::Instant::now() >= self.deadline_at {
             let _ = self
                 .cancellation
                 .cancel(tracedecay_contracts::clock::now_micros());
@@ -622,7 +638,8 @@ impl DispatchControl {
             Ok(admitted) => admitted,
             Err(error) => return RetainedDispatchOutcome::failed(error),
         };
-        let deadline = tokio::time::sleep_until(self.deadline_at);
+        // An unavailable timer fails closed: its arm answers as the deadline.
+        let deadline = native_runtime::sleep_until(self.deadline_at);
         let cancellation =
             tracedecay_daemon_protocol::wait_for_cancellation(self.cancellation.clone());
         tokio::pin!(deadline);
@@ -647,7 +664,7 @@ impl DispatchControl {
                     self.carries_effect,
                 )))
             }
-            () = &mut deadline => {
+            _ = &mut deadline => {
                 // An effect worker that is already settling is *producing the
                 // authoritative answer to this very deadline*: the retained
                 // owners report a `PartialEffect` carrying the committed
@@ -767,6 +784,14 @@ fn dispatch_shutdown_error() -> TraceDecayError {
         "tool_dispatch_shutdown",
         true,
         "MCP server is shutting down and cannot admit another tool dispatch",
+    )
+}
+
+fn dispatch_runtime_unavailable_error(error: &str) -> TraceDecayError {
+    TraceDecayError::project_route(
+        "tool_dispatch_runtime_unavailable",
+        true,
+        format!("MCP tool dispatch was not started: {error}"),
     )
 }
 

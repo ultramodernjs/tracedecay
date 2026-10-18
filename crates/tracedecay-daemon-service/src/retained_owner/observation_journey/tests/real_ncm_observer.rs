@@ -1,4 +1,4 @@
-//! Real NCM delivery, provider-local durability, and current-session isolation.
+//! Real NCM delivery, provider-local durability, and shared checkout recall.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -14,7 +14,9 @@ use tracedecay_domain::{
     DurableObservationV1, ObservationSourceCursorV1, ProjectId, SessionId, UserProfileId,
 };
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
-use tracedecay_memory_hygiene::canonical_payload_bytes;
+use tracedecay_memory_hygiene::{
+    ObservationAdmission, ObservationSanitizer, canonical_payload_bytes,
+};
 use tracedecay_memory_ncm_runtime::embedding::{
     MANIFEST_FILENAME, MODEL_ACQUISITION_RECEIPT_PATH, ModelAcquisitionManifest, install,
 };
@@ -24,8 +26,8 @@ use tracedecay_memory_observation::{
     ObservationRuntimeError, SqliteObservationJournal,
 };
 use tracedecay_memory_provider_ncm::{
-    NCM_PROVIDER_ID, NcmCognitiveSurface, NcmProviderAdapter, RustNcmConfig, RustNcmSurface,
-    RustNcmWorkerOwner, StateRoot, WorkerOptions,
+    NCM_PROVIDER_ID, NcmCognitiveSurface, NcmNamespace, NcmNamespaceBinding, NcmProviderAdapter,
+    RustNcmConfig, RustNcmSurface, RustNcmWorkerOwner, StateRoot, WorkerOptions,
 };
 use tracedecay_memory_provider_registry::{
     CancellationToken, DegradationKindV1, EnabledProviderMode, FabricConfig, HandshakeRequest,
@@ -36,8 +38,8 @@ use tracedecay_memory_provider_registry::{
     ProviderCall, ProviderCallParts, ProviderExecutionShapeV1, ProviderLifecycleOwnershipV1,
     ProviderOperation, ProviderRegistrationV1, ProviderReply, RecallBudgetsV1, RecallOutcomeV1,
     RecallScopeBindingsV1, ScopeBinding, SelectedProviderActivationV1, SupervisedReadinessError,
-    TerminalCode, UnknownValidityPolicy, admit_recall_reply, build_recall_request_payload,
-    decode_recall_outcome,
+    TerminalCode, UnknownValidityPolicy, WithheldReason, admit_recall_reply,
+    build_recall_request_payload, decode_recall_outcome,
 };
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_runtime_core::cancellation::CancellationToken as HostCancellationToken;
@@ -57,7 +59,11 @@ use super::super::{
     activate_required_with_instance_ready, canonical_message_eligibility, exact_scope_for_session,
     mount_and_replay, mount_observer_dormant, provider_observation_envelope, run_startup_replay,
 };
-use super::{anchored_write, canonical_observation_at, scope};
+use super::{
+    anchored_write, canonical_observation_at, canonical_observation_with_payload_at, scope,
+};
+
+const NCM_NAMESPACE_BINDING: NcmNamespaceBinding = NcmNamespaceBinding::CheckoutObservationsV1;
 
 /// Keep the worker owner with the fixture so a test can prove the final strong
 /// owner closes only after the mounted journeys and their provider adapters
@@ -119,7 +125,8 @@ fn construct_ncm_observer(
     );
     let provider = Arc::new(
         NcmProviderAdapter::new(Arc::clone(&surface) as Arc<dyn NcmCognitiveSurface>)
-            .map_err(|error| error.to_string())?,
+            .map_err(|error| error.to_string())?
+            .with_namespace_binding(NCM_NAMESPACE_BINDING),
     );
     Ok(NcmObserverFixture {
         observer: ObserverProviderRegistration {
@@ -154,8 +161,13 @@ fn compose_real_ncm(fixture: &NcmObserverFixture) -> Arc<ProjectMemoryProviderCo
                     registration_revision: fixture.mount.registration_revision,
                     mode: EnabledProviderMode::Active,
                     execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
-                    recall_scope_bindings: RecallScopeBindingsV1::from_wire(["exact_coding_scope"])
-                        .expect("NCM exact-scope recall binding"),
+                    recall_scope_bindings: RecallScopeBindingsV1::from_wire(
+                        NCM_NAMESPACE_BINDING
+                            .recall_scope_bindings()
+                            .iter()
+                            .copied(),
+                    )
+                    .expect("NCM recall bindings"),
                     lifecycle: ProviderLifecycleOwnershipV1::Owned(Arc::new(
                         NcmLifecycleOwner::new(Arc::clone(&fixture.worker_owner)),
                     )),
@@ -173,7 +185,7 @@ fn compose_real_ncm(fixture: &NcmObserverFixture) -> Arc<ProjectMemoryProviderCo
 /// owning-store hydration is exercised by the separate production journey.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires TRACEDECAY_NCM_PRODUCTION_WORKER and external TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
-async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
+async fn real_ncm_checkout_recall_survives_remount_without_duplicate_delivery() {
     let worker = PathBuf::from(
         std::env::var_os("TRACEDECAY_NCM_PRODUCTION_WORKER")
             .expect("real production worker fixture"),
@@ -302,9 +314,31 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
     .await
     .unwrap();
     assert_eq!(progress.frames_persisted, codex_records.len() as u64);
+    // Keep unknown eligibility independent of the real transcript's absolute
+    // filesystem context, which the hygiene policy scans before eligibility.
+    let eligibility_session = SessionId::new("session.unknown").unwrap();
+    let mut eligibility_payload =
+        canonical_observation_at(&project_id, &eligibility_session, "", 0)
+            .payload()
+            .clone();
+    eligibility_payload["native_record_kind"] = json!("turn_context");
+    eligibility_payload["facts"] = json!([CanonicalObservationFactV1::Unknown {
+        native_kind: "turn_context".to_owned(),
+        state: CanonicalUnknownStateV1::Unsupported,
+    }]);
+    let eligibility_unknown = canonical_observation_with_payload_at(
+        &project_id,
+        &eligibility_session,
+        eligibility_payload,
+        0,
+    );
+    store
+        .persist_observation(anchored_write(eligibility_unknown.clone()))
+        .await
+        .unwrap();
     let canonical = store
         .replay_observations(
-            ObservationReplayRequest::new(0, observations.len() + codex_records.len()).unwrap(),
+            ObservationReplayRequest::new(0, observations.len() + codex_records.len() + 1).unwrap(),
         )
         .await
         .unwrap();
@@ -339,6 +373,34 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
     let unknown_digest = tracedecay_domain::canonical_text::sha256_hex(
         &canonical_payload_bytes(&unknown_envelope).unwrap(),
     );
+    let sanitizer = ObservationSanitizer::new().unwrap();
+    let ObservationAdmission::Withheld {
+        reason: WithheldReason::SecretRejected,
+        finding_count: unknown_findings,
+        ..
+    } = sanitizer.admit_observation(&unknown_envelope, &[]).unwrap()
+    else {
+        panic!(
+            "real transcript context must exercise hygiene rejection before unknown eligibility"
+        );
+    };
+    assert!(unknown_findings > 0);
+    let eligibility_envelope = provider_observation_envelope(
+        SESSION_MESSAGE_OBSERVATION_KIND,
+        SESSION_MESSAGE_PAYLOAD_CONTRACT,
+        eligibility_unknown.payload(),
+        eligibility_unknown.observation_id(),
+    );
+    let ObservationAdmission::Admitted { receipt, .. } = sanitizer
+        .admit_observation(&eligibility_envelope, &[])
+        .unwrap()
+    else {
+        panic!("the clean unknown fixture must pass hygiene before eligibility is checked");
+    };
+    assert_eq!(receipt.finding_count(), 0);
+    let eligibility_digest = tracedecay_domain::canonical_text::sha256_hex(
+        &canonical_payload_bytes(&eligibility_envelope).unwrap(),
+    );
     let alpha_scope =
         exact_scope_for_session(&profile_id, &resolved_scope, alpha.as_str()).unwrap();
     let beta_scope = exact_scope_for_session(&profile_id, &resolved_scope, beta.as_str()).unwrap();
@@ -351,6 +413,8 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
     let mut retained_identity: Option<CurrentCapsuleIdentity> = None;
     let mut retained_codex_identity: Option<CurrentCapsuleIdentity> = None;
     let mut previous_journal_path: Option<PathBuf> = None;
+    let mut previous_settled_evidence: Option<Vec<SettledDeliveryEvidence>> = None;
+    let mut previous_watermark = None;
 
     for open in 0..3 {
         if open == 1 {
@@ -407,6 +471,18 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
         }
         previous_journal_path = Some(journey.journal_path().to_path_buf());
         wait_for_all_ncm_settlements(&journey, observations.len()).await;
+        if open == 2 {
+            assert_eq!(
+                settled_delivery_evidence(&journey),
+                previous_settled_evidence.as_ref().unwrap().clone(),
+                "reopening without a new canonical commit cannot append or retry a delivery"
+            );
+            assert_eq!(
+                journey.replay_watermark().await.unwrap(),
+                previous_watermark.unwrap(),
+                "reopening preserves the journey-wide replay position"
+            );
+        }
         if open == 2 {
             journey
                 .await_instance_ready(&cancellation, REQUIRED_ACTIVATION_BUDGET)
@@ -533,23 +609,44 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(reason, "unknown_eligibility");
+            assert_eq!(reason, "secret_rejected");
             assert_eq!(digest, unknown_digest);
+            assert_eq!(findings, i64::from(unknown_findings));
+            let (reason, digest, findings): (String, String, i64) = connection
+                .query_row(
+                    "SELECT reason, source_payload_sha256, finding_count \
+                 FROM tdmem_observation_withheld_v2 WHERE source_event_id = ?1",
+                    [eligibility_unknown.observation_id().as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(reason, "unknown_eligibility");
+            assert_eq!(digest, eligibility_digest);
             assert_eq!(findings, 0);
             let (withheld, delivered): (i64, i64) = connection
                 .query_row(
                     "SELECT (SELECT COUNT(*) FROM tdmem_observation_withheld_v2), \
-                 (SELECT COUNT(*) FROM tdmem_observation_journal_v1 WHERE source_event_id = ?1)",
-                    [unknown.observation_id().as_str()],
+                 (SELECT COUNT(*) FROM tdmem_observation_journal_v1 WHERE source_event_id IN (?1, ?2))",
+                    [unknown.observation_id().as_str(), eligibility_unknown.observation_id().as_str()],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(withheld, 1);
+            assert_eq!(withheld, 2);
             assert_eq!(
                 delivered, 0,
                 "Unknown must create no provider payload on any mount"
             );
         }
+        assert_eq!(
+            store
+                .get_observation(eligibility_unknown.observation_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .observation(),
+            &eligibility_unknown,
+            "eligibility withholding preserves clean canonical evidence on every mount"
+        );
         assert_eq!(
             store
                 .get_observation(unknown.observation_id())
@@ -616,7 +713,7 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
             beta_text,
         );
         assert_ne!(identity.stable_memory_ref, foreign.stable_memory_ref);
-        assert_ne!(identity.scope_sha256, foreign.scope_sha256);
+        assert_eq!(identity.checkout_namespace, foreign.checkout_namespace);
         let (call, reply, temporal) = real_ncm_recall(
             registry,
             &codex_scope,
@@ -633,8 +730,11 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
             &following,
             codex_text,
         );
-        assert_ne!(current_codex.scope_sha256, identity.scope_sha256);
-        assert_ne!(current_codex.scope_sha256, foreign.scope_sha256);
+        assert_eq!(
+            current_codex.checkout_namespace,
+            identity.checkout_namespace
+        );
+        assert_eq!(current_codex.checkout_namespace, foreign.checkout_namespace);
         if let Some(previous) = &retained_codex_identity {
             assert_eq!(
                 &current_codex, previous,
@@ -642,6 +742,56 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
             );
         }
         retained_codex_identity = Some(current_codex);
+        let before_recall = settled_delivery_evidence(&journey);
+        let watermark = journey.replay_watermark().await.unwrap();
+        let mut later_caller = exact_scope_for_session(
+            &profile_id,
+            &resolved_scope,
+            &format!("session.real-ncm-later-caller-{open}"),
+        )
+        .unwrap();
+        later_caller.resolved_scope_digest = format!(
+            "sha256:{}",
+            tracedecay_domain::canonical_text::sha256_hex(
+                format!("later-checkout-resolution-{open}").as_bytes()
+            )
+        );
+        assert_ne!(later_caller.agent_session_id, alpha_scope.agent_session_id);
+        assert_ne!(
+            later_caller.resolved_scope_digest,
+            alpha_scope.resolved_scope_digest
+        );
+        let (call, reply, temporal) = real_ncm_recall(
+            registry,
+            &later_caller,
+            alpha_text,
+            &format!("later-caller-after-open-{open}"),
+        );
+        let outcome = real_ncm_admitted_recall(&call, &reply, &temporal);
+        assert_eq!(
+            assert_current_capsule(
+                &outcome,
+                &profile_id,
+                &resolved_scope,
+                &later_caller,
+                &observations,
+                &observations[0],
+                alpha_text,
+            ),
+            identity,
+            "later callers recall the same retained record without observation redelivery"
+        );
+        assert_eq!(
+            run_startup_replay(&journey, &store, &cancellation)
+                .await
+                .unwrap()
+                .admitted,
+            0
+        );
+        assert_eq!(settled_delivery_evidence(&journey), before_recall);
+        assert_eq!(journey.replay_watermark().await.unwrap(), watermark);
+        previous_settled_evidence = Some(before_recall);
+        previous_watermark = Some(watermark);
         assert!(
             journey
                 .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
@@ -830,7 +980,48 @@ struct CurrentCapsuleIdentity {
     stable_memory_ref: String,
     content_sha256: String,
     canonical_observation_id: String,
-    scope_sha256: String,
+    checkout_namespace: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettledDeliveryEvidence {
+    observation_id: String,
+    source_event_id: String,
+    source_sequence: i64,
+    delivery_scope: String,
+    state: String,
+    attempts: i64,
+    receipts: i64,
+}
+
+fn settled_delivery_evidence(
+    journey: &ProjectObservationJourneyV1,
+) -> Vec<SettledDeliveryEvidence> {
+    let connection = rusqlite::Connection::open(journey.journal_path()).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT j.observation_id, j.source_event_id, j.source_sequence, j.exact_scope_sha256, \
+             d.state, d.attempt_number, \
+             (SELECT COUNT(*) FROM tdmem_observation_receipt_v1 r WHERE r.observation_id = j.observation_id) \
+             FROM tdmem_observation_journal_v1 j JOIN tdmem_observation_delivery_v1 d \
+             ON d.idempotency_key = j.idempotency_key ORDER BY j.source_sequence",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok(SettledDeliveryEvidence {
+                observation_id: row.get(0)?,
+                source_event_id: row.get(1)?,
+                source_sequence: row.get(2)?,
+                delivery_scope: row.get(3)?,
+                state: row.get(4)?,
+                attempts: row.get(5)?,
+                receipts: row.get(6)?,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
 }
 
 fn assert_current_capsule(
@@ -842,38 +1033,41 @@ fn assert_current_capsule(
     expected: &DurableObservationV1,
     text: &str,
 ) -> CurrentCapsuleIdentity {
-    let source_sessions = observations
-        .iter()
-        .map(|observation| observation.source().session_id().as_str())
-        .collect::<Vec<_>>();
+    assert_eq!(exact_scope.profile_id, profile_id.as_str());
+    assert_eq!(exact_scope.project_id, resolved_scope.project_id.as_str());
+    assert_eq!(
+        exact_scope.repository_identity,
+        resolved_scope.repository_id.as_str()
+    );
+    assert_eq!(
+        exact_scope.worktree_identity,
+        resolved_scope.worktree_id.as_str()
+    );
+    assert_eq!(
+        Some(exact_scope.branch_identity.as_str()),
+        resolved_scope
+            .reference
+            .as_ref()
+            .map(|reference| reference.as_str())
+    );
     let owned = observations
         .iter()
-        .filter(|observation| {
-            exact_scope_for_session(
-                profile_id,
-                resolved_scope,
-                observation.source().session_id().as_str(),
-            )
-            .expect("actual canonical source session binding")
-                == *exact_scope
-        })
         .map(|observation| observation.observation_id().as_str())
         .collect::<Vec<_>>();
-    assert!(
-        !owned.is_empty(),
-        "opaque agent session {} in exact scope {exact_scope:?} must bind actual raw canonical \
-         sessions {source_sessions:?}",
-        exact_scope.agent_session_id,
-    );
     assert!(
         !outcome.candidates.is_empty(),
         "provider-local recall must return retained content"
     );
     for candidate in &outcome.candidates {
-        assert_eq!(
-            candidate.exact_scope_identity.claimed_scope_sha256(),
-            Some(exact_scope.exact_scope_sha256())
-        );
+        let scope = &candidate.exact_scope_identity;
+        assert_eq!(scope.scope_binding, ScopeBinding::CheckoutObservations);
+        assert_eq!(scope.profile_id, exact_scope.profile_id);
+        assert_eq!(scope.project_id, exact_scope.project_id);
+        assert_eq!(scope.repository_identity, exact_scope.repository_identity);
+        assert_eq!(scope.worktree_identity, exact_scope.worktree_identity);
+        assert_eq!(scope.branch_identity, exact_scope.branch_identity);
+        assert_eq!(scope.agent_session_id, "");
+        assert_eq!(scope.resolved_scope_digest, "");
         assert_eq!(candidate.provenance["original_sources"], json!([]));
         assert_eq!(candidate.validity.temporal_state, "unknown");
         let observation_refs = candidate.provenance["observation_refs"].as_array().unwrap();
@@ -881,10 +1075,7 @@ fn assert_current_capsule(
         let observation_id = observation_refs[0].as_str().unwrap();
         assert!(
             owned.contains(&observation_id),
-            "a foreign source session entered this exact namespace: candidate observation \
-             {observation_id}, opaque agent session {}, exact scope {exact_scope:?}, raw canonical \
-             sessions {source_sessions:?}, canonical owners {owned:?}",
-            exact_scope.agent_session_id,
+            "a record outside the checkout's canonical deliveries entered recall: {observation_id}"
         );
         assert_eq!(
             candidate.source_refs,
@@ -913,7 +1104,9 @@ fn assert_current_capsule(
         stable_memory_ref,
         content_sha256: candidate.content_sha256.clone(),
         canonical_observation_id: expected_id.to_owned(),
-        scope_sha256: exact_scope.exact_scope_sha256(),
+        checkout_namespace: NcmNamespace::from_scope(exact_scope, NCM_NAMESPACE_BINDING)
+            .as_str()
+            .to_owned(),
     }
 }
 
@@ -1311,7 +1504,10 @@ fn real_ncm_admitted_recall(
         call,
         temporal,
         4,
-        &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+        &RecallScopeBindingsV1::new([
+            ScopeBinding::ExactCodingScope,
+            ScopeBinding::CheckoutObservations,
+        ]),
         reply,
     )
     .expect("admit NCM recall outcome");

@@ -46,6 +46,7 @@ use tracedecay_session_memory::fact_store::DatabaseFactStore;
 use tracedecay_store_runtime::retained_memory::MemoryTargetAccessV1;
 use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
+use crate::ToolCategory;
 use crate::handlers::graph::graph_tool_completion;
 use crate::handlers::support::decode_primitive_request;
 
@@ -56,130 +57,16 @@ const TOP_TOOLS_LIMIT: usize = 10;
 /// Bound on how many zero-call tool names are listed inline.
 const ZERO_CALL_SAMPLE_LIMIT: usize = 30;
 
-const NAVIGATION_TOOLS: &[&str] = &[
-    "search",
-    "grep",
-    "context",
-    "callers",
-    "callees",
-    "impact",
-    "node",
-    "similar",
-    "rename_preview",
-    "implementations",
-    "by_qualified_name",
-    "call_chain",
-    "file_dependents",
-    "find_exact_symbol",
-    "signature",
-    "derives",
-    "status",
-    "active_project",
-    "storage_status",
-    "remote_status",
-    "project_list",
-    "project_search",
-    "project_context",
-    "source_body",
-    "todos",
-    "source_lines",
-    "source_outline",
-    "config",
-    "signature_search",
-    "port_status",
-    "port_order",
-    "files",
-    "type_hierarchy",
-    "affected",
-    "diff_context",
-    "changelog",
-    "commit_context",
-    "pr_context",
-    "branch_search",
-    "branch_diff",
-    "branch_list",
-    "retrieve",
-];
-const ANALYSIS_TOOLS: &[&str] = &[
-    "dead_code",
-    "module_api",
-    "circular",
-    "hotspots",
-    "unmounted_files",
-    "rank",
-    "largest",
-    "coupling",
-    "inheritance_depth",
-    "distribution",
-    "recursion",
-    "complexity",
-    "doc_coverage",
-    "god_class",
-    "unsafe_patterns",
-    "diagnostics",
-    "constructors",
-    "field_sites",
-    "test_map",
-    "gini",
-    "dependency_depth",
-    "health",
-    "runtime",
-    "test_risk",
-    "dsm",
-];
-const SESSION_TOOLS: &[&str] = &[
-    "message_search",
-    "sessions_for",
-    "workflows",
-    "lcm_status",
-    "lcm_doctor",
-    "lcm_load_session",
-    "lcm_grep",
-    "lcm_describe",
-    "lcm_expand",
-    "lcm_expand_query",
-];
-const MEMORY_TOOLS: &[&str] = &[
-    "memory_status",
-    "fact_feedback",
-    "fact_store_add",
-    "fact_store_search",
-    "fact_store_probe",
-    "fact_store_related",
-    "fact_store_reason",
-    "fact_store_contradict",
-    "fact_store_get",
-    "fact_store_update",
-    "fact_store_remove",
-    "fact_store_supersede",
-    "fact_store_list",
-];
-const EDIT_TOOLS: &[&str] = &[
-    "str_replace",
-    "multi_str_replace",
-    "insert_at",
-    "insert_at_symbol",
-    "replace_symbol",
-    "ast_grep_rewrite",
-];
-const ADMIN_TOOLS: &[&str] = &[
-    "dashboard",
-    "skill_list",
-    "skill_view",
-    "automation_run_artifact_view",
-    "hermes_skill_bridge",
-    "diagnose",
-    "run_affected_tests",
-    "analytics",
-];
-/// Ordered tier list; used both for classification and stable output order.
-const TIERS: &[(&str, &[&str])] = &[
-    ("navigation", NAVIGATION_TOOLS),
-    ("analysis", ANALYSIS_TOOLS),
-    ("session", SESSION_TOOLS),
-    ("memory", MEMORY_TOOLS),
-    ("edit", EDIT_TOOLS),
-    ("admin", ADMIN_TOOLS),
+/// Analytics tier labels in output order. The labels are emitted in the
+/// analytics payload, so they stay stable when the catalog regroups tools.
+const TIERS: &[&str] = &[
+    "navigation",
+    "analysis",
+    "session",
+    "memory",
+    "edit",
+    "admin",
+    "work",
 ];
 
 fn config_error(message: impl std::fmt::Display) -> TraceDecayError {
@@ -195,12 +82,28 @@ fn tool_tier(tool_name: &str) -> &'static str {
     let normalized = normalized
         .strip_prefix("tracedecay_")
         .unwrap_or(normalized.as_str());
-    for (tier, names) in TIERS {
-        if names.contains(&normalized) {
-            return tier;
-        }
+    // These tools reported a tier other than their category's before tiers
+    // were derived from the catalog category; keep their reported tier.
+    match normalized {
+        "runtime" => return "analysis",
+        "diagnose" | "run_affected_tests" => return "admin",
+        _ => {}
     }
-    "other"
+    match ToolCategory::of(normalized) {
+        Some(
+            ToolCategory::CodeSearch
+            | ToolCategory::CodeNavigation
+            | ToolCategory::GitReview
+            | ToolCategory::ProjectRuntime,
+        ) => "navigation",
+        Some(ToolCategory::CodeAnalysis) => "analysis",
+        Some(ToolCategory::Sessions) => "session",
+        Some(ToolCategory::Memory) => "memory",
+        Some(ToolCategory::Edit) => "edit",
+        Some(ToolCategory::Operations) => "admin",
+        Some(ToolCategory::Work) => "work",
+        None => "other",
+    }
 }
 
 /// Maps host-neutral public names and short aliases to their canonical route.
@@ -243,81 +146,6 @@ fn bound_but_unadvertised_tool_names(defined: &[String]) -> BTreeSet<&'static st
             !public_names.contains(&tracedecay_automation::analytics::normalize_tool_name(name))
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{bound_but_unadvertised_tool_names, public_name_to_canonical, tool_tier};
-
-    #[test]
-    fn bound_unadvertised_tool_names_use_the_public_catalog() {
-        let defined: Vec<String> = crate::get_tool_definitions()
-            .expect("tool definitions are available")
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect();
-
-        let bound_unadvertised = bound_but_unadvertised_tool_names(&defined);
-
-        // Served by name as an internal owner operation, with no dispatch
-        // binding row and no advertised definition.
-        assert!(
-            !crate::tools::binding::MCP_TOOL_BINDINGS
-                .iter()
-                .any(|binding| binding.name == "tracedecay_admin_cli")
-        );
-        assert!(!defined.iter().any(|name| name == "tracedecay_admin_cli"));
-        assert!(bound_unadvertised.contains("tracedecay_admin_cli"));
-        assert!(bound_unadvertised.contains("tracedecay_admin_sync"));
-        assert!(
-            defined
-                .iter()
-                .any(|name| name == "tracedecay_ast_grep_rewrite")
-        );
-        assert!(!bound_unadvertised.contains("tracedecay_ast_grep_rewrite"));
-    }
-
-    #[test]
-    fn public_lookup_normalizes_host_namespaces() {
-        let defined: Vec<String> = crate::get_tool_definitions()
-            .expect("tool definitions are available")
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect();
-
-        let names = public_name_to_canonical(&defined);
-
-        let namespaced_context = tracedecay_automation::analytics::normalize_tool_name(
-            "mcp__tracedecay__tracedecay_context",
-        );
-        assert_eq!(
-            names.get(&namespaced_context),
-            Some(&"tracedecay_context".to_string())
-        );
-    }
-
-    #[test]
-    fn exact_fact_store_routes_remain_in_the_memory_tier() {
-        for route in [
-            "add",
-            "search",
-            "probe",
-            "related",
-            "reason",
-            "contradict",
-            "get",
-            "update",
-            "remove",
-            "list",
-        ] {
-            assert_eq!(
-                tool_tier(&format!("tracedecay_fact_store_{route}")),
-                "memory"
-            );
-        }
-        assert_eq!(tool_tier("tracedecay_fact_store"), "other");
-        assert_eq!(tool_tier("tracedecay_fact_store_unknown"), "other");
-    }
 }
 
 #[derive(Default)]
@@ -607,7 +435,7 @@ fn tools_section(rows: &[AnalyticsToolCounts]) -> Result<AnalyticsToolsSectionV1
     }
     let tiers = TIERS
         .iter()
-        .map(|(tier, _)| *tier)
+        .copied()
         .chain(std::iter::once("other"))
         .filter_map(|tier| {
             per_tier.get(tier).map(|counts| AnalyticsTierCountsV1 {
@@ -800,4 +628,132 @@ async fn automation_section(
         records_truncated: records.len() >= AUTOMATION_RECORD_LIMIT,
         by_job: by_job.into_values().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bound_but_unadvertised_tool_names, public_name_to_canonical, tool_tier};
+
+    #[test]
+    fn bound_unadvertised_tool_names_use_the_public_catalog() {
+        let defined: Vec<String> = crate::get_tool_definitions()
+            .expect("tool definitions are available")
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+
+        let bound_unadvertised = bound_but_unadvertised_tool_names(&defined);
+
+        // Served by name as an internal owner operation, with no dispatch
+        // binding row and no advertised definition.
+        assert!(
+            !crate::tools::binding::MCP_TOOL_BINDINGS
+                .iter()
+                .any(|binding| binding.name == "tracedecay_admin_cli")
+        );
+        assert!(!defined.iter().any(|name| name == "tracedecay_admin_cli"));
+        assert!(bound_unadvertised.contains("tracedecay_admin_cli"));
+        assert!(bound_unadvertised.contains("tracedecay_admin_sync"));
+        assert!(
+            defined
+                .iter()
+                .any(|name| name == "tracedecay_ast_grep_rewrite")
+        );
+        assert!(!bound_unadvertised.contains("tracedecay_ast_grep_rewrite"));
+    }
+
+    #[test]
+    fn public_lookup_normalizes_host_namespaces() {
+        let defined: Vec<String> = crate::get_tool_definitions()
+            .expect("tool definitions are available")
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+
+        let names = public_name_to_canonical(&defined);
+
+        let namespaced_context = tracedecay_automation::analytics::normalize_tool_name(
+            "mcp__tracedecay__tracedecay_context",
+        );
+        assert_eq!(
+            names.get(&namespaced_context),
+            Some(&"tracedecay_context".to_string())
+        );
+    }
+
+    #[test]
+    fn exact_fact_store_routes_remain_in_the_memory_tier() {
+        for route in [
+            "add",
+            "search",
+            "probe",
+            "related",
+            "reason",
+            "contradict",
+            "get",
+            "update",
+            "remove",
+            "list",
+        ] {
+            assert_eq!(
+                tool_tier(&format!("tracedecay_fact_store_{route}")),
+                "memory"
+            );
+        }
+        assert_eq!(tool_tier("tracedecay_fact_store"), "other");
+        assert_eq!(tool_tier("tracedecay_fact_store_unknown"), "other");
+    }
+
+    #[test]
+    fn retained_provider_controls_report_the_memory_tier() {
+        use tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation;
+
+        for operation in [
+            RetainedSurfaceOperation::ProviderFeedback,
+            RetainedSurfaceOperation::ProviderCorrection,
+            RetainedSurfaceOperation::ProviderDeleteBySource,
+            RetainedSurfaceOperation::ProviderHealth,
+            RetainedSurfaceOperation::ProviderInspection,
+            RetainedSurfaceOperation::ProviderMaintenance,
+            RetainedSurfaceOperation::ProviderSnapshotExport,
+            RetainedSurfaceOperation::ProviderSnapshotRestore,
+            RetainedSurfaceOperation::ProviderReplay,
+        ] {
+            for name in [
+                operation.as_str().to_owned(),
+                format!("tracedecay_{}", operation.as_str()),
+                format!("mcp__tracedecay__tracedecay_{}", operation.as_str()),
+            ] {
+                assert_eq!(tool_tier(&name), "memory", "{name}");
+            }
+        }
+        assert_eq!(tool_tier("tracedecay_provider_unknown"), "other");
+        assert_eq!(tool_tier("tracedecay_provider_health_extra"), "other");
+    }
+
+    #[test]
+    fn every_catalog_tool_reports_a_named_tier() {
+        let other: Vec<String> = crate::get_tool_definitions()
+            .expect("tool definitions are available")
+            .into_iter()
+            .map(|definition| definition.name)
+            .filter(|name| tool_tier(name) == "other")
+            .collect();
+        assert!(
+            other.is_empty(),
+            "catalog tools in the other tier: {other:?}"
+        );
+    }
+
+    #[test]
+    fn regrouped_tools_keep_their_reported_tier() {
+        for (tool, tier) in [
+            ("tracedecay_runtime", "analysis"),
+            ("tracedecay_diagnose", "admin"),
+            ("tracedecay_run_affected_tests", "admin"),
+            ("tracedecay_status", "navigation"),
+        ] {
+            assert_eq!(tool_tier(tool), tier, "{tool}");
+        }
+    }
 }

@@ -725,7 +725,7 @@ fn validate_alias_binding(
 }
 
 async fn validate_message_projection_row(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observation_id: &str,
     effect: &ObservationProjection,
     resolved: &ResolvedOutputAuthority<'_>,
@@ -988,7 +988,7 @@ fn owned_storage_columns_need_rewrite(
 
 #[allow(clippy::too_many_arguments)]
 async fn validate_message_projection(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observation_id: &str,
     state: ProjectionAuthorityState,
     unaliased: &ObservationProjection,
@@ -1055,7 +1055,7 @@ fn validate_skipped_projection_row(
 
 #[allow(clippy::too_many_arguments)]
 async fn validate_composite_projection(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observation_id: &str,
     state: ProjectionAuthorityState,
     unaliased: &ObservationProjection,
@@ -1138,7 +1138,7 @@ async fn validate_composite_projection(
 /// durable output-collision skip re-derives as `Skipped(OutputCollision)` and
 /// audits through the `Skipped` arm natively.
 async fn derive_projection_effect(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observation: &DurableObservationV1,
 ) -> tracedecay_domain::errors::Result<ObservationProjection> {
     crate::observation_projection::derive_projection_with_alias(conn, observation)
@@ -1170,7 +1170,7 @@ fn requested_outputs(effects: &[ObservationProjection]) -> BTreeSet<(String, Str
     skip_all
 )]
 async fn derive_page_effects(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observations: &[&DurableObservationV1],
 ) -> tracedecay_domain::errors::Result<Vec<ObservationProjection>> {
     let mut effects = Vec::with_capacity(observations.len());
@@ -1237,7 +1237,7 @@ async fn resolve_output_authority<'a>(
 /// per-row invariant is unchanged; only the number of round trips spent
 /// re-reading the same stored authority is.
 async fn validate_projection_effects(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observations: &[&DurableObservationV1],
     released: &ReleasedRenderingLedger,
 ) -> tracedecay_domain::errors::Result<()> {
@@ -1257,7 +1257,7 @@ async fn validate_projection_effects(
 }
 
 async fn validate_projection_effect(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observation: &DurableObservationV1,
     effect: &ObservationProjection,
     resolved: &ResolvedOutputAuthority<'_>,
@@ -1341,7 +1341,7 @@ async fn observation_by_id(
 /// Durable rejection dispositions and source retirement are admitted outcomes
 /// even when the observation does not derive a normal output.
 async fn historical_projection_requires_derivation(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     observation: &DurableObservationV1,
 ) -> tracedecay_domain::errors::Result<bool> {
     let state = ProjectionAuthorityState::load(conn, observation.observation_id().as_str()).await?;
@@ -1381,7 +1381,7 @@ async fn historical_projection_requires_derivation(
 
 /// Validates one rowid page before advancing its authority watermark.
 async fn validate_projection_table_page(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     table: &str,
     after_rowid: i64,
     through_observation_sequence: i64,
@@ -1436,7 +1436,7 @@ async fn validate_projection_table_page(
 }
 
 async fn validate_projection_authority_suffix_pages(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     mut checkpoint: AuditCheckpoint,
     page_limit: Option<i64>,
     released: &ReleasedRenderingLedger,
@@ -1680,7 +1680,7 @@ async fn validate_projection_authority_suffix_pages(
 }
 
 pub(super) async fn validate_projection_authority_suffix(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     checkpoint: AuditCheckpoint,
     released: &ReleasedRenderingLedger,
 ) -> tracedecay_domain::errors::Result<(AuditCheckpoint, i64, i64, i64)> {
@@ -1706,7 +1706,7 @@ pub(super) async fn validate_projection_authority_suffix(
 }
 
 pub(super) async fn validate_projection_authority_chunk(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
     checkpoint: AuditCheckpoint,
     released: &ReleasedRenderingLedger,
 ) -> tracedecay_domain::errors::Result<(AuditCheckpoint, i64, i64, i64, bool)> {
@@ -1871,7 +1871,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    crate::observation_projection::impl_send_projection_derive!(CountingQuery<'_>);
+
+    #[asupersync::test]
     async fn audit_checkpoint_schema_tracks_source_cursor_progress() {
         let directory = TempDir::new().unwrap();
         let connection = TestConnection::open(&directory.path().join("sessions.db"));
@@ -1919,7 +1921,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn observation_point_reads_have_covering_indexes() {
         let directory = TempDir::new().unwrap();
         let connection = open_registered_test_fixture(
@@ -2029,7 +2031,7 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn projection_audit_pages_near_limit_observation_payloads() {
         let (_directory, connection) = super::super::test_fixture::open_registered().await;
         let title = "x".repeat(tracedecay_domain::MAX_OBSERVATION_RECORD_BYTES - 8192);
@@ -2103,7 +2105,7 @@ mod tests {
         assert_eq!(dispositions, 65);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn projection_audit_batches_common_skip_rows() {
         const OBSERVATIONS: usize = 128;
 
@@ -2233,7 +2235,7 @@ mod tests {
         observation
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn projection_audit_accepts_metadata_retired_before_projection() {
         let directory = TempDir::new().unwrap();
         let connection = open_registered_test_fixture(
@@ -2381,7 +2383,7 @@ mod tests {
     /// an output it only adopted resolves to its *oldest*, and a requested key
     /// with no provenance resolves to nothing at all (the absence every caller
     /// turns into a typed provenance collision).
-    #[tokio::test]
+    #[asupersync::test]
     async fn batched_output_authority_reproduces_projector_ownership_ordering() {
         let directory = TempDir::new().unwrap();
         let connection = open_registered_test_fixture(
@@ -2496,7 +2498,7 @@ mod tests {
 
     /// Every requested key must be answered, including across the chunk
     /// boundary the batched statement pages at.
-    #[tokio::test]
+    #[asupersync::test]
     async fn batched_output_authority_answers_every_key_across_chunks() {
         const OUTPUTS: usize = 300;
 
@@ -2592,6 +2594,10 @@ mod tests {
             self.inner.query(sql, params).await
         }
     }
+
+    crate::observation_projection::impl_send_projection_derive!(
+        CountingSnapshot<'_, tracedecay_runtime_core::db::DatabaseEngineReadSnapshot>
+    );
 
     const CURSOR_COLLISION_MESSAGE_ID: &str = "fixture-session:0:generation:5552477573209801791";
 
@@ -2699,7 +2705,7 @@ mod tests {
         observation
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn projection_audit_preserves_receipt_bound_cursor_collision() {
         let directory = TempDir::new().unwrap();
         let runtime = crate::tests::harness::HostAdmissionTestRuntimeV1::profile(directory.path())
@@ -2803,7 +2809,7 @@ mod tests {
         assert!(rows.next().await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn projection_audit_restores_a_created_cursor_message_whose_row_is_gone() {
         let directory = TempDir::new().unwrap();
         let runtime = crate::tests::harness::HostAdmissionTestRuntimeV1::profile(directory.path())
@@ -2841,7 +2847,7 @@ mod tests {
     /// baseline this replaced issued two authority reads, one ownership read
     /// and a full owner re-derivation (two more reads) for every message on top
     /// of the rest; the batched path must land well under that.
-    #[tokio::test]
+    #[asupersync::test]
     async fn projection_audit_batches_message_output_authority() {
         const OBSERVATIONS: usize = 24;
 
@@ -3020,7 +3026,7 @@ mod tests {
     /// A resumed audit validates the observations committed since its
     /// checkpoint. Its work must follow those observations: re-reading the
     /// store for each one makes a streamed window cost O(new × store).
-    #[tokio::test]
+    #[asupersync::test]
     async fn resumed_authority_audit_work_follows_new_observations_not_the_store() {
         const BASE: usize = 48;
         const GROWN: usize = 8 * BASE;
@@ -3052,7 +3058,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn exhaustive_authority_audit_work_scales_with_the_rows() {
         async fn steps(count: usize) -> u64 {
             let directory = TempDir::new().unwrap();
@@ -3083,7 +3089,7 @@ mod tests {
     /// audited sits behind the observation checkpoint but past the projection
     /// rowid checkpoints. The resumed audit must still reach it when the same
     /// pass also validates newly committed observations.
-    #[tokio::test]
+    #[asupersync::test]
     async fn resumed_authority_audit_detects_a_projection_row_planted_behind_its_checkpoint() {
         let directory = TempDir::new().unwrap();
         let runtime = crate::tests::harness::HostAdmissionTestRuntimeV1::profile(directory.path())
@@ -3135,7 +3141,7 @@ mod tests {
     /// Batched creation-owner counting keeps the "one creator per output"
     /// invariant, including the cross-projector case a single projector-scoped
     /// query would miss, and reads an unknown output as zero creators.
-    #[tokio::test]
+    #[asupersync::test]
     async fn batched_output_ownership_still_rejects_multiple_creators() {
         let directory = TempDir::new().unwrap();
         let connection = open_registered_test_fixture(

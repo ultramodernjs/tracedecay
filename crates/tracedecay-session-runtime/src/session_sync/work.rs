@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use super::*;
 
 const GIT_SYNC_COMMAND_DEADLINE: Duration = Duration::from_secs(5);
@@ -83,7 +86,7 @@ impl DaemonSessionSyncService {
         let task_key = key.clone();
         let task_cancellation = cancellation.clone();
         let key_for_cleanup = key.clone();
-        let task = tokio::spawn(async move {
+        let task = NativeTask::spawn(async move {
             let worker = async {
                 loop {
                     let journal_changed = service.journal_changed.notified();
@@ -208,17 +211,27 @@ impl DaemonSessionSyncService {
                             return;
                         }
                         () = &mut journal_changed => {}
-                        () = tokio::time::sleep(COALESCED_JOURNAL_RECHECK_INTERVAL) => {}
+                        fired = native_runtime::sleep_until(Instant::now() + COALESCED_JOURNAL_RECHECK_INTERVAL) => {
+                            // The interruption wait times out on the same
+                            // missing timer, so this loop cannot spin.
+                            if let Err(error) = fired {
+                                tracing::warn!(%error, "coalesced session sync recheck has no native timer");
+                            }
+                        }
                     }
                 }
             };
             worker.await;
-            service
-                .active
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&key_for_cleanup);
+            service.release_active(&key_for_cleanup, None);
         });
+        let task = match task {
+            Ok(task) => task,
+            Err(error) => {
+                tracing::warn!(%error, "coalesced session sync wait did not start");
+                self.release_active(&task_key, None);
+                return;
+            }
+        };
         let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);
         tasks.retain(|task| !task.task.is_finished());
         tasks.push(super::project_lifecycle::SessionSyncTaskV1 {
@@ -421,10 +434,15 @@ impl SessionSyncProjectContext {
             ("project", project_sessions.as_ref()),
             ("profile", self.user_sessions.as_ref()),
         ] {
-            for (source_json, scope_json, committed_cursor_json) in database
-                .list_session_sync_source_frontiers()
-                .await
-                .map_err(store_error)?
+            let listed = tracedecay_runtime_core::erase_send!(
+                database.list_session_sync_source_frontiers(),
+                std::result::Result<
+                    Vec<(String, String, String)>,
+                    tracedecay_domain::TraceDecayError,
+                >
+            );
+            for (source_json, scope_json, committed_cursor_json) in
+                listed.await.map_err(store_error)?
             {
                 frontiers.push(SessionSyncSourceFrontierV1 {
                     store_scope: store_scope.to_owned(),
@@ -470,9 +488,9 @@ impl SessionSyncProjectContext {
         .await
         .map_err(store_error)?;
         Ok(
-            git_history_frontier_from_meta(change_sequence, source_rowid)
-                .map(|frontier| vec![git_history_source_frontier(&self.project_id, frontier)])
-                .unwrap_or_default(),
+            git_history_frontier_from_meta(change_sequence, source_rowid).map_or_default(
+                |frontier| vec![git_history_source_frontier(&self.project_id, frontier)],
+            ),
         )
     }
 
@@ -487,18 +505,27 @@ impl SessionSyncProjectContext {
             Ok(observation) => observation,
             Err(interruption) => return SessionSyncWorkResult::Interrupted(interruption),
         };
+        let stats = import_transcript_stats(tracedecay_sessions::TranscriptIngestStats::default());
+        let coverage = observation.coverage.clone();
+        let persisted: Pin<
+            Box<
+                dyn Future<
+                        Output = tracedecay_domain::errors::Result<
+                            Vec<SessionSyncSourceFrontierV1>,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(service.persist_progress(
+            self,
+            &project_sessions,
+            journal_key,
+            stats.clone(),
+            coverage.clone(),
+        ));
         let pass = async {
-            let stats =
-                import_transcript_stats(tracedecay_sessions::TranscriptIngestStats::default());
-            let coverage = observation.coverage.clone();
             let source_frontiers = tracing::Instrument::instrument(
-                service.persist_progress(
-                    self,
-                    &project_sessions,
-                    journal_key,
-                    stats.clone(),
-                    coverage.clone(),
-                ),
+                persisted,
                 tracing::trace_span!("daemon.session_sync.combined_frontier_persist"),
             )
             .await;
@@ -555,7 +582,17 @@ impl SessionSyncProjectContext {
             dry_run: options.dry_run(),
             project_root: Some(self.project_root.clone()),
         };
-        let backfill = store.run_bounded_history_index_page(&backfill_options, &control);
+        let backfill: Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            tracedecay_sessions::runtime::git_correlation::BoundedBackfillOutcome,
+                            tracedecay_sessions::runtime::git_correlation::GitCorrelationError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(store.run_bounded_history_index_page(&backfill_options, &control));
         tokio::pin!(backfill);
         let (result, mut requested_interruption) = tokio::select! {
             biased;
@@ -795,10 +832,8 @@ pub fn coalesced_alias_local_interruption(
     }
 }
 
-pub(super) fn log_session_sync_join(result: Result<(), tokio::task::JoinError>) {
-    if let Err(error) = result
-        && !error.is_cancelled()
-    {
-        tracing::warn!(%error, "session sync worker join failed");
+pub(super) fn log_session_sync_join(outcome: NativeTaskOutcome<()>) {
+    if let NativeTaskOutcome::Panicked(payload) = outcome {
+        tracing::warn!(%payload, "session sync worker panicked");
     }
 }

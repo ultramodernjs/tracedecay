@@ -47,6 +47,7 @@ use super::{
     LatestCompleteCodeIndexV1, PendingHintsV1, ServingReadLeaseV1, SharedCodeIndexBytePoolV1,
     newly_eligible_percentile, now_micros,
 };
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 #[cfg(test)]
@@ -382,10 +383,47 @@ pub(super) fn text_projection_unfinished_withholds_seat(exact_and_lexical_ready:
     !exact_and_lexical_ready
 }
 
+/// One armed pause: the paused step reports `entered` and waits on `release`.
 #[cfg(any(test, feature = "test-helpers"))]
-struct ColdMountFinalCommitGateV1 {
+struct WorkerStepGateV1 {
     entered: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Arm one pause gate at `key`, returning the receiver that resolves once the
+/// paused step waits there and the sender that releases it.
+#[cfg(any(test, feature = "test-helpers"))]
+fn arm_worker_step_gate<K: Ord>(
+    gates: &Mutex<BTreeMap<K, WorkerStepGateV1>>,
+    key: K,
+    already_armed: std::fmt::Arguments<'_>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, entered_observed) = tokio::sync::oneshot::channel();
+    let (released, release) = tokio::sync::oneshot::channel();
+    let replaced = gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, WorkerStepGateV1 { entered, release });
+    assert!(replaced.is_none(), "{already_armed}");
+    (entered_observed, released)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn take_worker_step_gate<K, Q>(
+    gates: &Mutex<BTreeMap<K, WorkerStepGateV1>>,
+    key: &Q,
+) -> Option<WorkerStepGateV1>
+where
+    K: Ord + std::borrow::Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key)
 }
 
 /// Test gates are armed with whatever path spelling the caller holds while the
@@ -400,16 +438,10 @@ pub(super) fn test_gate_root(path: &Path) -> PathBuf {
 /// Armed gates keyed by project root, so tests pausing distinct worktrees in
 /// one process do not contend for a single slot.
 #[cfg(any(test, feature = "test-helpers"))]
-fn cold_mount_final_commit_gate() -> &'static Mutex<BTreeMap<PathBuf, ColdMountFinalCommitGateV1>> {
-    static GATE: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, ColdMountFinalCommitGateV1>>> =
+fn cold_mount_final_commit_gate() -> &'static Mutex<BTreeMap<PathBuf, WorkerStepGateV1>> {
+    static GATE: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, WorkerStepGateV1>>> =
         std::sync::OnceLock::new();
     GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(any(test, feature = "test-helpers"))]
-struct RetainedGraphRecoveryGateV1 {
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Where a restart's retained graph recovery pauses for a fixture.
@@ -428,33 +460,20 @@ pub enum RetainedGraphRecoveryPauseV1 {
 /// accident; the key is the isolation the fixtures already have.
 #[cfg(any(test, feature = "test-helpers"))]
 fn retained_graph_recovery_gate()
--> &'static Mutex<BTreeMap<(PathBuf, RetainedGraphRecoveryPauseV1), RetainedGraphRecoveryGateV1>> {
+-> &'static Mutex<BTreeMap<(PathBuf, RetainedGraphRecoveryPauseV1), WorkerStepGateV1>> {
     static GATE: std::sync::OnceLock<
-        Mutex<BTreeMap<(PathBuf, RetainedGraphRecoveryPauseV1), RetainedGraphRecoveryGateV1>>,
+        Mutex<BTreeMap<(PathBuf, RetainedGraphRecoveryPauseV1), WorkerStepGateV1>>,
     > = std::sync::OnceLock::new();
     GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(any(test, feature = "test-helpers"))]
-struct RetainedTextProjectionGateV1 {
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Armed gates, keyed by the exact worktree they fence, on the same
 /// per-worktree isolation as the recovery gate above.
 #[cfg(any(test, feature = "test-helpers"))]
-fn retained_text_projection_gate() -> &'static Mutex<BTreeMap<PathBuf, RetainedTextProjectionGateV1>>
-{
-    static GATE: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, RetainedTextProjectionGateV1>>> =
+fn retained_text_projection_gate() -> &'static Mutex<BTreeMap<PathBuf, WorkerStepGateV1>> {
+    static GATE: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, WorkerStepGateV1>>> =
         std::sync::OnceLock::new();
     GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(test)]
-struct WorkerStepGateV1 {
-    entered: tokio::sync::oneshot::Sender<()>,
-    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[cfg(test)]
@@ -485,6 +504,15 @@ fn opened_published_text_projection_gate() -> &'static Mutex<BTreeMap<PathBuf, W
 /// Holds a worker's graph tail right before it seats the decoded generation.
 #[cfg(test)]
 fn serving_swap_gate() -> &'static Mutex<BTreeMap<PathBuf, WorkerStepGateV1>> {
+    static GATE: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, WorkerStepGateV1>>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Holds a woken worker after its shutdown check, before a terminal
+/// publication park suppresses the pass.
+#[cfg(test)]
+fn terminal_suppression_gate() -> &'static Mutex<BTreeMap<PathBuf, WorkerStepGateV1>> {
     static GATE: std::sync::OnceLock<Mutex<BTreeMap<PathBuf, WorkerStepGateV1>>> =
         std::sync::OnceLock::new();
     GATE.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -855,8 +883,94 @@ pub struct MountedCodeIndexWorktreeV1 {
     /// Live handle to the publication's encoded-byte counter; observed only by
     /// test memory accounting today.
     _active_generation_encoded_bytes: Arc<AtomicU64>,
-    pub task: tokio::task::JoinHandle<()>,
+    pub task: Arc<native_runtime::NativeTask<()>>,
 }
+
+// The scheduler registry stores these worktrees in a `BTreeMap`. One `Send`
+// proof of that map walks every slot past the recursion limit
+// (rust-lang/rust#159228); each field is checked on its own.
+unsafe impl Send for MountedCodeIndexWorktreeV1 {}
+unsafe impl Sync for MountedCodeIndexWorktreeV1 {}
+
+const _: fn(&MountedCodeIndexWorktreeV1) = |value| {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    let MountedCodeIndexWorktreeV1 {
+        project_id,
+        repository_id,
+        worktree_id,
+        query_authority,
+        scheduler,
+        path_policy,
+        build_publication_lock,
+        historical_generation_owner,
+        serving_generation,
+        complete_generation_requested,
+        complete_generation_requested_changed,
+        memory_retry,
+        source_freshness,
+        last_reconciled_at_micros,
+        text_generation,
+        convergence_park,
+        generation_recovery,
+        serving_source_witness,
+        build_progress,
+        serving_generation_epoch,
+        serving_generation_changed,
+        serving_generation_installation,
+        graph_activation,
+        residency,
+        _residency_registration,
+        graph_cursor_retention,
+        ignored_dependency_admissions,
+        hints,
+        wake,
+        epoch,
+        pending_wake,
+        index_observability,
+        shutting_down,
+        reconcile_in_progress,
+        worker_phase,
+        _active_generation_encoded_bytes,
+        task,
+    } = value;
+    assert_send_sync(project_id);
+    assert_send_sync(repository_id);
+    assert_send_sync(worktree_id);
+    assert_send_sync(query_authority);
+    assert_send_sync(scheduler);
+    assert_send_sync(path_policy);
+    assert_send_sync(build_publication_lock);
+    assert_send_sync(historical_generation_owner);
+    assert_send_sync(serving_generation);
+    assert_send_sync(complete_generation_requested);
+    assert_send_sync(complete_generation_requested_changed);
+    assert_send_sync(memory_retry);
+    assert_send_sync(source_freshness);
+    assert_send_sync(last_reconciled_at_micros);
+    assert_send_sync(text_generation);
+    assert_send_sync(convergence_park);
+    assert_send_sync(generation_recovery);
+    assert_send_sync(serving_source_witness);
+    assert_send_sync(build_progress);
+    assert_send_sync(serving_generation_epoch);
+    assert_send_sync(serving_generation_changed);
+    assert_send_sync(serving_generation_installation);
+    assert_send_sync(graph_activation);
+    assert_send_sync(residency);
+    assert_send_sync(_residency_registration);
+    assert_send_sync(graph_cursor_retention);
+    assert_send_sync(ignored_dependency_admissions);
+    assert_send_sync(hints);
+    assert_send_sync(wake);
+    assert_send_sync(epoch);
+    assert_send_sync(pending_wake);
+    assert_send_sync(index_observability);
+    assert_send_sync(shutting_down);
+    assert_send_sync(reconcile_in_progress);
+    assert_send_sync(worker_phase);
+    assert_send_sync(_active_generation_encoded_bytes);
+    assert_send_sync(task);
+};
 
 /// Unique mounted worktree for one admitted repo+worktree scope.
 ///
@@ -919,6 +1033,13 @@ const CONVERGENCE_PARK_CONTRACT_REMEDIATION_V1: &str = "fix the named contract v
 const CONVERGENCE_PARK_TASK_FAILURE_REMEDIATION_V1: &str = "inspect the daemon log for the \
      abnormal text-projection failure; indexing retries when a new generation seals over \
      changed input";
+
+/// Remediation when the background worker itself panicked. Nothing in the
+/// daemon restarts it, so only a new mount does.
+const CONVERGENCE_PARK_WORKER_PANIC_REMEDIATION_V1: &str = "the code-index worker for this \
+     worktree panicked and stopped indexing; the last seated generation keeps serving; run \
+     `tracedecay daemon restart` to restart indexing, and report the daemon log's \
+     code_index_worker_panicked event";
 
 /// Remediation when a background reconcile fails the same way over unchanged
 /// source. Passes stay held until the input changes, so the operator either
@@ -1068,16 +1189,75 @@ fn convergence_park_retries_on_wake(slot: &RwLock<Option<CodeIndexConvergencePar
 /// refusal is preserved too: text progress does not activate the refused
 /// graph, so only [`clear_graph_resident_memory_park`] retires it.
 fn clear_convergence_park(slot: &RwLock<Option<CodeIndexConvergenceParkedV1>>) {
+    clear_convergence_park_unless(slot, |_| false);
+}
+
+/// [`clear_convergence_park`] for text projection progress, which runs beside
+/// the worker's passes. A reconcile refusal over unchanged input is not text
+/// work: the worker holds its passes until the input changes, so clearing the
+/// park here would leave those held passes with nothing to report.
+fn clear_convergence_park_after_text_progress(slot: &RwLock<Option<CodeIndexConvergenceParkedV1>>) {
+    clear_convergence_park_unless(slot, is_reconcile_refusal_park);
+}
+
+fn clear_convergence_park_unless(
+    slot: &RwLock<Option<CodeIndexConvergenceParkedV1>>,
+    preserve: impl Fn(&CodeIndexConvergenceParkedV1) -> bool,
+) {
     let mut slot = slot
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if slot.as_ref().is_some_and(|parked| {
         is_terminal_publication_authority_park(parked)
+            || parked.remediation == CONVERGENCE_PARK_WORKER_PANIC_REMEDIATION_V1
             || parked.blocked_reason == Some(CodeIndexBuildBlockedReasonV1::ResidentMemory)
+            || preserve(parked)
     }) {
         return;
     }
     *slot = None;
+}
+
+/// The park a reconcile refusal over unchanged input leaves while the worker
+/// holds its passes.
+fn is_reconcile_refusal_park(parked: &CodeIndexConvergenceParkedV1) -> bool {
+    !parked.retries_on_wake
+        && parked.remediation == CONVERGENCE_PARK_RECONCILE_FAILURE_REMEDIATION_V1
+}
+
+/// Retire a reconcile refusal once a pass over changed input completed.
+fn clear_reconcile_refusal_park(slot: &RwLock<Option<CodeIndexConvergenceParkedV1>>) {
+    let mut slot = slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.as_ref().is_some_and(is_reconcile_refusal_park) {
+        *slot = None;
+    }
+}
+
+/// Park a worktree whose worker panicked and mark the worker failed, so
+/// status reports the panic and every seat wait ends with the park instead of
+/// waiting for a seat no pass will install.
+fn park_panicked_worker(
+    slot: &RwLock<Option<CodeIndexConvergenceParkedV1>>,
+    phase: &tokio::sync::watch::Sender<CodeIndexWorkerPhaseV1>,
+    serving_generation_changed: &tokio::sync::watch::Sender<()>,
+    panic: &str,
+) {
+    tracing::error!(
+        event = "code_index_worker_panicked",
+        panic,
+        "code-index worker panicked and stopped; its worktree is parked"
+    );
+    park_convergence(
+        slot,
+        format!("code-index worker panicked: {panic}"),
+        CONVERGENCE_PARK_WORKER_PANIC_REMEDIATION_V1,
+        None,
+        false,
+    );
+    CodeIndexWorkerPhaseV1::enter(phase, CodeIndexWorkerPhaseV1::Failed);
+    serving_generation_changed.send_replace(());
 }
 
 /// Retire a resident-memory graph refusal once a native graph activated.
@@ -1579,6 +1759,8 @@ pub enum CodeIndexWorkerPhaseV1 {
     /// Building a sealed generation's code graph: corpus-sized work a read
     /// that waits on the graph cannot shorten.
     PublishingGraph,
+    /// The worker panicked and stopped. Its convergence park names the panic.
+    Failed,
 }
 
 impl CodeIndexWorkerPhaseV1 {
@@ -1888,6 +2070,54 @@ pub struct CodeIndexSchedulerRegistryV1 {
     worker_shutdown_signals: Arc<Mutex<Vec<WorkerShutdownSignalV1>>>,
 }
 
+// Git watch and mount admission prove this registry `Send` through the mounted
+// worktree map. That walk exceeds the recursion limit (rust-lang/rust#159228);
+// each field is checked on its own.
+unsafe impl Send for CodeIndexSchedulerRegistryV1 {}
+unsafe impl Sync for CodeIndexSchedulerRegistryV1 {}
+
+const _: fn(&CodeIndexSchedulerRegistryV1) = |value| {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    let CodeIndexSchedulerRegistryV1 {
+        max_worktrees,
+        progress_daemon_incarnation,
+        next_progress_producer_incarnation,
+        resident_memory,
+        resident_owners,
+        byte_pool,
+        mounted,
+        retiring,
+        cold_mount_reservations,
+        background_reconcile_admission,
+        serving_generation_installation_tokens,
+        generation_publications,
+        serving_seats,
+        root_mounted,
+        cadence_telemetry,
+        activations,
+        test_attribution_authorities,
+        worker_shutdown_signals,
+    } = value;
+    assert_send_sync(max_worktrees);
+    assert_send_sync(progress_daemon_incarnation);
+    assert_send_sync(next_progress_producer_incarnation);
+    assert_send_sync(resident_memory);
+    assert_send_sync(resident_owners);
+    assert_send_sync(byte_pool);
+    assert_send_sync(mounted);
+    assert_send_sync(retiring);
+    assert_send_sync(cold_mount_reservations);
+    assert_send_sync(background_reconcile_admission);
+    assert_send_sync(serving_generation_installation_tokens);
+    assert_send_sync(generation_publications);
+    assert_send_sync(serving_seats);
+    assert_send_sync(root_mounted);
+    assert_send_sync(cadence_telemetry);
+    assert_send_sync(activations);
+    assert_send_sync(test_attribution_authorities);
+    assert_send_sync(worker_shutdown_signals);
+};
+
 /// One worker's early-shutdown handles, registered when it is mounted.
 struct WorkerShutdownSignalV1 {
     shutting_down: Weak<AtomicBool>,
@@ -2009,32 +2239,20 @@ impl CodeIndexSchedulerRegistryV1 {
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
     ) {
-        let (entered, entered_observed) = tokio::sync::oneshot::channel();
-        let (released, release) = tokio::sync::oneshot::channel();
-        let previous = cold_mount_final_commit_gate()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                test_gate_root(&project_root),
-                ColdMountFinalCommitGateV1 { entered, release },
-            );
-        assert!(
-            previous.is_none(),
-            "only one cold mount final-commit gate may be armed per project root"
-        );
-        (entered_observed, released)
+        arm_worker_step_gate(
+            cold_mount_final_commit_gate(),
+            test_gate_root(&project_root),
+            format_args!("only one cold mount final-commit gate may be armed per project root"),
+        )
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
     async fn wait_for_cold_mount_final_commit_gate(project_root: &Path) {
-        let gate = cold_mount_final_commit_gate()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&test_gate_root(project_root));
-        if let Some(gate) = gate {
-            let _ = gate.entered.send(());
-            let _ = gate.release.await;
-        }
+        let gate = take_worker_step_gate(
+            cold_mount_final_commit_gate(),
+            &test_gate_root(project_root),
+        );
+        Self::pass_worker_step_gate(gate).await;
     }
 
     /// Pause the next retained graph recovery of `project_root` `at` one of
@@ -2053,22 +2271,14 @@ impl CodeIndexSchedulerRegistryV1 {
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
     ) {
-        let (entered, entered_observed) = tokio::sync::oneshot::channel();
-        let (released, release) = tokio::sync::oneshot::channel();
-        let mut gates = retained_graph_recovery_gate()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            gates
-                .insert(
-                    (test_gate_root(&project_root), at),
-                    RetainedGraphRecoveryGateV1 { entered, release },
-                )
-                .is_none(),
-            "one retained graph recovery {at:?} gate per worktree: {}",
-            project_root.display()
-        );
-        (entered_observed, released)
+        arm_worker_step_gate(
+            retained_graph_recovery_gate(),
+            (test_gate_root(&project_root), at),
+            format_args!(
+                "one retained graph recovery {at:?} gate per worktree: {}",
+                project_root.display()
+            ),
+        )
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -2076,14 +2286,11 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         at: RetainedGraphRecoveryPauseV1,
     ) {
-        let gate = retained_graph_recovery_gate()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&(test_gate_root(project_root), at));
-        if let Some(gate) = gate {
-            let _ = gate.entered.send(());
-            let _ = gate.release.await;
-        }
+        let gate = take_worker_step_gate(
+            retained_graph_recovery_gate(),
+            &(test_gate_root(project_root), at),
+        );
+        Self::pass_worker_step_gate(gate).await;
     }
 
     /// Hold a restart's retained text projection at its first advance, so a
@@ -2099,35 +2306,33 @@ impl CodeIndexSchedulerRegistryV1 {
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
     ) {
-        let (entered, entered_observed) = tokio::sync::oneshot::channel();
-        let (released, release) = tokio::sync::oneshot::channel();
-        let mut gates = retained_text_projection_gate()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            gates
-                .insert(
-                    test_gate_root(&project_root),
-                    RetainedTextProjectionGateV1 { entered, release },
-                )
-                .is_none(),
-            "one retained text projection gate per worktree: {}",
-            project_root.display()
-        );
-        (entered_observed, released)
+        arm_worker_step_gate(
+            retained_text_projection_gate(),
+            test_gate_root(&project_root),
+            format_args!(
+                "one retained text projection gate per worktree: {}",
+                project_root.display()
+            ),
+        )
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
     async fn wait_for_retained_text_projection_gate(project_root: &Path) {
-        let gate = retained_text_projection_gate()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&test_gate_root(project_root));
+        let gate = take_worker_step_gate(
+            retained_text_projection_gate(),
+            &test_gate_root(project_root),
+        );
+        Self::pass_worker_step_gate(gate).await;
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    async fn pass_worker_step_gate(gate: Option<WorkerStepGateV1>) {
         if let Some(gate) = gate {
             let _ = gate.entered.send(());
             let _ = gate.release.await;
         }
     }
+
     /// Construct a registry with an explicit background-reconcile permit count so
     /// tests can deterministically exercise the bounded-admission behavior
     /// (parallelism across distinct stores vs. serialization at a bound of one)
@@ -2686,10 +2891,12 @@ impl CodeIndexSchedulerRegistryV1 {
     /// pointer. A publication's owner is not installed until it reopens, so
     /// that caller passes `None`.
     async fn join_retained_text_projection_on_worker_exit(
-        projection: &mut Option<tokio::task::JoinHandle<PublishedTextProjectionOutcomeV1>>,
+        projection: &mut Option<
+            Result<native_runtime::NativeTask<PublishedTextProjectionOutcomeV1>, String>,
+        >,
     ) {
         if let Some(projection) = projection.take() {
-            let _ = projection.await;
+            let _ = crate::code_index_task_support::join_native(&projection).await;
         }
     }
 
@@ -2727,9 +2934,17 @@ impl CodeIndexSchedulerRegistryV1 {
                 break;
             }
             let advancing = text.clone();
+            // Graph activation waits on `opened` for the build open and its
+            // reservation only, so that advance commits no pages: the page
+            // batches then run beside the graph build instead of ahead of it.
+            let maximum_work = if opened.is_some() {
+                0
+            } else {
+                TEXT_PROJECTION_DOCUMENTS_PER_PASS_V1
+            };
             let advance = tracing::Instrument::instrument(
-                tokio::task::spawn_blocking(move || {
-                    advancing.advance_text_serving(TEXT_PROJECTION_DOCUMENTS_PER_PASS_V1)
+                native_runtime::spawn_blocking(move || {
+                    advancing.advance_text_serving(maximum_work)
                 }),
                 tracing::trace_span!("daemon.code_index.text_projection"),
             )
@@ -2743,11 +2958,11 @@ impl CodeIndexSchedulerRegistryV1 {
             }
             match advance {
                 Ok(Ok(true)) => {
-                    clear_convergence_park(&convergence_park);
+                    clear_convergence_park_after_text_progress(&convergence_park);
                     break;
                 }
                 Ok(Ok(false)) => {
-                    clear_convergence_park(&convergence_park);
+                    clear_convergence_park_after_text_progress(&convergence_park);
                 }
                 Ok(Err(error)) => {
                     if matches!(
@@ -3514,7 +3729,7 @@ impl CodeIndexSchedulerRegistryV1 {
                     ],
                 );
                 let _ = tracing::Instrument::instrument(
-                    &mut worktree.task,
+                    worktree.task.wait(),
                     tracing::trace_span!("daemon.code_index.shutdown.worker_join"),
                 )
                 .await;
@@ -3535,7 +3750,7 @@ impl CodeIndexSchedulerRegistryV1 {
                 // long and hide it inside the owner's join budget, so the
                 // release runs on the blocking pool. Shutdown still joins it
                 // below: ownership must be gone when this returns.
-                owner_releases.push(tokio::task::spawn_blocking(move || {
+                owner_releases.push(native_runtime::spawn_blocking(move || {
                     let _span =
                         tracing::trace_span!("daemon.code_index.shutdown.owner_release").entered();
                     drop(worktree);
@@ -3614,14 +3829,14 @@ impl CodeIndexSchedulerRegistryV1 {
             worktree.wake.notify_one();
             retiring.insert(root, worktree);
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = std::time::Instant::now() + timeout;
         let mut drained = true;
         // A cold owner needs `retiring` for its final cancellation fence before
         // it can drop the reservation that this wait observes. The retired
         // reservation itself blocks remounts while this guard is released.
         drop(retiring);
         for (root, mut completion) in cold_mount_waiting {
-            match tokio::time::timeout_at(deadline, completion.changed()).await {
+            match native_runtime::timeout_at(deadline, completion.changed()).await {
                 Ok(_) => {
                     completed_cold_mounts.insert(root);
                 }
@@ -3636,7 +3851,7 @@ impl CodeIndexSchedulerRegistryV1 {
             let Some(worktree) = retiring.get_mut(root) else {
                 continue;
             };
-            match tokio::time::timeout_at(deadline, &mut worktree.task).await {
+            match native_runtime::timeout_at(deadline, worktree.task.wait()).await {
                 Ok(_) => {
                     joined.insert(root.clone());
                 }
@@ -3845,10 +4060,11 @@ fn feedback_document_identity_for_file(
     let manifest = generation.metadata().manifest();
     let generation_digest = ManifestDigest::new(manifest.snapshot_digest.as_str().to_owned())
         .map_err(|_| LspRuntimeFailure::new("feedback-code-index-generation-invalid"))?;
-    let language = file
-        .language
-        .clone()
-        .ok_or_else(|| LspRuntimeFailure::new("feedback-code-index-language-unavailable"))?;
+    // A file sealed without a language has no analyzer in this generation, so
+    // repeating the request for it cannot succeed.
+    let language = file.language.clone().ok_or_else(|| {
+        LspRuntimeFailure::invalid_request("feedback-code-index-language-unavailable")
+    })?;
     Ok(
         tracedecay_application::feedback::cycle_production::ProductionFeedbackDocumentIdentityV1 {
             generation_id: manifest.generation_id.clone(),
@@ -3941,7 +4157,7 @@ impl CodeIndexSchedulerRegistryV1 {
             )
         };
         let known = known.cloned();
-        let metadata = tokio::task::spawn_blocking(move || {
+        let metadata = native_runtime::spawn_blocking(move || {
             owner.active_publication_text_metadata(known.as_ref())
         })
         .await
@@ -4013,22 +4229,22 @@ impl tracedecay_application::diagnostics_publication::CodeIndexPublicationIdenti
     }
 }
 
-impl crate::code_index::provider::GenerationTestAttributionJoinReadPort
+impl tracedecay_code_index::provider::GenerationTestAttributionJoinReadPort
     for CodeIndexSchedulerRegistryV1
 {
     fn read_test_attribution(
         &self,
         generation: &CodeGenerationId,
     ) -> Arc<
-        crate::code_index::provider::GenerationProviderReadV1<
-            crate::code_index::test_attribution::GenerationTestJoinV1,
+        tracedecay_code_index::provider::GenerationProviderReadV1<
+            tracedecay_code_index::test_attribution::GenerationTestJoinV1,
         >,
     > {
         let unavailable = || {
             Arc::new(
-                crate::code_index::provider::GenerationProviderReadV1::new(
+                tracedecay_code_index::provider::GenerationProviderReadV1::new(
                     tracedecay_domain::ProviderEvaluationStateV1::Unavailable,
-                    crate::code_index::provider::GenerationProviderCoverageV1::Unavailable,
+                    tracedecay_code_index::provider::GenerationProviderCoverageV1::Unavailable,
                     None,
                 )
                 .unwrap_or_else(|_| panic!("static unavailable attribution read")),

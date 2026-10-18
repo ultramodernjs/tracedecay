@@ -1,12 +1,13 @@
 use tracedecay_runtime_core::db::Database;
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, params};
+use tracedecay_runtime_core::db::schema_version;
 use tracedecay_store::{
     CANONICAL_BODIES_TABLE_SQL, CanonicalBodyError, INLINE_BODY_BYTES, LOAD_CANONICAL_BODY_SQL,
     StoredCanonicalBody, UPSERT_CANONICAL_BODY_SQL, collect_body_refs, migrate_stored_json,
     parse_stored_observation, stored_json_needs_hydrate, unpack_body,
 };
 
-use super::super::global_db_operation_error;
+use super::super::{global_db_operation_error, global_db_operation_message};
 use super::codec::storage;
 
 pub(super) const CANONICAL_BODY_MIGRATION: &str = "session-canonical-bodies-root-refs-v1";
@@ -58,7 +59,7 @@ pub(crate) async fn converge_canonical_bodies(
         if after.is_none() {
             break;
         }
-        tokio::task::yield_now().await;
+        asupersync::runtime::yield_now().await;
     }
     let mut after = 0;
     loop {
@@ -79,22 +80,18 @@ pub(crate) async fn converge_canonical_bodies(
             break;
         };
         after = next;
-        tokio::task::yield_now().await;
+        asupersync::runtime::yield_now().await;
     }
     Ok(())
 }
 
 async fn record_migration(
-    conn: &impl Executor,
+    conn: &(impl Executor + ?Sized),
     migration: &str,
 ) -> tracedecay_domain::errors::Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO global_schema_migrations(migration) VALUES (?1)",
-        params![migration],
-    )
-    .await
-    .map_err(|error| global_db_operation_error(OPERATION, error))?;
-    Ok(())
+    schema_version::record_version(conn, migration, 1)
+        .await
+        .map_err(|error| global_db_operation_message(OPERATION, error.to_string()))
 }
 
 async fn compact_observation_page(
@@ -332,20 +329,13 @@ async fn persist_bodies(
 }
 
 async fn migration_recorded(
-    conn: &impl QueryExecutor,
+    conn: &(impl QueryExecutor + ?Sized),
     migration: &str,
 ) -> tracedecay_domain::errors::Result<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM global_schema_migrations WHERE migration = ?1",
-            params![migration],
-        )
+    schema_version::read_version(conn, migration)
         .await
-        .map_err(|error| global_db_operation_error(OPERATION, error))?;
-    rows.next()
-        .await
-        .map(|row| row.is_some())
-        .map_err(|error| global_db_operation_error(OPERATION, error))
+        .map(|version| version.is_some())
+        .map_err(|error| global_db_operation_message(OPERATION, error.to_string()))
 }
 
 async fn table_exists(
@@ -396,15 +386,11 @@ mod tests {
                 name.push(*suffix);
                 std::path::PathBuf::from(name)
             };
-            total.saturating_add(
-                std::fs::metadata(member)
-                    .map(|meta| meta.len())
-                    .unwrap_or(0),
-            )
+            total.saturating_add(std::fs::metadata(member).map_or(0, |meta| meta.len()))
         })
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn body_reads_distinguish_storage_failures_from_missing_rows() {
         let tmp = TempDir::new().unwrap();
         let conn = TestConnection::open(&tmp.path().join("body-read-errors.db"));
@@ -423,7 +409,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn completed_legacy_compaction_upgrades_small_reference_rows() {
         let tmp = TempDir::new().unwrap();
         let conn = TestConnection::open(&tmp.path().join("legacy-bodies.db"));
@@ -466,7 +452,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn compaction_advances_past_unchanged_rows_and_counts_utf8_bytes() {
         let tmp = TempDir::new().unwrap();
         let conn = TestConnection::open(&tmp.path().join("observations.db"));
@@ -545,7 +531,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn continuation_compaction_vm_work_does_not_grow_with_scanned_prefix() {
         let harness =
             crate::tests::harness::RegisteredGlobalDbHarness::open("canonical-compaction-keyset")
@@ -554,7 +540,7 @@ mod tests {
         let transaction = database.begin_write_transaction().await.unwrap();
         transaction
             .execute(
-                "DELETE FROM global_schema_migrations WHERE migration = ?1",
+                "DELETE FROM tracedecay_schema_version WHERE component = ?1",
                 params![CANONICAL_BODY_MIGRATION],
             )
             .await
@@ -597,7 +583,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn compaction_stores_large_bodies_once_and_shrinks_existing_rows() {
         const N: usize = 16;
         const PAYLOAD_CHARS: usize = 80_000;

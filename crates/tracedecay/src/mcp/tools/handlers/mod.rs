@@ -593,57 +593,32 @@ pub async fn execute_workflow_tool_surface(
     .await
 }
 
-/// Reads the canonical Work HTTP envelope the daemon owner already produced.
+/// Obtain the typed canonical Work envelope before transport presentation.
 async fn invoke_admitted_work_operation(
     executor: &dyn DaemonInvocationExecutor,
     request: WorkHttpRequest,
-) -> Result<Value> {
-    let response =
-        tracedecay_daemon_service::application_surface::invoke_work_operation(executor, request)
-            .await;
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+) -> Result<tracedecay_api::HttpJsonEnvelope<Value>> {
+    tracedecay_daemon_service::application_surface::invoke_work_operation(executor, request)
         .await
-        .map_err(|error| {
-            TraceDecayError::project_route(
-                "work.response_unavailable",
-                true,
-                format!("The Work application response could not be read: {error}"),
-            )
-        })?;
-    serde_json::from_slice(&body).map_err(|error| {
-        TraceDecayError::project_route(
-            "work.response_invalid",
-            true,
-            format!("The Work application response was not valid JSON: {error}"),
-        )
-    })
+        .map_err(owner_presentation_error)
 }
 
-/// Reads the canonical Workflow HTTP envelope the daemon owner already produced.
+/// Obtain the typed canonical Workflow envelope before transport presentation.
 async fn invoke_admitted_workflow_operation(
     executor: Option<&dyn DaemonInvocationExecutor>,
     request: WorkflowHttpRequest,
-) -> Result<Value> {
-    let response = tracedecay_daemon_service::application_surface::invoke_workflow_operation(
-        executor, request,
-    )
-    .await;
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+) -> Result<tracedecay_api::HttpJsonEnvelope<Value>> {
+    tracedecay_daemon_service::application_surface::invoke_workflow_operation(executor, request)
         .await
-        .map_err(|error| {
-            TraceDecayError::project_route(
-                "workflow.response_unavailable",
-                true,
-                format!("The Workflow application response could not be read: {error}"),
-            )
-        })?;
-    serde_json::from_slice(&body).map_err(|error| {
-        TraceDecayError::project_route(
-            "workflow.response_invalid",
-            true,
-            format!("The Workflow application response was not valid JSON: {error}"),
-        )
-    })
+        .map_err(owner_presentation_error)
+}
+
+fn owner_presentation_error(error: tracedecay_api::HttpAdapterError) -> TraceDecayError {
+    TraceDecayError::project_route(
+        "application.response_invalid",
+        false,
+        format!("The application owner could not construct its response: {error}"),
+    )
 }
 
 fn mcp_tool_bounded_identity(tool_name: &str) -> &str {

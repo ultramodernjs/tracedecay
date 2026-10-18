@@ -138,9 +138,6 @@ fn terminal_repository_discovery_failures_are_not_project_open_retryable() {
     }
 }
 
-// start_paused: these restart-window tests only wait on tokio timers
-// (sleep/poll intervals); paused time auto-advances them so each test
-// finishes in milliseconds instead of real 200-300 ms waits.
 #[cfg(unix)]
 #[test]
 fn transient_daemon_connect_errors_cover_restart_window_only() {
@@ -159,33 +156,8 @@ fn transient_daemon_connect_errors_cover_restart_window_only() {
     ));
 }
 
-#[test]
-fn read_deadline_classifier_accepts_typed_stalled() {
-    let error =
-        tracedecay_daemon_protocol::daemon_response_stalled(std::time::Duration::from_secs(5));
-    assert!(
-        super::super::error_is_read_deadline(&error),
-        "typed stalled must classify as a read deadline"
-    );
-    let prose = tracedecay_domain::errors::TraceDecayError::Config {
-        message: "daemon did not answer after 5s; stalled or saturated".to_owned(),
-    };
-    assert!(
-        !super::super::error_is_read_deadline(&prose),
-        "stalled English prose must not classify as a read deadline"
-    );
-    let down = tracedecay_daemon_protocol::daemon_connect_failure(
-        "/tmp/daemon.sock",
-        &std::io::Error::from(std::io::ErrorKind::NotFound),
-    );
-    assert!(
-        !super::super::error_is_read_deadline(&down),
-        "connect-down must not classify as a read deadline"
-    );
-}
-
 #[cfg(unix)]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn connect_with_restart_grace_reconnects_once_daemon_rebinds() {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir.path().join("daemon.sock");
@@ -211,7 +183,7 @@ async fn connect_with_restart_grace_reconnects_once_daemon_rebinds() {
 }
 
 #[cfg(unix)]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn connect_with_restart_grace_gives_up_with_restart_hint() {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir
@@ -222,22 +194,30 @@ async fn connect_with_restart_grace_gives_up_with_restart_hint() {
     let _authority = seed_socket_authority(&socket);
     let grace = std::time::Duration::from_millis(300);
     let poll = std::time::Duration::from_millis(50);
-    let started = tokio::time::Instant::now();
+    let profile_root = socket.parent().expect("socket parent");
+    let mut attempts = 0_u32;
+    let started = std::time::Instant::now();
 
-    let err = super::super::connect_with_restart_grace(
-        socket.parent().expect("socket parent"),
-        &socket,
+    let err = super::super::connect_with_restart_grace_resolving(
+        || {
+            attempts += 1;
+            tracedecay_daemon_identity::client_connection(profile_root, &socket)
+        },
         grace,
         poll,
     )
     .await
     .expect_err("connect should fail when no daemon ever binds");
 
-    let elapsed = started.elapsed();
-    assert!(elapsed >= grace, "restart grace must be fully observed");
     assert!(
-        elapsed <= grace + poll,
-        "restart retries must stop within one poll interval after grace"
+        started.elapsed() >= grace,
+        "restart grace must be fully observed"
+    );
+    // One attempt per poll through the grace, plus the first and one past it.
+    // A loaded machine stretches each poll, so it can only lower the count.
+    assert!(
+        u128::from(attempts) <= grace.as_millis() / poll.as_millis() + 2,
+        "restart retries must stop within one poll interval after grace: {attempts} attempts"
     );
 
     let message = err.to_string();
@@ -257,20 +237,23 @@ async fn connect_with_restart_grace_gives_up_with_restart_hint() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn client_deadline_run_reports_typed_stalled() {
     let deadline = super::super::DaemonClientDeadline::until(
-        tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        std::time::Instant::now() + std::time::Duration::from_millis(20),
     )
     .expect("future deadline");
-    let err = deadline
-        .run(
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        deadline.run(
             "read",
             "tracedecay_status",
             std::future::pending::<super::super::Result<()>>(),
-        )
-        .await
-        .expect_err("pending future must stall");
+        ),
+    )
+    .await
+    .expect("the client deadline ends the pending stage")
+    .expect_err("pending future must stall");
     assert_eq!(
         err.project_route_context()
             .map(|(code, retryable, _)| (code, retryable)),
@@ -300,7 +283,7 @@ async fn stalled_daemon_response_is_typed_within_deadline() {
     });
 
     let local_bound = std::time::Duration::from_millis(80);
-    let request_deadline = tokio::time::Instant::now()
+    let request_deadline = std::time::Instant::now()
         .checked_add(local_bound)
         .and_then(|bound| bound.checked_sub(tracedecay_daemon_protocol::DAEMON_TOOL_RESPONSE_GRACE))
         .expect("monotonic clock must outlive the response grace");
@@ -581,15 +564,7 @@ async fn initialize_root_routing_fails_closed_without_pinned_configuration() {
     let profile = TempDir::new().expect("profile temp dir");
     let fallback = TempDir::new().expect("fallback temp dir");
     let project = TempDir::new().expect("git project temp dir");
-    let git_status = std::process::Command::new(
-        tracedecay_runtime_core::git::try_git_program()
-            .expect("absolute git executable should resolve"),
-    )
-    .args(["init", "-q"])
-    .current_dir(project.path())
-    .status()
-    .expect("git init");
-    assert!(git_status.success(), "git init should succeed");
+    git(project.path(), &["init", "-q"]);
     let project = project
         .path()
         .canonicalize()
@@ -719,7 +694,7 @@ async fn serve_stays_in_process_without_socket_or_installed_service() {
 }
 
 #[cfg(unix)]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn serve_waits_out_restart_window_when_service_owns_socket() {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir.path().join("daemon.sock");
@@ -749,7 +724,7 @@ async fn serve_waits_out_restart_window_when_service_owns_socket() {
 }
 
 #[cfg(unix)]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn serve_attaches_during_first_service_start_once_the_record_appears() {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir.path().join("daemon.sock");
@@ -780,7 +755,7 @@ async fn serve_attaches_during_first_service_start_once_the_record_appears() {
 }
 
 #[cfg(unix)]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn serve_falls_back_when_installed_service_never_rebinds() {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir.path().join("daemon.sock");
@@ -799,7 +774,7 @@ async fn serve_falls_back_when_installed_service_never_rebinds() {
 }
 
 #[cfg(unix)]
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn proxied_request_survives_daemon_restart_window() {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir.path().join("daemon.sock");
@@ -1125,7 +1100,7 @@ async fn disconnected_client_does_not_outlive_a_daemon_that_never_answers() {
             None,
             &mut transport,
             Some(std::time::Duration::from_millis(250)),
-            super::super::tool_surface::ToolSurface::new(true),
+            super::super::tool_surface::ToolSurface::new(true, None).expect("tool surface"),
             tokio::sync::watch::channel(false).1,
         )
         .await
@@ -1308,7 +1283,7 @@ async fn requests_through_proxy(
             None,
             &mut transport,
             None,
-            super::super::tool_surface::ToolSurface::new(false),
+            super::super::tool_surface::ToolSurface::new(false, None).expect("tool surface"),
             tokio::sync::watch::channel(repeated_query_hints).1,
         )
         .await
@@ -1530,8 +1505,8 @@ async fn an_initialize_forgets_the_calls_before_it() {
 }
 
 /// A tool result with `isError: true` already reports the failure; appending
-/// a repeat hint would misreport it. The failed call still counts in the
-/// window, matching how JSON-RPC error responses are treated.
+/// a repeat hint would misreport it. The failed call still takes a window
+/// slot, but an identical call after it is compared with the earlier success.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_failed_tool_call_gets_no_hint_but_still_counts() {
@@ -1564,7 +1539,7 @@ async fn a_failed_tool_call_gets_no_hint_but_still_counts() {
         .and_then(|block| block["text"].as_str())
         .unwrap_or_default();
     assert!(
-        hint.contains("tracedecay_search call 1 call earlier"),
-        "the failed call still counts as a recent call: {hint}"
+        hint.contains("tracedecay_search call 2 calls earlier"),
+        "a failed call is no repeat target but still counts in the window: {hint}"
     );
 }

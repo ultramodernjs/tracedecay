@@ -49,8 +49,6 @@ pub enum WorkProductContractError {
     InvalidTime,
     #[error("Work proposal does not match the selected graph or task")]
     ProposalMismatch,
-    #[error("Work provider route was not explicitly selected")]
-    RouteNotSelected,
     #[error("Work acceptance criteria are not satisfied")]
     AcceptanceUnsatisfied,
     #[error("Task evidence is not rooted in the selected task")]
@@ -855,6 +853,10 @@ impl WorkItemV1 {
 
     pub fn hierarchy(&self) -> &WorkHierarchyV1 {
         &self.input.hierarchy
+    }
+
+    pub fn title(&self) -> &str {
+        &self.input.title
     }
 
     pub fn dependencies(&self) -> &BTreeSet<TaskId> {

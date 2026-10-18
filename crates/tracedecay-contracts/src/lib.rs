@@ -76,6 +76,7 @@ pub mod work_evidence;
 pub mod work_execution_history;
 pub mod work_handoff_frontier;
 pub mod work_intelligence;
+pub mod work_job;
 pub mod work_leak_adjudication;
 pub mod work_owner_observation;
 pub mod work_placement;
@@ -136,8 +137,8 @@ pub use configuration::{
 pub use context::{
     APPLICATION_REQUEST_ID_HEADER, ApplicationRequestControlV1, CancellationContext,
     CancellationSignal, CancellationState, CancellationTokenId, CapabilityGrantId,
-    CapabilityGrantSnapshot, Deadline, DisclosureClass, RequestAdmission, RequestContext,
-    RequestId, ResolvedScope,
+    CapabilityGrantSnapshot, Deadline, DisclosureClass, REMOTE_ENROLLMENT_CREDENTIAL_HEADER,
+    RequestAdmission, RequestContext, RequestId, ResolvedScope,
 };
 pub use context_scout::{
     context_scout_surface_catalog_contribution, context_scout_surface_handler_descriptors,
@@ -433,7 +434,9 @@ pub use surface_contracts::{
     CodeSymbolSearchSurfaceRequest, CodeTimelineSurfaceRequest, CodeTypeHierarchySurfaceRequest,
     NativeIntegrationSurfaceRequest, PrimitiveCodeSurfaceRequest, primitive_code_into_primitive,
 };
-pub use work::{WorkRoutingSnapshotErrorV1, WorkRoutingSnapshotPortV1, WorkRoutingSnapshotV1};
+pub use work::{
+    WorkRoutingSnapshotErrorV1, WorkRoutingSnapshotPortV1, WorkRoutingSnapshotV1, work_authority,
+};
 pub use work_artifact_hydration::{
     WorkArtifactHydrationRequestV1, WorkArtifactHydrationService, WorkArtifactHydrationV1,
     WorkAttemptArtifactsV1, WorkAttemptEvidencePageV1, WorkAttemptEvidenceReadPort,
@@ -455,21 +458,21 @@ pub use work_attempt::{
 };
 pub use work_attempt_effect::{
     WorkAttemptEffectDispatchOutcomeV1, WorkAttemptEffectHolderErrorV1, WorkAttemptEffectHolderV1,
-    WorkAttemptEffectResolutionV1, WorkAttemptEffectServiceV1, WorkAttemptEffectStorageErrorV1,
-    WorkAttemptEffectStoragePortV1,
+    WorkAttemptEffectReadPortV1, WorkAttemptEffectResolutionV1, WorkAttemptEffectServiceV1,
+    WorkAttemptEffectStorageErrorV1, WorkAttemptEffectStoragePortV1,
 };
 pub use work_catalog::{
     WORK_APPLICATION_OPERATION_IDS_V1, work_executable_binding, work_executable_binding_registry,
-    work_executable_catalog_digest,
+    work_executable_catalog_digest, work_profile_eligibility,
 };
 pub use work_duplicate_adjudication::{
     MAX_WORK_DUPLICATE_CLASSIFICATION_ATTEMPTS_V1, PrepareWorkDuplicateAdjudicationRequestV1,
     WorkDuplicateAdjudicationAppendOutcomeV1, WorkDuplicateAdjudicationPortV1,
-    WorkDuplicateAdjudicationServiceV1, WorkDuplicateAdjudicationStorageErrorV1,
-    WorkDuplicateAdjudicationWriteV1, WorkDuplicateAttemptClassificationReadV1,
-    WorkDuplicateAttemptClassificationRequestV1, WorkDuplicateAttemptClassificationV1,
-    WorkDuplicateClassificationUnavailableReasonV1, prepare_work_duplicate_adjudication,
-    work_duplicate_adjudication_input_digest,
+    WorkDuplicateAdjudicationRecordPortV1, WorkDuplicateAdjudicationServiceV1,
+    WorkDuplicateAdjudicationStorageErrorV1, WorkDuplicateAdjudicationWriteV1,
+    WorkDuplicateAttemptClassificationReadV1, WorkDuplicateAttemptClassificationRequestV1,
+    WorkDuplicateAttemptClassificationV1, WorkDuplicateClassificationUnavailableReasonV1,
+    prepare_work_duplicate_adjudication, work_duplicate_adjudication_input_digest,
 };
 pub use work_evidence::{
     MAX_WORK_ROOTED_EVIDENCE_SOURCES_V1, VerifiedWorkEvidenceRootV1, WorkAnchorHydrationFuture,
@@ -503,6 +506,15 @@ pub use work_intelligence::{
     WorkExpertiseLegalActionV1, WorkExpertiseUnavailableReasonV1, WorkIntelligenceServiceV1,
     WorkProposalComparisonEffectV1, WorkProposalComparisonRequestV1, WorkProposalComparisonV1,
 };
+pub use work_job::{
+    AdvanceWorkJobRequestV1, AdvanceWorkJobResultV1, MAX_WORK_JOB_TASKS, WORK_JOB_CONFLICT_CODE,
+    WORK_JOB_NEEDS_OPERATOR_CODE, WORK_JOB_PROPOSAL_WITHHELD_CODE, WorkJobBaseV1,
+    WorkJobIdentitiesV1, WorkJobKeyV1, WorkJobNameV1, WorkJobNextV1, WorkJobObservationV1,
+    WorkJobStateV1, WorkJobStepRecordV1, WorkJobStepResultV1, WorkJobStepV1,
+    WorkJobSynthesisPlanV1, WorkJobSynthesisV1, WorkJobTaskIdentitiesV1, WorkJobTaskPlanV1,
+    WorkJobTaskV1, WorkJobV1, WorkJobWaitV1, next_work_job_step, work_job_proposal_withheld,
+    work_job_synthesis_unsynthesized,
+};
 pub use work_leak_adjudication::{
     AdjudicateWorkLeakCommandV1, MAX_WORK_LEAK_EVIDENCE_REFS_V1, MAX_WORK_LEAK_HORIZON_MICROS_V1,
     MAX_WORK_LEAK_SCAN_MICROS_V1, VerifiedWorkLeakEvidenceV1, WorkLeakAdjudicationOutcomeV1,
@@ -517,15 +529,15 @@ pub use work_owner_observation::{
 };
 pub use work_placement::{
     AdmitWorkPlacementCommand, ReleaseWorkPlacementCommand, WorkPlacementPreflightRequestV1,
-    WorkPlacementReadingV1, WorkPlacementService, WorkPlacementStatusRequestV1,
-    WorkPlacementStorageError, WorkPlacementStoragePort,
+    WorkPlacementPublicationPort, WorkPlacementReadingV1, WorkPlacementService,
+    WorkPlacementStatusRequestV1, WorkPlacementStorageError, WorkPlacementStoragePort,
 };
 pub use work_product::{
     AcceptWorkProposalDispositionV1, AcceptWorkProposalRequestV1, AcceptWorkTaskRequestV1,
     AddWorkTaskRequestV1, AdmitWorkExecutionRequestV1, AdmittedWorkExecutionV1,
     AuthorizedWorkProductScopeV1, CreateWorkProductRequestV1, CreateWorkTaskRequestV1,
     DecideWorkProposalRequestV1, MAX_WORK_EVIDENCE_SELECTION_V1,
-    MAX_WORK_GRAPH_TEMPORAL_ENTRIES_V1, MAX_WORK_HISTORY_EVENTS_V1,
+    MAX_WORK_GRAPH_TEMPORAL_ENTRIES_V1, MAX_WORK_HISTORY_EVENTS_V1, PrefetchedWorkGraphReadV1,
     PrepareWorkProductMutationRequestV1, ReviewWorkProposalDispositionV1,
     ReviewWorkProposalRequestV1, SelectedWorkEvidenceV1, VerifiedWorkEvidenceExpansionV1,
     VerifiedWorkGraphVersionV1, WorkEvidenceExpandRequestV1, WorkEvidenceExpansionV1,
@@ -544,7 +556,7 @@ pub use work_product::{
     WorkProductOwnerAuthorizationErrorV1, WorkProductOwnerAuthorizationPortV1,
     WorkProductPortContextV1, WorkProductReadServiceV1, WorkProductRetryAdmissionV1,
     WorkProductRevisionPinsV1, WorkProductSelectionScopeV1, WorkProductSynthesisAdmissionV1,
-    work_product_projection_generation,
+    WorkStorageFailureV1, work_product_projection_generation,
 };
 pub use work_retry::{
     RetryWorkAttemptCommandV1, RuntimeWorkRetryEvidenceV1, VerifiedWorkRetryFailureV1,
@@ -556,8 +568,8 @@ pub use work_retry::{
 pub use work_run_control::{
     PauseWorkRunCommand, ResumeWorkRunCommand, WorkRunAdmissionV1, WorkRunControlFrontierV1,
     WorkRunControlReadingV1, WorkRunControlRequestV1, WorkRunControlService,
-    WorkRunControlStorageError, WorkRunControlStoragePort, WorkRunControlTransitionReceiptV1,
-    WorkRunLiveAttemptV1,
+    WorkRunControlStorageError, WorkRunControlStoragePort, WorkRunControlTransitionPort,
+    WorkRunControlTransitionReceiptV1, WorkRunLiveAttemptV1, WorkRunReservationPort,
 };
 pub use work_synthesis::{
     AdmitWorkSynthesisCommand, WorkSynthesisAdmissionRecordV1, WorkSynthesisAdmissionV1,
@@ -572,6 +584,7 @@ pub use work_topology_view::{
 pub use workflow_admission::WorkflowCatalogAdmissionError;
 pub use workflow_catalog::{
     WORKFLOW_APPLICATION_OPERATION_IDS, workflow_executable_binding_registry,
+    workflow_profile_eligibility,
 };
 pub use workflow_coordination::{
     TASK_HANDOFF_LIFETIME_MICROS, TaskHandoffAuthorityError, TaskHandoffAuthorityPort,
@@ -583,7 +596,7 @@ pub use workflow_coordination::{
     WorkflowDefinitionHistoryRequest, WorkflowDefinitionLifecycleCommand,
     WorkflowDefinitionLifecycleState, WorkflowDefinitionListRequest,
     WorkflowDefinitionRegisterRequest, WorkflowDefinitionRejectRequest,
-    WorkflowDefinitionRetireRequest, WorkflowDefinitionService, WorkflowDefinitionTransitionEntry,
+    WorkflowDefinitionRetireRequest, WorkflowDefinitionService,
     WorkflowDefinitionTransitionOutcome, WorkflowDefinitionValidateRequest,
     WorkflowDefinitionValidation, WorkflowLifecycleOperation, prepare_task_handoff_issue,
     prepare_task_handoff_redeem, prepare_workflow_definition_registration,
@@ -598,8 +611,8 @@ pub use workflow_effect::{
 pub use workflow_fan_out_census::{
     WorkflowFanOutCensusBackfillPageV1, WorkflowFanOutCensusError, WorkflowFanOutCensusEvidenceV1,
     WorkflowFanOutCensusObservationV1, WorkflowFanOutCensusPersistOutcomeV1,
-    WorkflowFanOutCensusStoragePort, WorkflowNonDuplicateAttemptsEvidenceV1,
-    derive_workflow_fan_out_census,
+    WorkflowFanOutCensusReadPort, WorkflowFanOutCensusStoragePort,
+    WorkflowNonDuplicateAttemptsEvidenceV1, derive_workflow_fan_out_census,
 };
 pub use workflow_provider::{
     WorkflowProviderPlacementError, WorkflowProviderPlacementService, WorkflowProviderRegistration,
@@ -611,9 +624,9 @@ pub use workflow_run::{
     WorkflowArtifactPayload, WorkflowArtifactPersistOutcome, WorkflowArtifactStoreError,
     WorkflowArtifactStorePort, WorkflowFanOutAttemptBindingV1, WorkflowRunAppendOutcome,
     WorkflowRunAppendRequest, WorkflowRunCancelRequest, WorkflowRunGetRequest,
-    WorkflowRunPauseRequest, WorkflowRunResumeRequest, WorkflowRunService, WorkflowRunServiceError,
-    WorkflowRunStartRequest, WorkflowRunStorageError, WorkflowRunStoragePort,
-    workflow_artifact_payload_digest,
+    WorkflowRunPauseRequest, WorkflowRunReadPort, WorkflowRunResumeRequest, WorkflowRunService,
+    WorkflowRunServiceError, WorkflowRunStartRequest, WorkflowRunStorageError,
+    WorkflowRunStoragePort, workflow_artifact_payload_digest,
 };
 pub use workflow_runtime::{
     WorkflowExecutionFence, WorkflowExecutionIdentity, WorkflowFailurePolicy, WorkflowFanOutInput,

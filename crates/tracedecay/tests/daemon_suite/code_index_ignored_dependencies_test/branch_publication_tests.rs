@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use tracedecay_domain::{CodeGenerationId, GitOidV1, RefId};
 
 use super::*;
+use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexWorkerPhaseV1;
 use tracedecay_code_index_runtime::code_index_scheduler::branch_generations::{
     BranchGenerationPairV1, BranchGenerationReadControlV1,
 };
@@ -343,6 +344,21 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
     let baseline = latest(&registry, fixture.path()).await;
     let incumbent = baseline.generation().manifest().generation_id.clone();
     let request = request_for(&baseline, "pkg");
+    // The first complete read queued a demand wake. Once the admission owns
+    // the sole permit, a worker still holding that wake queues ahead of the
+    // follow-up hold below.
+    let (idle_registry, idle_root) = (registry.as_ref(), fixture.path());
+    wait_for_owner(idle_registry, idle_root, || async move {
+        idle_registry
+            .subscribe_owner_activity(idle_root)
+            .await
+            .filter(|activity| {
+                activity.worker_phase() == CodeIndexWorkerPhaseV1::Parked
+                    && !activity.refresh_in_flight()
+                    && !activity.wake_pending()
+            })
+    })
+    .await;
     let scheduler = registry
         .scheduler_handle(fixture.path())
         .await
@@ -373,7 +389,7 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
         index_dependency(&owner_registry, &owner_root, owner_request, control).await
     });
     paused_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv()
         .expect("admission pauses after publishing its candidate");
     let candidate = wait_for_active_publication_change(&registry, fixture.path(), &incumbent).await;
 
@@ -405,13 +421,21 @@ export function CompetingTrackedEdit(value: PublicWidget) { return value.value; 
         }
         () = tokio::task::yield_now() => {}
     }
+    assert_eq!(
+        registry
+            .subscribe_owner_activity(fixture.path())
+            .await
+            .expect("mounted owner activity")
+            .worker_phase(),
+        CodeIndexWorkerPhaseV1::Parked,
+        "the follow-up hold must be the next waiter for the sole reconcile permit"
+    );
     release_activation_tx
         .send(())
         .expect("release candidate graph activation");
 
-    let error = tokio::time::timeout(Duration::from_secs(5), owner)
+    let error = owner
         .await
-        .expect("admission terminates after graph activation is released")
         .expect("admission task joins")
         .expect_err("superseded activation cannot publish serving state");
     assert_refusal(error, CodeIndexIgnoredDependencyRefusalV1::StaleGeneration);
@@ -451,7 +475,7 @@ export function CompetingTrackedEdit(value: PublicWidget) { return value.value; 
     });
     held_rx.recv().expect("follow-up scheduler is held");
     drop(worker_hold);
-    wait_for_reconciling(&registry, 1).await;
+    wait_for_reconciling(&registry, fixture.path(), 1).await;
     assert_serving_excludes_stale_candidate(
         &registry,
         fixture.path(),
@@ -465,7 +489,7 @@ export function CompetingTrackedEdit(value: PublicWidget) { return value.value; 
     scheduler_hold
         .join()
         .expect("follow-up scheduler holder joins");
-    wait_for_reconciling(&registry, 0).await;
+    wait_for_reconciling(&registry, fixture.path(), 0).await;
     let converged = latest_for_generation(&registry, fixture.path(), Some(&competitor)).await;
     assert_eq!(
         converged.generation().manifest().generation_id,

@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use asupersync::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracedecay_framing::BoundedLineReader;
 
 use tracedecay_contracts::{
     ApplicationInvocation, ApplicationInvocationExecutor, ApplicationInvocationFuture,
@@ -171,17 +172,6 @@ pub struct ResolvedBinding {
     pub result_schema: SchemaRef,
 }
 
-/// Resolves a visible, callable surface binding without exposing why lookup
-/// failed. `None` intentionally conflates unknown, hidden, unavailable, and
-/// incompatible operations.
-pub trait BindingResolver {
-    fn resolve_binding(
-        &self,
-        surface: BindingSurface,
-        request: &BindingResolution,
-    ) -> Option<ResolvedBinding>;
-}
-
 /// Metadata-only resolver backed by one immutable catalog snapshot.
 pub struct CatalogBindingResolver<'a> {
     catalog: &'a CatalogSnapshotV1,
@@ -191,10 +181,11 @@ impl<'a> CatalogBindingResolver<'a> {
     pub fn new(catalog: &'a CatalogSnapshotV1) -> Self {
         Self { catalog }
     }
-}
 
-impl BindingResolver for CatalogBindingResolver<'_> {
-    fn resolve_binding(
+    /// Resolves a visible, callable surface binding without exposing why
+    /// lookup failed. `None` intentionally conflates unknown, hidden,
+    /// unavailable, and incompatible operations.
+    pub fn resolve_binding(
         &self,
         surface: BindingSurface,
         request: &BindingResolution,
@@ -239,7 +230,7 @@ impl BindingResolver for CatalogBindingResolver<'_> {
 ///
 /// The surface is selected by adapter code, never decoded from user input.
 pub fn resolve_dispatch<T>(
-    resolver: &impl BindingResolver,
+    resolver: &CatalogBindingResolver<'_>,
     surface: BindingSurface,
     input: DispatchInput<T>,
 ) -> Result<DispatchedInvocation<T>, DispatchError> {
@@ -385,6 +376,10 @@ pub struct DaemonInvocationClient {
     handshake: crate::handshake::DaemonHandshake,
     pool: Arc<DaemonInvocationConnectionPool>,
     activity: Arc<DaemonInvocationClientActivity>,
+    liveness_poll_interval: Duration,
+    /// How long an interrupted authoritative effect waits for the daemon's
+    /// settlement before it reports the effect indeterminate.
+    response_grace: Duration,
 }
 
 #[derive(Default)]
@@ -443,8 +438,8 @@ impl Drop for DaemonInvocationClientActivityGuard {
 }
 
 struct DaemonInvocationConnection {
-    reader: BufReader<ReadHalf<crate::transport::BrokerStream>>,
-    writer: WriteHalf<crate::transport::BrokerStream>,
+    reader: BoundedLineReader<BufReader<crate::transport::DaemonClientReadHalf>>,
+    writer: crate::transport::DaemonClientWriteHalf,
 }
 
 /// Keeps one client well below the daemon's 64-connection per-client
@@ -603,6 +598,8 @@ impl DaemonInvocationClient {
             handshake,
             pool: DaemonInvocationConnectionPool::shared(),
             activity: Arc::new(DaemonInvocationClientActivity::default()),
+            liveness_poll_interval: crate::connection::DAEMON_TOOL_LIVENESS_POLL_INTERVAL,
+            response_grace: crate::connection::DAEMON_TOOL_RESPONSE_GRACE,
         }
     }
 
@@ -611,12 +608,7 @@ impl DaemonInvocationClient {
         connection: crate::connection::DaemonConnection,
         handshake: crate::handshake::DaemonHandshake,
     ) -> Self {
-        Self {
-            connection,
-            handshake,
-            pool: DaemonInvocationConnectionPool::shared(),
-            activity: Arc::new(DaemonInvocationClientActivity::default()),
-        }
+        Self::new(connection, handshake)
     }
 
     async fn checkout_connection(
@@ -650,7 +642,8 @@ impl DaemonInvocationClient {
                 )
                 .await?;
                 let (reader, mut writer) = stream.into_split();
-                tracing::Instrument::instrument(
+                let mut reader = BoundedLineReader::new(BufReader::new(reader));
+                let written = tracing::Instrument::instrument(
                     crate::connection::write_daemon_preamble(
                         &mut writer,
                         &self.connection,
@@ -658,11 +651,9 @@ impl DaemonInvocationClient {
                     ),
                     tracing::trace_span!("daemon.invocation.client.preamble"),
                 )
-                .await?;
-                DaemonInvocationConnection {
-                    reader: BufReader::new(reader),
-                    writer,
-                }
+                .await;
+                refusal_behind_failed_write(written, &mut reader, &self.handshake).await?;
+                DaemonInvocationConnection { reader, writer }
             }
         };
         Ok((
@@ -706,7 +697,7 @@ impl DaemonInvocationClient {
             let _span = tracing::trace_span!("daemon.invocation.client.request.encode").entered();
             serde_json::to_string(&request)
         }?;
-        tracing::Instrument::instrument(
+        let written = tracing::Instrument::instrument(
             async {
                 connection.writer.write_all(request_json.as_bytes()).await?;
                 connection.writer.write_all(b"\n").await?;
@@ -714,14 +705,16 @@ impl DaemonInvocationClient {
             },
             tracing::trace_span!("daemon.invocation.client.request.write"),
         )
-        .await?;
+        .await
+        .map_err(Into::into);
+        refusal_behind_failed_write(written, &mut connection.reader, &self.handshake).await?;
 
         let Some(line) = tracing::Instrument::instrument(
             crate::connection::next_daemon_response_line(
                 &mut connection.reader,
                 &self.connection,
                 request_label,
-                crate::connection::DAEMON_TOOL_LIVENESS_POLL_INTERVAL,
+                self.liveness_poll_interval,
             ),
             tracing::trace_span!("daemon.invocation.client.response.wait"),
         )
@@ -1059,6 +1052,39 @@ fn invocation_error_from_problem(problem: &ApplicationProblem) -> InvocationErro
     }
 }
 
+/// The outcome of a write to the daemon, with a failed write replaced by the
+/// refusal the daemon queued before it closed.
+///
+/// A daemon refusing the preamble queues one refusal frame, drains pipelined
+/// input until it idles for 100 ms, then closes. A client that stalls longer
+/// between writes gets a broken pipe or reset while that refusal waits in its
+/// receive buffer.
+pub async fn refusal_behind_failed_write<T, R>(
+    written: tracedecay_domain::errors::Result<T>,
+    reader: &mut BoundedLineReader<R>,
+    handshake: &crate::handshake::DaemonHandshake,
+) -> tracedecay_domain::errors::Result<T>
+where
+    R: asupersync::io::AsyncBufRead + Unpin,
+{
+    let Err(tracedecay_domain::errors::TraceDecayError::Io(io)) = &written else {
+        return written;
+    };
+    if !matches!(
+        io.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+    ) {
+        return written;
+    }
+    match reader.read_mcp_line().await {
+        Ok(Some(line)) => crate::handshake::DaemonHandshakeRefusal::from_line(&line)
+            .map_or(written, |refusal| {
+                Err(handshake_refusal_error(&refusal, handshake))
+            }),
+        _ => written,
+    }
+}
+
 /// A daemon that could not serve this client's handshake refused before any
 /// request ran; name the refusal, both versions, and the action.
 pub fn handshake_refusal_error(
@@ -1362,6 +1388,60 @@ mod tests {
             error.to_string().contains("0.1.0-beta.36+ffff"),
             "the error must name the refusing daemon version: {error}"
         );
+        daemon.await.expect("fake daemon completes");
+    }
+
+    /// A request larger than the socket buffer keeps the client writing after
+    /// the daemon has refused the preface and closed, which is the state a
+    /// client stalled past the daemon's drain window reaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refusal_queued_before_a_failed_request_write_is_still_reported() {
+        let isolation = tempfile::TempDir::new().expect("socket isolation");
+        let socket = isolation.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake daemon");
+        let refusal_line = crate::handshake::DaemonHandshakeRefusal::for_rejected_authentication(
+            "0.1.0-beta.36+hhhh",
+        )
+        .to_line()
+        .expect("refusal line");
+        let daemon = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let _ = lines.next_line().await.expect("read auth preface");
+            writer
+                .write_all(format!("{refusal_line}\n").as_bytes())
+                .await
+                .expect("write refusal");
+            writer.flush().await.expect("flush refusal");
+        });
+
+        let client = super::DaemonInvocationClient::new(
+            crate::connection::DaemonConnection::new(
+                crate::transport::DaemonEndpoint::Unix(socket),
+                "rejected-token".to_owned(),
+            ),
+            test_skew_handshake(),
+        );
+        let observed_at = now_micros();
+        let error = client
+            .invoke(crate::contract::DaemonInvocationRequest::feedback(
+                "request.refused-mid-write",
+                ApplicationSurfaceOperation::FeedbackList,
+                "f".repeat(4 * 1024 * 1024),
+                observed_at,
+                Deadline::new(UtcMicros(observed_at.0 + 5_000_000)).expect("deadline"),
+                CancellationContext::active("cancel.refused-mid-write").expect("cancellation"),
+            ))
+            .await
+            .expect_err("a refused preface must not look like an answered request");
+        let (code, retryable, _) = error
+            .project_route_context()
+            .unwrap_or_else(|| panic!("the queued refusal must be reported, got: {error:?}"));
+        assert_eq!(code, super::DAEMON_AUTHENTICATION_REJECTED);
+        assert!(retryable);
         daemon.await.expect("fake daemon completes");
     }
 

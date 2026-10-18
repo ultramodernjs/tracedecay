@@ -1,10 +1,11 @@
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
-use tokio::task::JoinSet;
 use tracedecay_contracts::clock::now_micros;
 use tracedecay_domain::{
     CanonicalObservationIdV1, ManifestDigest, ObservationContractError,
@@ -373,35 +374,13 @@ struct PersistedObservationCapture {
     durable: DurableObservationCapture,
 }
 
-/// Bounds independent batch preparation.
-///
-/// The daemon owns the actual width selection. Keeping the bound here makes
-/// the application boundary deterministic while allowing composition to pass
-/// the shared, memory-aware daemon plan without creating another CPU pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ObservationBatchConcurrency(NonZeroUsize);
-
-impl ObservationBatchConcurrency {
-    pub const fn new(max_in_flight: NonZeroUsize) -> Self {
-        Self(max_in_flight)
-    }
-
-    const fn max_in_flight(self) -> usize {
-        self.0.get()
-    }
-}
-
-impl Default for ObservationBatchConcurrency {
-    fn default() -> Self {
-        Self(NonZeroUsize::MIN)
-    }
-}
-
 /// Application-owned composition of sanitizer and an already-authoritative store.
 pub struct ObservationApplication<S> {
     store: S,
     sanitizer: RecordSanitizerV1,
-    batch_concurrency: ObservationBatchConcurrency,
+    /// Bounds independent batch preparation; the daemon selects the width
+    /// through [`Self::with_background_cpu`].
+    batch_concurrency: NonZeroUsize,
     background_cpu: Option<Arc<ProcessBackgroundCpuV1>>,
 }
 
@@ -413,18 +392,15 @@ where
         Self {
             store,
             sanitizer,
-            batch_concurrency: ObservationBatchConcurrency::default(),
+            batch_concurrency: NonZeroUsize::MIN,
             background_cpu: None,
         }
     }
 
-    /// Applies a narrow injected bound in projectless or test composition.
-    ///
-    /// Production composition must use [`Self::with_background_cpu`] so active
-    /// preparation participates in the process-wide CPU authority.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_batch_concurrency(mut self, batch_concurrency: NonZeroUsize) -> Self {
-        self.batch_concurrency = ObservationBatchConcurrency::new(batch_concurrency);
+    pub(crate) fn with_batch_concurrency(mut self, batch_concurrency: NonZeroUsize) -> Self {
+        self.batch_concurrency = batch_concurrency;
         self
     }
 
@@ -433,7 +409,7 @@ where
     /// store-owned batch transaction.
     #[must_use]
     pub fn with_background_cpu(mut self, background_cpu: Arc<ProcessBackgroundCpuV1>) -> Self {
-        self.batch_concurrency = ObservationBatchConcurrency::new(background_cpu.width());
+        self.batch_concurrency = background_cpu.width();
         self.background_cpu = Some(background_cpu);
         self
     }
@@ -473,7 +449,7 @@ where
     /// the Git index. Running that inline on a runtime worker starves every
     /// other task sharing the worker, with enough concurrent ingest frames,
     /// every worker at once, so the accept loop and unrelated requests stop
-    /// making progress. Awaiting a `spawn_blocking` join handle keeps the
+    /// making progress. Running it on the native blocking pool keeps the
     /// worker free, and the background-CPU permit bounds how many of these
     /// spans run at once.
     #[tracing::instrument(
@@ -487,7 +463,7 @@ where
     ) -> Result<PreparedObservationCapture, ObservationApplicationError> {
         let sanitizer = self.sanitizer.clone();
         let background_cpu = self.background_cpu.clone();
-        tokio::task::spawn_blocking(move || match background_cpu {
+        tracedecay_runtime_core::native_runtime::spawn_blocking(move || match background_cpu {
             Some(authority) => {
                 authority.with_permit(|| Self::prepare_capture_with_sanitizer(&sanitizer, request))
             }
@@ -776,8 +752,12 @@ where
     ) -> Result<Vec<PreparedObservationCapture>, ObservationApplicationError> {
         let total = requests.len();
         let mut pending = requests.into_iter().enumerate();
-        let limit = self.batch_concurrency.max_in_flight().min(total);
-        let mut tasks = JoinSet::new();
+        let limit = self.batch_concurrency.get().min(total);
+        let cx = tracedecay_runtime_core::native_runtime::cx()
+            .ok_or(ObservationApplicationError::PreparationWorkerStopped)?;
+        // Dropping a `join` cancels sections still queued on the pool; running
+        // ones finish detached.
+        let mut tasks = FuturesUnordered::new();
         let mut prepared = (0..total).map(|_| None).collect::<Vec<_>>();
 
         loop {
@@ -786,23 +766,26 @@ where
                     break;
                 };
                 if request.cancellation.is_cancelled() {
-                    tasks.abort_all();
                     return Err(ObservationApplicationError::Cancelled);
                 }
                 let sanitizer = self.sanitizer.clone();
                 let background_cpu = self.background_cpu.clone();
-                tasks.spawn_blocking(move || {
-                    let capture = match background_cpu {
-                        Some(authority) => authority.with_permit(|| {
-                            Self::prepare_capture_with_sanitizer(&sanitizer, request)
-                        }),
-                        None => Self::prepare_capture_with_sanitizer(&sanitizer, request),
-                    };
-                    (index, capture)
-                });
+                let mut task = cx
+                    .spawn_blocking(move |_cx| {
+                        let capture = match background_cpu {
+                            Some(authority) => authority.with_permit(|| {
+                                Self::prepare_capture_with_sanitizer(&sanitizer, request)
+                            }),
+                            None => Self::prepare_capture_with_sanitizer(&sanitizer, request),
+                        };
+                        (index, capture)
+                    })
+                    .map_err(|_| ObservationApplicationError::PreparationWorkerStopped)?;
+                let cx = cx.clone();
+                tasks.push(async move { task.join(&cx).await });
             }
 
-            let Some(joined) = tasks.join_next().await else {
+            let Some(joined) = tasks.next().await else {
                 break;
             };
             let (index, capture) =

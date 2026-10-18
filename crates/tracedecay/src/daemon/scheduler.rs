@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::task::JoinHandle;
-use tokio::time::{Duration, timeout};
 use tracedecay_automation_runtime::automation::AutomationRunControl;
 use tracedecay_automation_runtime::automation::backend::{AgentTaskBackend, AgentTaskKind};
 use tracedecay_automation_runtime::automation::maintenance_termination::MaintenanceTaskTermination;
 use tracedecay_automation_runtime::automation::scheduler_stop::AutomationSchedulerStop;
+use tracedecay_runtime_core::native_runtime::NativeTask;
 
 use tracedecay_automation_runtime::automation::effect_runtime::settlement::{
     AutomationEffectAdmission, AutomationEffectAuthority, RetainedAutomationSettlementOutcome,
@@ -19,6 +19,7 @@ use super::branch_admin::MaintenanceReaperKind;
 use super::{DaemonEngine, DaemonHandshake, ProjectServerKey, StoreAdministration};
 use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::native_runtime::{self, timeout};
 
 mod combined_effect;
 pub(crate) mod effect_admission;
@@ -260,7 +261,7 @@ pub(super) enum AutomationSchedulerLifecycle {
 }
 
 pub(super) struct AutomationSchedulerHandle {
-    pub(super) task: Option<JoinHandle<()>>,
+    pub(super) task: Option<NativeTask<()>>,
     pub(super) wake: Arc<tokio::sync::Notify>,
     pub(super) completion: Arc<()>,
     pub(super) generation: Arc<std::sync::atomic::AtomicU64>,
@@ -271,7 +272,7 @@ pub(super) struct AutomationSchedulerHandle {
 
 #[cfg(test)]
 impl AutomationSchedulerHandle {
-    pub(super) fn for_test(task: JoinHandle<()>) -> Self {
+    pub(super) fn for_test(task: NativeTask<()>) -> Self {
         Self {
             task: Some(task),
             wake: Arc::new(tokio::sync::Notify::new()),
@@ -540,7 +541,7 @@ impl DaemonEngine {
         if let Some(mut handle) = finished
             && let Some(task) = handle.task.take()
         {
-            let _ = task.await;
+            let _ = task.wait().await;
         }
 
         #[cfg(test)]
@@ -634,7 +635,7 @@ impl DaemonEngine {
             if let Some(mut handle) = finished
                 && let Some(task) = handle.task.take()
             {
-                let _ = task.await;
+                let _ = task.wait().await;
             }
             debug_assert!(matches!(
                 lifecycle,
@@ -770,10 +771,23 @@ impl DaemonEngine {
                         || handle.lifecycle == AutomationSchedulerLifecycle::Retiring
                 });
         };
-        let task = tokio::spawn(tracing::Instrument::instrument(
+        let task = match NativeTask::spawn(tracing::Instrument::instrument(
             scheduler_loop,
             tracing::trace_span!("daemon.scheduler.loop"),
-        ));
+        )) {
+            Ok(task) => task,
+            Err(error) => {
+                log_daemon_event(
+                    "scheduler_start",
+                    &[
+                        ("project", key.project_root.display().to_string()),
+                        ("outcome", "runtime_unavailable".to_string()),
+                        ("error", error),
+                    ],
+                );
+                return AutomationSchedulerReconcileOutcome::OwnerUnavailable;
+            }
+        };
         {
             let mut signals = self
                 .store_administration
@@ -1061,7 +1075,7 @@ pub(super) fn same_scheduler_owner(left: &ProjectServerKey, right: &ProjectServe
 fn observed_scheduler_lifecycle(
     handle: &AutomationSchedulerHandle,
 ) -> AutomationSchedulerLifecycle {
-    if handle.task.as_ref().is_some_and(JoinHandle::is_finished) {
+    if handle.task.as_ref().is_some_and(NativeTask::is_finished) {
         AutomationSchedulerLifecycle::Finished
     } else {
         handle.lifecycle
@@ -1190,9 +1204,9 @@ async fn run_automation_scheduler_loop(
                 // loop, but yield until the next tick or an explicit wake
                 // instead of spinning through the gate locks.
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(
+                    slept = scheduler_sleep(&project_path, Duration::from_secs(
                         tracedecay_automation_runtime::automation::config::DEFAULT_SCHEDULER_TICK_SECS,
-                    )) => {}
+                    )) => if !slept { break 'scheduler; },
                     () = wake.notified() => {}
                 }
                 continue;
@@ -1249,7 +1263,7 @@ async fn run_automation_scheduler_loop(
                         consecutive_open_failures,
                     );
                 tokio::select! {
-                    () = tokio::time::sleep(backoff) => {}
+                    slept = scheduler_sleep(&project_path, backoff) => if !slept { break 'scheduler; },
                     () = wake.notified() => {}
                 }
                 continue;
@@ -1296,7 +1310,11 @@ async fn run_automation_scheduler_loop(
             ],
         );
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(tick_secs)) => {}
+            slept = scheduler_sleep(&project_path, Duration::from_secs(tick_secs)) => {
+                if !slept {
+                    break 'scheduler;
+                }
+            }
             () = wake.notified() => {
                 if run_control.read_control().interrupted() {
                     break 'scheduler;
@@ -1306,7 +1324,12 @@ async fn run_automation_scheduler_loop(
                 // review for the burst rather than one review per command.
                 loop {
                     tokio::select! {
-                        () = tokio::time::sleep(Duration::from_secs(5)) => break,
+                        slept = scheduler_sleep(&project_path, Duration::from_secs(5)) => {
+                            if !slept {
+                                break 'scheduler;
+                            }
+                            break;
+                        }
                         () = wake.notified() => {}
                     }
                 }
@@ -1331,6 +1354,27 @@ async fn run_automation_scheduler_loop(
             }
         }
     }
+}
+
+/// Sleeps `duration` on the native timer. `false` when that timer is
+/// unavailable: every park would then return at once, so the loop exits and
+/// the next reconcile respawns it.
+async fn scheduler_sleep(project_path: &Path, duration: Duration) -> bool {
+    let Some(deadline) = std::time::Instant::now().checked_add(duration) else {
+        return std::future::pending().await;
+    };
+    let Err(error) = native_runtime::sleep_until(deadline).await else {
+        return true;
+    };
+    log_daemon_event(
+        "scheduler_exit",
+        &[
+            ("project", project_path.display().to_string()),
+            ("reason", "timer_unavailable".to_string()),
+            ("error", error),
+        ],
+    );
+    false
 }
 
 async fn automation_scheduler_has_work_for_project(cg: &TraceDecay) -> Result<bool> {

@@ -3,21 +3,22 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use tracedecay_contracts::RequestId;
 use tracedecay_contracts::remote::recovery::{
-    RecoveryAuthorityExpectationV1, RemoteRecoveryInterruptionV1,
+    RecoveryAuthorityExpectationV1, RemoteRecoveryControlPortV1, RemoteRecoveryInterruptionV1,
 };
-use tracedecay_domain::{ManifestDigest, canonical_sha256};
+use tracedecay_domain::{ManifestDigest, canonical_sha256, remote_recovery_authority_key};
 use tracedecay_rusqlite_runtime::remote::RemoteRecoveryPhysicalEffectErrorV1;
 use tracedecay_store::{
     RuntimeCancellationIdV1, RuntimeCancellationIdentityV1, RuntimeDeadlineIdV1, RuntimeDeadlineV1,
     RuntimeInterruptionV1, RuntimeRequestProbeV1,
 };
 
-use super::interruption_value;
+use super::{interruption_value, observe_control};
 
 pub(super) struct RecoveryRuntimeProbeV1 {
     cancellation: RuntimeCancellationIdentityV1,
     deadline: RuntimeDeadlineV1,
     interruption: Arc<AtomicU8>,
+    control: Option<(Arc<dyn RemoteRecoveryControlPortV1>, RequestId)>,
     commit_started: AtomicBool,
 }
 
@@ -42,8 +43,19 @@ impl RecoveryRuntimeProbeV1 {
                     .map_err(|_| RemoteRecoveryPhysicalEffectErrorV1::Corruption)?,
             },
             interruption,
+            control: None,
             commit_started: AtomicBool::new(false),
         })
+    }
+
+    /// Latches the caller's cancellation or deadline whenever the writer asks.
+    pub(super) fn observing(
+        mut self,
+        control: Arc<dyn RemoteRecoveryControlPortV1>,
+        request_id: RequestId,
+    ) -> Self {
+        self.control = Some((control, request_id));
+        self
     }
 }
 
@@ -57,6 +69,9 @@ impl RuntimeRequestProbeV1 for RecoveryRuntimeProbeV1 {
     }
 
     fn interruption(&self) -> Option<RuntimeInterruptionV1> {
+        if let Some((control, request_id)) = &self.control {
+            observe_control(control.as_ref(), request_id, &self.interruption);
+        }
         match interruption_value(&self.interruption) {
             Some(RemoteRecoveryInterruptionV1::Cancelled) => Some(RuntimeInterruptionV1::Cancelled),
             Some(RemoteRecoveryInterruptionV1::DeadlineExceeded) => {
@@ -78,11 +93,10 @@ impl RuntimeRequestProbeV1 for RecoveryRuntimeProbeV1 {
 pub(super) fn authority_key(
     expected: &RecoveryAuthorityExpectationV1,
 ) -> Result<ManifestDigest, RemoteRecoveryPhysicalEffectErrorV1> {
-    canonical_sha256(&(
-        "tracedecay.remote-recovery-authority.v1",
+    remote_recovery_authority_key(
         &expected.brain_id,
         &expected.shard_id,
         &expected.generation_id,
-    ))
+    )
     .map_err(|_| RemoteRecoveryPhysicalEffectErrorV1::Corruption)
 }

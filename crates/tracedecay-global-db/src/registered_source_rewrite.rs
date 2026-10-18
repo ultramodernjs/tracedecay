@@ -5,6 +5,9 @@
 //! a new generation; once that generation has been read to the end of the
 //! file, every record it did not offer again is retired from projection.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use tracedecay_domain::{
     CanonicalObservationIdV1, ObservationScopeV1, ObservationSourceGenerationV1,
     ObservationSourceIdentityV1,
@@ -13,7 +16,7 @@ use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
 use tracedecay_store::{ProjectionStoreError, ProjectionStoreResult};
 
 use super::RegisteredGlobalDb;
-use super::observation_projection::{ensure_projection_output_state_cache, retire_source_record};
+use super::observation_projection::retire_source_record;
 
 /// Unoffered-record reads are keyset-paginated at this page size. The exact-
 /// SQL engine refuses a query that materializes more rows than its hard cap,
@@ -210,7 +213,6 @@ impl RegisteredGlobalDb {
                 .map_err(|error| storage("release source rewrite completion", error))?;
             return Ok(0);
         }
-        ensure_projection_output_state_cache(&transaction).await?;
         let mut retired = 0_u64;
         // Keyset-paginate the unoffered ids instead of materializing the whole
         // set in one statement: a single rewritten source can hold more
@@ -255,7 +257,10 @@ impl RegisteredGlobalDb {
             let page_len = page.len();
             after_observation_id = page[page_len - 1].clone();
             for observation_id in &page {
-                if retire_source_record(&transaction, observation_id).await? {
+                let retired_one: Pin<
+                    Box<dyn Future<Output = ProjectionStoreResult<bool>> + Send + '_>,
+                > = Box::pin(retire_source_record(&transaction, observation_id));
+                if retired_one.await? {
                     retired += 1;
                 }
             }

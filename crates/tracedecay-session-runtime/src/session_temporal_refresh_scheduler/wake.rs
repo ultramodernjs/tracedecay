@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_store::SessionRefreshBeginOrJoinRequestV1;
 use tracedecay_temporal_query::execution::ExecutionControl;
 
@@ -843,7 +845,7 @@ struct SessionTemporalRefreshWakeRoute {
     target: std::sync::RwLock<std::sync::Weak<SessionTemporalRefreshWakeState>>,
 }
 
-fn enabled_idle_notification(
+pub(super) fn enabled_idle_notification(
     state: &SessionTemporalRefreshWakeState,
 ) -> std::pin::Pin<Box<tokio::sync::futures::Notified<'_>>> {
     let mut idle = Box::pin(state.idle.notified());
@@ -916,7 +918,7 @@ impl SessionTemporalRefreshWake {
             .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(state);
     }
 
-    #[cfg(any(test, feature = "test-helpers"))]
+    /// Two handles on one route bind and wake the same target together.
     pub fn same_route(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.route, &other.route)
     }
@@ -949,7 +951,7 @@ impl SessionTemporalRefreshWake {
         };
         let before = state.pass_count.load(Ordering::Acquire);
         state.wake();
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             let idle = tracing::Instrument::instrument(
                 enabled_idle_notification(&state),
@@ -962,7 +964,7 @@ impl SessionTemporalRefreshWake {
             if pass_count > before && !busy && !dirty && !pending {
                 return true;
             }
-            if tokio::time::timeout_at(deadline, idle).await.is_err() {
+            if native_runtime::timeout_at(deadline, idle).await.is_err() {
                 let pass_count = state.pass_count.load(Ordering::Acquire);
                 return pass_count > before
                     && !state.busy.load(Ordering::Acquire)

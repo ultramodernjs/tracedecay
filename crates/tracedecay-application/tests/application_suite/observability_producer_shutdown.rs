@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use tracedecay_application::observability::{
     BoundedObservabilityProducerV1, ObservabilityEmissionOutcomeV1,
-    ObservabilityOwnerEmissionOutcomeV1, ObservabilityProducerIdentityV1,
-    RegisteredAggregateShareExporterV1, RegisteredObservabilityPortV1, provider_latency_read_model,
+    ObservabilityOwnerEmissionOutcomeV1, ObservabilityProducerDeadlinesV1,
+    ObservabilityProducerIdentityV1, RegisteredAggregateShareExporterV1,
+    RegisteredObservabilityPortV1, provider_latency_read_model,
 };
 use tracedecay_contracts::{
     AggregateShareExportRequestV1, ObservabilityAggregateExportApplicationV1,
@@ -20,6 +21,15 @@ use tracedecay_domain::{
 use tracedecay_session_memory::provider_usage::{
     AggregatedProviderUsageCountersV1, ProviderUsageAggregateV1, ProviderUsageCoverageV1,
 };
+
+const HANG_GUARD: Duration = Duration::from_secs(10);
+/// A held writer exhausts this persistence deadline well inside the shutdown
+/// budget, which the receipts written after its release still need.
+const BLOCKED_WRITER_DEADLINES: ObservabilityProducerDeadlinesV1 =
+    ObservabilityProducerDeadlinesV1 {
+        persistence: Duration::from_millis(500),
+        shutdown: Duration::from_secs(5),
+    };
 
 fn identity(scope: &str, boot: &str) -> ObservabilityProducerIdentityV1 {
     ObservabilityProducerIdentityV1 {
@@ -309,14 +319,11 @@ async fn persistence_failure_cannot_be_rewritten_as_a_clean_terminal() {
         .begin_write_transaction()
         .await
         .expect("hold registered writer");
-    // The producer's deadlines read the Tokio clock. Paused, it advances only
-    // while every task waits, so the held writer exhausts the production
-    // persistence deadline without a wall-clock guess.
-    tokio::time::pause();
-    let producer = BoundedObservabilityProducerV1::start(
+    let producer = BoundedObservabilityProducerV1::start_with_deadlines(
         db.clone(),
         identity(scope, "boot:persistence-failed"),
         1,
+        BLOCKED_WRITER_DEADLINES,
     )
     .expect("producer");
     assert_eq!(
@@ -325,29 +332,23 @@ async fn persistence_failure_cannot_be_rewritten_as_a_clean_terminal() {
             .expect("queued observation"),
         ObservabilityEmissionOutcomeV1::Enqueued
     );
-    tokio::task::yield_now().await;
-    let mut queued = envelope(scope);
-    queued.event_id = "event:persistence-failed:queued".to_owned();
-    queued.idempotency_key = "idempotency:persistence-failed:queued".to_owned();
-    queued.trace_id = "trace:persistence-failed:queued".to_owned();
-    assert_eq!(
-        producer
-            .try_emit(queued)
-            .expect("second queued observation"),
-        ObservabilityEmissionOutcomeV1::Enqueued
-    );
-    let mut dropped = envelope(scope);
-    dropped.event_id = "event:persistence-failed:dropped".to_owned();
-    dropped.idempotency_key = "idempotency:persistence-failed:dropped".to_owned();
-    dropped.trace_id = "trace:persistence-failed:dropped".to_owned();
-    assert_eq!(
-        producer.try_emit(dropped).expect("capacity observation"),
-        ObservabilityEmissionOutcomeV1::DroppedAtCapacity
-    );
+    // The held writer parks the worker on each write for a whole persistence
+    // deadline, so it frees the single slot at most once per deadline. A test
+    // thread descheduled that long between offers sees the slot drained, so
+    // offers continue until one overflows. They stop at that first drop,
+    // which leaves its range pending for the shutdown receipts.
+    let dropped = (2..=64).find(|offer| {
+        let mut offered = envelope(scope);
+        offered.event_id = format!("event:persistence-failed:{offer}");
+        offered.idempotency_key = format!("idempotency:persistence-failed:{offer}");
+        offered.trace_id = format!("trace:persistence-failed:{offer}");
+        producer.try_emit(offered).expect("offered observation")
+            == ObservabilityEmissionOutcomeV1::DroppedAtCapacity
+    });
+    assert!(dropped.is_some(), "the single slot must overflow");
+    // A startup rollup pass may wait one deadline before the worker takes the
+    // first observation, whose write then waits another.
     tokio::time::sleep(producer.persistence_deadline() * 3).await;
-    // The receipts written after the release run under real production
-    // budgets.
-    tokio::time::resume();
     blocker.commit().await.expect("release registered writer");
 
     let error = producer
@@ -429,6 +430,111 @@ async fn persistence_failure_cannot_be_rewritten_as_a_clean_terminal() {
         latency[0].queue.p50.coverage.state,
         CoverageStateV1::Unknown
     );
+}
+
+#[tokio::test]
+async fn failed_flush_shutdown_leaves_rollup_maintenance_to_the_next_producer() {
+    let (_project, runtime) = runtime().await;
+    let db = runtime.project_database_arc().expect("project database");
+    let scope = "project.observability.shutdown";
+    let blocker = db
+        .begin_write_transaction()
+        .await
+        .expect("hold registered writer");
+    let producer = BoundedObservabilityProducerV1::start_with_deadlines(
+        db.clone(),
+        identity(scope, "boot:failed-flush-maintenance"),
+        1,
+        BLOCKED_WRITER_DEADLINES,
+    )
+    .expect("producer");
+    assert_eq!(
+        producer
+            .try_emit(envelope(scope))
+            .expect("queued observation"),
+        ObservabilityEmissionOutcomeV1::Enqueued
+    );
+    // A startup rollup pass may wait one deadline before the worker takes the
+    // observation, whose write then waits another.
+    tokio::time::sleep(producer.persistence_deadline() * 3).await;
+    blocker.commit().await.expect("release registered writer");
+
+    let error = producer
+        .shutdown()
+        .await
+        .expect_err("lost observation keeps shutdown typed as failed");
+    assert!(
+        error
+            .to_string()
+            .contains("observability_persistence_deadline"),
+        "unexpected shutdown error: {error}"
+    );
+    assert!(
+        producer.shutdown_settled(),
+        "the durable terminal settles the writer"
+    );
+    assert!(
+        db.claim_observability_rollup_dirty_day(scope, "shutdown:rollup-check", 30)
+            .await
+            .expect("inspect terminal day")
+            .is_some(),
+        "a failed flush spends no shutdown budget on optional rollup maintenance",
+    );
+}
+
+#[tokio::test]
+async fn shutdown_preempts_rollup_maintenance_waiting_on_the_writer() {
+    let (_project, runtime) = runtime().await;
+    let db = runtime.project_database_arc().expect("project database");
+    let scope = "project.observability.shutdown";
+    let blocker = db
+        .begin_write_transaction()
+        .await
+        .expect("hold registered writer");
+    // The first idle rollup tick is due at start, so the worker begins its
+    // frontier write on the held writer, where a deadline longer than the
+    // test can never elapse.
+    let producer = Arc::new(
+        BoundedObservabilityProducerV1::start_with_deadlines(
+            db.clone(),
+            identity(scope, "boot:preempted-maintenance"),
+            1,
+            ObservabilityProducerDeadlinesV1 {
+                persistence: Duration::from_secs(30),
+                shutdown: Duration::from_secs(60),
+            },
+        )
+        .expect("producer"),
+    );
+    // The writer lane exposes no waiter count, so give the native worker a
+    // moment to reach the frontier write. A cancel that lands first only
+    // makes this run vacuous; it cannot fail it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let cancel = tokio::spawn({
+        let producer = Arc::clone(&producer);
+        async move { producer.cancel().await }
+    });
+    // Cancellation writes nothing while the queue is empty, so the worker
+    // joins at once, unless maintenance still holds it.
+    let joined = tokio::time::timeout(HANG_GUARD, async {
+        while !producer.shutdown_joined() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        joined.is_ok(),
+        "shutdown must not wait for optional maintenance on a held writer"
+    );
+
+    blocker.commit().await.expect("release registered writer");
+    let summary = cancel
+        .await
+        .expect("cancel task")
+        .expect("the writer fence settles the preempted write");
+    assert!(summary.cancelled);
+    assert!(producer.shutdown_settled());
 }
 
 #[tokio::test]
@@ -630,18 +736,39 @@ async fn clean_shutdown_with_pending_drop_remains_partial() {
                 until_micros: i64::MAX,
             },
             after_watermark: None,
-            limit: 2,
+            limit: 16,
         })
         .await
         .expect("drop terminal query");
-    assert_eq!(page.events.len(), 1);
-    let terminal = &page.events[0];
-    let ObservabilityPayloadV1::TelemetryDrop(drop) = &terminal.payload else {
-        unreachable!()
+    // The native worker can free the slot between offers, so a later offer
+    // may carry earlier drops in its own range. The worker parks on the held
+    // writer before the loop ends, so the tail drops reach the terminal.
+    let ranges: Vec<_> = page
+        .events
+        .iter()
+        .map(|event| {
+            let ObservabilityPayloadV1::TelemetryDrop(drop) = &event.payload else {
+                unreachable!()
+            };
+            (event, drop)
+        })
+        .collect();
+    assert_eq!(
+        ranges
+            .iter()
+            .map(|(_, drop)| drop.proved_drop_lower_bound)
+            .sum::<u64>(),
+        dropped
+    );
+    let [(terminal, drop)] = ranges
+        .iter()
+        .filter(|(_, drop)| drop.clean_shutdown_observed)
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("exactly one clean terminal drop carrier is required");
     };
-    assert!(drop.clean_shutdown_observed);
-    assert_eq!(drop.proved_drop_lower_bound, dropped);
-    assert_eq!(terminal.dropped_count, dropped);
+    assert!(drop.proved_drop_lower_bound > 0);
+    assert_eq!(terminal.dropped_count, drop.proved_drop_lower_bound);
     assert_eq!(terminal.coverage, CoverageStateV1::Partial);
     assert_eq!(
         terminal.terminal_result,

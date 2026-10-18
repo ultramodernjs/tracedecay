@@ -60,7 +60,7 @@ async fn assert_session_temporal_version_refused(db_path: &Path, found_version: 
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_accepts_only_fresh_or_exact_final_stores() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -87,7 +87,7 @@ async fn temporal_schema_accepts_only_fresh_or_exact_final_stores() {
         "unexpected reason: {reason}"
     );
     assert!(
-        !table_exists(&db_path, "session_temporal_schema_migrations").await,
+        !table_exists(&db_path, "tracedecay_schema_version").await,
         "a rejected temporal schema must not gain a version marker"
     );
     assert!(
@@ -126,80 +126,7 @@ async fn temporal_schema_accepts_only_fresh_or_exact_final_stores() {
     );
 }
 
-#[tokio::test]
-async fn temporal_schema_rejects_extra_marker_rows_without_mutating_them() {
-    let tmp = TempDir::new().unwrap();
-    let db_path = tmp.path().join(".tracedecay").join("sessions.db");
-    let db = open_global_db(&db_path)
-        .await
-        .expect("fresh initialization should install the final temporal marker");
-    drop(db);
-
-    let raw_db = TestConnection::open(&db_path);
-    let conn = (*raw_db).clone();
-    conn.execute_batch(
-        "UPDATE session_temporal_schema_migrations
-         SET applied_at = 90
-         WHERE name = 'session-temporal';
-         INSERT INTO session_temporal_schema_migrations (name, version, applied_at)
-         VALUES ('unexpected-temporal-marker', 4, 91);",
-    )
-    .await
-    .unwrap();
-    drop(conn);
-    drop(raw_db);
-    let before_catalog = temporal_schema_object_catalog(&db_path).await;
-
-    let error = match open_global_db(&db_path).await {
-        Ok(_) => panic!("a current marker plus extra rows must require reset"),
-        Err(error) => error,
-    };
-    assert_eq!(
-        error
-            .reset_required_context()
-            .map(|(authority, _)| authority),
-        Some("session temporal")
-    );
-
-    let raw_db = TestConnection::open(&db_path);
-    let conn = (*raw_db).clone();
-    let mut rows = conn
-        .query(
-            "SELECT name, version, applied_at
-             FROM session_temporal_schema_migrations
-             ORDER BY name",
-            (),
-        )
-        .await
-        .unwrap();
-    let mut marker_rows = Vec::new();
-    while let Some(row) = rows.next().await.unwrap() {
-        marker_rows.push((
-            row.get::<String>(0).unwrap(),
-            row.get::<i64>(1).unwrap(),
-            row.get::<i64>(2).unwrap(),
-        ));
-    }
-    assert_eq!(
-        marker_rows,
-        [
-            (
-                "session-temporal".to_string(),
-                tracedecay_session_temporal_store::SESSION_TEMPORAL_SCHEMA_VERSION,
-                90,
-            ),
-            ("unexpected-temporal-marker".to_string(), 4, 91),
-        ],
-        "typed refusal must preserve every temporal marker row"
-    );
-    assert_eq!(
-        temporal_schema_object_catalog(&db_path).await,
-        before_catalog,
-        "typed refusal must not rewrite the current schema"
-    );
-}
-
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_malformed_marker_requires_reset_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -242,7 +169,7 @@ async fn temporal_schema_malformed_marker_requires_reset_without_mutation() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_lower_marker_requires_reset_without_repairing_guards() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -261,9 +188,9 @@ async fn temporal_schema_lower_marker_requires_reset_without_repairing_guards() 
          INSERT INTO session_temporal_generations (
              session_id, generation, state, frozen_watermarks_json, created_at
          ) VALUES ('session-a', 1, 'building', '{{}}', 1);
-         UPDATE session_temporal_schema_migrations
+         UPDATE tracedecay_schema_version
          SET version = {previous}
-         WHERE name = 'session-temporal';"
+         WHERE component = 'session-temporal';"
     ))
     .await
     .unwrap();
@@ -281,7 +208,7 @@ async fn temporal_schema_lower_marker_requires_reset_without_repairing_guards() 
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_replaces_an_empty_earlier_authority_with_the_final_contract() {
     let tmp = TempDir::new().unwrap();
     let fresh_path = tmp.path().join("fresh").join("sessions.db");
@@ -307,9 +234,9 @@ async fn temporal_schema_replaces_an_empty_earlier_authority_with_the_final_cont
          CREATE TRIGGER session_refresh_progress_insert_guard_v1
          BEFORE INSERT ON session_refresh_progress BEGIN SELECT 1; END;
          DROP INDEX idx_session_occurrences_introduced;
-         UPDATE session_temporal_schema_migrations
+         UPDATE tracedecay_schema_version
          SET version = {}
-         WHERE name = 'session-temporal';",
+         WHERE component = 'session-temporal';",
         SESSION_TEMPORAL_SCHEMA_VERSION - 1
     ))
     .await
@@ -340,7 +267,7 @@ async fn temporal_schema_replaces_an_empty_earlier_authority_with_the_final_cont
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_rejects_transition_storage_without_mutating_it() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -387,7 +314,7 @@ async fn temporal_schema_rejects_transition_storage_without_mutating_it() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_rejects_foreign_summary_namespace_tables_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -438,7 +365,7 @@ async fn temporal_schema_rejects_foreign_summary_namespace_tables_without_mutati
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_store_missing_temporal_marker_requires_reset_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -453,7 +380,7 @@ async fn final_store_missing_temporal_marker_requires_reset_without_mutation() {
         "INSERT INTO session_temporal_generations (
             session_id, generation, state, frozen_watermarks_json, created_at
          ) VALUES ('admission-sentinel', 1, 'building', '{}', 100);
-         DROP TABLE session_temporal_schema_migrations;",
+         DELETE FROM tracedecay_schema_version WHERE component = 'session-temporal';",
     )
     .await
     .unwrap();
@@ -471,8 +398,21 @@ async fn final_store_missing_temporal_marker_requires_reset_without_mutation() {
             .map(|(authority, _)| authority),
         Some("session temporal")
     );
-    assert!(
-        !table_exists(&db_path, "session_temporal_schema_migrations").await,
+    let marker = TestConnection::open(&db_path);
+    let marker_conn = (*marker).clone();
+    let mut marker_rows = marker_conn
+        .query(
+            "SELECT COUNT(*) FROM tracedecay_schema_version WHERE component = 'session-temporal'",
+            (),
+        )
+        .await
+        .unwrap();
+    let marker_count: i64 = marker_rows.next().await.unwrap().unwrap().get(0).unwrap();
+    drop(marker_rows);
+    drop(marker_conn);
+    drop(marker);
+    assert_eq!(
+        marker_count, 0,
         "typed refusal must not recreate a missing marker"
     );
     assert_eq!(
@@ -487,7 +427,7 @@ async fn final_store_missing_temporal_marker_requires_reset_without_mutation() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_is_not_installed_into_a_nonempty_store() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -512,7 +452,7 @@ async fn temporal_schema_is_not_installed_into_a_nonempty_store() {
         Some("session temporal")
     );
     assert!(
-        !table_exists(&db_path, "session_temporal_schema_migrations").await,
+        !table_exists(&db_path, "tracedecay_schema_version").await,
         "a rejected nonempty store must not gain a temporal marker: {error}"
     );
     assert!(
@@ -521,7 +461,7 @@ async fn temporal_schema_is_not_installed_into_a_nonempty_store() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn writer_ledger_alone_does_not_refuse_a_fresh_store() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -536,12 +476,12 @@ async fn writer_ledger_alone_does_not_refuse_a_fresh_store() {
         .expect("a store that holds only the writer ledger must receive the final temporal schema");
     drop(db);
     assert!(
-        table_exists(&db_path, "session_temporal_schema_migrations").await,
+        table_exists(&db_path, "tracedecay_schema_version").await,
         "writer ledger metadata must not block the final schema marker"
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn writer_ledger_does_not_hide_a_nonempty_unmarked_store() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -574,12 +514,12 @@ async fn writer_ledger_does_not_hide_a_nonempty_unmarked_store() {
         "unexpected reason: {reason}"
     );
     assert!(
-        !table_exists(&db_path, "session_temporal_schema_migrations").await,
+        !table_exists(&db_path, "tracedecay_schema_version").await,
         "typed refusal must not install a marker over a nonempty unmarked store: {error}"
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_extra_temporal_column_metadata() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -621,7 +561,7 @@ async fn final_schema_admission_rejects_extra_temporal_column_metadata() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_missing_temporal_occurrence_time_index() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -658,7 +598,7 @@ async fn final_schema_admission_rejects_missing_temporal_occurrence_time_index()
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_missing_graph_publication_table() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -693,7 +633,7 @@ async fn final_schema_admission_rejects_missing_graph_publication_table() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_incompatible_graph_publication_column_metadata() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -735,7 +675,7 @@ async fn final_schema_admission_rejects_incompatible_graph_publication_column_me
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_extra_graph_publication_table() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -776,7 +716,7 @@ async fn final_schema_admission_rejects_extra_graph_publication_table() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_mixed_case_extra_temporal_table() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -817,7 +757,7 @@ async fn final_schema_admission_rejects_mixed_case_extra_temporal_table() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_mixed_case_extra_graph_publication_table() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -858,7 +798,7 @@ async fn final_schema_admission_rejects_mixed_case_extra_graph_publication_table
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn final_schema_admission_rejects_extra_index_on_canonical_graph_table() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -896,7 +836,7 @@ async fn final_schema_admission_rejects_extra_index_on_canonical_graph_table() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn temporal_schema_refuses_future_version_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join(".tracedecay").join("sessions.db");
@@ -905,7 +845,7 @@ async fn temporal_schema_refuses_future_version_without_mutation() {
         .expect("temporal schema initialization should not error");
     drop(db);
     assert!(
-        table_exists(&db_path, "session_temporal_schema_migrations").await,
+        table_exists(&db_path, "tracedecay_schema_version").await,
         "the temporal schema must install a version marker before a future version is tested"
     );
 
@@ -914,9 +854,9 @@ async fn temporal_schema_refuses_future_version_without_mutation() {
     let raw_db = TestConnection::open(&db_path);
     let conn = (*raw_db).clone();
     conn.execute(
-        "UPDATE session_temporal_schema_migrations
+        "UPDATE tracedecay_schema_version
          SET version = ?1
-         WHERE name = 'session-temporal'",
+         WHERE component = 'session-temporal'",
         params![future_version],
     )
     .await

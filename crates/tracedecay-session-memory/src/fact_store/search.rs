@@ -1,6 +1,10 @@
 //! Canonical fact search, ranking, cursors, and retrieval recording.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
+
+use tracing::Instrument;
 
 use crate::memory::entities::normalize_entity;
 
@@ -124,86 +128,6 @@ fn project_memory_search_scores(
     )))
 }
 
-#[cfg(test)]
-mod score_tests {
-    use super::super::search_tests::{add_command, database, write_control};
-    use super::{HolographicEncoder, project_memory_search_scores, project_memory_tokens};
-    use crate::fact_store::DatabaseFactStore;
-    use tracedecay_store::ProjectMemoryFactStore;
-
-    #[tokio::test]
-    async fn lexical_eligibility_preserves_rounding_and_tokenless_scores() {
-        let (_directory, database) = database().await;
-        let store = DatabaseFactStore::new(&database);
-        let outcome = store
-            .add_project_memory_fact(
-                add_command(
-                    "operation.lexical-rounding",
-                    "canonical parser configuration",
-                    vec![],
-                ),
-                &write_control(),
-            )
-            .await
-            .unwrap();
-        let tracedecay_store::ProjectMemoryFactProjectionV1::Available(fact) = outcome.fact()
-        else {
-            panic!("canonical fixture payload must be available");
-        };
-        let encoder = HolographicEncoder::new();
-        let tokens = project_memory_tokens("unmatched");
-        let query = encoder.encode_fact("unmatched", &tokens).unwrap();
-        let query = encoder.prepare_query(&query).unwrap();
-        assert!(
-            project_memory_search_scores(
-                &tokens,
-                &encoder,
-                &query,
-                0.98e-6,
-                fact,
-                fact.telemetry().updated_at(),
-            )
-            .unwrap()
-            .is_none(),
-            "positive FTS below half a millionth still rounds to rejection"
-        );
-        let (scores, why) = project_memory_search_scores(
-            &tokens,
-            &encoder,
-            &query,
-            1.0e-6,
-            fact,
-            fact.telemetry().updated_at(),
-        )
-        .unwrap()
-        .expect("half a millionth is eligible");
-        assert_eq!(scores.fts_score_millionths(), 1);
-        assert_eq!(scores.jaccard_score_millionths(), 0);
-        assert_eq!(why.fts, 0.5e-6);
-        assert_eq!(why.temporal_decay, 1.0);
-
-        let tokens = project_memory_tokens("!");
-        assert!(tokens.is_empty());
-        let query = encoder.encode_fact("!", &tokens).unwrap();
-        let query = encoder.prepare_query(&query).unwrap();
-        let (scores, why) = project_memory_search_scores(
-            &tokens,
-            &encoder,
-            &query,
-            0.0,
-            fact,
-            fact.telemetry().updated_at(),
-        )
-        .unwrap()
-        .expect("tokenless queries retain holographic scoring");
-        assert_eq!(scores.fts_score_millionths(), 0);
-        assert_eq!(scores.jaccard_score_millionths(), 0);
-        assert_eq!(why.trust, fact.trust().as_f64());
-        assert_eq!(why.temporal_decay, 1.0);
-        assert_eq!(why.retrieval_count, fact.telemetry().retrieval_count());
-    }
-}
-
 /// Orders a page highest-score first, breaking ties on most-recently-updated
 /// and then ascending fact id, and drops everything at or before `after`.
 ///
@@ -259,8 +183,7 @@ async fn project_memory_rank_facts_tx(
         .unwrap_or(Confidence::new(0.3).map_err(FactStoreError::from)?);
     let fts_scores = candidates
         .as_mut()
-        .map(|candidates| std::mem::take(&mut candidates.fts_scores))
-        .unwrap_or_default();
+        .map_or_default(|candidates| std::mem::take(&mut candidates.fts_scores));
     let mut facts = if let Some(candidates) = candidates.take() {
         ensure_project_memory_read_active(read_control)?;
         let projections = load_project_memory_projections_controlled_tx(
@@ -490,55 +413,63 @@ async fn project_memory_candidates_snapshot(
     finish_read_snapshot(transaction, result).await
 }
 
-#[tracing::instrument(name = "runtime_core.memory.graph_assist", level = "trace", skip_all)]
-async fn project_memory_graph_assist(
-    db: &Database,
-    query: &ProjectMemoryFactSearchQuery,
-    candidates: &mut SearchCandidates,
-    read_control: &FactReadControl,
-) -> FactStoreResult<ProjectMemoryFactSearchGraphCoverageV1> {
-    if db.issue_memory_graph_runtime_operation().is_err() {
-        return Ok(ProjectMemoryFactSearchGraphCoverageV1::NotMounted);
-    }
-    let roots = candidates
-        .relation_roots
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    if roots.is_empty() {
-        return Ok(ProjectMemoryFactSearchGraphCoverageV1::Complete {
-            root_count: 0,
-            relation_count: 0,
-            expanded_fact_count: 0,
-        });
-    }
-    let graph_query = ProjectMemoryGraphQueryV1::new(
-        query.owner().clone(),
-        roots.clone(),
-        MAX_PROJECT_MEMORY_GRAPH_RELATIONS,
-    )?;
-    let page = match super::graph::project_memory_graph(db, graph_query, read_control).await {
-        Ok(page) => page,
-        Err(FactStoreError::GraphCancelled) => return Err(FactStoreError::GraphCancelled),
-        Err(error) => match project_memory_graph_degradation(&error) {
-            Some(reason) => {
-                return Ok(ProjectMemoryFactSearchGraphCoverageV1::Degraded { reason });
+fn project_memory_graph_assist<'a>(
+    db: &'a Database,
+    query: &'a ProjectMemoryFactSearchQuery,
+    candidates: &'a mut SearchCandidates,
+    read_control: &'a FactReadControl,
+) -> Pin<
+    Box<dyn Future<Output = FactStoreResult<ProjectMemoryFactSearchGraphCoverageV1>> + Send + 'a>,
+> {
+    let span = tracing::trace_span!("runtime_core.memory.graph_assist");
+    Box::pin(
+        async move {
+            if db.issue_memory_graph_runtime_operation().is_err() {
+                return Ok(ProjectMemoryFactSearchGraphCoverageV1::NotMounted);
             }
-            None => return Err(error),
-        },
-    };
-    let before = candidates.fact_ids.len();
-    candidates.fact_ids.extend(
-        page.facts()
-            .iter()
-            .filter(|&fact| matches!(fact, ProjectMemoryFactProjectionV1::Available(_)))
-            .map(|fact| fact.fact_id().clone()),
-    );
-    Ok(ProjectMemoryFactSearchGraphCoverageV1::Complete {
-        root_count: roots.len(),
-        relation_count: page.relations().len(),
-        expanded_fact_count: candidates.fact_ids.len().saturating_sub(before),
-    })
+            let roots = candidates
+                .relation_roots
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            if roots.is_empty() {
+                return Ok(ProjectMemoryFactSearchGraphCoverageV1::Complete {
+                    root_count: 0,
+                    relation_count: 0,
+                    expanded_fact_count: 0,
+                });
+            }
+            let graph_query = ProjectMemoryGraphQueryV1::new(
+                query.owner().clone(),
+                roots.clone(),
+                MAX_PROJECT_MEMORY_GRAPH_RELATIONS,
+            )?;
+            let page = match super::graph::project_memory_graph(db, graph_query, read_control).await
+            {
+                Ok(page) => page,
+                Err(FactStoreError::GraphCancelled) => return Err(FactStoreError::GraphCancelled),
+                Err(error) => match project_memory_graph_degradation(&error) {
+                    Some(reason) => {
+                        return Ok(ProjectMemoryFactSearchGraphCoverageV1::Degraded { reason });
+                    }
+                    None => return Err(error),
+                },
+            };
+            let before = candidates.fact_ids.len();
+            candidates.fact_ids.extend(
+                page.facts()
+                    .iter()
+                    .filter(|&fact| matches!(fact, ProjectMemoryFactProjectionV1::Available(_)))
+                    .map(|fact| fact.fact_id().clone()),
+            );
+            Ok(ProjectMemoryFactSearchGraphCoverageV1::Complete {
+                root_count: roots.len(),
+                relation_count: page.relations().len(),
+                expanded_fact_count: candidates.fact_ids.len().saturating_sub(before),
+            })
+        }
+        .instrument(span),
+    )
 }
 
 pub(super) fn project_memory_graph_degradation(
@@ -572,14 +503,16 @@ async fn project_memory_rank_snapshot(
         .begin_memory_read_transaction(PROJECT_MEMORY_READ_OPERATION)
         .await
         .map_err(|error| storage_error(PROJECT_MEMORY_READ_OPERATION, error))?;
-    let result = project_memory_rank_facts_tx(
+    let result: Pin<
+        Box<dyn Future<Output = FactStoreResult<ProjectMemoryFactSearchPageV1>> + Send + '_>,
+    > = Box::pin(project_memory_rank_facts_tx(
         &transaction,
         query,
         Some(candidates),
         graph_coverage,
         read_control,
-    )
-    .await;
+    ));
+    let result = result.await;
     finish_read_snapshot(transaction, result).await
 }
 
@@ -898,4 +831,84 @@ pub(super) async fn record_project_memory_fact_retrieval_tx(
     )
     .await?;
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod score_tests {
+    use super::super::search_tests::{add_command, database, write_control};
+    use super::{HolographicEncoder, project_memory_search_scores, project_memory_tokens};
+    use crate::fact_store::DatabaseFactStore;
+    use tracedecay_store::ProjectMemoryFactStore;
+
+    #[asupersync::test]
+    async fn lexical_eligibility_preserves_rounding_and_tokenless_scores() {
+        let (_directory, database) = database().await;
+        let store = DatabaseFactStore::new(&database);
+        let outcome = store
+            .add_project_memory_fact(
+                add_command(
+                    "operation.lexical-rounding",
+                    "canonical parser configuration",
+                    vec![],
+                ),
+                &write_control(),
+            )
+            .await
+            .unwrap();
+        let tracedecay_store::ProjectMemoryFactProjectionV1::Available(fact) = outcome.fact()
+        else {
+            panic!("canonical fixture payload must be available");
+        };
+        let encoder = HolographicEncoder::new();
+        let tokens = project_memory_tokens("unmatched");
+        let query = encoder.encode_fact("unmatched", &tokens).unwrap();
+        let query = encoder.prepare_query(&query).unwrap();
+        assert!(
+            project_memory_search_scores(
+                &tokens,
+                &encoder,
+                &query,
+                0.98e-6,
+                fact,
+                fact.telemetry().updated_at(),
+            )
+            .unwrap()
+            .is_none(),
+            "positive FTS below half a millionth still rounds to rejection"
+        );
+        let (scores, why) = project_memory_search_scores(
+            &tokens,
+            &encoder,
+            &query,
+            1.0e-6,
+            fact,
+            fact.telemetry().updated_at(),
+        )
+        .unwrap()
+        .expect("half a millionth is eligible");
+        assert_eq!(scores.fts_score_millionths(), 1);
+        assert_eq!(scores.jaccard_score_millionths(), 0);
+        assert_eq!(why.fts, 0.5e-6);
+        assert_eq!(why.temporal_decay, 1.0);
+
+        let tokens = project_memory_tokens("!");
+        assert!(tokens.is_empty());
+        let query = encoder.encode_fact("!", &tokens).unwrap();
+        let query = encoder.prepare_query(&query).unwrap();
+        let (scores, why) = project_memory_search_scores(
+            &tokens,
+            &encoder,
+            &query,
+            0.0,
+            fact,
+            fact.telemetry().updated_at(),
+        )
+        .unwrap()
+        .expect("tokenless queries retain holographic scoring");
+        assert_eq!(scores.fts_score_millionths(), 0);
+        assert_eq!(scores.jaccard_score_millionths(), 0);
+        assert_eq!(why.trust, fact.trust().as_f64());
+        assert_eq!(why.temporal_decay, 1.0);
+        assert_eq!(why.retrieval_count, fact.telemetry().retrieval_count());
+    }
 }

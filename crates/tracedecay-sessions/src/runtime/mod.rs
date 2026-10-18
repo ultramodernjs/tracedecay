@@ -8,6 +8,7 @@ pub mod git_correlation;
 mod host_coverage;
 pub use host_coverage::HostCoverageReason;
 mod host_scan;
+pub(crate) mod host_sqlite;
 pub mod hosts;
 pub mod ingest;
 mod native_ingest_source;
@@ -34,16 +35,14 @@ pub use ingest::{
     IngestPassCoverage, TranscriptCatchUpFailure, TranscriptIngestDisposition,
     TranscriptIngestOutcome, classify_claude_observation_failure,
     classify_transcript_ingest_disposition, classify_transcript_ingest_failure, home_dir,
-    ingest_project_sources_for_provider, ingest_project_sources_for_provider_with_cancellation,
+    ingest_project_sources_for_provider,
     ingest_project_sources_for_provider_with_cancellation_and_codex_state,
-    ingest_user_global_sources_for_provider_with_authorities,
     ingest_user_global_sources_for_provider_with_authorities_and_cancellation,
-    ingest_user_global_sources_for_startup_with_db,
     ingest_user_global_sources_for_startup_with_db_and_codex_state, registered_project_roots_from,
     subscribe_history_capacity_release, transcript_source_profile,
-    try_ingest_user_codex_sessions_with_db_and_admission, with_transcript_source_profile,
+    try_ingest_user_codex_sessions_with_db_and_admission, user_sessions_db_path,
+    with_transcript_source_profile,
 };
-pub use ingest::{USER_SESSIONS_DB_FILENAME, user_sessions_db_path};
 pub use registered_db::{
     SessionExec, SessionQuery, SessionRegisteredDb, SessionStoreAccess, SessionWriteTxn,
 };

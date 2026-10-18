@@ -15,12 +15,17 @@ use tracedecay_domain::canonical_text::default_true;
 use tracedecay_automation::config::AutomationConfig;
 use tracedecay_runtime_core::storage::{append_lock_path, retry_transient_file_op};
 
-/// Keys canonical `user.*` configuration settings own. They are never read
-/// from this file.
-const RETIRED_KEYS: [&str; 3] = [
+/// Keys canonical `user.*` configuration settings own, and caches of the
+/// retired status worldwide/flag decoration. They are never read from this
+/// file.
+const RETIRED_KEYS: [&str; 7] = [
     "upload_enabled",
     "watcher_debounce",
     "extraction_timeout_secs",
+    "last_worldwide_total",
+    "last_worldwide_fetch_at",
+    "cached_country_flags",
+    "last_flags_fetch_at",
 ];
 
 /// User-level tracedecay configuration.
@@ -33,14 +38,6 @@ pub struct UserConfig {
     /// UNIX timestamp of last successful upload.
     #[serde(default)]
     pub last_upload_at: i64,
-
-    /// Cached worldwide total from last fetch.
-    #[serde(default)]
-    pub last_worldwide_total: u64,
-
-    /// UNIX timestamp of last worldwide total fetch.
-    #[serde(default)]
-    pub last_worldwide_fetch_at: i64,
 
     /// UNIX timestamp of last flush attempt (success or failure).
     #[serde(default)]
@@ -67,13 +64,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_dashboard_enabled: BTreeMap<String, bool>,
 
-    /// Cached country flags from the worldwide counter.
-    #[serde(default)]
-    pub cached_country_flags: Vec<String>,
-
-    /// UNIX timestamp of last country flags fetch.
-    #[serde(default)]
-    pub last_flags_fetch_at: i64,
+    /// Per-agent catalog profile for the installed MCP registration, by short
+    /// name. A missing entry is the default profile; `default` is never stored.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_catalog_profile: BTreeMap<String, String>,
 
     /// Version that last ran `install` or `reinstall`. Used to trigger a
     /// silent reinstall when the binary is upgraded.
@@ -110,16 +104,13 @@ impl Default for UserConfig {
         Self {
             pending_upload: 0,
             last_upload_at: 0,
-            last_worldwide_total: 0,
-            last_worldwide_fetch_at: 0,
             last_flush_attempt_at: 0,
             cached_latest_version: String::new(),
             last_version_check_at: 0,
             last_version_warning_at: 0,
             installed_agents: Vec::new(),
             agent_dashboard_enabled: BTreeMap::new(),
-            cached_country_flags: Vec::new(),
-            last_flags_fetch_at: 0,
+            agent_catalog_profile: BTreeMap::new(),
             last_installed_version: String::new(),
             previous_version: String::new(),
             automation: AutomationConfig::default(),
@@ -618,6 +609,8 @@ mod tests {
         std::fs::write(
             &path,
             "upload_enabled = true\nwatcher_debounce = \"9s\"\nextraction_timeout_secs = 5\n\
+             last_worldwide_total = 1000000\nlast_worldwide_fetch_at = 1711375200\n\
+             cached_country_flags = [\"🇺🇸\", \"🇩🇪\"]\nlast_flags_fetch_at = 1711375200\n\
              future_key = \"keep-me\"\n[future_table]\nflag = true\n",
         )
         .unwrap();
@@ -633,7 +626,15 @@ mod tests {
         assert!(saved.contains("[future_table]"));
         assert!(saved.contains("flag = true"));
         assert!(saved.contains("pending_upload = 3"));
-        for retired in RETIRED_KEYS {
+        for retired in [
+            "upload_enabled",
+            "watcher_debounce",
+            "extraction_timeout_secs",
+            "last_worldwide_total",
+            "last_worldwide_fetch_at",
+            "cached_country_flags",
+            "last_flags_fetch_at",
+        ] {
             assert!(
                 !saved.contains(retired),
                 "{retired} survived a write:\n{saved}"

@@ -4,11 +4,12 @@ use tracedecay_contracts::{CancellationSignal, Deadline, RequestId, ResolvedScop
 use tracedecay_domain::UtcMicros;
 
 use super::verified_query_test_support::{
-    ImmediateProjection, admit_context, assert_route, fixture_scope, fixture_store, graph_operation,
+    ImmediateAdmission, ImmediateProjection, admit_context, assert_read_error, fixture_scope,
+    fixture_store, graph_operation,
 };
 use super::{
     CodeGraphProjectionReadPort, CodeGraphReadAdmissionPort, CodeGraphReadAdmissionRequest,
-    VerifiedGraphQueryRequest, open_verified_graph_query,
+    CodeGraphReadError, GraphQueryError, VerifiedGraphQueryRequest, open_verified_graph_query,
 };
 
 const SCOPE_TAG: &str = "verified-query-deadline";
@@ -26,7 +27,7 @@ impl CodeGraphReadAdmissionPort for DelayedAdmission {
         let scope = self.scope.clone();
         let delay = self.delay;
         Box::pin(async move {
-            tokio::time::sleep(delay).await;
+            asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
             Ok(admit_context(&request, &scope))
         })
     }
@@ -59,7 +60,7 @@ async fn expect_open_error(
     deadline: Deadline,
     cancellation: &CancellationSignal,
     request_tag: &str,
-) -> tracedecay_domain::errors::TraceDecayError {
+) -> GraphQueryError {
     let operation = graph_operation();
     match open_verified_graph_query(
         admission,
@@ -79,7 +80,7 @@ async fn expect_open_error(
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn delayed_admission_returns_exact_timed_out() {
     let admission = DelayedAdmission {
         scope: fixture_scope(SCOPE_TAG),
@@ -99,10 +100,10 @@ async fn delayed_admission_returns_exact_timed_out() {
         "request.verified-query-deadline.admit-timeout",
     )
     .await;
-    assert_route(error, "code-graph-timed-out");
+    assert_read_error(error, CodeGraphReadError::TimedOut);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn cancellation_during_admission_wait_returns_exact_cancelled() {
     let deadline = Deadline::new(UtcMicros(i64::MAX)).expect("deadline");
     let cancellation =
@@ -123,9 +124,52 @@ async fn cancellation_during_admission_wait_returns_exact_cancelled() {
         "request.verified-query-deadline.admit-cancel",
     );
     let cancel_task = async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
         cancel.cancel(now_micros());
     };
-    let (error, _) = tokio::join!(open, cancel_task);
-    assert_route(error, "code-graph-cancelled");
+    let (error, _) = asupersync::join!(open, cancel_task);
+    assert_read_error(error, CodeGraphReadError::Cancelled);
+}
+
+#[asupersync::test]
+async fn cancellation_after_open_stays_typed_in_query_and_reader_paths() {
+    let scope = fixture_scope("verified-query-after-open");
+    let admission = ImmediateAdmission {
+        scope: scope.clone(),
+    };
+    let projection = ImmediateProjection {
+        scope,
+        store: fixture_store("verified-query-after-open"),
+    };
+    let cancellation =
+        CancellationSignal::active("cancel.verified-query-after-open").expect("signal");
+    let operation = graph_operation();
+    let query = open_verified_graph_query(
+        &admission,
+        &projection,
+        VerifiedGraphQueryRequest::new(
+            &operation,
+            RequestId::new("request.verified-query-after-open").expect("request"),
+            Deadline::new(UtcMicros(i64::MAX)).expect("deadline"),
+            &cancellation,
+        ),
+        None,
+    )
+    .await
+    .expect("open");
+    query.census(1).expect("uncancelled query");
+    cancellation.cancel(now_micros());
+    assert_read_error(
+        query
+            .census(1)
+            .expect_err("query must stop after cancellation"),
+        CodeGraphReadError::Cancelled,
+    );
+    assert_read_error(
+        query
+            .manager()
+            .file_dependencies()
+            .expect_err("reader must stop after cancellation"),
+        CodeGraphReadError::Cancelled,
+    );
 }

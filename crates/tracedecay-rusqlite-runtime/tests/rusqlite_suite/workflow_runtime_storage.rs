@@ -24,7 +24,7 @@ use tracedecay_rusqlite_runtime::workflow::{
 
 use crate::registered_workflow_store;
 
-use registered_workflow_store::RegisteredWorkflowStore;
+use registered_workflow_store::{RegisteredWorkflowStore, WorkflowJobStorage};
 
 use tracedecay_domain::test_fixtures::id;
 
@@ -36,6 +36,29 @@ use tracedecay_domain::test_fixtures::id;
 fn digest(byte: char) -> ManifestDigest {
     let hex_byte = format!("{:02x}", u32::from(byte) & 0xff);
     ManifestDigest::new(format!("sha256:{}", hex_byte.repeat(32))).unwrap()
+}
+
+/// Version 1's immutable lifecycle journal as `(from, to, to_revision)` rows.
+fn transition_journal(
+    store: &RegisteredWorkflowStore,
+    definition: &WorkflowDefinition,
+) -> Vec<(String, String, i64)> {
+    store.inspect(|connection| {
+        connection
+            .prepare(
+                "SELECT from_state, to_state, to_revision
+                 FROM workflow_definition_transition_journal
+                 WHERE definition_id = ?1 AND definition_version = 1
+                 ORDER BY to_revision",
+            )
+            .unwrap()
+            .query_map([definition.definition_id().as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    })
 }
 
 fn definition(version: u64, operation: &str) -> WorkflowDefinition {
@@ -96,8 +119,8 @@ fn runtime_frontier() -> WorkHandoffFrontierV1 {
     .unwrap()
 }
 
-fn authority(store: &RegisteredWorkflowStore) -> WorkflowSqliteAuthority {
-    WorkflowSqliteAuthority::from_retained_exact_sql(store.retained_exact_sql()).unwrap()
+fn authority(store: &RegisteredWorkflowStore) -> WorkflowJobStorage {
+    WorkflowJobStorage::attach(store)
 }
 
 #[derive(Clone, Copy)]
@@ -272,7 +295,10 @@ fn non_final_store_requires_reset_without_runtime_schema_mutation() {
         });
 
     assert!(matches!(
-        WorkflowSqliteAuthority::from_retained_exact_sql(store.retained_exact_sql()),
+        tracedecay_rusqlite_runtime::native_runtime::block_on(
+            WorkflowSqliteAuthority::from_retained_exact_sql(store.retained_exact_sql())
+        )
+        .expect("native runtime"),
         Err(WorkflowSqliteAuthorityBuildError::ResetRequired)
     ));
     assert_eq!(
@@ -329,7 +355,10 @@ fn attachment_rejects_wrong_schema_version_digest_and_definition() {
             connection.execute_batch(mutation).unwrap();
         });
         assert!(matches!(
-            WorkflowSqliteAuthority::from_retained_exact_sql(store.retained_exact_sql()),
+            tracedecay_rusqlite_runtime::native_runtime::block_on(
+                WorkflowSqliteAuthority::from_retained_exact_sql(store.retained_exact_sql())
+            )
+            .expect("native runtime"),
             Err(WorkflowSqliteAuthorityBuildError::ResetRequired)
         ));
     }
@@ -613,8 +642,7 @@ fn definition_source_journal_and_handoff_survive_registered_store_restart() {
     );
 
     let store = store.restart("workflow-restart");
-    let authority =
-        WorkflowSqliteAuthority::from_retained_exact_sql(store.retained_exact_sql()).unwrap();
+    let authority = WorkflowJobStorage::attach(&store);
     assert_eq!(
         WorkflowEffectAuthorityPortV1::execute_effect(
             &authority,
@@ -1232,7 +1260,7 @@ fn concurrent_exact_replays_all_return_the_committed_terminal() {
     assert_eq!(store.count("workflow_definition_source_journal"), 1);
 }
 
-fn register(authority: &WorkflowSqliteAuthority, definition: &WorkflowDefinition, input: char) {
+fn register(authority: &WorkflowJobStorage, definition: &WorkflowDefinition, input: char) {
     let identity = effect_identity(
         WorkflowEffectOperationV1::RegisterDefinition,
         "actor.workflow.source",
@@ -1262,7 +1290,7 @@ fn lifecycle_command(
 }
 
 fn lifecycle_effect(
-    authority: &WorkflowSqliteAuthority,
+    authority: &WorkflowJobStorage,
     operation: WorkflowEffectOperationV1,
     input: char,
     command: WorkflowDefinitionLifecycleCommand,
@@ -1321,26 +1349,23 @@ fn registration_seeds_a_candidate_disposition_that_activation_advances() {
 
     // The lifecycle is `candidate -> validated -> active`, so the intermediate
     // state is an immutable history entry of its own.
-    let history = WorkflowDefinitionAuthorityPort::transition_history(
-        &authority,
-        definition.definition_id(),
-        1,
-    )
-    .unwrap();
     assert_eq!(
-        history
-            .iter()
-            .map(|entry| (entry.from_state, entry.to_state, entry.to_revision))
-            .collect::<Vec<_>>(),
+        transition_journal(&store, &definition),
         vec![
             (
-                WorkflowDefinitionLifecycleState::Candidate,
-                WorkflowDefinitionLifecycleState::Validated,
+                WorkflowDefinitionLifecycleState::Candidate
+                    .as_str()
+                    .to_owned(),
+                WorkflowDefinitionLifecycleState::Validated
+                    .as_str()
+                    .to_owned(),
                 2
             ),
             (
-                WorkflowDefinitionLifecycleState::Validated,
-                WorkflowDefinitionLifecycleState::Active,
+                WorkflowDefinitionLifecycleState::Validated
+                    .as_str()
+                    .to_owned(),
+                WorkflowDefinitionLifecycleState::Active.as_str().to_owned(),
                 3
             ),
         ]
@@ -1454,13 +1479,7 @@ fn a_replayed_lifecycle_command_appends_no_second_history_entry() {
     assert_eq!(first, replayed);
 
     assert_eq!(
-        WorkflowDefinitionAuthorityPort::transition_history(
-            &authority,
-            definition.definition_id(),
-            1
-        )
-        .unwrap()
-        .len(),
+        transition_journal(&store, &definition).len(),
         2,
         "replay must not append a second immutable history entry"
     );

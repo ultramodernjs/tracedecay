@@ -18,7 +18,18 @@ use tracedecay_contracts::now_micros;
 
 const RECOVERY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-pub(crate) fn reconcile_active_workflow_fan_out(
+/// Waits `delay` on the native clock. An unavailable timer ends the wait now,
+/// like an elapsed one.
+async fn recovery_backoff(delay: std::time::Duration) {
+    if let Err(error) =
+        tracedecay_runtime_core::native_runtime::sleep_until(std::time::Instant::now() + delay)
+            .await
+    {
+        tracing::warn!(%error, "workflow fan-out recovery backoff timer unavailable");
+    }
+}
+
+pub(crate) async fn reconcile_active_workflow_fan_out(
     registered: &RegisteredWorkRuntime,
     attempt_processes: Arc<super::super::super::work_attempt_exec::WorkAttemptProcessRegistryV1>,
     project_root: &Path,
@@ -33,21 +44,23 @@ pub(crate) fn reconcile_active_workflow_fan_out(
         observability_producer,
         None,
     )
+    .await
     .map(|_| ())
 }
 
-fn reconcile_active_workflow_fan_out_page(
+async fn reconcile_active_workflow_fan_out_page(
     registered: &RegisteredWorkRuntime,
     attempt_processes: Arc<super::super::super::work_attempt_exec::WorkAttemptProcessRegistryV1>,
     project_root: &Path,
     observability_producer: Option<
         Arc<tracedecay_application::observability::BoundedObservabilityProducerV1>,
     >,
-    cursor: Option<&tracedecay_contracts::WorkflowActiveRunRecoveryCursorV1>,
+    cursor: Option<tracedecay_contracts::WorkflowActiveRunRecoveryCursorV1>,
 ) -> Result<Option<tracedecay_contracts::WorkflowActiveRunRecoveryCursorV1>, ApplicationProblem> {
     let services = tracedecay_application::work::RegisteredWorkflowApplicationServicesV1::attach(
         &registered.database,
     )
+    .await
     .map_err(|_| workflow_runtime_unavailable())?;
     let registered_authority = tracedecay_domain::WorkAuthority::new(
         registered.grant.scope.project_id.clone(),
@@ -57,12 +70,19 @@ fn reconcile_active_workflow_fan_out_page(
         registered.grant.digest.clone(),
     )
     .map_err(|_| workflow_runtime_unavailable())?;
-    let page = tracedecay_contracts::WorkflowRunStoragePort::active_projection_page(
-        services.effects(),
-        &registered_authority,
-        cursor,
-    )
-    .map_err(workflow_run_storage_problem)?;
+    let page = {
+        let (authority, cursor) = (registered_authority.clone(), cursor.clone());
+        services
+            .read(move |services| {
+                tracedecay_contracts::WorkflowRunReadPort::active_projection_page(
+                    services.effects(),
+                    &authority,
+                    cursor.as_ref(),
+                )
+                .map_err(workflow_run_storage_problem)
+            })
+            .await?
+    };
     for projection in page.projections {
         let Some(identity) = projection
             .fan_out_plans()
@@ -75,7 +95,7 @@ fn reconcile_active_workflow_fan_out_page(
         };
         let context = work_background_context(registered, identity)
             .map_err(|_| workflow_runtime_unavailable())?;
-        reconcile_workflow_fan_out(
+        Box::pin(reconcile_workflow_fan_out(
             registered,
             &services,
             &context,
@@ -84,15 +104,19 @@ fn reconcile_active_workflow_fan_out_page(
             Arc::clone(&attempt_processes),
             project_root,
             observability_producer.clone(),
-        )?;
+        ))
+        .await?;
     }
-    let census_page =
-        tracedecay_contracts::WorkflowFanOutCensusStoragePort::census_backfill_projection_page(
-            services.effects(),
-            &registered_authority,
-            cursor,
-        )
-        .map_err(|_| workflow_runtime_unavailable())?;
+    let census_page = services
+        .read(move |services| {
+            tracedecay_contracts::WorkflowFanOutCensusReadPort::census_backfill_projection_page(
+                services.effects(),
+                &registered_authority,
+                cursor.as_ref(),
+            )
+            .map_err(|_| workflow_runtime_unavailable())
+        })
+        .await?;
     if census_page.continuation != page.continuation {
         return Err(workflow_runtime_unavailable());
     }
@@ -115,12 +139,13 @@ fn reconcile_active_workflow_fan_out_page(
             &projection,
             now_micros(),
             observability_producer.clone(),
-        );
+        )
+        .await;
     }
     Ok(page.continuation)
 }
 
-fn resume_work_attempts_for_workflow_recovery(
+async fn resume_work_attempts_for_workflow_recovery(
     registered: &RegisteredWorkRuntime,
     context: &RequestContext,
 ) -> Result<(), ApplicationProblem> {
@@ -137,25 +162,25 @@ fn resume_work_attempts_for_workflow_recovery(
     })?;
     // Restart recovery fences open attempts and retains their uncertain
     // outcome. It does not authorize dispatching an existing identity again.
-    work.attempts()
-        .resume(
-            context,
-            &tracedecay_contracts::ResumeWorkAttemptsCommand {
-                occurred_at: now_micros(),
-            },
-        )
-        .map_err(|error| {
-            tracing::error!(
-                ?error,
-                stage = "resume_work_attempts",
-                "workflow fan-out startup recovery authority failed"
-            );
-            workflow_runtime_unavailable()
-        })?;
+    work.resume_attempts(
+        context.clone(),
+        tracedecay_contracts::ResumeWorkAttemptsCommand {
+            occurred_at: now_micros(),
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            ?error,
+            stage = "resume_work_attempts",
+            "workflow fan-out startup recovery authority failed"
+        );
+        workflow_runtime_unavailable()
+    })?;
     Ok(())
 }
 
-fn recover_workflow_fan_out_startup(
+async fn recover_workflow_fan_out_startup(
     registered: &RegisteredWorkRuntime,
 ) -> Result<(), ApplicationProblem> {
     let context = workflow_fan_out_recovery_context(registered).map_err(|error| {
@@ -166,7 +191,7 @@ fn recover_workflow_fan_out_startup(
         );
         workflow_runtime_unavailable()
     })?;
-    resume_work_attempts_for_workflow_recovery(registered, &context)
+    resume_work_attempts_for_workflow_recovery(registered, &context).await
 }
 
 fn workflow_fan_out_recovery_context(
@@ -176,7 +201,7 @@ fn workflow_fan_out_recovery_context(
     RequestContext::new(
         registered.actor.clone(),
         registered.grant.scope.clone(),
-        registered.grant.clone(),
+        registered.grant_at(now_micros()),
         RequestId::new("workflow-fan-out-startup-recovery")?,
         Deadline::new(UtcMicros(
             now_micros().0.saturating_add(BACKGROUND_DEADLINE_MICROS),
@@ -192,7 +217,7 @@ pub(crate) struct WorkflowFanOutRecoveryOwnerV1 {
 
 struct WorkflowFanOutRecoveryInnerV1 {
     cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
-    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: std::sync::Mutex<Option<tracedecay_runtime_core::native_runtime::NativeTask<()>>>,
     registered: Arc<std::sync::Mutex<RegisteredWorkRuntime>>,
 }
 
@@ -215,7 +240,7 @@ impl WorkflowFanOutRecoveryOwnerV1 {
         let worker_cancellation = cancellation.clone();
         let registered = Arc::new(std::sync::Mutex::new(registered));
         let worker_registered = Arc::clone(&registered);
-        let task = tokio::spawn(async move {
+        let task = tracedecay_runtime_core::native_runtime::NativeTask::spawn(async move {
             let mut cursor = None;
             let mut resume_pending = true;
             loop {
@@ -232,7 +257,7 @@ impl WorkflowFanOutRecoveryOwnerV1 {
                     tokio::select! {
                         biased;
                         () = worker_cancellation.cancelled() => return,
-                        () = tokio::time::sleep(RECOVERY_RETRY_DELAY) => continue,
+                        () = recovery_backoff(RECOVERY_RETRY_DELAY) => continue,
                     }
                 };
 
@@ -241,20 +266,18 @@ impl WorkflowFanOutRecoveryOwnerV1 {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
-                    let mut resume = tokio::task::spawn_blocking(move || {
-                        recover_workflow_fan_out_startup(&resume_registered)
-                    });
+                    let resume = recover_workflow_fan_out_startup(&resume_registered);
+                    tokio::pin!(resume);
                     let resumed = tokio::select! {
                         biased;
                         () = worker_cancellation.cancelled() => {
-                            resume.abort();
                             return;
                         }
                         result = &mut resume => result,
                     };
                     match resumed {
-                        Ok(Ok(())) => resume_pending = false,
-                        Ok(Err(problem)) => {
+                        Ok(()) => resume_pending = false,
+                        Err(problem) => {
                             tracing::warn!(
                                 ?problem,
                                 "workflow fan-out startup recovery remains pending"
@@ -263,19 +286,7 @@ impl WorkflowFanOutRecoveryOwnerV1 {
                             tokio::select! {
                                 biased;
                                 () = worker_cancellation.cancelled() => return,
-                                () = tokio::time::sleep(RECOVERY_RETRY_DELAY) => continue,
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                ?error,
-                                "workflow fan-out startup recovery worker failed"
-                            );
-                            drop(_holder_admission);
-                            tokio::select! {
-                                biased;
-                                () = worker_cancellation.cancelled() => return,
-                                () = tokio::time::sleep(RECOVERY_RETRY_DELAY) => continue,
+                                () = recovery_backoff(RECOVERY_RETRY_DELAY) => continue,
                             }
                         }
                     }
@@ -285,27 +296,21 @@ impl WorkflowFanOutRecoveryOwnerV1 {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
-                let page_attempt_processes = Arc::clone(&attempt_processes);
-                let page_project_root = project_root.clone();
-                let page_producer = observability_producer.clone();
-                let page_cursor = cursor.clone();
-                let mut page = tokio::task::spawn_blocking(move || {
-                    reconcile_active_workflow_fan_out_page(
-                        &page_registered,
-                        page_attempt_processes,
-                        &page_project_root,
-                        page_producer,
-                        page_cursor.as_ref(),
-                    )
-                });
+                let page = reconcile_active_workflow_fan_out_page(
+                    &page_registered,
+                    Arc::clone(&attempt_processes),
+                    &project_root,
+                    observability_producer.clone(),
+                    cursor.clone(),
+                );
+                tokio::pin!(page);
                 let delay = tokio::select! {
                     biased;
                     () = worker_cancellation.cancelled() => {
-                        page.abort();
                         return;
                     }
                     result = &mut page => match result {
-                        Ok(Ok(continuation)) => {
+                        Ok(continuation) => {
                             cursor = continuation;
                             if cursor.is_some() {
                                 std::time::Duration::from_millis(100)
@@ -313,17 +318,10 @@ impl WorkflowFanOutRecoveryOwnerV1 {
                                 RECOVERY_RETRY_DELAY
                             }
                         }
-                        Ok(Err(problem)) => {
+                        Err(problem) => {
                             tracing::warn!(
                                 ?problem,
                                 "bounded workflow fan-out recovery page failed"
-                            );
-                            RECOVERY_RETRY_DELAY
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                ?error,
-                                "bounded workflow fan-out recovery worker failed"
                             );
                             RECOVERY_RETRY_DELAY
                         }
@@ -333,10 +331,14 @@ impl WorkflowFanOutRecoveryOwnerV1 {
                 tokio::select! {
                     biased;
                     () = worker_cancellation.cancelled() => return,
-                    () = tokio::time::sleep(delay) => {}
+                    () = recovery_backoff(delay) => {}
                 }
             }
-        });
+        })
+        .map_err(|error| {
+            tracing::error!(%error, "workflow fan-out recovery could not start");
+            workflow_runtime_unavailable()
+        })?;
         Ok(Self {
             inner: Arc::new(WorkflowFanOutRecoveryInnerV1 {
                 cancellation,
@@ -370,10 +372,12 @@ impl WorkflowFanOutRecoveryOwnerV1 {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        if let Some(task) = task
-            && let Err(error) = task.await
-        {
-            tracing::warn!(%error, "workflow fan-out recovery shutdown failed");
+        if let Some(task) = task {
+            let outcome = task.wait().await;
+            if outcome != tracedecay_runtime_core::native_runtime::NativeTaskOutcome::Completed(())
+            {
+                tracing::warn!(?outcome, "workflow fan-out recovery shutdown failed");
+            }
         }
     }
 }
@@ -388,5 +392,42 @@ impl Drop for WorkflowFanOutRecoveryInnerV1 {
         if let Some(task) = task {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tracedecay_domain::test_fixtures::id;
+    use tracedecay_domain::{WorkAttemptIdentityV1, WorktreeId};
+
+    use super::super::super::super::work_attempt_exec::WorkAttemptProcessRegistryV1;
+
+    #[test]
+    fn a_reconcile_page_dispatches_a_child_without_a_tokio_runtime() {
+        let registry = Arc::new(WorkAttemptProcessRegistryV1::default());
+        let identity = WorkAttemptIdentityV1::new(
+            id("task.fan-out-page"),
+            id("run.fan-out-page"),
+            id("attempt.fan-out-page"),
+        )
+        .expect("attempt identity");
+        let worktree_id: WorktreeId = id("worktree.fan-out-page");
+        let (ran, child_ran) = std::sync::mpsc::channel();
+
+        let dispatched = tracedecay_runtime_core::native_runtime::block_on(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            registry.spawn_for_worktree(&identity, &worktree_id, move |_cancellation| async move {
+                let _ = ran.send(());
+            })
+        })
+        .expect("native runtime");
+
+        assert!(dispatched, "the page must dispatch the child");
+        child_ran
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the dispatched child must run");
     }
 }

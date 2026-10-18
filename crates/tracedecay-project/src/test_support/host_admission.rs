@@ -3,8 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
-use tokio::sync::Mutex as AsyncMutex;
-
 use tracedecay_code_index::parallelism::install_worker_plan;
 use tracedecay_domain::configuration::CodeIndexWorkerSelectionV1;
 use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
@@ -26,7 +24,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{BrainId, ProjectId, UserProfileId};
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use tracedecay_runtime_core::db::DaemonDatabaseScope;
-use tracedecay_runtime_core::weak_registry::WeakRegistry;
+use tracedecay_runtime_core::weak_registry::SingleFlightWeakRegistry;
 use tracedecay_store::StoreShardScopeV1;
 use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
@@ -78,8 +76,8 @@ pub enum SessionTemporalFixtureCountV1 {
 /// for its profile. Entries are weak: when the last runtime for a profile
 /// drops, its registry drops with it and the next open starts fresh.
 static SHARED_TEST_SESSION_REGISTRIES: LazyLock<
-    AsyncMutex<WeakRegistry<PathBuf, DaemonSessionRuntimeRegistryV1>>,
-> = LazyLock::new(|| AsyncMutex::new(WeakRegistry::new()));
+    SingleFlightWeakRegistry<PathBuf, DaemonSessionRuntimeRegistryV1>,
+> = LazyLock::new(SingleFlightWeakRegistry::new);
 
 /// Process-scoped scratch-memory authority shared by every host-admission
 /// fixture in this test binary. Its capacity follows the same RAM-derived
@@ -203,6 +201,8 @@ impl HostAdmissionTestRuntimeV1 {
                 .project_memory(project_id.clone(), [project_root.to_path_buf()])
                 .await?;
             let graph_proxy = verified_graph_test_support::await_bound_graph_runtime(
+                &self.session_registry,
+                &project_id,
                 &project_database,
                 "bind sibling test runtime project graph",
             )
@@ -263,13 +263,11 @@ impl HostAdmissionTestRuntimeV1 {
             let profile_key = tracedecay_runtime_core::lifecycle_lease::canonical_or_original(
                 identity.profile_root(),
             );
-            // Held across construction so two concurrent opens of one profile
+            // Single-flight per profile so two concurrent opens of one profile
             // cannot race into two registries (the loser would fail the
             // exclusive profile session store open).
-            let registries = SHARED_TEST_SESSION_REGISTRIES.lock().await;
-            match registries.get_live(&profile_key) {
-                Some(registry) => registry,
-                None => {
+            SHARED_TEST_SESSION_REGISTRIES
+                .get_or_open(profile_key, || async {
                     // The fixture stands in for the composition root: it
                     // registers the runtime ports with the fixture daemon
                     // client, exactly as it registers the fixture product
@@ -277,12 +275,9 @@ impl HostAdmissionTestRuntimeV1 {
                     crate::runtime_ports::register_runtime_ports(
                         crate::runtime_ports::fixture_daemon_client_ports(),
                     )?;
-                    let registry =
-                        Arc::new(DaemonSessionRuntimeRegistryV1::open(identity.clone()).await?);
-                    registries.insert(profile_key, &registry);
-                    registry
-                }
-            }
+                    DaemonSessionRuntimeRegistryV1::open(identity.clone()).await
+                })
+                .await?
         };
         let profile_database = session_registry.profile_database().await?;
         let profile_registered = session_registry.profile_sessions().await?;
@@ -312,6 +307,8 @@ impl HostAdmissionTestRuntimeV1 {
                     .project_memory(project_id.clone(), [project_root])
                     .await?;
                 let graph_proxy = verified_graph_test_support::await_bound_graph_runtime(
+                    &session_registry,
+                    &project_id,
                     &project_database,
                     "bind test runtime project graph",
                 )
@@ -417,14 +414,21 @@ impl HostAdmissionTestRuntimeV1 {
         session_registry.cancel_store_opens_for_shutdown();
         session_registry.cancel_terminal_tasks();
         session_registry.cancel_memory_graph_reconciliation_tasks();
-        let terminal = session_registry.shutdown_terminal_tasks().await;
+        let cx = tracedecay_runtime_core::native_runtime::cx().ok_or_else(|| {
+            TraceDecayError::Config {
+                message: "native execution runtime is unavailable".to_owned(),
+            }
+        })?;
+        let terminal = session_registry.shutdown_terminal_tasks(&cx).await;
         let reconciliation = session_registry
             .shutdown_memory_graph_reconciliation_tasks()
             .await;
         terminal.map_err(|message| TraceDecayError::Config { message })?;
         reconciliation.map_err(|message| TraceDecayError::Config { message })?;
         session_registry
-            .close_retained_graph_runtimes_for_shutdown()
+            .close_retained_graph_runtimes_for_shutdown(
+                std::time::Instant::now() + std::time::Duration::from_mins(1),
+            )
             .await?;
         drop((session_registry, database_scope));
         Ok(())
@@ -1018,50 +1022,6 @@ impl HostAdmissionTestRuntimeV1 {
             .await?;
         TraceDecay::open_with_registered_configuration(
             project_root,
-            open_options,
-            store_layout,
-            project_database,
-            self.profile_database.clone(),
-            Arc::clone(&self.session_registry),
-        )
-        .await
-    }
-
-    /// Opens one tracked branch through this retained registered runtime.
-    #[doc(hidden)]
-    pub async fn open_project_branch_for_test(
-        &self,
-        project_root: &Path,
-        branch_name: &str,
-        open_options: TraceDecayOpenOptions,
-    ) -> Result<TraceDecay> {
-        let project_id = self
-            .project_id
-            .as_ref()
-            .ok_or_else(|| TraceDecayError::Config {
-                message: "project branch open requires project-scoped test authority".to_owned(),
-            })?;
-        let project_database =
-            self.project_registered
-                .clone()
-                .ok_or_else(|| TraceDecayError::Config {
-                    message: "project branch open requires a registered project session".to_owned(),
-                })?;
-        let store_layout = TraceDecay::resolve_registered_configuration_layout(
-            project_root,
-            &open_options,
-            self.profile_database.as_ref(),
-        )
-        .await?;
-        if store_layout.identity.project_id.as_deref() != Some(project_id.as_str()) {
-            return Err(TraceDecayError::Config {
-                message: "project branch identity differs from registered test authority"
-                    .to_owned(),
-            });
-        }
-        TraceDecay::open_branch_with_registered_configuration(
-            project_root,
-            branch_name,
             open_options,
             store_layout,
             project_database,

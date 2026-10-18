@@ -243,8 +243,9 @@ fn project_replay(
         let (key_text, value_text) = evidence_text(kind, &observation["canonical_payload"])?;
         let binding = source_binding(namespace, &source)?;
         let source_id = &binding.source_id;
-        let delivery_key = opaque_surface_id(
+        let delivery_key = opaque_caller_id(
             namespace,
+            &call.exact_scope,
             b"replay-delivery-key",
             string(&observation["idempotency_key"])?,
         );
@@ -269,11 +270,15 @@ fn project_replay(
     {
         return None;
     }
-    let page_delivery = serde_json::to_vec(&json!({
+    let mut page_delivery = json!({
         "operation_id": call.operation_id,
         "idempotency_key": call.idempotency_key.as_deref()?
-    }))
-    .ok()?;
+    });
+    if namespace.1 == NcmNamespaceBinding::CheckoutObservationsV1 {
+        page_delivery["caller_binding"] =
+            json!({"version": 1, "exact_scope": scope_value(&call.exact_scope)});
+    }
+    let page_delivery = serde_json::to_vec(&page_delivery).ok()?;
     if page_delivery.len() > 131_072 {
         return None;
     }
@@ -641,6 +646,7 @@ fn byte_array(value: &Value, limit: u64) -> Option<Vec<u8>> {
 
 pub(crate) fn reconstruct(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     reply: &mut ProviderReply,
     descriptor: &ProviderDescriptor,
     limits: ProviderLimits,
@@ -659,11 +665,7 @@ pub(crate) fn reconstruct(
     };
     let mut output = if call.operation == ProviderOperation::SnapshotExport {
         let bytes = byte_array(&worker["bytes"], limits.snapshot_bytes)?;
-        let inventory = snapshot_inventory(
-            &bytes,
-            &NcmNamespace::from_exact_scope(&call.exact_scope),
-            &call.exact_scope,
-        )?;
+        let inventory = snapshot_inventory(&bytes, namespace, &call.exact_scope)?;
         if inventory.generation != reply.state_generation {
             return None;
         }
@@ -687,7 +689,12 @@ pub(crate) fn reconstruct(
             output.remove("no_change");
             let delivery =
                 super::lifecycle::decode_receipt_capsule(&worker["page_delivery_capsule"])?;
-            fields(&delivery, &["operation_id", "idempotency_key"])?;
+            super::lifecycle::validate_delivery_caller(call, namespace, &delivery)?;
+            if namespace.1 == NcmNamespaceBinding::CheckoutObservationsV1
+                && delivery.get("caller_binding").is_none()
+            {
+                return None;
+            }
             let original_key = string(&delivery["idempotency_key"])?;
             let original_operation = string(&delivery["operation_id"])?;
             if Some(original_key) != call.idempotency_key.as_deref() {
@@ -936,7 +943,7 @@ mod tests {
             state_generation: 1,
         };
         let mut baseline = worker_reply.clone();
-        reconstruct(&call, &mut baseline, &descriptor, limits).unwrap();
+        reconstruct(&call, &namespace, &mut baseline, &descriptor, limits).unwrap();
         let body_bytes = baseline.payload.as_ref().unwrap().bytes.len() as u64;
         let framed_bytes = crate::encoded_response_bytes(&call, &baseline);
         assert!(framed_bytes > body_bytes + 2048);
@@ -947,7 +954,14 @@ mod tests {
         };
         snapshot_limits.validate().unwrap();
         let mut exported = worker_reply.clone();
-        reconstruct(&call, &mut exported, &descriptor, snapshot_limits).unwrap();
+        reconstruct(
+            &call,
+            &namespace,
+            &mut exported,
+            &descriptor,
+            snapshot_limits,
+        )
+        .unwrap();
         assert_eq!(
             crate::encoded_response_bytes(&call, &exported),
             framed_bytes
@@ -968,6 +982,7 @@ mod tests {
             assert!(
                 reconstruct(
                     &call,
+                    &namespace,
                     &mut rejected,
                     &descriptor,
                     ProviderLimits {
@@ -987,7 +1002,7 @@ mod tests {
             CancellationToken, CommittedEffectEvidence, FallbackDirective, OperationControl,
             OwnedVersionedId, ProviderCallParts, TerminalRecord,
         };
-        let (exact, _, _, _) = fixture();
+        let (exact, namespace, _, _) = fixture();
         let request = serde_json::to_vec(&json!({
             "resolved_observations":[{}], "expected_previous_acknowledged_sequence":1
         }))
@@ -1078,7 +1093,7 @@ mod tests {
             state_generation: 2,
         };
         let mut reply = incoming.clone();
-        reconstruct(&call, &mut reply, &descriptor, limits).unwrap();
+        reconstruct(&call, &namespace, &mut reply, &descriptor, limits).unwrap();
         reply.validate(limits.response_bytes).unwrap();
         let output: Value = serde_json::from_slice(&reply.payload.as_ref().unwrap().bytes).unwrap();
         fields(
@@ -1138,7 +1153,7 @@ mod tests {
                 _ => invalid.payload.as_mut().unwrap().bytes.push(b' '),
             }
             assert!(
-                reconstruct(&call, &mut invalid, &descriptor, limits).is_none(),
+                reconstruct(&call, &namespace, &mut invalid, &descriptor, limits).is_none(),
                 "accepted {malformed}"
             );
         }

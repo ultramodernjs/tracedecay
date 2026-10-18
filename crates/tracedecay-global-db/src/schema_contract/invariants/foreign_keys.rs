@@ -374,7 +374,7 @@ mod tests {
         violations
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn composite_nullable_keys_resolve_omitted_primary_key_order() {
         let (_directory, conn) = fixture(
             "CREATE TABLE fk_parent (
@@ -405,7 +405,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn parent_affinity_and_collation_match_sqlite_for_every_declared_key() {
         let (_directory, conn) = fixture(
             "CREATE TABLE fk_text_parent (value TEXT PRIMARY KEY);
@@ -437,7 +437,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn child_numeric_affinity_and_collation_do_not_override_parent() {
         let (_directory, conn) = fixture(
             "CREATE TABLE fk_parent (value TEXT PRIMARY KEY);
@@ -462,7 +462,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn violation_after_page_boundary_is_found_on_resumption() {
         let (_directory, conn) = fixture(&format!(
             "CREATE TABLE fk_parent (value INTEGER PRIMARY KEY);
@@ -497,7 +497,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn keyset_pages_cover_negative_minimum_gaps_and_multiple_pages() {
         let (_directory, conn) = fixture(&format!(
             "CREATE TABLE fk_parent (value INTEGER PRIMARY KEY);
@@ -553,7 +553,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn empty_and_foreign_key_free_tables_complete() {
         let (_directory, conn) = fixture(
             "CREATE TABLE fk_parent (value INTEGER PRIMARY KEY);
@@ -570,7 +570,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn quoted_identifiers_and_one_shadowed_rowid_use_real_rowids() {
         let (_directory, conn) = fixture(
             "CREATE TABLE \"fk\"\"parent\" (\"key\"\"value\" TEXT PRIMARY KEY);
@@ -589,7 +589,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn unsupported_rowid_shapes_fail_closed() {
         let (_directory, conn) = fixture(
             "CREATE TABLE fk_parent (value INTEGER PRIMARY KEY);
@@ -614,7 +614,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn malformed_parent_keys_fail_even_when_child_is_empty() {
         for schema in [
             "CREATE TABLE fk_parent(value TEXT);

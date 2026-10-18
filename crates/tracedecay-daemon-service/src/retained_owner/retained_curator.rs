@@ -1,5 +1,7 @@
 //! Retained application adapter for the canonical Memory Curator.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::DaemonInvocationService;
@@ -17,6 +19,7 @@ use tracedecay_contracts::retained_surfaces::{
     RetainedSurfaceResultV1,
 };
 use tracedecay_project::project::TraceDecay;
+use tracedecay_runtime_core::native_runtime::{self, NativeTask};
 
 const MEMORY_CURATOR_REQUEST_TIMEOUT_SECS: u64 = 80;
 
@@ -31,6 +34,11 @@ pub async fn execute_retained_memory_curator(
     context: &RetainedSurfaceExecutionContextV1<'_>,
     request: &FactStoreCurateRequestV1,
 ) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, RetainedSurfaceExecutionErrorV1> {
+    if native_runtime::handle().is_none() {
+        return Err(RetainedSurfaceExecutionErrorV1::unavailable(
+            "the memory curator runtime is unavailable".to_owned(),
+        ));
+    }
     let pinned = cg
         .configuration_runtime()
         .client()
@@ -78,7 +86,16 @@ pub async fn execute_retained_memory_curator(
                 "the automation project context could not be composed: {error}"
             ))
         })?;
-    let admission = crate::automation_effect::prepare(
+    let prepared: Pin<
+        Box<
+            dyn Future<
+                    Output = tracedecay_domain::errors::Result<
+                        tracedecay_automation_runtime::automation::effect_runtime::AutomationEffectAdmission,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > = Box::pin(crate::automation_effect::prepare(
         invocation_service,
         cg,
         automation_context.project_root(),
@@ -89,9 +106,8 @@ pub async fn execute_retained_memory_curator(
         context.observed_at,
         configuration_digest,
         automation_request,
-    )
-    .await
-    .map_err(|error| {
+    ));
+    let admission = prepared.await.map_err(|error| {
         RetainedSurfaceExecutionErrorV1::unavailable(format!(
             "the automation effect authority could not be prepared: {error}"
         ))
@@ -141,7 +157,7 @@ pub async fn execute_retained_memory_curator(
         min_confidence,
     };
     let curator_run_id = run_id.clone();
-    let curator = tokio::spawn(async move {
+    let run = async move {
         let retained_run = run_memory_curator_with_backend_for_retained_settlement(
             &automation_context,
             &config,
@@ -155,19 +171,14 @@ pub async fn execute_retained_memory_curator(
             (run.ledger_record, run.committed_receipt)
         });
         log_curator_settlement(&run_id, waiter.wait().await);
-    });
-    // The run outlives the request. A panic before settlement would otherwise
-    // vanish with the dropped join handle, leaving a run that never settles
-    // and nothing that names it.
-    drop(tokio::spawn(async move {
-        if let Err(error) = curator.await {
-            tracing::error!(
-                run_id = %curator_run_id,
-                error = %error,
-                "retained memory curator run ended without settling"
-            );
+    };
+    if let Err(error) = NativeTask::spawn(async move {
+        if let Err(error) = native_runtime::off_native_thread(run).await {
+            tracing::error!(run_id = %curator_run_id, %error, "retained memory curator run ended without settling");
         }
-    }));
+    }) {
+        tracing::error!(%error, "memory curator run was not started");
+    }
     Ok(started)
 }
 

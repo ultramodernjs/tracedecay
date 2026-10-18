@@ -10,13 +10,15 @@ use crate::runtime::{
     SessionProvider, hosts::claude_observation, hosts::codex, hosts::cursor, hosts::cursor_composer,
 };
 use tracedecay_domain::{BrainId, ObservationScopeV1, UserProfileId};
+use tracedecay_runtime_core::storage::USER_SESSIONS_DB_FILENAME;
 use tracedecay_store::StoreShardScopeV1;
 
 use super::failure::{
-    IngestPassBounds, IngestPassCoverage, IngestPassOutcome, ProviderRunFold,
-    TranscriptCatchUpFailure, allocate_pass_byte_budgets, observation_catch_up_failure,
-    scheduling_write_required, warn_transcript_catch_up_failure,
+    IngestPassBounds, IngestPassCoverage, IngestPassOutcome, MAX_CODEX_SOURCE_FAILURES_PER_PASS,
+    ProviderRunFold, TranscriptCatchUpFailure, allocate_pass_byte_budgets,
+    observation_catch_up_failure, scheduling_write_required, warn_transcript_catch_up_failure,
 };
+use super::quarantine::SourceSweep;
 use super::scheduler::{
     USER_CATCH_UP_PROVIDERS, USER_INGEST_PROVIDER_FRONTIER_KEY, default_ingest_pass_bounds,
     finish_user_provider_coverage, plan_provider_rotation_admission, read_ingest_frontier,
@@ -24,8 +26,6 @@ use super::scheduler::{
 };
 use super::startup::TranscriptIngestOutcome;
 use super::user_provider::UserProviderUnit;
-
-pub const USER_SESSIONS_DB_FILENAME: &str = "user-sessions.db";
 
 pub fn user_sessions_db_path(profile_root: &Path) -> PathBuf {
     profile_root.join(USER_SESSIONS_DB_FILENAME)
@@ -63,7 +63,7 @@ pub async fn try_ingest_user_codex_sessions_with_db_and_admission(
             });
         };
         let session_id_owned = session_id.to_owned();
-        let lookup = tokio::task::spawn_blocking(move || {
+        let lookup = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             source.find_session_transcript_paths_bounded(&session_id_owned)
         })
         .await
@@ -139,6 +139,7 @@ pub(super) async fn try_ingest_user_codex_sessions_with_db_bounded(
         cancellation,
         codex::CodexDiscoveryFrontier::initial(),
         None,
+        &mut SourceSweep::new("codex", None),
     )
     .await
     .map(|result| result.outcome)
@@ -159,6 +160,7 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
     cancellation: &ObservationCancellation,
     frontier: codex::CodexDiscoveryFrontier,
     discovery_state: Option<(&codex::CodexDiscoveryHub, &str)>,
+    sweep: &mut SourceSweep,
 ) -> source::TranscriptIngestResult<CodexUserIngestOutcome> {
     let Some(source) = codex::CodexSource::new() else {
         return Ok(CodexUserIngestOutcome {
@@ -213,7 +215,7 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
     let mut bytes_consumed = 0u64;
     let mut deferred_by_byte_cap = discovery.is_truncated();
     let mut frontier_committable = true;
-    let mut metadata_failures = 0usize;
+    let mut metadata_failures = 0;
     let mut failures = Vec::new();
     for path in &discovery.paths {
         if remaining == Some(0) {
@@ -224,14 +226,9 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
         if cancellation.is_cancelled() {
             return Err(source::TranscriptIngestError::Cancelled { provider: "codex" });
         }
-        let Some(pending) = codex::PendingTranscript::observe(discovery_state, path).await? else {
+        let Some(pending) = sweep.observe_file(path).await? else {
             continue;
         };
-        if let Some(failure) = pending.cached_source_failure(path) {
-            failures.push(failure);
-            deferred_by_byte_cap = true;
-            continue;
-        }
         let progress = match codex::try_admit_codex_jsonl_observations_for_profile_with_admission_and_cancellation(
             path,
             session_id.as_deref(),
@@ -252,20 +249,25 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
                     "Codex transcript catch-up failed",
                 );
                 if !error.is_source_disposition() {
+                    frontier_committable = false;
+                    let Err(error) = sweep.refused(pending, error) else {
+                        deferred_by_byte_cap = true;
+                        continue;
+                    };
                     return Err(error);
                 }
                 metadata_failures += usize::from(error.consumes_metadata_failure_budget());
-                pending.record_source_failure(path, &error, failure)?;
+                pending.retain_failure(failure)?;
                 failures.push(failure);
                 deferred_by_byte_cap = true;
-                if metadata_failures >= super::failure::MAX_CODEX_SOURCE_FAILURES_PER_PASS {
+                if metadata_failures >= MAX_CODEX_SOURCE_FAILURES_PER_PASS {
                     frontier_committable = false;
                     break;
                 }
                 continue;
             }
         };
-        pending.admitted(path, progress.source_deferred, progress.covered_through)?;
+        pending.admitted(progress.source_deferred, progress.covered_through)?;
         deferred_by_byte_cap |= progress.source_deferred;
         frontier_committable &= !progress.source_deferred;
         bytes_consumed = bytes_consumed.saturating_add(progress.bytes_consumed);
@@ -274,12 +276,15 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
         }
     }
     if let Some((hub, consumer)) = discovery_state {
-        for failure in hub.retained_source_failures(consumer) {
+        let retained = hub.retained_source_failures(consumer);
+        // Keep coverage partial without re-reporting unchanged permanent
+        // refusals. Pending metadata still advertises its retryable outcome.
+        deferred_by_byte_cap |= !retained.is_empty() || !failures.is_empty();
+        for failure in retained.into_iter().filter(|failure| failure.retryable) {
             if !failures.contains(&failure) {
                 failures.push(failure);
             }
         }
-        deferred_by_byte_cap |= !failures.is_empty();
     }
     let stats = drain_observation_projections(
         admission,
@@ -354,6 +359,7 @@ pub(super) async fn try_ingest_user_cursor_sessions_with_db_bounded(
     admission: &dyn HostAdmission,
     max_new_bytes: Option<u64>,
     cancellation: &ObservationCancellation,
+    sweep: &mut SourceSweep,
 ) -> Result<BoundedProviderOutcome, BoundedProviderFailure> {
     if cancellation.is_cancelled() {
         return Ok(BoundedProviderOutcome {
@@ -370,6 +376,7 @@ pub(super) async fn try_ingest_user_cursor_sessions_with_db_bounded(
                 cursor_composer::DEFAULT_COMPOSER_ENVELOPE_CAP,
                 max_new_bytes,
                 cancellation,
+                sweep,
             )
             .await
         {
@@ -391,12 +398,13 @@ pub(super) async fn try_ingest_user_cursor_sessions_with_db_bounded(
     let jsonl_skip_session_ids = composer.jsonl_skip_session_ids();
     let remaining = max_new_bytes.map(|limit| limit.saturating_sub(composer.bytes_consumed));
     let composer_outcome = BoundedProviderOutcome::from_composer(&composer);
-    let sweep = cursor::try_ingest_cursor_user_sweep_capped_with_session_ids(
+    let jsonl = cursor::try_ingest_cursor_user_sweep_capped_with_session_ids(
         &registered_roots,
         admission,
         remaining,
         jsonl_skip_session_ids,
         cancellation,
+        sweep,
     )
     .await
     .map_err(|error| BoundedProviderFailure {
@@ -406,7 +414,7 @@ pub(super) async fn try_ingest_user_cursor_sessions_with_db_bounded(
     Ok(merge_user_cursor_sweep(
         &composer,
         projected_session_ids,
-        sweep,
+        jsonl,
     ))
 }
 
@@ -430,26 +438,6 @@ pub(super) fn provider_selected(
     candidate: SessionProvider,
 ) -> bool {
     scope.is_none() || scope == Some(candidate)
-}
-
-pub async fn ingest_user_global_sources_for_provider_with_authorities<A: SessionIngestAuthority>(
-    brain_id: &BrainId,
-    profile_id: &UserProfileId,
-    registered: &A,
-    registry_db: &A,
-    profile_root: &Path,
-    provider: Option<SessionProvider>,
-) -> TranscriptIngestOutcome {
-    ingest_user_global_sources_for_provider_with_authorities_and_cancellation(
-        brain_id,
-        profile_id,
-        registered,
-        registry_db,
-        profile_root,
-        provider,
-        &ObservationCancellation::default(),
-    )
-    .await
 }
 
 pub async fn ingest_user_global_sources_for_provider_with_authorities_and_cancellation<
@@ -524,23 +512,6 @@ pub(super) async fn ingest_user_global_sources_for_provider_with_roots_and_cance
     .into_transcript_outcome()
 }
 
-#[cfg(any(test, feature = "test-helpers"))]
-pub async fn ingest_user_global_sources_for_provider_with_roots_without_registered_authority<
-    A: SessionIngestAuthority,
->(
-    _db: &A,
-    _profile_root: &Path,
-    provider: Option<SessionProvider>,
-    _roots: Vec<PathBuf>,
-) -> TranscriptIngestOutcome {
-    TranscriptIngestOutcome::new(
-        TranscriptIngestStats::default(),
-        vec![TranscriptCatchUpFailure::registered_authority_unavailable(
-            provider.map_or("all", SessionProvider::id),
-        )],
-    )
-}
-
 /// Bounded fair multi-provider user catch-up with typed coverage outcomes.
 pub async fn ingest_user_global_sources_for_provider_with_roots_bounded<
     A: SessionIngestAuthority,
@@ -612,9 +583,6 @@ async fn ingest_user_global_sources_for_provider_with_roots_bounded_inner<
             false,
         ));
     }
-    let Some(session_review) = registered.session_review() else {
-        return IngestPassOutcome::failed(TranscriptCatchUpFailure::session_review_unwired());
-    };
     let selected: Vec<SessionProvider> = USER_CATCH_UP_PROVIDERS
         .iter()
         .copied()
@@ -764,12 +732,6 @@ async fn ingest_user_global_sources_for_provider_with_roots_bounded_inner<
             usize::try_from(provider_runs.deferred_units).unwrap_or(usize::MAX),
         );
     }
-    if provider_runs.stats.messages_upserted > 0 {
-        session_review
-            .schedule(provider.map_or("all", SessionProvider::id), None)
-            .await;
-    }
-
     if matches!(coverage, IngestPassCoverage::Backpressured { .. })
         && !provider_runs
             .failures

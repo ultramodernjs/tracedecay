@@ -39,14 +39,14 @@ pub mod workflow_family;
 
 pub use bounded_search::run_bounded_search;
 pub use multi_root::handle_multi_root;
-pub(crate) use multi_root::multi_root_operation_for_tool;
+pub(crate) use multi_root::{multi_root_operation_for_tool, multi_root_tool_name};
 pub use session_authorities::SessionAuthorities;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use session_authorities::mcp_session_authorities;
 pub use support::{
-    decode_primitive_request, effective_path, generic_tool_result, json_result,
-    rendered_tool_result, require_object_args, require_positive_limit, text_tool_result, tool_json,
-    tool_json_with_md, unique_file_paths, unknown_tool_error,
+    decode_primitive_request, generic_tool_result, json_result, rendered_tool_result,
+    require_object_args, require_positive_limit, text_tool_result, tool_json, unique_file_paths,
+    unknown_tool_error,
 };
 pub use verified_read::{VerifiedGraphOpen, VerifiedGraphOpenFuture, verified_read_operation};
 pub use work::handle_work;

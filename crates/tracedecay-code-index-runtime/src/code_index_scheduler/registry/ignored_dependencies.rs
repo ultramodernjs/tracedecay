@@ -7,23 +7,26 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
 
 use tracedecay_code_index::graph_projection::CodeGraphProjectionStore;
 use tracedecay_code_index::production::{CodeIndexExecutionControlV1, CodeIndexProductionErrorV1};
 use tracedecay_domain::canonical_sha256;
 
+use super::super::control_poll;
 use super::{
     CodeIndexSchedulerRegistryV1, CodeIndexSeatParkV1, CodeIndexSeatWaitV1, PendingWakeV1,
     ServingGenerationSlot,
 };
-use crate::code_index_scheduler::graph_activation::CodeGraphActivationAuthorityV1;
+use crate::code_index_scheduler::graph_activation::{
+    CodeGraphActivationAuthorityV1, CodeGraphCatalogWarmV1,
+};
 use crate::code_index_scheduler::{
     CodeGraphReplayBindingV1, CodeIndexCadenceTriggerV1, CodeIndexIgnoredDependencyIndexOutcomeV1,
     CodeIndexIgnoredDependencyRefusalV1, CodeIndexIgnoredDependencyRequestV1,
     CodeIndexSchedulerErrorV1, DaemonCodeIndexControlV1, LatestCompleteCodeIndexV1, PendingHintsV1,
     ReconcilePassGuard,
 };
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -396,7 +399,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         request: CodeIndexIgnoredDependencyRequestV1,
         control: Arc<dyn CodeIndexExecutionControlV1 + Send + Sync + '_>,
-        deadline: tokio::time::Instant,
+        deadline: std::time::Instant,
     ) -> Result<CodeIndexIgnoredDependencyIndexOutcomeV1, CodeIndexSchedulerErrorV1> {
         let project_root = canonical_existing_identity(project_root)?;
         let flight_key = AdmissionFlightKeyV1::for_request(&request)?;
@@ -496,7 +499,7 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         project_root: &Path,
         control: &(dyn CodeIndexExecutionControlV1 + Send + Sync),
-        deadline: tokio::time::Instant,
+        deadline: std::time::Instant,
     ) -> Result<(), CodeIndexSchedulerErrorV1> {
         let demanded = &AtomicBool::new(false);
         let Ok(waited) = self
@@ -627,7 +630,7 @@ impl CodeIndexSchedulerRegistryV1 {
         let build_bridge = Arc::clone(bridge);
         let build_serving = serving.clone();
         let publication_flight = Arc::clone(&flight);
-        let mut build_task = tokio::task::spawn_blocking(move || {
+        let build_task = native_runtime::spawn_blocking(move || {
             let mut scheduler = build_scheduler
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -641,6 +644,7 @@ impl CodeIndexSchedulerRegistryV1 {
                 scheduler.code_graph_replay_binding(&build.outcome.generation_id)?;
             Ok::<_, CodeIndexSchedulerErrorV1>((build, replay_binding))
         });
+        let mut build_task = std::pin::pin!(build_task);
         let (build, replay_binding) = loop {
             bridge.refresh(control, &shutting_down);
             tokio::select! {
@@ -649,7 +653,7 @@ impl CodeIndexSchedulerRegistryV1 {
                         format!("ignored-dependency indexing task failed: {error}"),
                     ))??;
                 }
-                () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                () = control_poll() => {}
             }
         };
         // `build_and_publish` has now atomically advanced the durable active
@@ -693,10 +697,13 @@ impl CodeIndexSchedulerRegistryV1 {
             replay_binding,
         )
         .await;
-        if let Err(error) = activation {
-            request_reactivation();
-            return Err(error);
-        }
+        let catalog_warm = match activation {
+            Ok(catalog_warm) => catalog_warm,
+            Err(error) => {
+                request_reactivation();
+                return Err(error);
+            }
+        };
         *text_generation
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -712,7 +719,7 @@ impl CodeIndexSchedulerRegistryV1 {
         let swap_serving_generation_epoch = Arc::clone(&serving_generation_epoch);
         let incumbent = serving.clone();
         let candidate = build.latest.clone();
-        let swap_task = tokio::task::spawn_blocking(move || {
+        let swap_task = native_runtime::spawn_blocking(move || {
             // Durable publication already committed this candidate. Do not
             // consult request cancellation while acquiring the scheduler or
             // serving locks: this CAS must converge the live head with the
@@ -792,6 +799,10 @@ impl CodeIndexSchedulerRegistryV1 {
             project_root.to_path_buf(),
             &build.publication,
         );
+        drop((_reconcile_pass, _build_publication, _daemon_admission));
+        if let Some(catalog_warm) = catalog_warm {
+            await_catalog_warm(catalog_warm, control, &shutting_down).await;
+        }
         Ok(build.outcome)
     }
 }
@@ -855,7 +866,7 @@ async fn await_flight(
         refuse_if_interrupted(control, &active_route)?;
         tokio::select! {
             () = flight.completed.notified() => {}
-            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            () = control_poll() => {}
         }
     }
 }
@@ -868,7 +879,7 @@ async fn activate_committed_generation(
     latest: LatestCompleteCodeIndexV1,
     predecessor: Option<Arc<CodeGraphProjectionStore>>,
     replay_binding: CodeGraphReplayBindingV1,
-) -> Result<(), CodeIndexSchedulerErrorV1> {
+) -> Result<Option<CodeGraphCatalogWarmV1>, CodeIndexSchedulerErrorV1> {
     graph_activation
         .activate(
             project_id,
@@ -882,6 +893,28 @@ async fn activate_committed_generation(
         .await
 }
 
+/// Admission answers "the generation advanced, retry", and the retry reads the
+/// catalog this warm builds, so the answer waits for it. A request out of time
+/// or a worktree shutting down answers without it: the generation is already
+/// committed, and catalog reads serve once the warm settles.
+async fn await_catalog_warm(
+    catalog_warm: CodeGraphCatalogWarmV1,
+    control: &(dyn CodeIndexExecutionControlV1 + Send + Sync),
+    shutting_down: &AtomicBool,
+) {
+    let mut settled = std::pin::pin!(catalog_warm.settled());
+    loop {
+        tokio::select! {
+            () = &mut settled => return,
+            () = control_poll() => {
+                if refuse_if_interrupted(control, shutting_down).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 async fn acquire_publication_gate<'a>(
     gate: &'a tokio::sync::Mutex<()>,
     control: &(dyn CodeIndexExecutionControlV1 + Send + Sync),
@@ -891,7 +924,7 @@ async fn acquire_publication_gate<'a>(
     loop {
         tokio::select! {
             guard = &mut lock => return Ok(guard),
-            () = tokio::time::sleep(Duration::from_millis(5)) => {
+            () = control_poll() => {
                 refuse_if_interrupted(control, shutting_down)?;
             }
         }
@@ -910,7 +943,7 @@ async fn acquire_daemon_admission(
                 return permit
                     .map_err(|_| CodeIndexIgnoredDependencyRefusalV1::Cancelled.into());
             }
-            () = tokio::time::sleep(Duration::from_millis(5)) => {
+            () = control_poll() => {
                 refuse_if_interrupted(control, shutting_down)?;
             }
         }
@@ -959,5 +992,85 @@ mod flight_recovery_tests {
         flight.owner_abandoned();
         flight.publication_committed();
         assert_eq!(epoch.load(Ordering::Acquire), 1);
+    }
+}
+
+#[cfg(test)]
+mod interruption_poll_tests {
+    use super::*;
+    use std::time::Duration;
+
+    use tracedecay_runtime_core::native_runtime;
+
+    /// The gate wait reaches the control only through its poll, so this
+    /// control acts on its first check: it releases `held`, then answers
+    /// `cancel`.
+    struct OnFirstCheck {
+        held: Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
+        cancel: bool,
+    }
+
+    impl CodeIndexExecutionControlV1 for OnFirstCheck {
+        fn is_cancelled(&self) -> bool {
+            drop(
+                self.held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+            self.cancel
+        }
+
+        fn is_deadline_exceeded(&self) -> bool {
+            false
+        }
+    }
+
+    async fn gate_wait_polls_its_control() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let shutting_down = AtomicBool::new(false);
+
+        let releasing = OnFirstCheck {
+            held: Mutex::new(Some(Arc::clone(&gate).lock_owned().await)),
+            cancel: false,
+        };
+        drop(
+            acquire_publication_gate(&gate, &releasing, &shutting_down)
+                .await
+                .expect("the gate released at the first poll is taken"),
+        );
+
+        let _held = Arc::clone(&gate).lock_owned().await;
+        let cancelling = OnFirstCheck {
+            held: Mutex::new(None),
+            cancel: true,
+        };
+        let refused = acquire_publication_gate(&gate, &cancelling, &shutting_down).await;
+        assert!(
+            matches!(
+                refused,
+                Err(CodeIndexSchedulerErrorV1::IgnoredDependency(
+                    CodeIndexIgnoredDependencyRefusalV1::Cancelled
+                ))
+            ),
+            "a request cancelled while the gate is held is refused"
+        );
+    }
+
+    #[test]
+    fn a_gate_wait_off_tokio_polls_its_control() {
+        native_runtime::block_on(native_runtime::timeout(
+            Duration::from_secs(30),
+            gate_wait_polls_its_control(),
+        ))
+        .expect("process runtime")
+        .expect("the gate wait settles within its bound");
+    }
+
+    #[tokio::test]
+    async fn a_gate_wait_on_tokio_polls_its_control() {
+        native_runtime::timeout(Duration::from_secs(30), gate_wait_polls_its_control())
+            .await
+            .expect("the gate wait settles within its bound");
     }
 }

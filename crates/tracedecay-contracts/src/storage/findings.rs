@@ -43,7 +43,28 @@ const fn kind_slug(kind: DoctorStorageFindingKindV1) -> &'static str {
         DoctorStorageFindingKindV1::RetentionBacklog => "retention_backlog",
         DoctorStorageFindingKindV1::TableGrowth => "table_growth",
         DoctorStorageFindingKindV1::PendingSchemaMigration => "pending_schema_migration",
+        DoctorStorageFindingKindV1::WalCheckpointPinned => "wal_checkpoint_pinned",
     }
+}
+
+/// Report a store whose WAL checkpoint outlived its fence: `holders` names
+/// what still holds a read slot (a reader of this daemon or another process)
+/// and the WAL size. The log grows until the holder lets go, so the finding
+/// is `Degraded` with complete coverage: the writer observed it directly.
+pub fn wal_checkpoint_pinned_finding(
+    store: &StoreKeyV1,
+    holders: &str,
+) -> Result<DoctorStorageFindingV1, ApplicationContractError> {
+    let kind = DoctorStorageFindingKindV1::WalCheckpointPinned;
+    let finding = problem_finding(
+        kind,
+        store,
+        DoctorEvidenceStateV1::Degraded,
+        DoctorCoverageCompletenessV1::Complete,
+        holders,
+        "the WAL checkpoint fence expired with its read slot still held",
+    )?;
+    DoctorStorageFindingV1::new(kind, finding)
 }
 
 /// Report a store whose historical schema migrations have not completed.
@@ -102,13 +123,6 @@ pub(crate) fn truncate_at_char_boundary(value: &str, max: usize) -> String {
     tracedecay_domain::utf8_prefix_at_or_before(value, max).to_string()
 }
 
-fn coverage(
-    completeness: DoctorCoverageCompletenessV1,
-    statement: &str,
-) -> Result<DoctorCoverageStatementV1, ApplicationContractError> {
-    DoctorCoverageStatementV1::new(completeness, statement)
-}
-
 /// Map an observed retention/size problem into a non-healthy Storage finding.
 fn problem_finding(
     kind: DoctorStorageFindingKindV1,
@@ -138,24 +152,7 @@ fn problem_finding_with_evidence(
         DoctorFindingFamilyV1::Storage,
         state,
         evidence,
-        coverage(completeness, coverage_statement)?,
-    )
-}
-
-/// Map an unobservable evidence source (unsupported/denied/unknown) into a
-/// Storage finding that carries the honest non-healthy state.
-fn unobservable_finding(
-    kind: DoctorStorageFindingKindV1,
-    store: &StoreKeyV1,
-    state: DoctorEvidenceStateV1,
-    detail: &str,
-    coverage_statement: &str,
-) -> Result<DoctorFindingV1, ApplicationContractError> {
-    DoctorFindingV1::new(
-        DoctorFindingFamilyV1::Storage,
-        state,
-        vec![evidence(kind, store, detail)?],
-        coverage(DoctorCoverageCompletenessV1::Unknown, coverage_statement)?,
+        DoctorCoverageStatementV1::new(completeness, coverage_statement)?,
     )
 }
 
@@ -190,7 +187,7 @@ fn clean_finding_with_evidence(
         DoctorFindingFamilyV1::Storage,
         state,
         evidence,
-        coverage(completeness, coverage_statement)?,
+        DoctorCoverageStatementV1::new(completeness, coverage_statement)?,
     )
 }
 
@@ -270,19 +267,19 @@ pub fn table_growth_finding(
             "denied".to_string(),
             "table payload growth measurement was denied",
         ),
-        TableGrowthDoctorEvidenceV1::Unknown { store } => (
+        TableGrowthDoctorEvidenceV1::Unknown { store, reason } => (
             store,
             DoctorEvidenceStateV1::Unknown,
             DoctorCoverageCompletenessV1::Unknown,
-            "unknown".to_string(),
-            "table payload growth measurement is unavailable",
+            format!("unknown.{}", reason.as_str()),
+            reason.statement(),
         ),
     };
     let finding = DoctorFindingV1::new(
         DoctorFindingFamilyV1::Storage,
         state,
         vec![evidence(kind, store, &detail)?],
-        coverage(completeness, statement)?,
+        DoctorCoverageStatementV1::new(completeness, statement)?,
     )?;
     DoctorStorageFindingV1::new(kind, finding)
 }
@@ -351,24 +348,27 @@ pub fn over_budget_finding(
                 )?
             }
         }
-        StorageTelemetryReadV1::Unsupported { store } => unobservable_finding(
+        StorageTelemetryReadV1::Unsupported { store } => problem_finding(
             kind,
             store,
             DoctorEvidenceStateV1::Unsupported,
+            DoctorCoverageCompletenessV1::Unknown,
             "telemetry-unsupported",
             "store size telemetry unsupported on this platform",
         )?,
-        StorageTelemetryReadV1::Denied { store } => unobservable_finding(
+        StorageTelemetryReadV1::Denied { store } => problem_finding(
             kind,
             store,
             DoctorEvidenceStateV1::Denied,
+            DoctorCoverageCompletenessV1::Unknown,
             "telemetry-denied",
             "store size telemetry read denied",
         )?,
-        StorageTelemetryReadV1::Unknown { store } => unobservable_finding(
+        StorageTelemetryReadV1::Unknown { store } => problem_finding(
             kind,
             store,
             DoctorEvidenceStateV1::Unknown,
+            DoctorCoverageCompletenessV1::Unknown,
             "telemetry-unknown",
             "store size telemetry undetermined",
         )?,
@@ -583,7 +583,9 @@ mod tests {
     use super::*;
     use crate::storage::debris::{IncidentDebrisArtifactV1, IncidentDebrisScanV1};
     use crate::storage::identity::{RelativeArtifactPathV1, StorageByteSizeV1, TableNameV1};
-    use crate::storage::telemetry::{StoreSizeSampleV1, TableGrowthDoctorEvidenceV1};
+    use crate::storage::telemetry::{
+        StoreSizeSampleV1, TableGrowthDoctorEvidenceV1, TableGrowthUnavailableReasonV1,
+    };
     use tracedecay_domain::UtcMicros;
 
     fn store() -> StoreKeyV1 {
@@ -647,11 +649,18 @@ mod tests {
         assert_eq!(baseline.finding().state(), DoctorEvidenceStateV1::Partial);
         assert!(only_evidence(&baseline).contains("baseline-pending"));
 
-        let unknown =
-            table_growth_finding(&TableGrowthDoctorEvidenceV1::Unknown { store: store() })
-                .expect("unknown finding");
+        let unknown = table_growth_finding(&TableGrowthDoctorEvidenceV1::Unknown {
+            store: store(),
+            reason: TableGrowthUnavailableReasonV1::StorageCorrupt,
+        })
+        .expect("unknown finding");
         assert_eq!(unknown.finding().state(), DoctorEvidenceStateV1::Unknown);
         assert!(!only_evidence(&unknown).contains("0b"));
+        assert!(only_evidence(&unknown).ends_with("unknown.storage_corrupt"));
+        assert_eq!(
+            unknown.finding().coverage().statement(),
+            "table payload growth is unmeasured: the store reported corruption"
+        );
     }
 
     #[test]

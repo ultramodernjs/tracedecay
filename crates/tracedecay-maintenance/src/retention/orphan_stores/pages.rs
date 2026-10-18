@@ -1,9 +1,12 @@
 //! Census paging, store walks, and sweep reports for orphan-store retention.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_runtime_core::cancellation::{CancellationToken, MonotonicDeadline};
+use tracedecay_runtime_core::native_runtime;
 
 #[cfg(test)]
 use super::collection::unbounded_deadline;
@@ -158,8 +161,22 @@ pub async fn build_store_census(
     db: &RegisteredGlobalDb,
     profile_root: &Path,
 ) -> tracedecay_domain::errors::Result<Vec<StoreCensusEntry>> {
-    let projects = db.list_code_projects(usize::MAX).await?;
-    build_store_census_for_projects(db, profile_root, &projects, None)
+    let listed: Pin<
+        Box<
+            dyn Future<
+                    Output = tracedecay_domain::errors::Result<
+                        Vec<tracedecay_global_db::CodeProjectRecord>,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > = Box::pin(db.list_code_projects(usize::MAX));
+    let projects = listed.await?;
+    let census = tracedecay_runtime_core::erase_send!(
+        build_store_census_for_projects(db, profile_root, &projects, None,),
+        tracedecay_domain::errors::Result<Option<Vec<StoreCensusEntry>>>
+    );
+    census
         .await?
         .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
             message: "unbounded store census was unexpectedly interrupted".to_owned(),
@@ -222,19 +239,37 @@ async fn build_store_census_for_projects(
             Ok(Err(error)) => return Err(error),
             Err(_) => return Ok(None),
         },
-        None => db.project_registry_contexts_for_projects(projects).await?,
+        None => {
+            let contexts: Pin<
+                Box<
+                    dyn Future<
+                            Output = tracedecay_domain::errors::Result<
+                                Vec<tracedecay_global_db::ProjectRegistryContext>,
+                            >,
+                        > + Send
+                        + '_,
+                >,
+            > = Box::pin(db.project_registry_contexts_for_projects(projects));
+            contexts.await?
+        }
     };
     for context in contexts {
         if control.is_some_and(|control| control.completion().is_some()) {
             return Ok(None);
         }
         let project = &context.project;
+        // Checkout paths only: the git-common-dir alias names the repository's
+        // shared git directory, which is not a checkout that can use the store.
         let alias_roots = context
             .aliases
             .iter()
+            .filter(|alias| {
+                !alias
+                    .alias_path
+                    .starts_with(tracedecay_global_db::GIT_COMMON_DIR_ALIAS_PREFIX)
+            })
             .map(|alias| PathBuf::from(&alias.alias_path))
             .collect::<Vec<_>>();
-        let git_common_dir = project.git_common_dir.as_deref().map(PathBuf::from);
         let stores = match control {
             Some(control) => match control
                 .race(db.try_list_store_instances_for_project(&project.project_id))
@@ -245,8 +280,17 @@ async fn build_store_census_for_projects(
                 Err(_) => return Ok(None),
             },
             None => {
-                db.try_list_store_instances_for_project(&project.project_id)
-                    .await?
+                let stores: Pin<
+                    Box<
+                        dyn Future<
+                                Output = tracedecay_domain::errors::Result<
+                                    Vec<tracedecay_global_db::StoreInstanceRecord>,
+                                >,
+                            > + Send
+                            + '_,
+                    >,
+                > = Box::pin(db.try_list_store_instances_for_project(&project.project_id));
+                stores.await?
             }
         };
         for store in stores {
@@ -272,7 +316,6 @@ async fn build_store_census_for_projects(
                 canonical_root: PathBuf::from(&project.canonical_root),
                 display_root: (project.display_root != project.canonical_root)
                     .then(|| PathBuf::from(&project.display_root)),
-                git_common_dir: git_common_dir.clone(),
                 alias_roots: alias_roots.clone(),
                 manifest_readable: cheap.manifest_readable,
                 data_root,
@@ -372,7 +415,7 @@ async fn inspect_store_leaf_cheap(
     }
     let profile_root = profile_root.to_path_buf();
     let data_root = data_root.to_path_buf();
-    tokio::task::spawn_blocking(move || inspect_store_leaf_cheap_sync(&profile_root, &data_root))
+    native_runtime::spawn_blocking(move || inspect_store_leaf_cheap_sync(&profile_root, &data_root))
         .await
         .map(Some)
         .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
@@ -401,7 +444,7 @@ async fn attach_lazy_content_fences(
                 Err(_) => StoreContentFence::Unverifiable,
             }
         } else {
-            tokio::task::spawn_blocking(move || {
+            native_runtime::spawn_blocking(move || {
                 capture_store_content_fence(&profile_root, &data_root)
                     .unwrap_or(StoreContentFence::Unverifiable)
             })
@@ -638,7 +681,13 @@ pub async fn sweep_unregistered_stores(
     apply: bool,
 ) -> tracedecay_domain::errors::Result<UnregisteredStoreSweepReport> {
     let cancellation = CancellationToken::new();
-    let report = sweep_unregistered_store_page(
+    let swept: Pin<
+        Box<
+            dyn Future<Output = tracedecay_domain::errors::Result<UnregisteredStoreSweepReport>>
+                + Send
+                + '_,
+        >,
+    > = Box::pin(sweep_unregistered_store_page(
         db,
         profile_root,
         UnregisteredStoreSweepRequestV1 {
@@ -652,8 +701,8 @@ pub async fn sweep_unregistered_stores(
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
             ),
         },
-    )
-    .await?;
+    ));
+    let report = swept.await?;
     let completion_is_terminal = report.completion == UnregisteredSweepCompletionV1::Complete;
     let receipt_is_consistent = (!report.applied || apply && completion_is_terminal)
         && (completion_is_terminal || report.next_cursor.is_none())

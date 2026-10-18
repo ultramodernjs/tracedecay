@@ -85,6 +85,18 @@ pub trait PhysicalRuntimeAttachment: Send + Sync {
         Err("physical runtime has no opened SQLite file identity".to_owned())
     }
 
+    /// Whether the file was unlinked or replaced under this attachment, which
+    /// then closed every handle on it.
+    fn file_lost(&self) -> bool {
+        false
+    }
+
+    /// Whether a lost file has no open connection left. A registry must not
+    /// publish a successor runtime for the key while this is false.
+    fn lost_file_closed(&self) -> bool {
+        true
+    }
+
     /// Stops admission and drains writer/read work. Returning success promises
     /// that a following snapshot has no writer, readers, or queued work.
     fn drain(&self) -> Result<(), String>;
@@ -117,10 +129,11 @@ pub trait PhysicalRuntimeAttachment: Send + Sync {
     /// and before commit; no SQL or path crosses this port.
     fn run_bounded_incremental_compaction<'a>(
         &'a self,
+        cx: &'a asupersync::Cx,
         max_pages: u32,
         authority: Arc<dyn tracedecay_rusqlite_runtime::RuntimeWriteAuthority>,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreRuntimeRegistryFailure>> + Send + 'a>> {
-        let _ = (max_pages, authority);
+        let _ = (cx, max_pages, authority);
         Box::pin(async {
             Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
                 operation: "run bounded incremental compaction",
@@ -131,6 +144,7 @@ pub trait PhysicalRuntimeAttachment: Send + Sync {
 
     fn run_checkpoint<'a>(
         &'a self,
+        cx: &'a asupersync::Cx,
         request: tracedecay_rusqlite_runtime::CheckpointRequest,
         authority: Arc<dyn tracedecay_rusqlite_runtime::RuntimeWriteAuthority>,
     ) -> Pin<
@@ -144,7 +158,7 @@ pub trait PhysicalRuntimeAttachment: Send + Sync {
                 + 'a,
         >,
     > {
-        let _ = (request, authority);
+        let _ = (cx, request, authority);
         Box::pin(async {
             Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
                 operation: "run checkpoint",
@@ -155,6 +169,7 @@ pub trait PhysicalRuntimeAttachment: Send + Sync {
 
     fn dispatch_submit<'a>(
         &'a self,
+        cx: &'a asupersync::Cx,
         request: RuntimeSubmitRequestV1,
         probe: Arc<dyn RuntimeRequestProbeV1>,
         authority: Arc<dyn tracedecay_rusqlite_runtime::RuntimeWriteAuthority>,
@@ -165,7 +180,7 @@ pub trait PhysicalRuntimeAttachment: Send + Sync {
                 + 'a,
         >,
     > {
-        let _ = (request, probe, authority);
+        let _ = (cx, request, probe, authority);
         Box::pin(async {
             Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
                 operation: "dispatch submit",
@@ -177,12 +192,20 @@ pub trait PhysicalRuntimeAttachment: Send + Sync {
     fn dispatch_read(
         &self,
         request: RuntimeReadRequestV1,
-        probe: &dyn RuntimeRequestProbeV1,
-    ) -> Result<RuntimeReadOutcomeV1, StoreRuntimeRegistryFailure> {
+        probe: Arc<dyn RuntimeRequestProbeV1>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<RuntimeReadOutcomeV1, StoreRuntimeRegistryFailure>>
+                + Send
+                + '_,
+        >,
+    > {
         let _ = (request, probe);
-        Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-            operation: "dispatch read",
-            message: "physical runtime has no read data port".to_owned(),
+        Box::pin(async {
+            Err(StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
+                operation: "dispatch read",
+                message: "physical runtime has no read data port".to_owned(),
+            })
         })
     }
 }

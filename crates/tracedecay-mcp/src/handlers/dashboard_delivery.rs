@@ -86,10 +86,11 @@ impl DashboardDeliveryReadAdapter {
         else {
             return ProjectDeliveryReadOutcomeV1::Unavailable;
         };
-        let Some((context, release_control)) = request_context(
-            &control,
-            access,
+        let Some((context, release_control)) = request_context_from_parts_with_deadline(
+            control.request_id(),
+            control.cancellation(),
             authorization_observed_at,
+            access,
             expires_at,
             request_deadline,
         ) else {
@@ -145,14 +146,14 @@ async fn live_expected_head_commit_id(
         cancel: Some(cancellation),
         ..GitQueryBounds::default()
     };
-    let mut worker = tokio::task::spawn_blocking(move || {
+    let worker = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         authority.read(&selected_scope, &GitReadRequestV1::Status, &bounds)
     });
     let cancellation_signal = control.cancellation().clone();
     let outcome = tokio::select! {
         biased;
         () = cancellation_signal.cancelled() => return None,
-        outcome = &mut worker => outcome.ok()?,
+        outcome = worker => outcome.ok()?,
     };
     let GitReadOutcomeV1::Complete {
         scope: returned_scope,
@@ -267,23 +268,6 @@ impl DashboardDeliveryReadPortV1 for DashboardDeliveryReadAdapter {
     ) -> DashboardProximityAttentionReadFutureV1<'_> {
         Box::pin(async move { self.read_proximity(control, project).await })
     }
-}
-
-fn request_context(
-    control: &DashboardHttpRequestControlV1,
-    access: tracedecay_application::source_authorization::ProjectSourceAccessSnapshot,
-    issued_at: tracedecay_domain::UtcMicros,
-    expires_at: tracedecay_domain::UtcMicros,
-    release_deadline: Instant,
-) -> Option<(RequestContext, GitHubReleaseReadControlV1)> {
-    request_context_from_parts_with_deadline(
-        control.request_id(),
-        control.cancellation(),
-        issued_at,
-        access,
-        expires_at,
-        release_deadline,
-    )
 }
 
 #[cfg(test)]

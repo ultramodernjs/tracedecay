@@ -1,12 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracedecay_domain::{BrainId, ProjectId, UserProfileId, UtcMicros};
+use tracedecay_domain::{BrainId, ProjectId, UserProfileId};
 use tracedecay_store::{
-    RuntimeLeaseIdV1, RuntimeLeaseV1, RuntimeMaintenanceStateV1, RuntimePublicationIdV1,
-    StoreAuthorityEpochV1, StoreClientIdV1, StoreIncarnationV1, StoreRuntimeBindingV1,
-    StoreRuntimeRegistryPublicationV1, StoreShardIdV1, VerifiedStoreLocatorV1,
-    canonical_store_locator_digest,
+    RuntimeMaintenanceStateV1, RuntimePublicationIdV1, StoreAuthorityEpochV1, StoreIncarnationV1,
+    StoreRuntimeBindingV1, StoreRuntimeRegistryPublicationV1, StoreShardIdV1,
+    VerifiedStoreLocatorV1, canonical_store_locator_digest,
 };
 
 use super::*;
@@ -189,7 +188,12 @@ fn project_shard(project: &str) -> StoreShardIdV1 {
 }
 
 fn registry() -> StoreRuntimeRegistry {
-    StoreRuntimeRegistry::new(Arc::new(UnusedResolver), Arc::new(UnusedPublisher))
+    StoreRuntimeRegistry::new(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        Arc::new(UnusedResolver),
+        Arc::new(UnusedPublisher),
+    )
+    .unwrap()
 }
 
 fn authority(root: &std::path::Path, name: &str) -> DatabaseAuthority {
@@ -329,7 +333,7 @@ fn stale_owner_target(
     )
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn paired_graph_owner_target_reserves_and_restores_with_the_database_owner() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
@@ -398,7 +402,7 @@ async fn paired_graph_owner_target_reserves_and_restores_with_the_database_owner
     drop(graph_owner);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn two_exact_owner_targets_survive_blocked_and_cancelled_retries() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
@@ -566,18 +570,8 @@ async fn two_exact_owner_targets_survive_blocked_and_cancelled_retries() {
     drop(second_graph_owner);
 }
 
-fn active_lease(binding: &StoreRuntimeBindingV1, lease_id: &str) -> RuntimeLeaseV1 {
-    RuntimeLeaseV1 {
-        lease_id: RuntimeLeaseIdV1::new(lease_id).unwrap(),
-        binding: binding.clone(),
-        holder: StoreClientIdV1::new("retirement-fixture-client").unwrap(),
-        acquired_at: UtcMicros(0),
-        expires_at: UtcMicros(i64::MAX),
-    }
-}
-
-#[test]
-fn preflight_is_all_or_none_and_foreign_identity_never_transitions_the_live_entry() {
+#[asupersync::test]
+async fn preflight_is_all_or_none_and_foreign_identity_never_transitions_the_live_entry() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let initial_authority = authority(directory.path(), "first");
@@ -618,8 +612,8 @@ fn preflight_is_all_or_none_and_foreign_identity_never_transitions_the_live_entr
     drop(lease);
 }
 
-#[test]
-fn owner_preflight_failure_rolls_back_every_target_before_committing_any() {
+#[asupersync::test]
+async fn owner_preflight_failure_rolls_back_every_target_before_committing_any() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let first_authority = authority(directory.path(), "preflight-first");
@@ -668,8 +662,8 @@ fn owner_preflight_failure_rolls_back_every_target_before_committing_any() {
     ));
 }
 
-#[test]
-fn stale_foreign_owner_identity_cannot_reclassify_the_canonical_attachment() {
+#[asupersync::test]
+async fn stale_foreign_owner_identity_cannot_reclassify_the_canonical_attachment() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let authority = authority(directory.path(), "foreign-owner");
@@ -695,8 +689,8 @@ fn stale_foreign_owner_identity_cannot_reclassify_the_canonical_attachment() {
     ));
 }
 
-#[test]
-fn owner_commit_failure_is_terminal_truth_for_the_entire_batch() {
+#[asupersync::test]
+async fn owner_commit_failure_is_terminal_truth_for_the_entire_batch() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let first_authority = authority(directory.path(), "commit-first");
@@ -748,8 +742,8 @@ fn owner_commit_failure_is_terminal_truth_for_the_entire_batch() {
     ));
 }
 
-#[test]
-fn client_clone_and_direct_runtime_lease_block_then_release_for_retry() {
+#[asupersync::test]
+async fn client_clones_and_independent_clients_block_then_release_for_retry() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let authority = authority(directory.path(), "client-and-direct");
@@ -762,29 +756,20 @@ fn client_clone_and_direct_runtime_lease_block_then_release_for_retry() {
     let first = owner.issue_client_lease().unwrap();
     let first_clone = first.clone();
     let second = owner.issue_client_lease().unwrap();
-    let direct = active_lease(&binding, "retirement.direct-lease");
-    assert!(matches!(
-        registry.acquire_lease(direct.clone()),
-        super::super::StoreRuntimeLeaseAcquireResult::Acquired(_)
-    ));
 
     let blocked = registry.reserve_retirement_batch(vec![target(&binding, &owner)]);
     assert!(matches!(
         blocked,
         StoreRuntimeRetirementResult::Blocked(refusal)
-            if refusal.blockers().iter().any(|blocker| matches!(
-                blocker,
-                StoreRuntimeRetirementBlocker::ClientLeases { count: 2, .. }
-            )) && refusal.blockers().iter().any(|blocker| matches!(
-                blocker,
-                StoreRuntimeRetirementBlocker::RuntimeLeases { count: 1, .. }
-            ))
+            if matches!(
+                refusal.blockers(),
+                [StoreRuntimeRetirementBlocker::ClientLeases { count: 2, .. }]
+            )
     ));
 
     drop(first);
     drop(first_clone);
     drop(second);
-    assert!(registry.release_lease(&binding, &direct.lease_id));
     let StoreRuntimeRetirementResult::Reserved(reservation) =
         registry.reserve_retirement_batch(vec![target(&binding, &owner)])
     else {
@@ -793,8 +778,8 @@ fn client_clone_and_direct_runtime_lease_block_then_release_for_retry() {
     drop(reservation);
 }
 
-#[test]
-fn independently_attached_database_facade_blocks_retirement() {
+#[asupersync::test]
+async fn independently_attached_database_facade_blocks_retirement() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let authority = authority(directory.path(), "database-facade");
@@ -829,8 +814,8 @@ fn independently_attached_database_facade_blocks_retirement() {
     drop(reservation);
 }
 
-#[test]
-fn operation_profile_and_graph_leases_block_and_dropping_reservation_restores_ready() {
+#[asupersync::test]
+async fn operation_profile_and_graph_leases_block_and_dropping_reservation_restores_ready() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let authority = authority(directory.path(), "operation-profile-graph");
@@ -888,10 +873,8 @@ fn operation_profile_and_graph_leases_block_and_dropping_reservation_restores_re
         panic!("dropping every blocker must reserve the exact entry");
     };
     assert!(matches!(
-        registry.acquire_lease(active_lease(&binding, "retirement.retiring")),
-        super::super::StoreRuntimeLeaseAcquireResult::Rejected(
-            StoreRuntimeRegistryFailure::RuntimeRetirementInProgress { .. }
-        )
+        registry.lookup(&binding),
+        StoreRuntimeLookup::Retiring { .. }
     ));
     assert!(matches!(
         registry.profile_authority_pin(&binding.shard_id),
@@ -913,8 +896,8 @@ fn operation_profile_and_graph_leases_block_and_dropping_reservation_restores_re
     drop(lease);
 }
 
-#[test]
-fn postcommit_drain_failure_is_faulted_and_never_restored_to_ready() {
+#[asupersync::test]
+async fn postcommit_drain_failure_is_faulted_and_never_restored_to_ready() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let authority = authority(directory.path(), "fault");
@@ -940,8 +923,8 @@ fn postcommit_drain_failure_is_faulted_and_never_restored_to_ready() {
     ));
 }
 
-#[test]
-fn postcommit_irreversible_close_failure_is_durability_uncertain() {
+#[asupersync::test]
+async fn postcommit_irreversible_close_failure_is_durability_uncertain() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();
     let authority = authority(directory.path(), "close-fault");
@@ -967,8 +950,8 @@ fn postcommit_irreversible_close_failure_is_durability_uncertain() {
     ));
 }
 
-#[test]
-fn reservations_are_one_shot_after_commit_or_cancellation() {
+#[asupersync::test]
+async fn reservations_are_one_shot_after_commit_or_cancellation() {
     let directory = tempfile::tempdir().unwrap();
 
     let committed_registry = registry();
@@ -1021,7 +1004,7 @@ fn reservations_are_one_shot_after_commit_or_cancellation() {
     ));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn retain_rejects_retiring_project_without_waiting_for_resolution() {
     let directory = tempfile::tempdir().unwrap();
     let registry = registry();

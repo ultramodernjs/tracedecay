@@ -30,9 +30,6 @@ export function resolveSubject(
   inspectedId: string | null,
   selectedId: string | null,
   defaultSessionId: string | null,
-  /** Whether the selected id names a session the reading still holds. A
-   * selection can outlive a refetch; the wording must not call that a fold. */
-  selectedInReading: boolean = true,
 ): InspectorSubject {
   const byId = new Map(model.marks.map((mark) => [mark.id, mark]));
   const inspected = inspectedId === null ? undefined : byId.get(inspectedId);
@@ -42,13 +39,9 @@ export function resolveSubject(
   const selected = selectedId === null ? undefined : byId.get(selectedId);
   if (selected && selected.kind === 'session') return { kind: 'session', mark: selected, mode: 'selected' };
   if (selectedId !== null && selected === undefined) {
-    // Selected, but not drawn. Either the reading still holds it and a bundle
-    // or the depth limit folded it, or a refetch dropped it altogether.
     return {
       kind: 'none',
-      detail: selectedInReading
-        ? 'the selected session is folded out of the field; open its bundle or generation to inspect it'
-        : 'the selected session is no longer in the reading; clear the selection or select a drawn session',
+      detail: 'the selected session is folded out of the field; open its bundle or generation to inspect it',
     };
   }
   const fallback =
@@ -76,7 +69,7 @@ function subjectFor(mark: TopologyMark, mode: 'inspecting'): InspectorSubject {
 
 /** The delegation that brought a session into being, graded by what the
  * store could establish about it. */
-export type IncomingDelegation =
+type IncomingDelegation =
   | {
       readonly kind: 'root';
       readonly grade: EvidenceGradeKind;
@@ -157,7 +150,7 @@ export function incomingDelegation(
 }
 
 /** One delegation out of the subject, to a drawn child or a drawn bundle. */
-export interface OutgoingDelegation {
+interface OutgoingDelegation {
   readonly to: TopologyMark;
   readonly toolUseId: string | null;
 }
@@ -182,7 +175,7 @@ export function outgoingDelegations(
  * hooks names this session" is a statement about twenty hooks and not about
  * the session's history. The join is on identity and nothing else.
  */
-export interface SessionHooks {
+interface SessionHooks {
   readonly matched: readonly AnalyticsRecentHookV1[];
   readonly served: number;
   readonly truncated: boolean;

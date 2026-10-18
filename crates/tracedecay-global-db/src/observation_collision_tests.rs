@@ -722,7 +722,7 @@ async fn provenance_rows(runtime: &HostAdmissionTestRuntimeV1) -> Vec<Provenance
 /// cursor converges past the colliding record and the refusal lands in the
 /// `source_cursor_advances` ledger with the typed
 /// `observation_identity_collision` reason.
-#[tokio::test]
+#[asupersync::test]
 async fn identity_collision_records_durable_typed_coverage() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -817,7 +817,7 @@ async fn identity_collision_records_durable_typed_coverage() {
 /// alternate identity then owns the ordinary exact-CAS write; if it persists,
 /// the primary candidate was never a terminal refusal and therefore must not
 /// leave refusal or coverage state behind.
-#[tokio::test]
+#[asupersync::test]
 async fn retryable_primary_collision_leaves_frontier_for_positional_fallback() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -937,7 +937,7 @@ async fn retryable_primary_collision_leaves_frontier_for_positional_fallback() {
     assert_eq!(table_count(&runtime, "observations").await, 2);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn exhausted_positional_fallback_settles_terminal_collision_coverage() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1051,7 +1051,7 @@ async fn exhausted_positional_fallback_settles_terminal_collision_coverage() {
 /// the same typed error without accessing the retained observation row and
 /// without any point-read runtime dispatches: the bounded preflight snapshot
 /// supplies the refusal, retained identity, and source-cursor authorities.
-#[tokio::test]
+#[asupersync::test]
 async fn re_admitted_identity_collision_uses_marker_without_retained_row_access() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1179,7 +1179,7 @@ async fn re_admitted_identity_collision_uses_marker_without_retained_row_access(
 /// cursor-transition authority accepts that shape when the FileBytes range
 /// restarts at zero, so collision refusal must commit the same terminal
 /// coverage and keep later re-admission on the zero-record-work fast path.
-#[tokio::test]
+#[asupersync::test]
 async fn replacement_domain_collision_records_terminal_coverage_without_rework() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1281,7 +1281,7 @@ async fn replacement_domain_collision_records_terminal_coverage_without_rework()
 /// checkpoint advances, the queue drains, replay is an exact duplicate,
 /// while the real pre-existing output stays durable and no partial
 /// replacement output rows leak.
-#[tokio::test]
+#[asupersync::test]
 async fn drain_provenance_collision_with_existing_output_converges_to_durable_skip() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1444,7 +1444,7 @@ async fn drain_provenance_collision_with_existing_output_converges_to_durable_sk
 /// message row is corrupt authority, not an existing-output
 /// collision. It must stay a hard `ProvenanceCollision`: the checkpoint and
 /// queue remain in place and the ghost provenance row is not deleted.
-#[tokio::test]
+#[asupersync::test]
 async fn drain_keeps_ghost_provenance_binding_a_hard_error() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1670,7 +1670,7 @@ async fn run_catch_up_pass(
 /// the cursor is a retryable cursor race, not proof that the candidate itself
 /// is permanently invalid. With no matching refusal terminal, the loser must
 /// leave every coverage ledger untouched and retry from the winning cursor.
-#[tokio::test]
+#[asupersync::test]
 async fn covered_collision_without_a_terminal_is_a_retryable_cursor_conflict() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1732,7 +1732,7 @@ async fn covered_collision_without_a_terminal_is_a_retryable_cursor_conflict() {
 /// A colliding candidate whose expected cursor does not match the durable one
 /// has not established a terminal content refusal. It must surface the typed
 /// retryable cursor conflict and never record coverage.
-#[tokio::test]
+#[asupersync::test]
 async fn stale_expected_cursor_collision_is_a_retryable_cursor_conflict() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1805,8 +1805,8 @@ async fn stale_expected_cursor_collision_is_a_retryable_cursor_conflict() {
 /// enters the canonical writer lane. If the winner advances that cursor while
 /// the collision loser is waiting for the refusal transaction, the loser has
 /// lost a CAS; it has not established a permanent content refusal.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refusal_cursor_cas_loser_is_retryable_and_writes_no_terminal() {
+#[asupersync::test(flavor = "multi_thread", workers = 2)]
+async fn refusal_cursor_cas_loser_is_retryable_and_writes_no_terminal(cx: &asupersync::Cx) {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
         .await
@@ -1848,12 +1848,18 @@ async fn refusal_cursor_cas_loser_is_retryable_and_writes_no_terminal() {
         .expect("registered profile database");
     let winner = database.begin_write_transaction().await.unwrap();
     let losing_store = store.clone();
-    let mut losing_write =
-        tokio::spawn(async move { losing_store.persist_observation(rewritten_write).await });
+    let mut losing_write = cx
+        .spawn(move |_| async move { losing_store.persist_observation(rewritten_write).await })
+        .expect("spawn losing write");
+    let mut losing_write = std::pin::pin!(losing_write.join(cx));
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut losing_write)
-            .await
-            .is_err(),
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_millis(100),
+            &mut losing_write
+        )
+        .await
+        .is_err(),
         "the loser must wait behind the held writer lane"
     );
 
@@ -1910,7 +1916,7 @@ async fn refusal_cursor_cas_loser_is_retryable_and_writes_no_terminal() {
 /// FileBytes replacement generations must restart at zero. The canonical
 /// observation-write contract rejects a mid-file replacement before it can
 /// reach persistence, so no refusal, coverage, or cursor mutation can occur.
-#[tokio::test]
+#[asupersync::test]
 async fn file_bytes_generation_jump_is_rejected_before_persistence() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1982,7 +1988,7 @@ async fn file_bytes_generation_jump_is_rejected_before_persistence() {
 
 /// The refusal CAS compares typed cursor authority. JSON whitespace is not
 /// part of that authority and must not prevent atomic coverage.
-#[tokio::test]
+#[asupersync::test]
 async fn refusal_cas_accepts_equivalent_cursor_json_spelling() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -2157,7 +2163,7 @@ fn codex_revision_observation(
 /// canonical payload revision replay must still converge as
 /// `CoveredDuplicate`. The terminal is bound to the exact refused candidate
 /// digest, so it can never blanket-reject every differing digest.
-#[tokio::test]
+#[asupersync::test]
 async fn canonical_payload_revision_replay_survives_an_earlier_refusal() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -2255,7 +2261,7 @@ async fn canonical_payload_revision_replay_survives_an_earlier_refusal() {
 /// marker with unconverged coverage. That orphan must be self-repairing: the
 /// next frontier pass answers from the marker AND repairs coverage, so the
 /// record is reopened at most once and never again.
-#[tokio::test]
+#[asupersync::test]
 async fn orphaned_refusal_marker_repairs_coverage_on_the_next_frontier_pass() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -2656,12 +2662,11 @@ async fn run_vibe_trigger(
         ObservationScopeV1::Profile,
         None,
         &tracedecay_sessions::observation::ObservationCancellation::default(),
-        None,
     )
     .await
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn retained_duplicate_rescan_restores_native_jsonl_frontier() {
     use std::io::Write;
 
@@ -2755,7 +2760,7 @@ async fn retained_duplicate_rescan_restores_native_jsonl_frontier() {
 /// A rewritten EOF record collides once; the global-db transaction records the
 /// refusal and cursor together. Retention, another file generation, the next
 /// trigger, and a full store restart must never rematerialize that record.
-#[tokio::test]
+#[asupersync::test]
 async fn vibe_jsonl_eof_refusal_survives_retention_generation_and_restart_without_rework() {
     use crate::observation::retention::{ObservationRetentionConfig, RetentionMode};
 
@@ -2941,7 +2946,7 @@ async fn vibe_jsonl_eof_refusal_survives_retention_generation_and_restart_withou
 /// must leave NO visible refusal marker (no orphan), no cursor movement, and
 /// the injected row untouched; clearing the conflict lets the next frontier
 /// pass record marker + coverage together.
-#[tokio::test]
+#[asupersync::test]
 async fn failed_coverage_advance_leaves_no_visible_refusal_marker() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -3108,7 +3113,7 @@ async fn failed_coverage_advance_leaves_no_visible_refusal_marker() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn covered_frontier_keeps_the_first_reason_when_a_second_owner_advances() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -3174,7 +3179,7 @@ async fn covered_frontier_keeps_the_first_reason_when_a_second_owner_advances() 
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn runtime_cursor_replay_preserves_structured_ledger_disagreement() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -3249,7 +3254,7 @@ async fn runtime_cursor_replay_preserves_structured_ledger_disagreement() {
     ));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn covered_cursor_without_a_ledger_row_is_already_owned() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -3285,8 +3290,8 @@ async fn covered_cursor_without_a_ledger_row_is_already_owned() {
     );
 }
 
-#[tokio::test]
-async fn concurrent_cursor_owners_with_different_reasons_share_one_frontier() {
+#[asupersync::test]
+async fn concurrent_cursor_owners_with_different_reasons_share_one_frontier(cx: &asupersync::Cx) {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
         .await
@@ -3332,19 +3337,32 @@ async fn concurrent_cursor_owners_with_different_reasons_share_one_frontier() {
     let gate = database.begin_write_transaction().await.unwrap();
     let left_store = store.clone();
     let right_store = store.clone();
-    let mut left_task = tokio::spawn(async move { left_store.advance_source_cursor(blank).await });
-    let mut right_task =
-        tokio::spawn(async move { right_store.advance_source_cursor(out_of_scope).await });
+    let mut left_task = cx
+        .spawn(move |_| async move { left_store.advance_source_cursor(blank).await })
+        .expect("spawn blank-frame owner");
+    let mut right_task = cx
+        .spawn(move |_| async move { right_store.advance_source_cursor(out_of_scope).await })
+        .expect("spawn out-of-scope owner");
+    let mut left_task = std::pin::pin!(left_task.join(cx));
+    let mut right_task = std::pin::pin!(right_task.join(cx));
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut left_task)
-            .await
-            .is_err(),
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_millis(200),
+            &mut left_task
+        )
+        .await
+        .is_err(),
         "the blank-frame owner must wait behind the held writer"
     );
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut right_task)
-            .await
-            .is_err(),
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_millis(200),
+            &mut right_task
+        )
+        .await
+        .is_err(),
         "the out-of-scope owner must wait behind the held writer"
     );
     gate.rollback().await.unwrap();
@@ -3430,8 +3448,8 @@ async fn rewind_source_cursor(
 /// what wedges retained ingest. The durable cursor already sits exactly at
 /// `next_cursor`, so the coverage is applied and the replay is a duplicate.
 /// A conflict whose ledger already records this coverage restores the cursor.
-/// A missing ledger row stays a collision.
-#[tokio::test]
+/// A pruned ledger row is recorded again from the durable cursor.
+#[asupersync::test]
 async fn already_positioned_cursor_replay_with_new_command_bytes_is_a_duplicate() {
     const FILE_IDENTITY: u64 = 41;
 
@@ -3529,7 +3547,7 @@ async fn already_positioned_cursor_replay_with_new_command_bytes_is_a_duplicate(
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn runtime_cursor_replay_preserves_storage_failure() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -3604,7 +3622,7 @@ async fn runtime_cursor_replay_preserves_storage_failure() {
 /// existing-output collision. It must stay a hard `ProvenanceCollision` with
 /// the queue item retained and the checkpoint unmoved; only a row binding a
 /// DIFFERENT output converges to the durable skip.
-#[tokio::test]
+#[asupersync::test]
 async fn drain_keeps_corrupt_provenance_with_matching_output_a_hard_error() {
     // Learn the derived output binding from a clean drain of the identical
     // fixture in a scratch store (the derivation is deterministic).
@@ -3838,7 +3856,7 @@ async fn drain_keeps_corrupt_provenance_with_matching_output_a_hard_error() {
 /// durable skip. Divergent durable workflow-fact state is corrupt authority,
 /// not an output collision, it must stay a hard `ProvenanceCollision` error
 /// with the queue item retained and the checkpoint unmoved.
-#[tokio::test]
+#[asupersync::test]
 async fn drain_keeps_divergent_workflow_fact_state_a_hard_error() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -3943,4 +3961,312 @@ async fn drain_keeps_divergent_workflow_fact_state_a_hard_error() {
         store.projection_checkpoint().await.unwrap().last_sequence(),
         0
     );
+}
+
+fn file_bytes_advance(
+    observation: &DurableObservationV1,
+    expected: Option<&ObservationCursorAdvance>,
+    range: (u64, u64),
+    reason: ObservationCoverageReason,
+) -> ObservationCursorAdvance {
+    ObservationCursorAdvance::for_ordering(
+        observation.source().clone(),
+        observation.scope().clone(),
+        observation.identity().generation(),
+        ObservationOrderingDomainV1::FileBytes,
+        expected.map(|advance| advance.next_cursor().clone()),
+        ObservationSourceRangeV1::new(range.0, range.1).unwrap(),
+        reason,
+    )
+    .unwrap()
+}
+
+/// Admits `[0, 5)`, `[5, 10)` and `[10, 20)`, so the durable cursor sits two
+/// advances past `[5, 10)` and that range's ledger row is already pruned.
+async fn admitted_three_ranges(
+    name: &str,
+) -> (
+    TempDir,
+    HostAdmissionTestRuntimeV1,
+    DurableObservationV1,
+    [ObservationCursorAdvance; 3],
+) {
+    let tmp = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+        .await
+        .unwrap();
+    let store = runtime
+        .observation_store(HostAdmissionScope::Profile)
+        .unwrap();
+    let session_id = SessionId::new(format!("session.{name}")).unwrap();
+    let (observation, _) = collision_candidate(
+        &session_id,
+        &format!("record.{name}"),
+        1,
+        "admitted ranges fixture",
+        &format!("receipt.{name}"),
+        None,
+    );
+    let first = file_bytes_advance(
+        &observation,
+        None,
+        (0, 5),
+        ObservationCoverageReason::BlankFrame,
+    );
+    let second = file_bytes_advance(
+        &observation,
+        Some(&first),
+        (5, 10),
+        ObservationCoverageReason::OutOfScope,
+    );
+    let third = file_bytes_advance(
+        &observation,
+        Some(&second),
+        (10, 20),
+        ObservationCoverageReason::BlankFrame,
+    );
+    for advance in [&first, &second, &third] {
+        assert_eq!(
+            store.advance_source_cursor(advance.clone()).await.unwrap(),
+            CursorAdvanceOutcome::Committed
+        );
+    }
+    (tmp, runtime, observation, [first, second, third])
+}
+
+/// Issue #4012: a rescan that resumes more than one advance behind the
+/// admitted frontier replays a coverage whose runtime receipt is committed
+/// and whose ledger row was pruned. That failed every pass with a
+/// non-retryable `observation_cursor_advance_collision`, and the cursor never
+/// moved again.
+#[asupersync::test]
+async fn rescan_behind_a_pruned_ledger_row_reconciles_from_the_durable_cursor() {
+    let (_tmp, runtime, observation, [first, second, _]) =
+        admitted_three_ranges("rescan-pruned-row").await;
+    let store = runtime
+        .observation_store(HostAdmissionScope::Profile)
+        .unwrap();
+    rewind_source_cursor(&runtime, first.next_cursor()).await;
+    let rescan = file_bytes_advance(
+        &observation,
+        Some(&first),
+        (5, 10),
+        ObservationCoverageReason::BlankFrame,
+    );
+    assert_eq!(rescan.coverage(), second.coverage());
+
+    assert_eq!(
+        store.advance_source_cursor(rescan.clone()).await.unwrap(),
+        CursorAdvanceOutcome::Committed,
+        "the rescan must advance from the durable cursor"
+    );
+    assert_eq!(
+        store.advance_source_cursor(rescan.clone()).await.unwrap(),
+        CursorAdvanceOutcome::ExactDuplicate,
+        "the next pass finds the range owned"
+    );
+    assert_eq!(
+        store
+            .get_source_cursor(observation.source(), observation.scope())
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(rescan.next_cursor())
+    );
+}
+
+/// The same rescan with the original command bytes is an exact runtime
+/// replay. Reporting it as a duplicate left the cursor behind, so the next
+/// advance lost its compare-and-swap on every pass.
+#[asupersync::test]
+async fn exact_replay_behind_the_frontier_moves_the_cursor() {
+    let (_tmp, runtime, observation, [first, second, _]) =
+        admitted_three_ranges("rescan-exact-replay").await;
+    let store = runtime
+        .observation_store(HostAdmissionScope::Profile)
+        .unwrap();
+    rewind_source_cursor(&runtime, first.next_cursor()).await;
+
+    store.advance_source_cursor(second.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .get_source_cursor(observation.source(), observation.scope())
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(second.next_cursor())
+    );
+}
+
+/// A rescan behind a retained ledger row that names another reason is the
+/// runtime write path's typed ledger disagreement, not an anonymous
+/// collision.
+#[asupersync::test]
+async fn rescan_behind_a_retained_row_reports_the_ledger_disagreement() {
+    let (_tmp, runtime, observation, [_, second, third]) =
+        admitted_three_ranges("rescan-retained-row").await;
+    let store = runtime
+        .observation_store(HostAdmissionScope::Profile)
+        .unwrap();
+    rewind_source_cursor(&runtime, second.next_cursor()).await;
+    let rescan = file_bytes_advance(
+        &observation,
+        Some(&second),
+        (10, 20),
+        ObservationCoverageReason::OutOfScope,
+    );
+    assert_eq!(rescan.coverage(), third.coverage());
+
+    let error = store.advance_source_cursor(rescan).await.unwrap_err();
+    let ObservationStoreError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
+        panic!("a retained row with another reason is a ledger disagreement, got {error:?}");
+    };
+    assert!(matches!(
+        disagreement.stored().reason(),
+        CursorAdvanceLedgerReasonV1::Known(ObservationCoverageReason::BlankFrame)
+    ));
+    assert!(matches!(
+        disagreement.candidate().reason(),
+        CursorAdvanceLedgerReasonV1::Known(ObservationCoverageReason::OutOfScope)
+    ));
+}
+
+/// Output ownership is durable provenance, read fresh by every projection.
+///
+/// Retiring a quarantined projection removes the output the observation
+/// created and its provenance through the same writer connection that
+/// projects (`retire_quarantined_projection`). The next observation of that
+/// output must then create it, exactly as it would on a freshly opened store,
+/// instead of acting on ownership the writer remembered from before.
+#[asupersync::test]
+async fn retired_output_is_created_by_the_next_observation_of_it() {
+    let tmp = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+        .await
+        .unwrap();
+    let store = runtime
+        .observation_store(HostAdmissionScope::Profile)
+        .unwrap();
+    let session_id = SessionId::new("session.retired-output-owner").unwrap();
+    let record_id = "record.retired-output-owner";
+    let output_message_id = format!("message.{record_id}");
+    let (first, write) = collision_candidate(
+        &session_id,
+        record_id,
+        1,
+        "first rendering",
+        "receipt.retired-output-owner.first",
+        None,
+    );
+    store.persist_observation(write).await.unwrap();
+    assert!(matches!(
+        store
+            .project_observation(first.observation_id())
+            .await
+            .unwrap(),
+        ProjectionPersistOutcome::Projected(_)
+    ));
+
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .expect("registered profile database");
+    let transaction = database.begin_write_transaction().await.unwrap();
+    transaction
+        .execute(
+            "DELETE FROM lcm_raw_messages WHERE provider = ?1 AND message_id = ?2",
+            params![COLLISION_PROVIDER, output_message_id.as_str()],
+        )
+        .await
+        .unwrap();
+    transaction
+        .execute(
+            "DELETE FROM observation_projection_provenance
+             WHERE projector_version = ?1 AND observation_id = ?2",
+            params![
+                SESSION_MESSAGE_PROJECTOR_VERSION,
+                first.observation_id().as_str()
+            ],
+        )
+        .await
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO observation_projection_dispositions
+                (projector_version, observation_id, receipt_id, reason)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                SESSION_MESSAGE_PROJECTOR_VERSION,
+                first.observation_id().as_str(),
+                first.receipt().receipt().receipt_id().as_str(),
+                ProjectionSkipReason::SanitizationRefused.as_str(),
+            ],
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let cursor = store
+        .get_source_cursor(first.source(), first.scope())
+        .await
+        .unwrap();
+    let provider = ProviderId::new(COLLISION_PROVIDER).unwrap();
+    let next_record = ObservationId::new("record.retired-output-owner.next").unwrap();
+    let range = ObservationSourceRangeV1::new(1, 2).unwrap();
+    let envelope = CanonicalObservationEnvelopeV1::new(
+        provider.clone(),
+        "message",
+        next_record.clone(),
+        CanonicalObservationRelationsV1::new(session_id.clone())
+            .with_message_id(ObservationId::new(output_message_id.as_str()).unwrap()),
+        vec![CanonicalObservationFactV1::Message {
+            role: CanonicalMessageRoleV1::Assistant,
+            content: json!({"text": "second rendering"}),
+            model: None,
+            timestamp: Some(1_750_000_001),
+        }],
+        CanonicalObservationEvidenceV1::new(ObservationOrderingDomainV1::SnapshotOrder, range),
+    )
+    .unwrap();
+    let payload = serde_json::to_value(envelope).unwrap();
+    let second = DurableObservationV1::new(
+        ObservationIdentityMaterialV1::for_native_record(
+            ObservationSourceIdentityV1::for_provider(provider, session_id.clone()).unwrap(),
+            ObservationScopeV1::Profile,
+            ObservationSourceGenerationV1::new(1).unwrap(),
+            range,
+            ObservationOrderingDomainV1::SnapshotOrder,
+            next_record,
+        )
+        .unwrap(),
+        fixture_receipt("receipt.retired-output-owner.second", &payload),
+        RetentionClass::new("retention.collision-test").unwrap(),
+        payload,
+    )
+    .unwrap();
+    assert_ne!(second.observation_id(), first.observation_id());
+    store
+        .persist_observation(anchored_write_for(second.clone(), cursor))
+        .await
+        .unwrap();
+    let outcome = store
+        .project_observation(second.observation_id())
+        .await
+        .expect("the next observation of a retired output must project");
+    assert!(
+        matches!(outcome, ProjectionPersistOutcome::Projected(_)),
+        "{outcome:?}"
+    );
+
+    let owners = provenance_rows(&runtime)
+        .await
+        .into_iter()
+        .filter(|row| row.5 == output_message_id)
+        .map(|row| (row.1, row.7))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        owners,
+        vec![(second.observation_id().as_str().to_owned(), 1)],
+        "the retired output's next observation must own and create it"
+    );
+    assert_eq!(table_count(&runtime, "lcm_raw_messages").await, 1);
 }

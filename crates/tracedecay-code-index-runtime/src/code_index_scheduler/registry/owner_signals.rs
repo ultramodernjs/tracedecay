@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 use tracedecay_contracts::code_index_freshness::{
@@ -182,6 +183,15 @@ impl CodeIndexOwnerSignalsV1 {
             .is_some_and(CodeIndexOwnerActivityV1::pass_finished)
     }
 
+    /// Owner passes this worktree has finished. The count only grows, so a
+    /// reader that looks late still sees a pass that began and ended between
+    /// two of its looks.
+    fn passes_settled(&self) -> u64 {
+        self.activity
+            .as_ref()
+            .map_or(0, |activity| activity.passes().settled)
+    }
+
     /// Consume publications until a scheduler turn passes without one.
     async fn settle_burst(&mut self) {
         loop {
@@ -237,13 +247,15 @@ impl CodeIndexSchedulerRegistryV1 {
     /// parked worker installs no seat, so its park is the answer once the
     /// worker is back at a wait. A park the worker re-checks on every wake
     /// answers only after a pass since the wait began observed it again (each
-    /// observation rewrites it). An unmounted root is waited through; the
+    /// observation rewrites it) and some pass has settled since, even when the
+    /// worker is re-woken before the wait can catch it between passes. An
+    /// unmounted root is waited through; the
     /// probe decides whether that ends the wait. Dropping the future cancels
     /// the wait.
     pub(crate) async fn wait_for_seat<T, E, Probe>(
         &self,
         project_root: &Path,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
         mut probe: impl FnMut(bool) -> Probe,
     ) -> Result<CodeIndexSeatWaitV1<T>, E>
     where
@@ -251,17 +263,23 @@ impl CodeIndexSchedulerRegistryV1 {
     {
         let mut signals = CodeIndexOwnerSignalsV1::subscribe(self, project_root).await;
         let park_at_start = self.convergence_park(project_root).await;
+        let settled_at_start = signals.passes_settled();
         loop {
             if let Some(ended) = probe(signals.owner_settled()).await? {
                 return Ok(ended);
             }
             if let Some(ended) = self
-                .seat_worker_end(project_root, &signals, park_at_start.as_ref())
+                .seat_worker_end(
+                    project_root,
+                    &signals,
+                    park_at_start.as_ref(),
+                    settled_at_start,
+                )
                 .await
             {
                 return Ok(ended);
             }
-            match tokio::time::timeout_at(deadline, signals.changed()).await {
+            match native_runtime::timeout_at(deadline, signals.changed()).await {
                 Err(_) => return Ok(CodeIndexSeatWaitV1::Deadline),
                 Ok(Err(CodeIndexOwnerSignalsClosedV1)) => {
                     return Ok(CodeIndexSeatWaitV1::Cancelled);
@@ -278,6 +296,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         signals: &CodeIndexOwnerSignalsV1,
         park_at_start: Option<&CodeIndexConvergenceParkedV1>,
+        settled_at_start: u64,
     ) -> Option<CodeIndexSeatWaitV1<T>> {
         let canonical = canonical_existing_identity(project_root).ok()?;
         let (park, shutting_down) = {
@@ -296,8 +315,16 @@ impl CodeIndexSchedulerRegistryV1 {
             return Some(CodeIndexSeatWaitV1::Cancelled);
         }
         let parked = park?;
-        (signals.owner_settled() && (!parked.retries_on_wake || park_at_start != Some(&parked)))
-            .then(|| CodeIndexSeatWaitV1::Parked(CodeIndexSeatParkV1::Convergence(parked)))
+        // A worker re-woken as fast as it parks is never seen between passes,
+        // so a rewritten park ends the wait once any pass has settled since
+        // the wait began, not only at the instant the worker is back at a wait.
+        let ended = if parked.retries_on_wake {
+            park_at_start != Some(&parked)
+                && (signals.owner_settled() || signals.passes_settled() > settled_at_start)
+        } else {
+            signals.owner_settled()
+        };
+        ended.then(|| CodeIndexSeatWaitV1::Parked(CodeIndexSeatParkV1::Convergence(parked)))
     }
 
     /// Sweep the source witness now and post a wake for any proven change,
@@ -334,7 +361,7 @@ impl CodeIndexSchedulerRegistryV1 {
                 Arc::clone(&worktree.wake),
             )
         };
-        tokio::task::spawn_blocking(move || {
+        native_runtime::spawn_blocking(move || {
             match source_freshness.ladder_verdict(&canonical, &shutting_down, None) {
                 FreshnessProbeVerdictV1::Current => return,
                 FreshnessProbeVerdictV1::Unverified => {}
@@ -368,7 +395,7 @@ impl CodeIndexSchedulerRegistryV1 {
     pub(crate) async fn current_text_owner_for_scope(
         &self,
         scope: &ResolvedScope,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Option<LatestCodeTextGenerationV1> {
         let root = {
             let mounted = self.mounted.lock().await;
@@ -423,7 +450,7 @@ impl CodeIndexSchedulerRegistryV1 {
         target: CodeIndexReadinessTargetV1,
         budget: Duration,
     ) -> Result<CodeIndexReadinessWaitReadV1, CodeIndexFreshnessReadFailureV1> {
-        let deadline = tokio::time::Instant::now() + budget;
+        let deadline = Instant::now() + budget;
         if target != CodeIndexReadinessTargetV1::Fresh
             && let Some(reading) = self
                 .dashboard_freshness_read(project_root)
@@ -442,8 +469,11 @@ impl CodeIndexSchedulerRegistryV1 {
         // The caller's budget bounds the sweep, and an unproven source cannot
         // be reported as reached.
         let sweep_source = target != CodeIndexReadinessTargetV1::GraphReady;
-        match tokio::time::timeout_at(deadline, self.request_fresh_now(project_root, sweep_source))
-            .await
+        match native_runtime::timeout_at(
+            deadline,
+            self.request_fresh_now(project_root, sweep_source),
+        )
+        .await
         {
             Ok(Err(CodeIndexFreshSweepRefusedV1::PublicationParked)) => {
                 return Ok(CodeIndexReadinessWaitReadV1::Unreachable {
@@ -528,40 +558,36 @@ impl CodeIndexSchedulerRegistryV1 {
         let reconcile_requested = AtomicBool::new(false);
         let (published, reconcile_requested) = (&published, &reconcile_requested);
         let Ok(waited) = self
-            .wait_for_seat(
-                project_root,
-                tokio::time::Instant::now() + budget,
-                |_| async move {
-                    if !published.load(Ordering::Acquire) {
-                        match self.has_active_publication(project_root).await {
-                            Some(Ok(true)) => published.store(true, Ordering::Release),
-                            Some(Ok(false)) => {
-                                return Ok(Some(CodeIndexSeatWaitV1::Parked(
-                                    CodeIndexSeatParkV1::Unpublished,
-                                )));
-                            }
-                            Some(Err(_)) => {
-                                return Ok(Some(CodeIndexSeatWaitV1::Parked(
-                                    CodeIndexSeatParkV1::PublicationUnreadable,
-                                )));
-                            }
-                            None => return Ok(None),
+            .wait_for_seat(project_root, Instant::now() + budget, |_| async move {
+                if !published.load(Ordering::Acquire) {
+                    match self.has_active_publication(project_root).await {
+                        Some(Ok(true)) => published.store(true, Ordering::Release),
+                        Some(Ok(false)) => {
+                            return Ok(Some(CodeIndexSeatWaitV1::Parked(
+                                CodeIndexSeatParkV1::Unpublished,
+                            )));
                         }
+                        Some(Err(_)) => {
+                            return Ok(Some(CodeIndexSeatWaitV1::Parked(
+                                CodeIndexSeatParkV1::PublicationUnreadable,
+                            )));
+                        }
+                        None => return Ok(None),
                     }
-                    if self.text_serves_search(project_root, scope).await {
-                        return Ok(Some(CodeIndexSeatWaitV1::Seated(())));
-                    }
-                    if !reconcile_requested.swap(true, Ordering::AcqRel)
-                        && let CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(parked) =
-                            self.request_query_background_reconcile(scope).await
-                    {
-                        return Ok(Some(CodeIndexSeatWaitV1::Parked(
-                            CodeIndexSeatParkV1::Convergence(parked),
-                        )));
-                    }
-                    Ok::<_, Infallible>(None)
-                },
-            )
+                }
+                if self.text_serves_search(project_root, scope).await {
+                    return Ok(Some(CodeIndexSeatWaitV1::Seated(())));
+                }
+                if !reconcile_requested.swap(true, Ordering::AcqRel)
+                    && let CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(parked) =
+                        self.request_query_background_reconcile(scope).await
+                {
+                    return Ok(Some(CodeIndexSeatWaitV1::Parked(
+                        CodeIndexSeatParkV1::Convergence(parked),
+                    )));
+                }
+                Ok::<_, Infallible>(None)
+            })
             .await;
         waited
     }
@@ -586,19 +612,45 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         project_root: &Path,
     ) -> Option<Result<bool, CodeIndexSchedulerErrorV1>> {
-        let canonical = canonical_existing_identity(project_root).ok()?;
-        let owner = {
-            let mounted = self.mounted.lock().await;
-            mounted.get(&canonical)?.historical_generation_owner.clone()
-        };
-        Some(
-            tokio::task::spawn_blocking(move || owner.has_active_publication())
-                .await
-                .unwrap_or_else(|error| {
-                    Err(CodeIndexSchedulerErrorV1::Identity(format!(
-                        "publication pointer read task failed: {error}"
-                    )))
-                }),
-        )
+        self.historical_owner_read(project_root, "publication pointer", |owner| {
+            owner.has_active_publication()
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use tracedecay_contracts::code_index_freshness::{
+        CodeIndexReadinessTargetV1, CodeIndexReadinessWaitReadV1,
+    };
+    use tracedecay_runtime_core::native_runtime;
+
+    use super::CodeIndexSchedulerRegistryV1;
+
+    #[test]
+    fn a_readiness_wait_off_tokio_times_out_at_its_budget() {
+        let root = tempfile::TempDir::new().expect("unmounted root");
+        let registry = CodeIndexSchedulerRegistryV1::new(1);
+        let budget = Duration::from_millis(50);
+        let started = Instant::now();
+
+        let waited = native_runtime::block_on(registry.wait_for_readiness(
+            root.path(),
+            CodeIndexReadinessTargetV1::Fresh,
+            budget,
+        ))
+        .expect("process runtime");
+
+        assert!(
+            matches!(
+                waited,
+                Ok(CodeIndexReadinessWaitReadV1::TimedOut { last: None })
+            ),
+            "an unmounted root never becomes fresh, so the wait ends at its budget: {waited:?}"
+        );
+        assert!(started.elapsed() >= budget);
     }
 }

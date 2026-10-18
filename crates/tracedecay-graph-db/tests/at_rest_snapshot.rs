@@ -16,24 +16,19 @@
 //! invoked once per cell of the matrix:
 //!
 //! ```text
-//! TRACEDECAY_ATREST_MODE=replay  TRACEDECAY_ATREST_ROWS=500000 \
-//!   cargo test -p tracedecay-graph-db --features test-helpers,graph-disk-tier \
-//!   --test at_rest_snapshot -- --ignored --nocapture --exact at_rest_reopen_probe
-//!
-//! TRACEDECAY_ATREST_MODE=compact TRACEDECAY_ATREST_ROWS=500000 \
-//!   cargo test -p tracedecay-graph-db --features test-helpers,graph-disk-tier \
-//!   --test at_rest_snapshot -- --ignored --nocapture --exact at_rest_reopen_probe
+//! bazel test //crates/tracedecay-graph-db:at_rest_snapshot \
+//!   --test_env=TRACEDECAY_ATREST_MODE=replay --test_env=TRACEDECAY_ATREST_ROWS=500000 \
+//!   --test_arg=--ignored --test_arg=--nocapture --test_output=streamed
 //! ```
 //!
-//! `graph-disk-tier` is required for the `compact` mode: it turns on
-//! `grafeo-engine/compact-store`, without which `GrafeoDB::compact()` does not
-//! exist. The `replay` mode runs under either feature state and is the baseline.
+//! `TRACEDECAY_ATREST_MODE=compact` runs the columnar side; `replay` is the
+//! baseline.
 //!
 //! # What the two modes do differently
 //!
 //! Exactly one call. Both stage the same rows through the same public
 //! `apply_unverified` path and close through the same registry. `compact` mode
-//! additionally calls [`GraphDb::compact_snapshot_for_bench`] after the last
+//! also calls [`GraphDb::compact_snapshot_for_bench`] after the last
 //! commit and before the close. That single call swaps grafeo's live store for a
 //! `LayeredStore` (columnar base + empty overlay), which changes what `close`
 //! serializes and what the next `open` has to reconstruct:
@@ -300,12 +295,6 @@ fn at_rest_reopen_probe() {
         .unwrap_or(DEFAULT_ROWS);
     let mode = Mode::from_env();
 
-    #[cfg(not(feature = "graph-disk-tier"))]
-    if mode == Mode::Compact {
-        println!("compact mode needs --features graph-disk-tier; skipping");
-        return;
-    }
-
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("store");
     std::fs::create_dir_all(&root).unwrap();
@@ -316,11 +305,8 @@ fn at_rest_reopen_probe() {
     let stage_wall = started.elapsed();
 
     // The seal. In compact mode this is the whole intervention.
-    // Only ever assigned under `graph-disk-tier`, where `compact()` exists.
-    #[cfg_attr(not(feature = "graph-disk-tier"), allow(unused_mut))]
     let mut compact_error: Option<String> = None;
     let compact_started = Instant::now();
-    #[cfg(feature = "graph-disk-tier")]
     if mode == Mode::Compact
         && let Err(error) = db.compact_snapshot_for_bench()
     {
@@ -340,9 +326,7 @@ fn at_rest_reopen_probe() {
     let hwm_closed = peak_rss_kib().unwrap();
     let rss_closed = live_rss_kib().unwrap();
 
-    let on_disk = std::fs::metadata(root.join("graph.grafeo"))
-        .map(|meta| meta.len())
-        .unwrap_or(0);
+    let on_disk = std::fs::metadata(root.join("graph.grafeo")).map_or(0, |meta| meta.len());
 
     // ---- activation path ----
     let open_started = Instant::now();

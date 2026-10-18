@@ -2,12 +2,15 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tracedecay_code_index::graph_projection::CodeGraphCatalogReleaseV1;
-use tracedecay_domain::{ProjectId, SymbolOccurrenceId, UtcMicros};
+use tracedecay_code_index::graph_projection::{
+    CodeGraphCatalogReleaseV1, CodeGraphReadinessRequirement,
+};
+use tracedecay_domain::{ProjectId, SymbolOccurrenceId};
 use tracedecay_graph_db::NeverCancelled;
 
 use super::ProductionProjectCompositionHarnessV1;
-use super::journey_test_support::{git, tool_payload};
+use super::journey_test_support::tool_payload;
+use crate::test_support::git::git;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn source_body_serves_while_the_released_catalog_cannot_rewarm() {
@@ -45,23 +48,18 @@ async fn source_body_serves_while_the_released_catalog_cannot_rewarm() {
         .await
         .unwrap();
     let store = serving.interactive_graph_store().unwrap();
-    // A background idle release may drop the engine first; that answer is
-    // retryable by contract, so warm until it takes.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match store.warm_interactive_catalog_with_cancellation(None, Arc::new(NeverCancelled)) {
-            Ok(()) => break,
-            Err(
-                tracedecay_code_index::graph_projection::CodeGraphProjectionError::Unavailable(
-                    reason,
-                ),
-            ) if std::time::Instant::now() < deadline => {
-                tracing::debug!(%reason, "catalog warm retried after a background release");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => panic!("warm the interactive catalog: {error:?}"),
-        }
-    }
+    // Hold the engine the way a graph read's admission does: the lookup's
+    // drained park release may already have closed it, and the hold keeps a
+    // later one from closing it under the reader this test opens directly.
+    let admission = store
+        .await_rewarm_and_retain_for(
+            Duration::from_secs(5),
+            CodeGraphReadinessRequirement::Engine,
+        )
+        .unwrap();
+    store
+        .warm_interactive_catalog_with_cancellation(None, Arc::new(NeverCancelled))
+        .unwrap();
     let node_id = lookup["matches"][0]["id"].as_str().unwrap();
     let occurrence = SymbolOccurrenceId::new(node_id).unwrap();
     // An admitted reader pins the catalog, so release it before retaining the engine.
@@ -84,13 +82,13 @@ async fn source_body_serves_while_the_released_catalog_cannot_rewarm() {
     // These point reads prove that the retained engine and occurrence are ready.
     let point = reader.symbol_summary(&occurrence, Arc::new(NeverCancelled));
     let catalog_pending = store.await_rewarm(Duration::ZERO);
-    let deadline = UtcMicros(tracedecay_contracts::now_micros().0 + 1_000_000);
+    // A read that waited on the held catalog would spend its re-warm budget
+    // and answer unavailable instead of evidence.
     let response = harness
-        .call_tool_with_deadline(
+        .call_tool(
             &project,
             "tracedecay_source_body",
             serde_json::json!({"node_id": node_id, "format": "json"}),
-            deadline,
         )
         .await;
     let still_pending = store.await_rewarm(Duration::ZERO);
@@ -98,6 +96,7 @@ async fn source_body_serves_while_the_released_catalog_cannot_rewarm() {
     holding.join().unwrap();
     let warmed = store.await_rewarm(Duration::from_secs(5));
     drop(reader);
+    drop(admission);
     drop(store);
     drop(serving);
     harness.shutdown().await;

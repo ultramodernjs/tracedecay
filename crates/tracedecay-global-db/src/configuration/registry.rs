@@ -1269,6 +1269,58 @@ mod memory_provider_registration_tests {
     }
 
     #[test]
+    fn ncm_namespace_admission_preserves_omitted_legacy_and_requires_canonical_checkout() {
+        let registry = ConfigurationRegistry::core().unwrap();
+        let ncm_key = SettingKey::new(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY).unwrap();
+        let observer = MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: provider_test_root().join("worker"),
+            state_root: provider_test_root().join("state"),
+            namespace_binding: Default::default(),
+        };
+        let legacy = serde_json::to_value(&observer).unwrap();
+        assert!(legacy.get("namespace_binding").is_none());
+        let resolution = crate::configuration::resolver::resolve_configuration(&registry, &[])
+            .expect("default provider settings resolve");
+
+        for (binding, admitted) in [
+            (None, true),
+            (Some("exact_session_v1"), false),
+            (Some("checkout_observations_v1"), true),
+        ] {
+            let mut document = legacy.clone();
+            if let Some(binding) = binding {
+                document["namespace_binding"] = serde_json::json!(binding);
+            }
+            // Canonicalize JSON syntax without erasing an explicitly supplied default.
+            let value = ConfigurationValueV1::Text(canonical_text(&document));
+            let mut values = resolution.snapshot.effective_values.clone();
+            values.insert(ncm_key.clone(), value.clone());
+            let before = values.clone();
+            let validation = registry.validate_value(&ncm_key, &value);
+            let selection = registry.resolve_provider_selection(&values);
+            if admitted {
+                validation.unwrap();
+                assert_eq!(
+                    selection.unwrap().ncm,
+                    MemoryProviderParticipationV1::Observer,
+                );
+            } else {
+                for error in [validation.unwrap_err(), selection.unwrap_err()] {
+                    assert!(matches!(
+                        error,
+                        ConfigurationRegistryError::InvalidStructuredValue {
+                            key,
+                            message,
+                            ..
+                        } if key == ncm_key && message.contains("canonical serialization")
+                    ));
+                }
+            }
+            assert_eq!(values, before);
+        }
+    }
+
+    #[test]
     fn noncanonical_provider_document_is_rejected_without_mutating_values() {
         let registry = ConfigurationRegistry::core().unwrap();
         let resolution = crate::configuration::resolver::resolve_configuration(&registry, &[])
@@ -1340,6 +1392,7 @@ mod memory_provider_registration_tests {
             ConfigurationValueV1::Text(canonical_text(&MemoryProviderNcmObserverV1::Enabled {
                 worker_binary: provider_test_root().join("worker"),
                 state_root: provider_test_root().join("state"),
+                namespace_binding: Default::default(),
             })),
         );
         let enabled_fallback = MemoryProviderRecallRoutingV1 {

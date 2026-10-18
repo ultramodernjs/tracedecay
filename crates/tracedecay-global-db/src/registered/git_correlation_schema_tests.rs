@@ -10,7 +10,7 @@ use crate::tests::harness::open_registered_test_database_fixture;
 
 /// A store recorded at the previous Git evidence schema is admitted in its typed reset-required state and left byte-for-byte
 /// untouched: nothing converts or copies the older shape.
-#[tokio::test]
+#[asupersync::test]
 async fn an_older_git_correlation_schema_is_refused_without_mutation() {
     crate::register_registered_schema_installer();
     let directory = TempDir::new().unwrap();
@@ -28,7 +28,7 @@ async fn an_older_git_correlation_schema_is_refused_without_mutation() {
     rusqlite::Connection::open(&database_path)
         .unwrap()
         .execute(
-            "UPDATE session_schema_migrations SET version = ?1 WHERE name = 'git_correlation'",
+            "UPDATE tracedecay_schema_version SET version = ?1 WHERE component = 'git_correlation'",
             [previous],
         )
         .unwrap();

@@ -11,11 +11,12 @@ use tracedecay_domain::{
     canonical_sha256,
 };
 
-use crate::exact_sql::{ExactSqlTransaction, ExactSqlValue};
+use crate::exact_sql::ExactSqlValue;
 use crate::work::{
-    WorkSqliteStorage, authority_params_owned, exact_sql_integer, exact_sql_statement,
+    RegisteredWorkWrite, authority_params_owned, exact_sql_integer, exact_sql_statement,
     exact_sql_text, registered_work_query,
 };
+use crate::work_attempt::identity_params;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,21 +25,13 @@ struct StoredWorkAttemptV1 {
     synthesis: Option<serde_json::Value>,
 }
 
-impl WorkRetryStoragePortV1 for WorkSqliteStorage {
+impl WorkRetryStoragePortV1 for crate::work_run_control::WorkSqliteJobStorage<'_> {
     fn retry_by_command(
         &self,
         authority: &WorkAuthority,
         command_id: &tracedecay_domain::WorkCommandId,
     ) -> Result<Option<WorkRetryAttemptOutcomeV1>, WorkAttemptStorageError> {
-        let transaction = self
-            .handle()
-            .begin_deferred()
-            .map_err(|_| WorkAttemptStorageError::Unavailable)?;
-        let outcome = replay(&transaction, authority, command_id.as_str())?;
-        transaction
-            .commit()
-            .map_err(|_| WorkAttemptStorageError::Unavailable)?;
-        Ok(outcome)
+        replay(self.transaction, authority, command_id.as_str())
     }
 
     fn insert_retry_bounded(
@@ -47,38 +40,26 @@ impl WorkRetryStoragePortV1 for WorkSqliteStorage {
         write: &WorkRetryWriteV1,
         concurrency: &TopologyConcurrencyPolicyV1,
     ) -> Result<WorkRetryAttemptOutcomeV1, WorkAttemptStorageError> {
-        let transaction = self
-            .handle()
-            .begin_immediate()
-            .map_err(|_| WorkAttemptStorageError::Unavailable)?;
-        let outcome =
-            insert_retry_bounded_in_transaction(&transaction, authority, write, concurrency);
-        match outcome {
-            Ok(created @ WorkRetryAttemptOutcomeV1::Created { .. }) => {
-                transaction
-                    .commit()
-                    .map_err(|_| WorkAttemptStorageError::Unavailable)?;
-                Ok(created)
-            }
-            Ok(replayed @ WorkRetryAttemptOutcomeV1::Replayed { .. }) => {
-                transaction
-                    .rollback()
-                    .map_err(|_| WorkAttemptStorageError::Unavailable)?;
-                Ok(replayed)
-            }
-            Err(error) => {
-                transaction
-                    .rollback()
-                    .map_err(|_| WorkAttemptStorageError::Unavailable)?;
-                Err(error)
-            }
-        }
+        insert_retry_bounded_in_transaction(self.transaction, authority, write, concurrency)
+    }
+
+    fn admit_retry(
+        &self,
+        admission: &tracedecay_contracts::WorkProductRetryAdmissionV1,
+    ) -> Result<
+        (
+            tracedecay_contracts::WorkProductEventCommitV1,
+            WorkRetryAttemptOutcomeV1,
+        ),
+        tracedecay_contracts::WorkProductAttemptAdmissionErrorV1,
+    > {
+        crate::work_product::admit_retry(self.transaction, admission)
     }
 }
 
 /// Persist one retry and receipt without settling the caller-owned transaction.
 pub(crate) fn insert_retry_bounded_in_transaction(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     write: &WorkRetryWriteV1,
     concurrency: &TopologyConcurrencyPolicyV1,
@@ -102,13 +83,9 @@ pub(crate) fn insert_retry_bounded_in_transaction(
     }
     require_run_reservation(transaction, authority, write.attempt.identity())?;
     require_first_run_admission(transaction, authority, &write.attempt)?;
+    crate::work_attempt::require_placement_root(transaction, authority, &write.attempt)?;
     insert_receipt(transaction, authority, write)?;
-    crate::work::capacity::require_capacity(
-        transaction,
-        authority,
-        write.attempt.identity().task_id(),
-        concurrency,
-    )?;
+    crate::work::capacity::require_capacity(transaction, authority, &write.attempt, concurrency)?;
     insert_attempt(transaction, authority, &write.attempt)?;
     Ok(WorkRetryAttemptOutcomeV1::Created {
         receipt: write.receipt.clone(),
@@ -135,7 +112,7 @@ fn validate_write(write: &WorkRetryWriteV1) -> Result<(), WorkAttemptStorageErro
 }
 
 fn replay(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     command_id: &str,
 ) -> Result<Option<WorkRetryAttemptOutcomeV1>, WorkAttemptStorageError> {
@@ -204,7 +181,7 @@ fn replay(
 }
 
 fn load_attempt(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     identity: &WorkAttemptIdentityV1,
 ) -> Result<Option<WorkAttemptV1>, WorkAttemptStorageError> {
@@ -266,7 +243,7 @@ const fn attempt_state(state: tracedecay_domain::WorkAttemptStateV1) -> &'static
 }
 
 fn require_original_retry_evidence(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     write: &WorkRetryWriteV1,
 ) -> Result<(), WorkAttemptStorageError> {
@@ -293,7 +270,7 @@ fn require_original_retry_evidence(
 }
 
 fn require_run_reservation(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     identity: &WorkAttemptIdentityV1,
 ) -> Result<(), WorkAttemptStorageError> {
@@ -323,7 +300,7 @@ fn require_run_reservation(
 }
 
 fn require_first_run_admission(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     attempt: &WorkAttemptV1,
 ) -> Result<(), WorkAttemptStorageError> {
@@ -360,7 +337,7 @@ fn require_first_run_admission(
 }
 
 fn insert_attempt(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     attempt: &WorkAttemptV1,
 ) -> Result<(), WorkAttemptStorageError> {
@@ -370,7 +347,7 @@ fn insert_attempt(
     })
     .map_err(|_| WorkAttemptStorageError::Unavailable)?;
     transaction
-        .execute(
+        .work_execute(
             exact_sql_statement(
                 "INSERT INTO work_attempts_v1 (
                     project_id, repository_id, worktree_id, actor_id, policy_digest,
@@ -397,7 +374,7 @@ fn insert_attempt(
 }
 
 fn insert_receipt(
-    transaction: &ExactSqlTransaction,
+    transaction: &impl RegisteredWorkWrite,
     authority: &WorkAuthority,
     write: &WorkRetryWriteV1,
 ) -> Result<(), WorkAttemptStorageError> {
@@ -408,7 +385,7 @@ fn insert_receipt(
     )
     .map_err(|_| WorkAttemptStorageError::Unavailable)?;
     transaction
-        .execute(
+        .work_execute(
             exact_sql_statement(
                 "INSERT INTO work_retry_receipts_v1 (
                     project_id, repository_id, worktree_id, actor_id, policy_digest,
@@ -449,12 +426,4 @@ fn insert_receipt(
         )
         .map_err(|_| WorkAttemptStorageError::Unavailable)?;
     Ok(())
-}
-
-fn identity_params(identity: &WorkAttemptIdentityV1) -> [ExactSqlValue; 3] {
-    [
-        ExactSqlValue::Text(identity.task_id().as_str().to_owned()),
-        ExactSqlValue::Text(identity.run_id().as_str().to_owned()),
-        ExactSqlValue::Text(identity.attempt_id().as_str().to_owned()),
-    ]
 }

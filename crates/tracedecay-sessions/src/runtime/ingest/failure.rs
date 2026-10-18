@@ -69,37 +69,12 @@ impl TranscriptCatchUpFailure {
         Self::new("scheduler", "frontier", "ingest_frontier_unavailable", true)
     }
 
-    /// The authority carries no session review scheduler, so the user pass
-    /// could ingest transcripts it can never hand to review. A composition
-    /// defect, not a transient condition.
-    pub(super) const fn session_review_unwired() -> Self {
-        Self::new(
-            "scheduler",
-            "session_review",
-            "session_review_unwired",
-            false,
-        )
-    }
-
     pub(super) const fn source_discovery_partial(provider: &'static str) -> Self {
         Self::new(provider, "discovery", "source_discovery_partial", true)
     }
 
     pub(super) const fn source_scan_partial(provider: &'static str, retryable: bool) -> Self {
         Self::new(provider, "scan", "source_scan_partial", retryable)
-    }
-
-    /// Mutable session ingestion requires a retained daemon registry mount.
-    /// Compatibility callers without that mount must fail before touching the
-    /// legacy database or any provider source.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub(super) const fn registered_authority_unavailable(provider: &'static str) -> Self {
-        Self::new(
-            provider,
-            "host_admission",
-            "registered_authority_unavailable",
-            true,
-        )
     }
 }
 
@@ -318,6 +293,14 @@ pub struct TranscriptIngestDisposition {
     pub source_locator: Option<ObservationSourceRangeV1>,
 }
 
+impl TranscriptIngestDisposition {
+    /// A permanent refusal of the source's own records by a healthy
+    /// authority: reading the same bytes again fails the same way.
+    pub const fn quarantines_source(&self) -> bool {
+        !self.retryable && matches!(self.status, HostAdmissionStatus::Degraded)
+    }
+}
+
 pub fn classify_transcript_ingest_disposition(
     error: &source::TranscriptIngestError,
 ) -> TranscriptIngestDisposition {
@@ -349,8 +332,11 @@ pub fn classify_transcript_ingest_disposition(
         // retryability verdict; hard-coding either answer here launders a
         // transient still-mounting authority into a terminal Blocked state.
         source::TranscriptIngestError::HostAdmission {
-            reason, retryable, ..
-        } => (*reason, *retryable, Unavailable),
+            reason,
+            retryable,
+            status,
+            ..
+        } => (*reason, *retryable, *status),
         source::TranscriptIngestError::Cancelled { .. } => {
             ("ingest_pass_cancelled", true, Backpressured)
         }
@@ -383,6 +369,12 @@ pub fn classify_transcript_ingest_disposition(
         source::TranscriptIngestError::InvalidCodexDiscoveryFrontier { .. } => {
             ("codex_discovery_frontier_invalid", false, Degraded)
         }
+        // A policy or detector fault rejects every record alike until the
+        // sanitizer is repaired; only the remaining refusals name the record.
+        source::TranscriptIngestError::Privacy(
+            tracedecay_privacy::PrivacySanitizerError::InvalidPolicy
+            | tracedecay_privacy::PrivacySanitizerError::DetectorUnavailable,
+        ) => ("transcript_privacy_rejected", false, Unavailable),
         source::TranscriptIngestError::Privacy(_) => {
             ("transcript_privacy_rejected", false, Degraded)
         }
@@ -557,6 +549,19 @@ pub fn classify_claude_observation_failure(
             }
         }
     };
+    // A policy or detector fault rejects every record alike until the
+    // sanitizer is repaired; only the remaining refusals name the record.
+    let privacy = |error: &tracedecay_privacy::PrivacySanitizerError| match error {
+        tracedecay_privacy::PrivacySanitizerError::InvalidPolicy
+        | tracedecay_privacy::PrivacySanitizerError::DetectorUnavailable => {
+            ClaudeObservationFailureClass {
+                reason_code: "observation_privacy_rejected",
+                retryable: false,
+                status: Unavailable,
+            }
+        }
+        _ => permanent("observation_privacy_rejected"),
+    };
     let transcript = |error: &source::TranscriptIngestError| {
         let disposition = classify_transcript_ingest_disposition(error);
         ClaudeObservationFailureClass {
@@ -570,7 +575,7 @@ pub fn classify_claude_observation_failure(
         Ingest::Domain(_) => permanent("observation_domain_invalid"),
         Ingest::Contract(_) => permanent("observation_contract_invalid"),
         Ingest::Request(_) => permanent("observation_request_invalid"),
-        Ingest::Privacy(_) => permanent("observation_privacy_rejected"),
+        Ingest::Privacy(error) => privacy(error),
         Ingest::Store(error) => store(error),
         Ingest::Projection(error) => projection(error),
         Ingest::Transcript(error) => transcript(error),
@@ -583,9 +588,7 @@ pub fn classify_claude_observation_failure(
             crate::observation::ObservationApplicationError::Contract(_) => {
                 permanent("observation_contract_invalid")
             }
-            crate::observation::ObservationApplicationError::Privacy(_) => {
-                permanent("observation_privacy_rejected")
-            }
+            crate::observation::ObservationApplicationError::Privacy(error) => privacy(error),
             // A batch reached the durable persist path carrying a rejected or
             // quarantined outcome. That is an admission invariant break, not a
             // transient source or authority fault, so re-running cannot fix it.
@@ -682,6 +685,7 @@ mod cancellation_tests {
             provider: "cursor",
             reason: "cursor_conflict",
             retryable: true,
+            status: HostAdmissionStatus::Backpressured,
             detail: None,
         };
         let disposition = classify_transcript_ingest_disposition(&conflict);
@@ -690,6 +694,7 @@ mod cancellation_tests {
             disposition.retryable,
             "a cursor CAS lost to a peer ingestor is converging, not terminal"
         );
+        assert_eq!(disposition.status, HostAdmissionStatus::Backpressured);
 
         let malformed = source::TranscriptIngestError::NonDurableRecord {
             provider: "cursor",

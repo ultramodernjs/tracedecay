@@ -16,6 +16,7 @@ exports_files(
         ".github/workflows/release-beta.yml",
         "version.txt",
         "Cargo.toml",
+        "clippy.toml",
         "rustfmt.toml",
         "pnpm-lock.yaml",
     ],

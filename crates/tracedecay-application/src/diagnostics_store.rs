@@ -4,11 +4,9 @@
 //!
 //! Durable `GenerationDiagnosticV1` records persist in the project store and
 //! survive restarts. Publication is version-monotone: a newer clean
-//! generation clears prior current records deterministically,
-//! stale findings never cross snapshots, and dirty editor overlays live only
-//! in memory, they are never sealed into the durable store.
+//! generation clears prior current records deterministically, and
+//! stale findings never cross snapshots.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -19,6 +17,7 @@ use tracedecay_domain::{
     RetrievalAnchorId, SourceSpan, UtcMicros,
 };
 use tracedecay_store::{
+    CLEAR_CURRENT_DIAGNOSTIC_PUBLICATION_SQL, CLEAR_CURRENT_DIAGNOSTICS_SQL,
     DIAGNOSTIC_STATE_CLEARED, DIAGNOSTIC_STATE_CURRENT, DiagnosticRecordStateKindV1,
     DiagnosticStore, DiagnosticStoreError, DiagnosticStoreResult, diagnostic_evidence_class_name,
     diagnostic_producer_kind_name, diagnostic_severity_name, diagnostic_snapshot_observation_eq,
@@ -47,6 +46,13 @@ pub const SCHEMA: &str = tracedecay_store::GENERATION_DIAGNOSTICS_SCHEMA_DDL;
 // across a cutover. These aliases keep the SQL below readable.
 const STATE_CURRENT: &str = DIAGNOSTIC_STATE_CURRENT;
 const STATE_CLEARED: &str = DIAGNOSTIC_STATE_CLEARED;
+
+// Names the `'current'` literal of the `idx_diagnostic_generation_current`
+// predicate: the connection plans once without bound values, so a bound state
+// would scan the publication table.
+const CURRENT_GENERATION_SQL: &str = "SELECT generation_id
+     FROM diagnostic_generation_publications
+     WHERE record_state = 'current'";
 
 /// SQLite-backed store for durable generation-bound diagnostics.
 ///
@@ -265,12 +271,7 @@ impl<'a> DiagnosticsStore<'a> {
                 let operation = "diagnostics current_generation";
                 let mut rows = self
                     .conn
-                    .query(
-                        "SELECT generation_id
-                 FROM diagnostic_generation_publications
-                 WHERE record_state = ?1",
-                        params![STATE_CURRENT],
-                    )
+                    .query(CURRENT_GENERATION_SQL, params![])
                     .await
                     .map_err(|e| db_error(operation, e))?;
                 let generation = rows
@@ -505,14 +506,7 @@ impl<'a> DiagnosticsStore<'a> {
             let cleared = store
                 .conn
                 .execute(
-                    "UPDATE generation_diagnostics
-                     SET record_state = ?1, state_generation = ?2
-                     WHERE record_state = ?3 AND generation_id != ?2
-                     AND (generation_id, publication_revision) IN (
-                       SELECT generation_id, publication_revision
-                       FROM diagnostic_generation_publications
-                       WHERE record_state = ?3
-                     )",
+                    CLEAR_CURRENT_DIAGNOSTICS_SQL,
                     params![STATE_CLEARED, generation.as_str(), STATE_CURRENT],
                 )
                 .await
@@ -520,10 +514,8 @@ impl<'a> DiagnosticsStore<'a> {
 
             store.conn
                 .execute(
-                    "UPDATE diagnostic_generation_publications
-                     SET record_state = ?1, state_generation = ?2
-                     WHERE record_state = ?3",
-                    params![STATE_CLEARED, generation.as_str(), STATE_CURRENT],
+                    CLEAR_CURRENT_DIAGNOSTIC_PUBLICATION_SQL,
+                    params![STATE_CLEARED, generation.as_str()],
                 )
                 .await
                 .map_err(|e| db_error(operation, e))?;
@@ -762,37 +754,6 @@ impl<'a> DiagnosticsStore<'a> {
         .await
     }
 
-    /// Merges the durable current set for `generation` with a dirty overlay
-    /// for the same generation. The two lanes stay typed and separate: the
-    /// overlay lane is session-only data that is never persisted and never
-    /// alters the durable lane (Plan 35: "Two clients editing the same file
-    /// must not share unsaved analyzer state"; "Dirty-overlay diagnostics are
-    /// never sealed into a clean code-intelligence generation").
-    pub async fn current_with_overlay(
-        &self,
-        generation: &CodeGenerationId,
-        overlay: &DirtyDiagnosticOverlay,
-    ) -> Result<MergedGenerationDiagnostics> {
-        if overlay.clean_generation() != generation {
-            return Err(db_message(
-                "diagnostics current_with_overlay",
-                format!(
-                    "overlay targets generation {} but query targets {}",
-                    overlay.clean_generation(),
-                    generation
-                ),
-            ));
-        }
-        Ok(MergedGenerationDiagnostics {
-            durable: tracing::Instrument::instrument(
-                self.current_records(generation),
-                tracing::trace_span!("usecases.diagnostics_store.current_with_overlay"),
-            )
-            .await?,
-            overlay_only: overlay.records(),
-        })
-    }
-
     #[tracing::instrument(
         name = "usecases.diagnostics_store.insert_record",
         level = "trace",
@@ -1004,163 +965,6 @@ impl DiagnosticStore for DiagnosticsStore<'_> {
             .await
             .map_err(|error| port_error("diagnostic_by_anchor", error))
     }
-}
-
-/// One overlay entry: diagnostics computed against unsaved editor content for
-/// one client document version.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OverlayDiagnostic {
-    pub client_id: String,
-    pub document_uri: String,
-    pub document_version: i64,
-    pub record: GenerationDiagnosticV1,
-}
-
-/// In-memory overlay of diagnostics for uncommitted editor buffers.
-///
-/// The overlay owns no connection and exposes no write path into
-/// [`DiagnosticsStore`]: entries live only for the authorized overlay owner's
-/// session and are dropped with it (Plan 35: "Unsaved overlays are ephemeral
-/// and isolated per client"; overlay findings "are never published as durable
-/// LSP diagnostics"). Two clients editing the same file never share entries
-/// because every entry is keyed by `(client_id, document_uri)`.
-#[derive(Debug)]
-pub struct DirtyDiagnosticOverlay {
-    clean_generation: CodeGenerationId,
-    entries: BTreeMap<(String, String), OverlayDocumentDiagnostics>,
-}
-
-#[derive(Debug)]
-struct OverlayDocumentDiagnostics {
-    document_version: i64,
-    records: Vec<OverlayDiagnostic>,
-}
-
-impl DirtyDiagnosticOverlay {
-    /// Creates an empty overlay bound to the clean generation it overlays.
-    pub fn new(clean_generation: CodeGenerationId) -> Self {
-        Self {
-            clean_generation,
-            entries: BTreeMap::new(),
-        }
-    }
-
-    /// The clean generation this overlay is bound to. Overlays never rebind:
-    /// a generation change drops the overlay with its session.
-    pub fn clean_generation(&self) -> &CodeGenerationId {
-        &self.clean_generation
-    }
-
-    /// Replaces one client document's overlay entries for a new document
-    /// version. Every record must be current and bound to the overlay's
-    /// clean generation; stale findings cannot cross snapshots even in
-    /// memory.
-    pub fn replace_document(
-        &mut self,
-        client_id: impl Into<String>,
-        document_uri: impl Into<String>,
-        document_version: i64,
-        records: Vec<GenerationDiagnosticV1>,
-    ) -> Result<()> {
-        let client_id = client_id.into();
-        let document_uri = document_uri.into();
-        let key = (client_id.clone(), document_uri.clone());
-        if let Some(existing) = self.entries.get(&key)
-            && document_version < existing.document_version
-        {
-            return Err(db_message(
-                "diagnostics overlay replace_document",
-                format!(
-                    "document version {document_version} is older than current version {}",
-                    existing.document_version
-                ),
-            ));
-        }
-        let clean_generation = self.clean_generation().clone();
-        let mut entries = Vec::with_capacity(records.len());
-        for record in records {
-            record.validate().map_err(|error| {
-                db_message(
-                    "diagnostics overlay replace_document",
-                    format!(
-                        "invalid overlay record {}: {error}",
-                        record.diagnostic_anchor
-                    ),
-                )
-            })?;
-            if record.generation_id != clean_generation {
-                return Err(db_message(
-                    "diagnostics overlay replace_document",
-                    format!(
-                        "overlay record {} names generation {} but the overlay is bound to {}",
-                        record.diagnostic_anchor, record.generation_id, clean_generation
-                    ),
-                ));
-            }
-            if !record.state.is_current() {
-                return Err(db_message(
-                    "diagnostics overlay replace_document",
-                    format!("overlay record {} is not current", record.diagnostic_anchor),
-                ));
-            }
-            entries.push(OverlayDiagnostic {
-                client_id: client_id.clone(),
-                document_uri: document_uri.clone(),
-                document_version,
-                record,
-            });
-        }
-        self.entries.insert(
-            key,
-            OverlayDocumentDiagnostics {
-                document_version,
-                records: entries,
-            },
-        );
-        Ok(())
-    }
-
-    /// Releases every overlay entry, as on session expiry.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries
-            .values()
-            .all(|document| document.records.is_empty())
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries
-            .values()
-            .map(|document| document.records.len())
-            .sum()
-    }
-
-    /// Overlay entries for one client document, oldest insertion first.
-    pub fn records_for(&self, client_id: &str, document_uri: &str) -> &[OverlayDiagnostic] {
-        self.entries
-            .get(&(client_id.to_owned(), document_uri.to_owned()))
-            .map_or(&[], |document| document.records.as_slice())
-    }
-
-    /// Every overlay entry across all client documents, in deterministic key
-    /// order. Session-only; never persisted.
-    pub fn records(&self) -> Vec<OverlayDiagnostic> {
-        self.entries
-            .values()
-            .flat_map(|document| document.records.iter().cloned())
-            .collect()
-    }
-}
-
-/// The merged read model for one generation: durable current records and
-/// session-only overlay records in separate typed lanes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MergedGenerationDiagnostics {
-    pub durable: Vec<GenerationDiagnosticV1>,
-    pub overlay_only: Vec<OverlayDiagnostic>,
 }
 
 const SELECT_RECORDS: &str = "SELECT diagnostic_anchor, generation_id, repository, worktree,
@@ -1400,6 +1204,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_generation_lookup_searches_its_partial_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = open_store(&temp.path().join("diagnostics.db")).await;
+        let mut rows = conn
+            .query(&format!("EXPLAIN QUERY PLAN {CURRENT_GENERATION_SQL}"), ())
+            .await
+            .expect("explain current-generation lookup");
+        let mut plan = Vec::new();
+        while let Some(row) = rows.next().await.expect("read query plan") {
+            plan.push(row.get::<String>(3).expect("query plan detail"));
+        }
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_diagnostic_generation_current")),
+            "the current-generation lookup must search its partial index: {plan:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn persist_restart_read_back() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("diagnostics.db");
@@ -1480,78 +1303,6 @@ mod tests {
                 cleared_in_generation
             } if cleared_in_generation.as_str() == gen2
         )));
-    }
-
-    #[tokio::test]
-    async fn dirty_overlay_never_writes() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("diagnostics.db");
-        let conn = open_store(&path).await;
-        let store = DiagnosticsStore::new_runtime(&conn);
-        let gen1 = "generation.clean.1";
-
-        let durable = fixture_record(gen1, "anchor.diagnostic.1");
-        store
-            .publish_clean_generation(&id(gen1), std::slice::from_ref(&durable))
-            .await
-            .unwrap();
-
-        let mut overlay = DirtyDiagnosticOverlay::new(id(gen1));
-        let overlay_record = with_message(
-            fixture_record(gen1, "anchor.overlay.1"),
-            "unused_variables",
-            "unused variable: `tmp`",
-        );
-        overlay
-            .replace_document(
-                "client.a",
-                "file:///src/main.rs",
-                7,
-                vec![overlay_record.clone()],
-            )
-            .expect("overlay accepts current clean-generation record");
-
-        // Overlays are generation-bound: stale or foreign-generation records
-        // are rejected even in memory.
-        let foreign = fixture_record("generation.clean.2", "anchor.overlay.2");
-        assert_database_refusal(
-            overlay
-                .replace_document("client.a", "file:///src/lib.rs", 1, vec![foreign.clone()])
-                .unwrap_err(),
-            "diagnostics overlay replace_document",
-            format!(
-                "overlay record {} names generation {} but the overlay is bound to {}",
-                foreign.diagnostic_anchor,
-                foreign.generation_id,
-                id::<tracedecay_domain::CodeGenerationId>(gen1)
-            ),
-        );
-
-        // The merged read keeps durable and overlay lanes separate.
-        let merged = store
-            .current_with_overlay(&id(gen1), &overlay)
-            .await
-            .unwrap();
-        assert_eq!(merged.durable, vec![durable]);
-        assert_eq!(merged.overlay_only.len(), 1);
-        assert_eq!(merged.overlay_only[0].record, overlay_record);
-        assert_eq!(merged.overlay_only[0].document_version, 7);
-
-        // Dropping the overlay leaves the durable store untouched: only the
-        // clean generation's row was ever persisted.
-        drop(overlay);
-        assert_eq!(
-            store.records_for_generation(&id(gen1)).await.unwrap().len(),
-            1
-        );
-        assert!(
-            store
-                .record_by_anchor(&id("anchor.overlay.1"))
-                .await
-                .unwrap()
-                .is_none(),
-            "overlay records are never persisted"
-        );
     }
 
     #[tokio::test]
@@ -1655,19 +1406,6 @@ mod tests {
             ),
         );
 
-        // Overlay release drops every entry without touching the store.
-        let mut overlay = DirtyDiagnosticOverlay::new(id(gen1));
-        overlay
-            .replace_document(
-                "client.a",
-                "file:///src/main.rs",
-                1,
-                vec![fixture_record(gen1, "anchor.overlay.1")],
-            )
-            .unwrap();
-        assert_eq!(overlay.len(), 1);
-        overlay.clear();
-        assert!(overlay.is_empty());
         assert!(
             store
                 .records_for_generation(&id(gen1))
@@ -1832,57 +1570,6 @@ mod tests {
                 "generation {} is already historical and cannot be republished",
                 id::<tracedecay_domain::CodeGenerationId>(gen1)
             ),
-        );
-    }
-
-    #[test]
-    fn dirty_overlay_rejects_older_document_versions() {
-        let gen1 = "generation.clean.1";
-        let mut overlay = DirtyDiagnosticOverlay::new(id(gen1));
-        overlay
-            .replace_document(
-                "client.a",
-                "file:///src/main.rs",
-                7,
-                vec![fixture_record(gen1, "anchor.overlay.current")],
-            )
-            .unwrap();
-
-        assert_database_refusal(
-            overlay
-                .replace_document(
-                    "client.a",
-                    "file:///src/main.rs",
-                    6,
-                    vec![fixture_record(gen1, "anchor.overlay.stale")],
-                )
-                .unwrap_err(),
-            "diagnostics overlay replace_document",
-            "document version 6 is older than current version 7",
-        );
-        let records = overlay.records_for("client.a", "file:///src/main.rs");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].document_version, 7);
-
-        overlay
-            .replace_document("client.a", "file:///src/main.rs", 8, Vec::new())
-            .unwrap();
-        assert!(
-            overlay
-                .records_for("client.a", "file:///src/main.rs")
-                .is_empty()
-        );
-        assert_database_refusal(
-            overlay
-                .replace_document(
-                    "client.a",
-                    "file:///src/main.rs",
-                    7,
-                    vec![fixture_record(gen1, "anchor.overlay.stale.after-clear")],
-                )
-                .unwrap_err(),
-            "diagnostics overlay replace_document",
-            "document version 7 is older than current version 8",
         );
     }
 }

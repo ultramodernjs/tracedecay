@@ -1,12 +1,41 @@
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::task::Poll;
+use std::time::Instant;
 
-use tokio::time::Instant;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::native_runtime::{self, TimeoutError};
 pub use tracedecay_store_runtime::ShutdownStatus;
 
-type ShutdownJoin = Pin<Box<dyn Future<Output = ShutdownStatus> + Send + 'static>>;
+type ShutdownJoin = Pin<Box<dyn Future<Output = ShutdownJoined> + Send + 'static>>;
 type ShutdownJoinFactory = Box<dyn FnOnce(Instant) -> ShutdownJoin + Send + 'static>;
+
+/// What an owner's join reports. `status` says whether the owner stopped;
+/// `lost_work` names best-effort work it dropped on the way out, such as an
+/// observation write past its deadline. Lost work never makes shutdown
+/// unclean, because the owner did stop.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShutdownJoined {
+    pub status: ShutdownStatus,
+    pub lost_work: Vec<String>,
+}
+
+impl From<ShutdownStatus> for ShutdownJoined {
+    fn from(status: ShutdownStatus) -> Self {
+        Self {
+            status,
+            lost_work: Vec::new(),
+        }
+    }
+}
+
+/// One item of best-effort work an owner lost while it stopped.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShutdownLostWork {
+    pub owner: &'static str,
+    pub work: String,
+}
 
 pub struct ShutdownOwner {
     name: &'static str,
@@ -39,7 +68,7 @@ impl ShutdownOwner {
             join: Box::new(move |deadline| {
                 Box::pin(async move {
                     join(deadline).await;
-                    ShutdownStatus::Clean
+                    ShutdownStatus::Clean.into()
                 })
             }),
         }
@@ -65,11 +94,14 @@ impl ShutdownOwner {
                         Ok(()) => ShutdownStatus::Clean,
                         Err(error) => ShutdownStatus::Failed(error.to_string()),
                     }
+                    .into()
                 })
             }),
         }
     }
 
+    /// `Join` resolves to a [`ShutdownStatus`], or to a [`ShutdownJoined`]
+    /// when the owner can stop yet lose best-effort work.
     pub fn with_deadline_status<Cancel, JoinFactory, Join>(
         name: &'static str,
         cancel: Cancel,
@@ -78,12 +110,13 @@ impl ShutdownOwner {
     where
         Cancel: FnOnce() + Send + 'static,
         JoinFactory: FnOnce(Instant) -> Join + Send + 'static,
-        Join: Future<Output = ShutdownStatus> + Send + 'static,
+        Join: Future + Send + 'static,
+        Join::Output: Into<ShutdownJoined>,
     {
         Self {
             name,
             cancel: Box::new(cancel),
-            join: Box::new(move |deadline| Box::pin(join(deadline))),
+            join: Box::new(move |deadline| Box::pin(async move { join(deadline).await.into() })),
         }
     }
 }
@@ -98,12 +131,16 @@ pub struct ShutdownOwnerReceipt {
 pub struct ShutdownReceipt {
     pub deadline: Instant,
     pub owners: Vec<ShutdownOwnerReceipt>,
+    /// Best-effort work lost by owners that stopped. Not part of
+    /// `unfinished`: every owner named here joined.
+    pub lost_work: Vec<ShutdownLostWork>,
     unfinished: Vec<&'static str>,
 }
 
 impl ShutdownReceipt {
     pub fn extend(&mut self, other: Self) {
         self.owners.extend(other.owners);
+        self.lost_work.extend(other.lost_work);
         for owner in other.unfinished {
             if !self.unfinished.contains(&owner) {
                 self.unfinished.push(owner);
@@ -122,6 +159,7 @@ impl ShutdownReceipt {
                 name,
                 status: ShutdownStatus::Failed(error),
             }],
+            lost_work: Vec::new(),
             unfinished: vec![name],
         }
     }
@@ -133,6 +171,7 @@ impl ShutdownReceipt {
                 name,
                 status: ShutdownStatus::TimedOut,
             }],
+            lost_work: Vec::new(),
             unfinished: vec![name],
         }
     }
@@ -221,11 +260,16 @@ impl PreparedShutdownOwners {
         for phase in self.phases {
             receipts.extend(join_shutdown_phase(deadline, phase).await);
         }
-        receipts.sort_by_key(|(ordinal, _)| *ordinal);
-        let owners = receipts
-            .into_iter()
-            .map(|(_, receipt)| receipt)
-            .collect::<Vec<_>>();
+        receipts.sort_by_key(|(ordinal, _, _)| *ordinal);
+        let mut owners = Vec::with_capacity(receipts.len());
+        let mut lost_work = Vec::new();
+        for (_, receipt, lost) in receipts {
+            lost_work.extend(lost.into_iter().map(|work| ShutdownLostWork {
+                owner: receipt.name,
+                work,
+            }));
+            owners.push(receipt);
+        }
         let unfinished = owners
             .iter()
             .filter_map(|receipt| (!receipt.status.is_clean()).then_some(receipt.name))
@@ -233,6 +277,7 @@ impl PreparedShutdownOwners {
         ShutdownReceipt {
             deadline,
             owners,
+            lost_work,
             unfinished,
         }
     }
@@ -241,46 +286,75 @@ impl PreparedShutdownOwners {
 #[tracing::instrument(name = "daemon.shutdown.phase.join", level = "trace", skip_all)]
 async fn join_shutdown_phase(
     deadline: Instant,
-    owners: Vec<(usize, &'static str, Option<String>, ShutdownJoinFactory)>,
-) -> Vec<(usize, ShutdownOwnerReceipt)> {
-    let mut joins = tokio::task::JoinSet::new();
-    let mut pending = std::collections::HashMap::new();
+    owners: Vec<PreparedShutdownOwner>,
+) -> Vec<(usize, ShutdownOwnerReceipt, Vec<String>)> {
+    let mut joins = Vec::with_capacity(owners.len());
+    let mut joined = Vec::with_capacity(owners.len());
     for (ordinal, name, cancellation_error, join) in owners {
-        let handle = joins.spawn(async move {
-            let started = std::time::Instant::now();
-            log_daemon_event(
-                "daemon_shutdown",
-                &[
-                    ("outcome", "owner_join_start".to_string()),
-                    ("owner", name.to_string()),
-                    (
-                        "since_arm_ms",
-                        super::watchdog::shutdown_elapsed_ms().to_string(),
-                    ),
-                ],
-            );
-            let join_status = match tokio::time::timeout_at(deadline, join(deadline)).await {
-                Ok(status) => status,
-                Err(_) => ShutdownStatus::TimedOut,
-            };
-            let status_label = match &join_status {
-                ShutdownStatus::Clean => "clean",
-                ShutdownStatus::Failed(_) => "failed",
-                ShutdownStatus::TimedOut => "timed_out",
-            };
-            log_daemon_event(
-                "daemon_shutdown",
-                &[
-                    ("outcome", "owner_joined".to_string()),
-                    ("owner", name.to_string()),
-                    ("status", status_label.to_string()),
-                    ("elapsed_ms", started.elapsed().as_millis().to_string()),
-                    (
-                        "since_arm_ms",
-                        super::watchdog::shutdown_elapsed_ms().to_string(),
-                    ),
-                ],
-            );
+        log_daemon_event(
+            "daemon_shutdown",
+            &[
+                ("outcome", "owner_join_start".to_string()),
+                ("owner", name.to_string()),
+                (
+                    "since_arm_ms",
+                    super::watchdog::shutdown_elapsed_ms().to_string(),
+                ),
+            ],
+        );
+        joins.push(Some(join(deadline)));
+        joined.push((ordinal, name, cancellation_error, Instant::now(), None));
+    }
+    // Owner joins still reach Tokio, so they are polled in place rather than
+    // spawned; at the deadline the stragglers are dropped, not aborted and
+    // joined.
+    // ponytail: every pending join is polled on any wake, O(owners) per wake;
+    // a phase holds about ten owners.
+    let drained = native_runtime::timeout_at(
+        deadline,
+        std::future::poll_fn(|context| {
+            for (slot, (_, name, _, started, status)) in joins.iter_mut().zip(joined.iter_mut()) {
+                let Some(join) = slot else {
+                    continue;
+                };
+                let polled = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    join.as_mut().poll(context)
+                })) {
+                    Ok(Poll::Pending) => continue,
+                    Ok(Poll::Ready(polled)) => polled,
+                    Err(panic) => ShutdownStatus::Failed(format!(
+                        "shutdown owner {name} panicked: {}",
+                        panic_message(panic.as_ref())
+                    ))
+                    .into(),
+                };
+                *slot = None;
+                log_owner_joined(name, &polled.status, *started);
+                *status = Some(polled);
+            }
+            if joins.iter().all(Option::is_none) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await;
+    let straggler = match drained {
+        Ok(()) | Err(TimeoutError::Elapsed) => ShutdownStatus::TimedOut,
+        Err(error @ TimeoutError::TimerUnavailable(_)) => ShutdownStatus::Failed(error.to_string()),
+    };
+    drop(joins);
+    joined
+        .into_iter()
+        .map(|(ordinal, name, cancellation_error, started, status)| {
+            let ShutdownJoined {
+                status: join_status,
+                lost_work,
+            } = status.unwrap_or_else(|| {
+                log_owner_joined(name, &straggler, started);
+                straggler.clone().into()
+            });
             let status = match (cancellation_error, join_status) {
                 (None, status) => status,
                 (Some(error), ShutdownStatus::Clean) => ShutdownStatus::Failed(error),
@@ -297,58 +371,85 @@ async fn join_shutdown_phase(
             if let ShutdownStatus::TimedOut = &status {
                 tracing::trace!(name: "daemon.shutdown.straggler.owner", value = ?name);
             }
-            (ordinal, ShutdownOwnerReceipt { name, status })
-        });
-        pending.insert(handle.id(), (ordinal, name));
-    }
-    let mut receipts = Vec::new();
-    while let Some(joined) = joins.join_next_with_id().await {
-        match joined {
-            Ok((id, receipt)) => {
-                pending.remove(&id);
-                receipts.push(receipt);
-            }
-            Err(error) => {
-                let id = error.id();
-                if let Some((ordinal, name)) = pending.remove(&id) {
-                    receipts.push((
-                        ordinal,
-                        ShutdownOwnerReceipt {
-                            name,
-                            status: ShutdownStatus::Failed(error.to_string()),
-                        },
-                    ));
-                }
-                tracing::error!(task_id = ?id, "daemon shutdown owner join task failed");
-            }
-        }
-    }
-    receipts.extend(pending.into_values().map(|(ordinal, name)| {
-        (
-            ordinal,
-            ShutdownOwnerReceipt {
-                name,
-                status: ShutdownStatus::Failed(
-                    "shutdown join task ended without a receipt".to_string(),
-                ),
-            },
-        )
-    }));
-    receipts
+            (ordinal, ShutdownOwnerReceipt { name, status }, lost_work)
+        })
+        .collect()
+}
+
+fn log_owner_joined(name: &'static str, status: &ShutdownStatus, started: Instant) {
+    let status_label = match status {
+        ShutdownStatus::Clean => "clean",
+        ShutdownStatus::Failed(_) => "failed",
+        ShutdownStatus::TimedOut => "timed_out",
+    };
+    log_daemon_event(
+        "daemon_shutdown",
+        &[
+            ("outcome", "owner_joined".to_string()),
+            ("owner", name.to_string()),
+            ("status", status_label.to_string()),
+            ("elapsed_ms", started.elapsed().as_millis().to_string()),
+            (
+                "since_arm_ms",
+                super::watchdog::shutdown_elapsed_ms().to_string(),
+            ),
+        ],
+    );
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use tokio::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::{
-        ShutdownOwner, ShutdownStatus, join_shutdown_owner_phases, join_shutdown_owners,
-        prepare_shutdown_owner_phases,
+        ShutdownJoined, ShutdownLostWork, ShutdownOwner, ShutdownStatus,
+        join_shutdown_owner_phases, join_shutdown_owners, prepare_shutdown_owner_phases,
     };
+
+    #[tokio::test]
+    async fn lost_work_is_reported_without_leaving_its_owner_unfinished() {
+        let receipt = join_shutdown_owners(
+            Instant::now() + Duration::from_secs(1),
+            vec![
+                ShutdownOwner::with_deadline_status(
+                    "lossy",
+                    || {},
+                    |_| async {
+                        ShutdownJoined {
+                            status: ShutdownStatus::Clean,
+                            lost_work: vec!["observation write missed its deadline".to_owned()],
+                        }
+                    },
+                ),
+                ShutdownOwner::with_deadline_status(
+                    "stuck",
+                    || {},
+                    |_| async { ShutdownStatus::Failed("owner did not stop".to_owned()) },
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(receipt.unfinished(), &["stuck"]);
+        assert_eq!(receipt.owners[0].status, ShutdownStatus::Clean);
+        assert_eq!(
+            receipt.lost_work,
+            vec![ShutdownLostWork {
+                owner: "lossy",
+                work: "observation write missed its deadline".to_owned(),
+            }]
+        );
+    }
 
     #[test]
     fn preparing_owner_phases_cancels_every_owner_synchronously() {
@@ -371,7 +472,7 @@ mod tests {
         assert_eq!(cancelled.load(Ordering::Acquire), 3);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn cancellation_reaches_every_owner_before_any_join_is_polled() {
         let cancelled = Arc::new(AtomicUsize::new(0));
         let first_join_polled = Arc::new(AtomicBool::new(false));
@@ -407,13 +508,23 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn every_owner_uses_the_same_deadline_and_unfinished_receipts_are_exact() {
+        struct Dropped(Arc<AtomicBool>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
         let owner_deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let straggler_dropped = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_millis(100);
         let mut owners = Vec::new();
         for (name, finishes) in [("quick", true), ("blocked-a", false), ("blocked-b", false)] {
             let observed = Arc::clone(&owner_deadlines);
+            let dropped = (!finishes).then(|| Dropped(Arc::clone(&straggler_dropped)));
             owners.push(ShutdownOwner::with_deadline(
                 name,
                 || {},
@@ -425,16 +536,27 @@ mod tests {
                     if finishes {
                         return;
                     }
+                    let _dropped = dropped;
                     std::future::pending::<()>().await;
                 },
             ));
         }
 
-        let shutdown = join_shutdown_owners(deadline, owners);
-        tokio::pin!(shutdown);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        let receipt = shutdown.await;
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(10),
+            join_shutdown_owners(deadline, owners),
+        )
+        .await
+        .expect("the shared deadline bounds the owner joins");
 
+        assert!(
+            Instant::now() >= deadline,
+            "blocked owners are cut off at the deadline, not before it"
+        );
+        assert!(
+            straggler_dropped.load(Ordering::Acquire),
+            "a timed-out owner join is dropped once its receipt is written"
+        );
         assert_eq!(
             owner_deadlines
                 .lock()
@@ -495,7 +617,10 @@ mod tests {
         let ShutdownStatus::Failed(panic_error) = &receipt.owners[0].status else {
             panic!("panicked join must be a typed failure");
         };
-        assert!(panic_error.contains("join panic"), "{panic_error}");
+        assert_eq!(
+            panic_error,
+            "shutdown owner panicked_join panicked: join panic"
+        );
         assert_eq!(
             receipt.owners[1].status,
             ShutdownStatus::Failed("typed join failure".to_string())

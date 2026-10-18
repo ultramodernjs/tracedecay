@@ -5,7 +5,9 @@
 //! comes only from durable analytics events.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
 use axum::extract::State;
 use axum::response::Json;
@@ -231,23 +233,38 @@ pub async fn overview(
         async move {
             // These reads are independent of one another; run them concurrently. The
             // hint/usage/diagnostics summaries then share the one durable-event fetch.
-            let (durable_events, observatory, agents, underused) = tokio::join!(
-                durable_analytics_rows_for_state(&state),
-                observatory_model(&state),
-                agent_usage_summary(&state.host_io, state.lcm_db.as_deref()),
+            let durable_events: Pin<
+                Box<dyn Future<Output = Option<Vec<AnalyticsEventRecord>>> + Send>,
+            > = Box::pin(durable_analytics_rows_for_state(&state));
+            let observatory: Pin<Box<dyn Future<Output = ObservatoryReadModelV1> + Send>> =
+                Box::pin(observatory_model(&state));
+            let agents: Pin<
+                Box<dyn Future<Output = Result<AnalyticsAgentsPayloadV1, String>> + Send>,
+            > = Box::pin(agent_usage_summary(&state.host_io, state.lcm_db.as_deref()));
+            let underused = tracedecay_runtime_core::erase_send!(
                 underused_tool_families(state.lcm_db.as_deref()),
+                Result<Option<Vec<AnalyticsUnderusedFamilyV1>>, String>
             );
+            let (durable_events, observatory, agents, underused) =
+                tokio::join!(durable_events, observatory, agents, underused);
             let observatory = Some(observatory);
             let project_id = RegisteredGlobalDb::canonical_project_key(&state.project_root);
-            let (hints, usage, diagnostics) = tokio::join!(
-                hint_summary(
+            let hints: Pin<Box<dyn Future<Output = AnalyticsHintsPayloadV1> + Send>> =
+                Box::pin(hint_summary(
                     state.savings_db.as_deref().or(state.lcm_db.as_deref()),
                     durable_events.as_deref(),
                     Some(&project_id),
-                ),
-                usage_summary(state.lcm_db.as_deref(), durable_events.as_deref()),
-                typed_diagnostics_summary(&state, durable_events.as_deref()),
-            );
+                ));
+            let usage: Pin<
+                Box<dyn Future<Output = Result<AnalyticsUsageSummaryV1, String>> + Send>,
+            > = Box::pin(usage_summary(
+                state.lcm_db.as_deref(),
+                durable_events.as_deref(),
+            ));
+            let diagnostics: Pin<
+                Box<dyn Future<Output = Result<AnalyticsDiagnosticsPayloadV1, String>> + Send>,
+            > = Box::pin(typed_diagnostics_summary(&state, durable_events.as_deref()));
+            let (hints, usage, diagnostics) = tokio::join!(hints, usage, diagnostics);
             let usage = match usage {
                 Ok(usage) => usage,
                 Err(error) => {
@@ -1117,6 +1134,10 @@ pub fn hint_summary_from_events(events: &[AnalyticsEventRecord]) -> AnalyticsHin
         }
     }
 
+    hints_payload(by_category)
+}
+
+fn hints_payload(by_category: BTreeMap<String, HintCounts>) -> AnalyticsHintsPayloadV1 {
     AnalyticsHintsPayloadV1 {
         available: true,
         source: "analytics_events".to_owned(),
@@ -1154,21 +1175,7 @@ pub fn hint_summary_from_counts(counts: &[AnalyticsHintCounts]) -> AnalyticsHint
             },
         );
     }
-    AnalyticsHintsPayloadV1 {
-        available: true,
-        source: "analytics_events".to_owned(),
-        error: None,
-        by_category: by_category
-            .into_iter()
-            .map(|(category, counts)| AnalyticsHintCategoryV1 {
-                category,
-                emitted: counts.emitted,
-                followed: counts.followed,
-                ignored: counts.ignored,
-                suppressed: counts.suppressed,
-            })
-            .collect(),
-    }
+    hints_payload(by_category)
 }
 
 async fn hint_summary(
@@ -1385,7 +1392,7 @@ async fn typed_diagnostics_summary(
     let store_root = state.store_root.clone();
     let profile_root = state.profile_root.clone();
     let project_root = state.project_root.clone();
-    let hook_analytics = tokio::task::spawn_blocking(move || {
+    let hook_analytics = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         read_hook_analytics_rows_at(&profile_root, Some(&store_root), Some(&project_root))
     })
     .await
@@ -1885,5 +1892,25 @@ mod tests {
                 "the unmounted envelope must not leak {forbidden}: {encoded}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostics_summary_reads_hooks_without_a_tokio_runtime() {
+        let (_project, state) =
+            crate::events_api::dashboard_state_fixture("project.dashboard-analytics-native").await;
+        let summary = std::thread::spawn(move || {
+            tracedecay_runtime_core::native_runtime::block_on(async {
+                super::typed_diagnostics_summary(&state, None).await
+            })
+        })
+        .join()
+        .expect("the diagnostics read must not need a Tokio runtime")
+        .expect("native block_on")
+        .expect("diagnostics summary");
+        assert_eq!(
+            (summary.message_count, summary.hook_call_count),
+            (0, 0),
+            "an empty fixture store reports no messages and no hook calls"
+        );
     }
 }

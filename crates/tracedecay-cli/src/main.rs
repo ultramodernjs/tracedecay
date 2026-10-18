@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(clippy::too_many_arguments, clippy::collapsible_if)]
 // binary crate: match lib allow policy for CLI dispatch
 use clap::{ArgMatches, CommandFactory, FromArgMatches};
@@ -56,16 +57,11 @@ mod workflow_command;
 
 use cli::*;
 use tracedecay_contracts::retrieval::{
-    AdminCliRegistryContextV1, AdminCliResultV1, AdminCliSurfaceRequestV1,
+    AdminCliRegistryContextV1, AdminProjectResultV1, AdminProjectSurfaceRequestV1,
 };
-use tracedecay_contracts::retrieval::{AdminProjectResultV1, AdminProjectSurfaceRequestV1};
 use tracedecay_daemon_service::logging::StderrTracingDefault;
 use tracedecay_domain::process_heap::collect_idle_thread_heap_v1;
 use tracedecay_runtime_core::config::{ProfileRoot, admit_process_host_program_search_path};
-
-pub(crate) fn current_unix_timestamp() -> i64 {
-    tracedecay_runtime_core::tracedecay::current_timestamp()
-}
 
 /// A self-animating spinner that ticks on a background thread.
 /// Call `set_message` to update what is displayed; the background thread
@@ -238,10 +234,17 @@ impl Drop for Spinner {
 /// an explicit stack size gives every platform the same headroom.
 const ASYNC_STACK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ASYNC_WORKER_THREADS: usize = 16;
+const MIN_LONG_LIVED_WORKER_THREADS: usize = 2;
+/// The runtimes a command's process owns. The native runtime drives every
+/// command's future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AsyncRuntimeFlavor {
-    CurrentThread,
-    MultiThread,
+enum CommandRuntime {
+    /// The native runtime alone. No Tokio runtime exists in the process.
+    Native,
+    /// The native runtime plus one multi-thread Tokio runtime, which the
+    /// daemon's remaining Tokio sites reach through
+    /// `native_runtime::tokio_handle`.
+    NativeWithTokio,
 }
 
 const MIN_SERVING_BLOCKING_RESERVE: usize = 4;
@@ -249,20 +252,30 @@ const DEFAULT_MAX_DAEMON_CPU_THREADS: usize = 16;
 const DAEMON_CPU_THREADS_ENV: &str = "TRACEDECAY_DAEMON_CPU_THREADS";
 const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 
-fn async_worker_threads() -> usize {
+fn async_worker_threads(command: Option<&Commands>) -> usize {
+    // One-shot daemon clients drive a single socket request and exit; up to
+    // 16 eagerly started workers would sit idle.
+    if is_one_shot_daemon_client(command) {
+        return 1;
+    }
+    // At least two, even on a one-CPU host: the reactor handoff patch
+    // (asupersync-scheduler.patch) promotes a parked follower only when
+    // the runtime has two or more parkers (`count < 2` returns early), so on
+    // one worker a long poll in `daemon run` or `serve` holds every socket
+    // wake and timer until it returns.
     std::thread::available_parallelism()
         .map_or(1, usize::from)
-        .clamp(1, MAX_ASYNC_WORKER_THREADS)
+        .clamp(MIN_LONG_LIVED_WORKER_THREADS, MAX_ASYNC_WORKER_THREADS)
 }
 
-fn async_runtime_flavor(command: Option<&Commands>) -> AsyncRuntimeFlavor {
-    match command {
-        // One-shot daemon clients drive a single socket request and exit. A
-        // multi-thread runtime eagerly starts up to 16 workers they never
-        // use; the current thread already has a fixed 16 MiB stack and
-        // Tokio's blocking pool remains available when needed.
-        Some(Commands::Tool { .. } | Commands::Status { .. }) => AsyncRuntimeFlavor::CurrentThread,
-        _ => AsyncRuntimeFlavor::MultiThread,
+/// Every command but `daemon run` is a daemon client or a local store tool
+/// whose paths are Tokio-free. The foreground daemon still owns Tokio-only
+/// project-server lifecycle and invocation seams.
+fn command_runtime(command: Option<&Commands>) -> CommandRuntime {
+    if is_daemon_run(command) {
+        CommandRuntime::NativeWithTokio
+    } else {
+        CommandRuntime::Native
     }
 }
 
@@ -308,8 +321,7 @@ fn try_print_cli_version(args: &[std::ffi::OsString]) -> Option<ExitCode> {
 fn tokio_blocking_thread_limit() -> usize {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
     let effective = tracedecay_code_index::parallelism::installed_worker_status()
-        .map(|status| usize::from(status.effective_workers))
-        .unwrap_or(available);
+        .map_or(available, |status| usize::from(status.effective_workers));
     tokio_blocking_thread_limit_from(available, effective)
 }
 
@@ -609,34 +621,47 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         let _span = tracing::trace_span!("daemon_cpu_pool_install").entered();
         install_daemon_cpu_pool(cli.command.as_ref())
     }?;
-    let runtime_flavor = async_runtime_flavor(cli.command.as_ref());
-    let worker_threads = match runtime_flavor {
-        AsyncRuntimeFlavor::CurrentThread => 1,
-        AsyncRuntimeFlavor::MultiThread => async_worker_threads(),
-    };
+    let worker_threads = async_worker_threads(cli.command.as_ref());
     let blocking_threads = tokio_blocking_thread_limit();
-    let runtime = {
-        let _span = tracing::trace_span!("tokio_runtime_build").entered();
-        {
-            let build = match runtime_flavor {
-                AsyncRuntimeFlavor::CurrentThread => tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .max_blocking_threads(blocking_threads)
-                    .thread_stack_size(ASYNC_STACK_BYTES)
-                    .build(),
-                AsyncRuntimeFlavor::MultiThread => tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .worker_threads(worker_threads)
-                    .max_blocking_threads(blocking_threads)
-                    .thread_stack_size(ASYNC_STACK_BYTES)
-                    .on_thread_park(collect_idle_thread_heap_v1)
-                    .build(),
-            };
-            build.map_err(|e| tracedecay_domain::errors::TraceDecayError::Config {
-                message: format!("failed to start async runtime: {e}"),
-            })
+    let native = {
+        use tracedecay_runtime_core::native_runtime;
+        let _span = tracing::trace_span!("native_runtime_install").entered();
+        native_runtime::install(
+            native_runtime::RuntimeBuilder::multi_thread()
+                .thread_name_prefix("tracedecay-native")
+                .worker_threads(worker_threads)
+                .thread_stack_size(ASYNC_STACK_BYTES)
+                .blocking_threads(1, native_runtime::MAX_BLOCKING_THREADS),
+        )
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: error.to_string(),
+        })?
+    };
+    let command_runtime = command_runtime(cli.command.as_ref());
+    tracing::trace!(name: "process_command_runtime", value = ?command_runtime);
+    let tokio = match command_runtime {
+        CommandRuntime::Native => None,
+        CommandRuntime::NativeWithTokio => {
+            let _span = tracing::trace_span!("tokio_runtime_build").entered();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(worker_threads)
+                .max_blocking_threads(blocking_threads)
+                .thread_stack_size(ASYNC_STACK_BYTES)
+                .on_thread_park(collect_idle_thread_heap_v1)
+                .build()
+                .map_err(|e| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!("failed to start async runtime: {e}"),
+                })?;
+            tracedecay_runtime_core::native_runtime::install_tokio_runtime(
+                runtime.handle().clone(),
+            )
+            .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!("failed to install the Tokio runtime: {error}"),
+            })?;
+            Some(runtime)
         }
-    }?;
+    };
 
     {
         let command_family = cli.command.as_ref().map_or("none", |command| {
@@ -645,33 +670,25 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         tracing::trace!(name: "process_command_family", value = ?command_family);
         tracing::trace!(name: "cli.command.name", value = ?command_name.as_str());
     }
-    let foreground_daemon = matches!(
-        cli.command.as_ref(),
-        Some(Commands::Daemon {
-            action: DaemonAction::Run { .. }
-        })
-    );
-
     let result = {
         let _span = tracing::trace_span!("process_command").entered();
-        runtime.block_on(tracing::Instrument::instrument(
+        let command = tracing::Instrument::instrument(
             run(cli),
             tracing::trace_span!("process_command_future"),
-        ))
+        );
+        native.block_on(command)
     };
 
-    // Runtime drop waits indefinitely for blocking tasks. Daemon integrations
-    // can leave OS-backed watcher work behind after their async handles abort,
-    // so bound teardown after the command's own graceful shutdown completes.
-    //
-    // The foreground daemon already coordinated every owner with typed
-    // receipts; a blocking task still running here is one its shutdown owner
-    // reported as pending and abandoned at the task-abort deadline. Waiting
-    // for it a second time only spends the supervisor's TERM grace.
-    if foreground_daemon {
+    // Only the foreground daemon has a Tokio runtime, and it outlives the
+    // daemon's shutdown coordinator, whose Tokio-side owners report typed
+    // receipts before `run` returns. A blocking task still running here is
+    // one its shutdown owner reported as pending and abandoned at the
+    // task-abort deadline. Waiting for it a second time only spends the
+    // supervisor's TERM grace. The installed native runtime is process-static
+    // and never dropped.
+    if let Some(runtime) = tokio {
+        tracedecay_runtime_core::native_runtime::uninstall_tokio_runtime();
         runtime.shutdown_background();
-    } else {
-        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
     }
     if json_requested
         && let Err(error) = &result
@@ -875,21 +892,15 @@ async fn resolve_registered_project_root(
         (None, Some(project_path)) => registered_project_path_selector(&project_path)?,
         (None, None) => return Ok(None),
     };
-    let request = AdminCliSurfaceRequestV1::RegistryContext {
-        project_arg: Some(PathBuf::from(&selector)),
-    };
-    match commands::admin_cli_result(profile, None, request).await? {
-        AdminCliResultV1::RegistryContext(AdminCliRegistryContextV1::Ok { project, .. }) => {
+    match commands::registry_context(profile, PathBuf::from(&selector)).await? {
+        AdminCliRegistryContextV1::Ok { project, .. } => {
             Ok(Some(PathBuf::from(project.display_root)))
         }
-        AdminCliResultV1::RegistryContext(_) => {
-            Err(tracedecay_domain::errors::TraceDecayError::project_route(
-                "project_route_not_found",
-                false,
-                format!("registered project not found for '{selector}'"),
-            ))
-        }
-        _ => Err(commands::admin_cli_result_mismatch("registry_context")),
+        _ => Err(tracedecay_domain::errors::TraceDecayError::project_route(
+            "project_route_not_found",
+            false,
+            format!("registered project not found for '{selector}'"),
+        )),
     }
 }
 
@@ -1353,16 +1364,17 @@ async fn dispatch_runtime_command(
         Commands::Workflow { invocation } => workflow_command::run(profile, invocation).await?,
         Commands::Remote { action } => {
             let profile = profile.clone();
-            let command = action.into();
             tracing::Instrument::instrument(
                 async {
-                    tokio::task::spawn_blocking(move || {
-                        crate::remote_command::run(&profile, command)
+                    // The remote client blocks on reqwest's own runtime, so it
+                    // runs on a blocking-pool thread, never a native worker.
+                    tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
+                        crate::remote_command::run(&profile, action)
                     })
                     .await
-                    .map_err(|error| {
+                    .map_err(|message| {
                         tracedecay_domain::errors::TraceDecayError::Config {
-                            message: format!("remote command task failed to join: {error}"),
+                            message: format!("remote command task failed: {message}"),
                         }
                     })?
                 },
@@ -1474,6 +1486,7 @@ async fn dispatch_runtime_command(
             path,
             timings,
             full_tool_list,
+            catalog_profile,
         } => {
             if matches!(std::env::var("DISABLE_TRACEDECAY").as_deref(), Ok("true")) {
                 // Allow users to opt out per-project by setting
@@ -1486,7 +1499,7 @@ async fn dispatch_runtime_command(
             // do (they would drop the sweep mid-parse on exit).
             tracedecay_store_runtime::mark_process_long_lived_for_session_maintenance();
             tracing::Instrument::instrument(
-                serve_cmd::run_serve(profile, path, timings, full_tool_list),
+                serve_cmd::run_serve(profile, path, timings, full_tool_list, catalog_profile),
                 tracing::trace_span!("cli.serve.run"),
             )
             .await?;
@@ -1523,11 +1536,16 @@ async fn dispatch_daemon_command(
             // value — unboxed, the whole machine inlines into this dispatch future and
             // overflows the main thread's stack at startup (measured tonight;
             // same class as the 37MB serve_broker_socket_client machine).
-            Box::pin(tracing::Instrument::instrument(
+            let end = Box::pin(tracing::Instrument::instrument(
                 tracedecay::daemon::run_foreground(profile.clone(), socket_path, remote_tls),
                 tracing::trace_span!("cli.daemon.run"),
             ))
             .await?;
+            if end == tracedecay::daemon::DaemonRunEnd::ProfileLost {
+                return Ok(CommandOutcome::Exit(
+                    tracedecay::daemon::PROFILE_LOST_EXIT_CODE,
+                ));
+            }
         }
         DaemonAction::InstallService {
             socket,
@@ -1657,49 +1675,58 @@ async fn dispatch_agent_command(
 ) -> tracedecay_domain::errors::Result<agent_cmd::HostLifecycleCompletion> {
     use agent_cmd::HostBundleCliOperation as Operation;
 
-    let (operation, agent, local, no_dashboard, automation, git_hook) = match command {
-        Commands::FeedbackRollback { mut action } => {
-            if host_bundle.component.is_some() || host_bundle.dry_run {
-                return Err(tracedecay_domain::errors::TraceDecayError::Config {
-                    message: "feedback-rollback does not accept host-component selectors"
-                        .to_string(),
-                });
-            }
-            match &mut action {
-                crate::cli::FeedbackRollbackAction::Apply { yes, .. }
-                | crate::cli::FeedbackRollbackAction::Restore { yes, .. } => {
-                    *yes |= host_bundle.yes;
+    let (operation, agent, local, no_dashboard, automation, git_hook, catalog_profile) =
+        match command {
+            Commands::FeedbackRollback { mut action } => {
+                if host_bundle.component.is_some() || host_bundle.dry_run {
+                    return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                        message: "feedback-rollback does not accept host-component selectors"
+                            .to_string(),
+                    });
                 }
-                crate::cli::FeedbackRollbackAction::DryRun { .. } => {}
+                match &mut action {
+                    crate::cli::FeedbackRollbackAction::Apply { yes, .. }
+                    | crate::cli::FeedbackRollbackAction::Restore { yes, .. } => {
+                        *yes |= host_bundle.yes;
+                    }
+                    crate::cli::FeedbackRollbackAction::DryRun { .. } => {}
+                }
+                agent_cmd::handle_feedback_rollback_command(profile, action).await?;
+                return Ok(agent_cmd::HostLifecycleCompletion::Complete);
             }
-            agent_cmd::handle_feedback_rollback_command(profile, action).await?;
-            return Ok(agent_cmd::HostLifecycleCompletion::Complete);
-        }
-        Commands::Install {
-            agent,
-            local,
-            no_dashboard,
-            automation,
-            git_hook,
-        } => (
-            Operation::Install,
-            agent,
-            local,
-            no_dashboard,
-            automation,
-            git_hook,
-        ),
-        Commands::Reinstall { local, agent } => {
-            (Operation::Repair, agent, local, false, false, false)
-        }
-        Commands::UpdatePlugin { local, agent } => {
-            (Operation::Update, agent, local, false, false, false)
-        }
-        Commands::Uninstall { agent, local } => {
-            (Operation::Uninstall, agent, local, false, false, false)
-        }
-        _ => unreachable!("non-agent command passed to agent dispatcher"),
-    };
+            Commands::Install {
+                agent,
+                local,
+                no_dashboard,
+                automation,
+                git_hook,
+                catalog_profile,
+            } => (
+                Operation::Install,
+                agent,
+                local,
+                no_dashboard,
+                automation,
+                git_hook,
+                catalog_profile,
+            ),
+            Commands::Reinstall { local, agent } => {
+                (Operation::Repair, agent, local, false, false, false, None)
+            }
+            Commands::UpdatePlugin { local, agent } => {
+                (Operation::Update, agent, local, false, false, false, None)
+            }
+            Commands::Uninstall { agent, local } => (
+                Operation::Uninstall,
+                agent,
+                local,
+                false,
+                false,
+                false,
+                None,
+            ),
+            _ => unreachable!("non-agent command passed to agent dispatcher"),
+        };
     let completion = if local {
         if host_bundle.component.is_some() || host_bundle.dry_run {
             return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -1718,6 +1745,7 @@ async fn dispatch_agent_command(
             operation,
             host_bundle,
             no_dashboard,
+            catalog_profile,
             automation.then_some(agent_cmd::CodexAutomationInstall),
         )
         .await?
@@ -2122,3 +2150,6 @@ fn normalize_tool_reserved_global_flags(cli: &mut Cli) {
 
 #[cfg(test)]
 mod startup_tests;
+
+#[cfg(test)]
+mod native_root_tests;

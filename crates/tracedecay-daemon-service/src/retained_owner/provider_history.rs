@@ -883,9 +883,10 @@ where
         Ok(())
     }
 
-    /// Resolves current-session evidence through the mounted canonical store.
+    /// Resolves current canonical evidence through the mounted project store.
     /// The returned record supplies a locator for the owning message's current
-    /// content/redaction authority; it does not grant historical source rights.
+    /// content/redaction authority. Its owning session may precede the caller;
+    /// this does not assert its original checkout or grant historical source rights.
     pub(crate) async fn resolve_current_session_observation(
         &self,
         provider_id: &OwnedProviderId,
@@ -922,17 +923,6 @@ where
             || stored.retrieval_anchor().owner() != observation.scope()
         {
             return Err(ProviderHistoryErrorV1::Ineligible("canonical project"));
-        }
-        let current_scope = exact_scope_for_session(
-            &self.profile_id,
-            &self.mounted_scope,
-            observation.source().session_id().as_str(),
-        )
-        .map_err(|_| ProviderHistoryErrorV1::Ineligible("canonical session namespace"))?;
-        if &current_scope != destination {
-            return Err(ProviderHistoryErrorV1::Ineligible(
-                "canonical session namespace",
-            ));
         }
         let envelope: CanonicalObservationEnvelopeV1 =
             serde_json::from_value(observation.payload().clone())

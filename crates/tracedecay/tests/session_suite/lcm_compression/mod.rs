@@ -3,15 +3,21 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay_lcm::{
-    LcmCompressionRequest, LcmGrepRequest, LcmGrepSort, LcmLifecycleUpdate, LcmLoadSessionRequest,
-    LcmMaintenanceDebt, LcmPreflightRequest, LcmScope, LcmSessionBoundaryRequest, LcmSourceRef,
-    LcmStorageKind, LcmSummarizerMode, LcmSummaryNodeDraft, MAX_DERIVED_SNIPPET_CHARS,
+    LcmCompressionRequest, LcmLifecycleUpdate, LcmLoadSessionRequest, LcmMaintenanceDebt,
+    LcmPreflightRequest, LcmSessionBoundaryRequest, LcmSourceRef, LcmStorageKind,
+    LcmSummarizerMode, LcmSummaryNodeDraft, MAX_DERIVED_SNIPPET_CHARS,
 };
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
 use crate::common::{self, LcmTestRuntime, open_lcm_db};
+
+/// The unit every LCM budget is denominated in: ordinary `o200k_base` tokens.
+fn budget_tokens(text: &str) -> i64 {
+    i64::try_from(tracedecay_tokenizer::count_ordinary_tokens(text).expect("o200k tokenizer"))
+        .expect("token count fits i64")
+}
 
 async fn open_registered_lcm_runtime(tmp: &TempDir) -> HostAdmissionTestRuntimeV1 {
     HostAdmissionTestRuntimeV1::profile(tmp.path().join(".tracedecay"))

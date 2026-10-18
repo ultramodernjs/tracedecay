@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use std::sync::atomic::AtomicBool;
@@ -7,12 +9,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tracedecay_contracts::remote::auth::RemoteEnrollmentAdmissionEvidenceV1;
-use tracedecay_domain::{BrainNodeId, EnrollmentGrantV1};
+use tracedecay_contracts::remote::discovery::RemoteAuthorityDiscoveryV1;
+use tracedecay_domain::{BrainId, BrainNodeId, EnrollmentGrantV1};
 use tracedecay_graph_db::{GraphDbRegistry, GraphDbRegistryConfig};
 use tracedecay_runtime_core::RuntimeOperationTaskOwnerV1;
 use tracedecay_runtime_core::storage::{
-    SESSIONS_DB_FILENAME, STORE_MANIFEST_FILENAME, profile_sharded_data_root, read_store_manifest,
-    write_store_manifest_to_path,
+    REMOTE_DB_FILENAME, SESSIONS_DB_FILENAME, STORE_MANIFEST_FILENAME, profile_sharded_data_root,
+    read_store_manifest, write_store_manifest_to_path,
 };
 #[cfg(any(test, feature = "test-helpers"))]
 use tracedecay_rusqlite_runtime::remote::RemoteRecoverySqliteAuthorityV1;
@@ -35,6 +38,7 @@ use super::{
     StoreRuntimeRegistry, StoreRuntimeResolver, bind_ready_project_memory_graph, open_runtime,
     open_runtime_with_presence, registry_open_error, runtime_incarnation, session_registry_error,
 };
+use crate::RemoteNodeOperatorErrorV1;
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_global_db::register_registered_schema_installer;
 use tracedecay_global_db::schema_contract::registered_schema_admission_digest;
@@ -149,12 +153,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             identity.profile_id().clone(),
         ));
         let remote_replay_transaction = Arc::new(
-            crate::remote_replay_transaction::DaemonRemoteReplayTransactionAuthorityV1::new(
-                tokio::runtime::Handle::current(),
-            )
-            .map_err(|error| {
-                session_registry_error("start remote replay transaction authority", error)
-            })?,
+            crate::remote_replay_transaction::DaemonRemoteReplayTransactionAuthorityV1::new(),
         );
         // The kernel's registry initialises profile- and session-scoped shards
         // through a fail-closed port, because the registered schema lives in
@@ -170,9 +169,33 @@ impl DaemonSessionRuntimeRegistryV1 {
                 identity.profile_root().to_path_buf(),
             ),
         ));
-        let registry_resolver: Arc<dyn StoreRuntimeResolver> = resolver.clone();
-        let registry =
-            StoreRuntimeRegistry::new(registry_resolver, Arc::new(LifecycleShardRuntimePublisher));
+        let (operation_task_owner, registry) =
+            {
+                // The handle's Send proof is the asupersync self-cycle. Consume it
+                // before the first await so the constructor future does not capture it.
+                let operation_runtime = tracedecay_runtime_core::native_runtime::handle()
+                    .ok_or_else(|| TraceDecayError::Config {
+                        message: "session runtime registry requires a native execution runtime"
+                            .to_owned(),
+                    })?;
+                let operation_task_owner = Arc::new(
+                    RuntimeOperationTaskOwnerV1::new(operation_runtime.clone()).map_err(
+                        |error| TraceDecayError::Config {
+                            message: error.to_string(),
+                        },
+                    )?,
+                );
+                let registry_resolver: Arc<dyn StoreRuntimeResolver> = resolver.clone();
+                let registry = StoreRuntimeRegistry::new(
+                    operation_runtime,
+                    registry_resolver,
+                    Arc::new(LifecycleShardRuntimePublisher),
+                )
+                .map_err(|error| {
+                    session_registry_error("create store runtime registry", format!("{error:?}"))
+                })?;
+                (operation_task_owner, registry)
+            };
         let graph_manifest_provider =
             Arc::new(super::code_graph_manifest::DaemonCodeGraphManifestProviderV1::default());
         let graph_registry = GraphDbRegistry::new_with_manifest_provider(
@@ -188,8 +211,8 @@ impl DaemonSessionRuntimeRegistryV1 {
         })?;
         let profile_shard =
             StoreShardIdV1::profile(identity.brain_id().clone(), identity.profile_id().clone());
-        let profile_runtime = tracing::Instrument::instrument(
-            open_runtime(
+        let opened: Pin<Box<dyn Future<Output = Result<StoreRuntimeClientLease>> + Send + '_>> =
+            Box::pin(open_runtime(
                 &registry,
                 resolver.as_ref(),
                 StoreRuntimeOpenSpec::new(
@@ -200,7 +223,9 @@ impl DaemonSessionRuntimeRegistryV1 {
                     true,
                     "mount profile authority store",
                 ),
-            ),
+            ));
+        let profile_runtime = tracing::Instrument::instrument(
+            opened,
             tracing::trace_span!("daemon.store.profile_authority.bootstrap_open"),
         )
         .await?;
@@ -225,7 +250,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             graph_registry,
             graph_manifest_provider,
             graph_lifecycle_cancelled: Arc::new(AtomicBool::new(false)),
-            operation_task_owner: Arc::new(RuntimeOperationTaskOwnerV1::new()),
+            operation_task_owner,
             profile_pin: Mutex::new(Some(profile_pin)),
             profile_database_mount: Mutex::new(()),
             profile_database: std::sync::Mutex::new(None),
@@ -240,6 +265,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             code_graph_publication_gates: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             registered_schema_convergence: RegisteredSchemaConvergenceMaintenance::new(),
             reset_required_stores: std::sync::Mutex::new(BTreeMap::new()),
+            lost_store_files: std::sync::Mutex::new(BTreeMap::new()),
             retained_hook_tasks: RetainedHookTasks::new(),
             session_sync_service: Arc::new(std::sync::OnceLock::new()),
             remote_recovery_project_lifecycle: Arc::new(std::sync::OnceLock::new()),
@@ -247,9 +273,17 @@ impl DaemonSessionRuntimeRegistryV1 {
             #[cfg(any(test, feature = "test-helpers"))]
             session_graph_publication_gate: std::sync::Mutex::new(None),
         };
-        registry.mount_registered_remote_nodes().await?;
+        let mounted_nodes: Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> =
+            Box::pin(registry.mount_registered_remote_nodes());
+        tracing::Instrument::instrument(
+            mounted_nodes,
+            tracing::trace_span!("daemon.session_registry.mount_remote_nodes"),
+        )
+        .await?;
         if registry.long_lived_session_maintenance {
-            registry.inspect_project_session_stores().await;
+            let inspected: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                Box::pin(registry.inspect_project_session_stores());
+            inspected.await;
         }
         Ok(registry)
     }
@@ -297,9 +331,9 @@ impl DaemonSessionRuntimeRegistryV1 {
         manifests.sort();
         let digest = registered_schema_admission_digest();
         for manifest in manifests {
-            if let Err(error) =
-                Box::pin(self.inspect_project_session_store(&manifest, &digest)).await
-            {
+            let inspected: Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> =
+                Box::pin(self.inspect_project_session_store(&manifest, &digest));
+            if let Err(error) = inspected.await {
                 tracing::warn!(
                     event = "project_session_store_inspection_failed",
                     path = %manifest.display(),
@@ -330,10 +364,12 @@ impl DaemonSessionRuntimeRegistryV1 {
         }
         let project_id = ProjectId::new(project_id)
             .map_err(|error| session_registry_error(OPERATION, error.to_string()))?;
-        let authority =
-            LocalProjectEnrollmentAuthorityV1::new(project_id.clone(), [manifest.project_root]);
-        self.resolver
-            .register_project_authority(authority.clone())
+        let added = self
+            .resolver
+            .register_project_authority(LocalProjectEnrollmentAuthorityV1::new(
+                project_id.clone(),
+                [manifest.project_root],
+            ))
             .map_err(|error| session_registry_error(OPERATION, format!("{error:?}")))?;
         let shard_id = StoreShardIdV1::project_sessions(
             self.identity.brain_id().clone(),
@@ -343,7 +379,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         let refusal = self
             .registered_store_reset_refusal(shard_id.clone(), OPERATION)
             .await;
-        self.resolver.withdraw_project_authority(&authority);
+        self.resolver.withdraw_project_authority(&added);
         match refusal? {
             Some(refusal) => self.record_registered_admission(shard_id, Some(&refusal)),
             None => stamp_sessions_admission(manifest_path, digest),
@@ -384,11 +420,6 @@ impl DaemonSessionRuntimeRegistryV1 {
         }
     }
 
-    #[tracing::instrument(
-        name = "daemon.session_registry.mount_remote_nodes",
-        level = "trace",
-        skip_all
-    )]
     async fn mount_registered_remote_nodes(&self) -> Result<()> {
         let nodes_root = self.identity.profile_root().join("remote").join("nodes");
         if !nodes_root.exists() {
@@ -400,7 +431,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         let mut databases = entries
             .map(|entry| {
                 entry
-                    .map(|entry| entry.path().join("remote.db"))
+                    .map(|entry| entry.path().join(REMOTE_DB_FILENAME))
                     .map_err(|error| {
                         session_registry_error(
                             "discover registered Remote Brain node",
@@ -415,7 +446,6 @@ impl DaemonSessionRuntimeRegistryV1 {
         for database in databases {
             let node_id = RemoteSqliteStorageV1::discover_registered_node(
                 &database,
-                self.identity.brain_id(),
                 self.identity.profile_id(),
             )
             .map_err(|error| {
@@ -424,8 +454,9 @@ impl DaemonSessionRuntimeRegistryV1 {
                     error.to_string(),
                 )
             })?;
-            self.remote_node_storage(node_id, Arc::clone(&keyring))
-                .await?;
+            let mounted: Pin<Box<dyn Future<Output = Result<RemoteSqliteStorageV1>> + Send + '_>> =
+                Box::pin(self.remote_node_storage(node_id, Arc::clone(&keyring)));
+            mounted.await?;
         }
         Ok(())
     }
@@ -607,7 +638,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         );
         // Boxed store-open composition: keeps this mount machine (and the
         // measured wrapper embedding it by value) pointer-sized per await.
-        let runtime = tracing::Instrument::instrument(
+        let opened: Pin<Box<dyn Future<Output = Result<StoreRuntimeClientLease>> + Send + '_>> =
             Box::pin(open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
@@ -619,12 +650,15 @@ impl DaemonSessionRuntimeRegistryV1 {
                     true,
                     "mount profile authority store",
                 ),
-            )),
+            ));
+        let runtime = tracing::Instrument::instrument(
+            opened,
             tracing::trace_span!("daemon.store.profile_authority.mount_open"),
         )
         .await?;
-        let database =
-            Box::pin(self.attach_registered(runtime, "attach profile authority store")).await?;
+        let attached: Pin<Box<dyn Future<Output = Result<RegisteredGlobalDbOwnerV1>> + Send + '_>> =
+            Box::pin(self.attach_registered(runtime, "attach profile authority store"));
+        let database = attached.await?;
         let lease = database.issue_lease().map_err(|error| {
             session_registry_error(
                 "issue profile authority database client",
@@ -641,7 +675,9 @@ impl DaemonSessionRuntimeRegistryV1 {
     /// The profile session store. A store held in its typed reset-required
     /// state answers that refusal instead of a client.
     pub async fn profile_sessions(&self) -> Result<RegisteredGlobalDbLeaseV1> {
-        refuse_reset_required(Box::pin(self.mount_profile_session_store()).await?)
+        let mounted: Pin<Box<dyn Future<Output = Result<RegisteredGlobalDbLeaseV1>> + Send + '_>> =
+            Box::pin(self.mount_profile_session_store());
+        refuse_reset_required(mounted.await?)
     }
 
     async fn mount_profile_session_store(&self) -> Result<RegisteredGlobalDbLeaseV1> {
@@ -681,8 +717,10 @@ impl DaemonSessionRuntimeRegistryV1 {
             self.identity.brain_id().clone(),
             self.identity.profile_id().clone(),
         );
-        let pin = Box::pin(self.profile_authority_pin("mount profile session store")).await?;
-        let runtime = tracing::Instrument::instrument(
+        let pin: Pin<Box<dyn Future<Output = Result<super::ProfileAuthorityPin>> + Send + '_>> =
+            Box::pin(self.profile_authority_pin("mount profile session store"));
+        let pin = pin.await?;
+        let opened: Pin<Box<dyn Future<Output = Result<StoreRuntimeClientLease>> + Send + '_>> =
             Box::pin(open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
@@ -694,12 +732,15 @@ impl DaemonSessionRuntimeRegistryV1 {
                     true,
                     "mount profile session store",
                 ),
-            )),
+            ));
+        let runtime = tracing::Instrument::instrument(
+            opened,
             tracing::trace_span!("daemon.store.profile_sessions.open"),
         )
         .await?;
-        let database =
-            Box::pin(self.attach_registered(runtime, "mount profile session store")).await?;
+        let attached: Pin<Box<dyn Future<Output = Result<RegisteredGlobalDbOwnerV1>> + Send + '_>> =
+            Box::pin(self.attach_registered(runtime, "mount profile session store"));
+        let database = attached.await?;
         let (database, lease) = self.publish_session_owner(
             database,
             shard_id,
@@ -737,6 +778,8 @@ impl DaemonSessionRuntimeRegistryV1 {
         ));
         let graph_open_task_key = format!("{shard_id:?}");
         let task_graph = Arc::clone(&graph);
+        let graph_settled = Arc::new(tokio::sync::Notify::new());
+        let task_graph_settled = Arc::clone(&graph_settled);
         let task_database = database.clone();
         let unadmitted_database = database.clone();
         let identity = self.identity.clone();
@@ -817,6 +860,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                     // that is never coming.
                     task_database.mark_memory_graph_runtime_unavailable();
                 }
+                task_graph_settled.notify_waiters();
                 if let Some(project_id) = task_project_id
                     && let Err(error) =
                         bind_ready_project_memory_graph(&project_owners, &project_id)
@@ -847,6 +891,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             MemoryStoreOwnerV1 {
                 database: database_issuer,
                 graph,
+                graph_settled,
                 graph_open_task_key,
             },
             Arc::new(database),
@@ -882,8 +927,8 @@ impl DaemonSessionRuntimeRegistryV1 {
         let pin = self
             .profile_authority_pin("mount profile memory store")
             .await?;
-        let runtime = tracing::Instrument::instrument(
-            open_runtime(
+        let opened: Pin<Box<dyn Future<Output = Result<StoreRuntimeClientLease>> + Send + '_>> =
+            Box::pin(open_runtime(
                 &self.registry,
                 self.resolver.as_ref(),
                 StoreRuntimeOpenSpec::new(
@@ -894,11 +939,17 @@ impl DaemonSessionRuntimeRegistryV1 {
                     true,
                     "mount profile memory store",
                 ),
-            ),
+            ));
+        let runtime = tracing::Instrument::instrument(
+            opened,
             tracing::trace_span!("daemon.store.profile_memory.open"),
         )
         .await?;
-        let (owner, database) = self.publish_memory_owner(shard_id, runtime).await?;
+        let published = tracedecay_runtime_core::erase_send!(
+            self.publish_memory_owner(shard_id, runtime),
+            Result<(MemoryStoreOwnerV1, Arc<Database>)>
+        );
+        let (owner, database) = published.await?;
         *self
             .profile_memory
             .lock()
@@ -911,48 +962,104 @@ impl DaemonSessionRuntimeRegistryV1 {
         node_id: BrainNodeId,
         keyring: Arc<dyn RemoteSpoolKeyringV1>,
     ) -> Result<RemoteSqliteStorageV1> {
-        self.mount_remote_node_storage(node_id, keyring, false)
+        self.mount_remote_node_storage(node_id, keyring, None).await
+    }
+
+    /// Makes this profile the node that `discovery` names in another
+    /// profile's Brain. Only the operator join route reaches this, with an
+    /// answer the authority returned to the node's own credential and the
+    /// caller already verified; provisioning keeps refusing every foreign
+    /// grant. The store adopts the authority's enrollment record verbatim, so
+    /// both sides hold one enrollment identity and revision. A rerun with the
+    /// same answer converges.
+    pub async fn join_remote_node(
+        &self,
+        discovery: &RemoteAuthorityDiscoveryV1,
+    ) -> std::result::Result<(), RemoteNodeOperatorErrorV1> {
+        let enrollment = &discovery.enrollment.enrollment;
+        if &enrollment.brain_id == self.identity.brain_id() {
+            return Err(RemoteNodeOperatorErrorV1::BrainIdentityConflict);
+        }
+        let keyring: Arc<dyn RemoteSpoolKeyringV1> = Arc::new(UnavailableRemoteSpoolKeyringV1);
+        let storage = self
+            .mount_remote_node_storage(
+                enrollment.node_id.clone(),
+                keyring,
+                Some(&enrollment.brain_id),
+            )
             .await
+            .map_err(|error| {
+                tracing::warn!(%error, "remote node store mount failed during join");
+                RemoteNodeOperatorErrorV1::Unavailable
+            })?;
+        if storage.member_brain() != &enrollment.brain_id {
+            return Err(RemoteNodeOperatorErrorV1::BrainIdentityConflict);
+        }
+        storage
+            .record_authority_discovery(discovery, tracedecay_contracts::clock::now_micros())
+            .map_err(|error| match error {
+                RemoteSqliteStorageErrorV1::Conflict
+                | RemoteSqliteStorageErrorV1::BindingMismatch => {
+                    RemoteNodeOperatorErrorV1::Conflict
+                }
+                error => {
+                    tracing::warn!(%error, "remote node join persistence failed");
+                    RemoteNodeOperatorErrorV1::Unavailable
+                }
+            })?;
+        self.remote_credential_authority
+            .refresh_storage(&enrollment.node_id)
+            .map_err(map_registry_error)
     }
 
     pub async fn provision_remote_node(
         &self,
         grant: EnrollmentGrantV1,
         admission: RemoteEnrollmentAdmissionEvidenceV1,
-    ) -> Result<()> {
-        grant.validate().map_err(|error| {
-            session_registry_error("provision Remote Brain node", error.to_string())
-        })?;
-        admission.validate_for(&grant).map_err(|error| {
-            session_registry_error("authenticate Remote Brain provisioning", error.to_string())
-        })?;
+    ) -> std::result::Result<(), RemoteNodeOperatorErrorV1> {
+        grant
+            .validate()
+            .map_err(|_| RemoteNodeOperatorErrorV1::InvalidRequest)?;
+        admission
+            .validate_for(&grant)
+            .map_err(|_| RemoteNodeOperatorErrorV1::InvalidRequest)?;
         if &grant.brain_id != self.identity.brain_id() {
-            return Err(session_registry_error(
-                "provision Remote Brain node",
-                "grant brain identity does not match the profile authority".to_owned(),
-            ));
+            return Err(RemoteNodeOperatorErrorV1::BrainIdentityConflict);
         }
         let keyring: Arc<dyn RemoteSpoolKeyringV1> = Arc::new(UnavailableRemoteSpoolKeyringV1);
         let storage = self
-            .mount_remote_node_storage(grant.node_id.clone(), keyring, true)
-            .await?;
+            .mount_remote_node_storage(
+                grant.node_id.clone(),
+                keyring,
+                Some(self.identity.brain_id()),
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "remote node store mount failed during provisioning");
+                RemoteNodeOperatorErrorV1::Unavailable
+            })?;
+        if storage.is_joined() {
+            return Err(RemoteNodeOperatorErrorV1::BrainIdentityConflict);
+        }
         storage
             .store_enrollment_grant(&grant, &admission)
-            .map_err(|error| {
-                session_registry_error("publish Remote Brain enrollment grant", error.to_string())
+            .map_err(|error| match error {
+                RemoteSqliteStorageErrorV1::Corruption => RemoteNodeOperatorErrorV1::Conflict,
+                error => {
+                    tracing::warn!(%error, "remote enrollment grant persistence failed");
+                    RemoteNodeOperatorErrorV1::Unavailable
+                }
             })?;
         self.remote_credential_authority
             .refresh_storage(&grant.node_id)
-            .map_err(|error| {
-                session_registry_error("register Remote Brain enrollment grant", error.to_string())
-            })
+            .map_err(map_registry_error)
     }
 
     async fn mount_remote_node_storage(
         &self,
         node_id: BrainNodeId,
         keyring: Arc<dyn RemoteSpoolKeyringV1>,
-        provision_if_new: bool,
+        provision_member_brain: Option<&BrainId>,
     ) -> Result<RemoteSqliteStorageV1> {
         let (database, newly_mounted, existed) = match self.admit_remote_node_owner(&node_id)? {
             super::RemoteNodeOwnerAdmissionV1::Existing(database) => (database, false, true),
@@ -962,10 +1069,11 @@ impl DaemonSessionRuntimeRegistryV1 {
                     self.identity.profile_id().clone(),
                     node_id.clone(),
                 );
-                let pin = self
-                    .profile_authority_pin("mount Remote Brain node store")
-                    .await?;
-                let (runtime, existed) = tracing::Instrument::instrument(
+                let pin: Pin<
+                    Box<dyn Future<Output = Result<super::ProfileAuthorityPin>> + Send + '_>,
+                > = Box::pin(self.profile_authority_pin("mount Remote Brain node store"));
+                let pin = pin.await?;
+                let opened = tracedecay_runtime_core::erase_send!(
                     open_runtime_with_presence(
                         &self.registry,
                         self.resolver.as_ref(),
@@ -976,12 +1084,21 @@ impl DaemonSessionRuntimeRegistryV1 {
                         true,
                         "mount Remote Brain node store",
                     ),
+                    Result<(StoreRuntimeClientLease, bool)>
+                );
+                let (runtime, existed) = tracing::Instrument::instrument(
+                    opened,
                     tracing::trace_span!("daemon.store.remote_node.open"),
                 )
                 .await?;
+                let published: Pin<
+                    Box<dyn Future<Output = Result<super::DatabaseOwnerV1>> + Send + '_>,
+                > = Box::pin(Database::publish_runtime(
+                    runtime,
+                    DatabaseAccessMode::ReadWrite,
+                ));
                 let owner = RemoteNodeStoreOwnerV1 {
-                    database: Database::publish_runtime(runtime, DatabaseAccessMode::ReadWrite)
-                        .await?,
+                    database: published.await?,
                 };
                 let database = owner.database.issue_lease().map_err(|error| {
                     session_registry_error(
@@ -993,10 +1110,11 @@ impl DaemonSessionRuntimeRegistryV1 {
                 (database, true, existed)
             }
         };
-        let storage = if provision_if_new && newly_mounted && !existed {
-            database.provision_remote_storage(keyring)
-        } else {
-            database.remote_storage(keyring)
+        let storage = match provision_member_brain {
+            Some(member_brain) if newly_mounted && !existed => {
+                database.provision_remote_storage(keyring, member_brain)
+            }
+            _ => database.remote_storage(keyring),
         }
         .map_err(|error| {
             session_registry_error("attach Remote Brain node store", error.to_string())
@@ -1032,7 +1150,6 @@ impl DaemonSessionRuntimeRegistryV1 {
                 storage.clone(),
                 Arc::clone(&self.remote_replay_transaction),
                 self.remote_recovery_project_lifecycle(),
-                tokio::runtime::Handle::current(),
             ));
             let recovery = database.remote_recovery_authority(effects)?;
             let recovery = Arc::new(recovery);
@@ -1054,13 +1171,11 @@ impl DaemonSessionRuntimeRegistryV1 {
             })?;
         let projects = self.project_owners.ready_session_projects()?;
         for project_id in projects {
-            {
-                let _span = tracing::trace_span!(
-                    "daemon.session_registry.mount.remote_promotion_reconcile"
-                )
-                .entered();
-                recovery.reconcile_interrupted_promotions(&project_id)
-            }
+            tracing::Instrument::instrument(
+                recovery.reconcile_interrupted_promotions(&project_id),
+                tracing::trace_span!("daemon.session_registry.mount.remote_promotion_reconcile"),
+            )
+            .await
             .map_err(|error| {
                 session_registry_error(
                     "reconcile interrupted remote promotion",
@@ -1159,8 +1274,12 @@ impl DaemonSessionRuntimeRegistryV1 {
     /// The dropped owners leave their `SQLite` runtimes mounted, so the
     /// profile database owner and pin are released too and every store
     /// runtime no longer held is then closed: its writer runs the shutdown
-    /// TRUNCATE checkpoint instead of leaving a retained WAL.
-    pub async fn close_retained_graph_runtimes_for_shutdown(&self) -> Result<()> {
+    /// TRUNCATE checkpoint instead of leaving a retained WAL. A runtime still
+    /// held is waited on until `deadline`, the caller's store-close budget.
+    pub async fn close_retained_graph_runtimes_for_shutdown(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         let identities = self.drain_retained_graph_owners_for_shutdown()?;
         let mut first_error = None;
         for (binding, locator) in identities {
@@ -1182,7 +1301,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                 .take(),
         );
         drop(self.profile_pin.lock().await.take());
-        if let Err(failure) = self.registry.close_idle_for_shutdown().await
+        if let Err(failure) = self.registry.close_idle_for_shutdown(deadline).await
             && first_error.is_none()
         {
             first_error = Some(session_registry_error(
@@ -1396,6 +1515,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                 project_id.clone(),
                 enrollment_roots,
             ))
+            .map(drop)
             .map_err(|error| {
                 session_registry_error("register project session authority", format!("{error:?}"))
             })
@@ -1544,13 +1664,11 @@ impl DaemonSessionRuntimeRegistryV1 {
             .cloned()
             .collect::<Vec<_>>();
         for recovery in recoveries {
-            {
-                let _span = tracing::trace_span!(
-                    "daemon.session_registry.mount.remote_promotion_reconcile"
-                )
-                .entered();
-                recovery.reconcile_interrupted_promotions(&project_id)
-            }
+            tracing::Instrument::instrument(
+                recovery.reconcile_interrupted_promotions(&project_id),
+                tracing::trace_span!("daemon.session_registry.mount.remote_promotion_reconcile"),
+            )
+            .await
             .map_err(|error| {
                 session_registry_error(
                     "reconcile interrupted remote promotion",
@@ -1906,6 +2024,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                     error: "test read-only memory owner does not attach a writer graph".to_owned(),
                 },
             )),
+            graph_settled: Arc::new(tokio::sync::Notify::new()),
             graph_open_task_key: format!("{shard_id:?}"),
         })?;
         Ok(database)
@@ -1921,6 +2040,23 @@ impl DaemonSessionRuntimeRegistryV1 {
             mounted.get(project_id),
             Some(ProjectRuntimeOwnerStateV1::Ready(owners)) if owners.memory.is_some()
         )
+    }
+}
+
+fn map_registry_error(
+    error: crate::DaemonRemoteCredentialRegistryErrorV1,
+) -> RemoteNodeOperatorErrorV1 {
+    match error {
+        crate::DaemonRemoteCredentialRegistryErrorV1::IdentityConflict => {
+            RemoteNodeOperatorErrorV1::Conflict
+        }
+        crate::DaemonRemoteCredentialRegistryErrorV1::CapacityExceeded => {
+            RemoteNodeOperatorErrorV1::CapacityExceeded
+        }
+        error => {
+            tracing::warn!(%error, "remote node credential registration failed");
+            RemoteNodeOperatorErrorV1::Unavailable
+        }
     }
 }
 

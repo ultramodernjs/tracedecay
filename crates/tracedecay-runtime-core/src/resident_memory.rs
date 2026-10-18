@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use asupersync::channel::watch;
 #[cfg(target_os = "macos")]
 use mach2::{
     kern_return::KERN_SUCCESS,
@@ -18,7 +19,6 @@ use mach2::{
     traps::mach_task_self,
 };
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-use tokio::sync::watch;
 use tracedecay_domain::process_heap::installed_process_allocator_release_v1;
 use tracedecay_domain::{CodeGenerationId, ProjectId, WorktreeId};
 
@@ -228,7 +228,7 @@ pub fn detected_process_resident_memory_limit_v1() -> NonZeroU64 {
 #[must_use]
 pub fn physical_memory_bytes_v1() -> Option<u64> {
     let system = System::new_with_specifics(
-        RefreshKind::new().with_memory(MemoryRefreshKind::new().with_ram()),
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
     );
     Some(system.total_memory()).filter(|bytes| *bytes != 0)
 }
@@ -757,7 +757,7 @@ impl ResidentMemoryPressureV1 {
             observed_bytes: AtomicU64::new(0),
             observed: AtomicBool::new(false),
             over_budget: AtomicBool::new(false),
-            headroom: watch::Sender::new(0),
+            headroom: watch::channel(0).0,
             waiting: Mutex::new(Vec::new()),
             any_waiting: AtomicBool::new(false),
             state: Mutex::new(ResidentMemoryPressureReclaimerStateV1::default()),
@@ -1028,7 +1028,8 @@ impl Drop for ResidentMemoryPressureRegistrationV1 {
 }
 
 fn advance_headroom_epoch(epoch: &watch::Sender<u64>) {
-    epoch.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    // Refused only once the sender is dropped, and the caller still holds it.
+    let _ = epoch.send_modify(|epoch| *epoch = epoch.wrapping_add(1));
 }
 
 static PROCESS_RESIDENT_MEMORY_PRESSURE_V1: OnceLock<Arc<ResidentMemoryPressureV1>> =
@@ -1353,10 +1354,6 @@ pub struct ResidentMemoryAdjustmentFailureV1 {
     pub measured_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("resident-memory reclaimer registration sequence exhausted")]
-pub struct ResidentMemoryReclaimerRegistrationFailureV1;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResidentMemoryChargeV1 {
     pub key: ResidentMemoryKeyV1,
@@ -1410,28 +1407,11 @@ impl ResidentMemorySnapshotV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResidentMemoryReclaimRequestV1 {
-    pub key: ResidentMemoryKeyV1,
-    pub used_bytes: u64,
-    pub requested_bytes: u64,
-    pub limit_bytes: u64,
-    pub shortfall_bytes: u64,
-}
-
-pub type ResidentMemoryReclaimerV1 = dyn Fn(ResidentMemoryReclaimRequestV1) + Send + Sync + 'static;
-
-struct ReclaimerEntryV1 {
-    callback: Arc<ResidentMemoryReclaimerV1>,
-}
-
 #[derive(Default)]
 struct ResidentMemoryStateV1 {
     used_bytes: u64,
     charges: BTreeMap<ResidentMemoryKeyV1, u64>,
     process_shared_charges: BTreeMap<ResidentMemoryComponentIdV1, u64>,
-    reclaimers: BTreeMap<(u32, u64), Arc<ResidentMemoryReclaimerV1>>,
-    next_reclaimer_sequence: u64,
     /// The highest occupancy (ledger or measured, whichever is larger) at
     /// which some refused request fits; `None` while nothing waits.
     waiting_level: Option<u64>,
@@ -1543,16 +1523,6 @@ impl ProcessResidentMemoryV1 {
             return Ok(reservation);
         }
 
-        if requested_bytes.get() <= self.limit_bytes.get() {
-            let reclaimers = self.reclaimers();
-            for reclaimer in reclaimers {
-                (reclaimer.callback)(self.reclaim_request(key.clone(), requested_bytes));
-                if let Some(reservation) = self.try_reserve(&key, requested_bytes) {
-                    return Ok(reservation);
-                }
-            }
-        }
-
         Err(self.refused(self.admission_failure(requested_bytes)))
     }
 
@@ -1588,25 +1558,6 @@ impl ProcessResidentMemoryV1 {
             authority: Arc::clone(self),
             component,
             reserved_bytes: requested_bytes.get(),
-        })
-    }
-
-    pub fn register_reclaimer(
-        self: &Arc<Self>,
-        priority: u32,
-        callback: Arc<ResidentMemoryReclaimerV1>,
-    ) -> Result<ResidentMemoryReclaimerRegistrationV1, ResidentMemoryReclaimerRegistrationFailureV1>
-    {
-        let mut state = self.lock_state();
-        let sequence = state.next_reclaimer_sequence;
-        state.next_reclaimer_sequence = sequence
-            .checked_add(1)
-            .ok_or(ResidentMemoryReclaimerRegistrationFailureV1)?;
-        state.reclaimers.insert((priority, sequence), callback);
-        Ok(ResidentMemoryReclaimerRegistrationV1 {
-            authority: Arc::downgrade(self),
-            priority,
-            sequence,
         })
     }
 
@@ -1691,34 +1642,6 @@ impl ProcessResidentMemoryV1 {
             key: key.clone(),
             reserved_bytes: requested_bytes.get(),
         })
-    }
-
-    fn reclaimers(&self) -> Vec<ReclaimerEntryV1> {
-        let state = self.lock_state();
-        state
-            .reclaimers
-            .values()
-            .map(|callback| ReclaimerEntryV1 {
-                callback: Arc::clone(callback),
-            })
-            .collect()
-    }
-
-    fn reclaim_request(
-        &self,
-        key: ResidentMemoryKeyV1,
-        requested_bytes: NonZeroU64,
-    ) -> ResidentMemoryReclaimRequestV1 {
-        let state = self.lock_state();
-        let available_bytes = self.limit_bytes.get() - state.used_bytes;
-        let shortfall_bytes = requested_bytes.get().saturating_sub(available_bytes);
-        ResidentMemoryReclaimRequestV1 {
-            key,
-            used_bytes: state.used_bytes,
-            requested_bytes: requested_bytes.get(),
-            limit_bytes: self.limit_bytes.get(),
-            shortfall_bytes,
-        }
     }
 
     /// Refuse growth that exceeds measured RSS headroom or its pressure latch.
@@ -2019,24 +1942,6 @@ impl Drop for ProcessSharedMemoryReservationV1 {
     fn drop(&mut self) {
         self.authority
             .release_process_shared(self.component, self.reserved_bytes);
-    }
-}
-
-pub struct ResidentMemoryReclaimerRegistrationV1 {
-    authority: Weak<ProcessResidentMemoryV1>,
-    priority: u32,
-    sequence: u64,
-}
-
-impl Drop for ResidentMemoryReclaimerRegistrationV1 {
-    fn drop(&mut self) {
-        let Some(authority) = self.authority.upgrade() else {
-            return;
-        };
-        authority
-            .lock_state()
-            .reclaimers
-            .remove(&(self.priority, self.sequence));
     }
 }
 

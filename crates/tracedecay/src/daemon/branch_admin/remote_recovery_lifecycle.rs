@@ -19,10 +19,8 @@ pub(in crate::daemon) struct RemoteRecoveryProjectLifecycleV1 {
     profile_id: UserProfileId,
     profile_root: PathBuf,
     gate: Arc<StoreWriterGates>,
-    /// Weak on purpose: the profile's session runtime registry retains this
-    /// lifecycle, and the registry lives in this map. A strong handle here
-    /// closes a cycle that keeps every registry, with its profile databases
-    /// and their reader pools, alive after its store administration is gone.
+    // Weak: the registry this lifecycle is installed into lives in this map,
+    // so a strong handle would keep the registry and every store it owns alive.
     session_runtime_registries: Weak<tokio::sync::Mutex<super::SessionRuntimeRegistries>>,
     project_server_retirements:
         Arc<tokio::sync::Mutex<Vec<super::project_retirement::ProjectServerRetirement>>>,
@@ -113,7 +111,7 @@ impl RemoteRecoveryProjectLifecycleV1 {
     }
 
     async fn settle_retained_runtime_retirement(&self, project_id: &ProjectId) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + DAEMON_TASK_ABORT_DEADLINE;
+        let deadline = std::time::Instant::now() + DAEMON_TASK_ABORT_DEADLINE;
         let receipt = super::project_retirement::settle_project_retirements(
             &self.project_server_retirements,
             &self.profile_root,
@@ -265,12 +263,25 @@ pub(super) async fn retire_runtime_work(
     #[cfg(unix)]
     retire_maintenance_tasks(automation, tracked_retirements, profile_root, project_id).await;
     for (owner, servers) in server_retirements {
-        let task = tokio::spawn(async move {
+        let retirement = async move {
+            // Replay is a data-root owner outside the MCP server task set and
+            // retains the exact ProjectSessions client used for native lifecycle
+            // delivery. Join it inside the tracked retirement deadline before
+            // store retirement inspects live clients.
+            for server in &servers {
+                let graph = server.cg().await;
+                crate::daemon::hook_v2_replay_consumer::retire_hook_v2_replay_consumer(
+                    &graph.hook_store_layout().data_root,
+                    &Arc::downgrade(&graph),
+                )
+                .await;
+            }
             super::super::project_server_lifecycle::retire_project_servers_now(servers).await;
-        });
-        super::project_retirement::track_retirement_task(tracked_retirements, owner, task).await;
+        };
+        super::project_retirement::track_tokio_retirement(tracked_retirements, owner, retirement)
+            .await;
     }
-    let deadline = tokio::time::Instant::now() + DAEMON_TASK_ABORT_DEADLINE;
+    let deadline = std::time::Instant::now() + DAEMON_TASK_ABORT_DEADLINE;
     let receipt = super::project_retirement::settle_project_retirements(
         tracked_retirements,
         profile_root,
@@ -319,7 +330,8 @@ async fn retire_maintenance_tasks(
         task.abort();
     }
     for (owner, task) in tasks {
-        super::project_retirement::track_aborted_retirement_task(retirements, owner, task).await;
+        super::project_retirement::track_aborted_native_retirement_task(retirements, owner, task)
+            .await;
     }
 }
 

@@ -1,4 +1,4 @@
-//! Connection context for the `rmcp` adapter, server shutdown, and
+//! Connection context for the MCP session, server shutdown, and
 //! daemon-owned host-admission replay driving.
 
 use super::*;
@@ -19,22 +19,19 @@ pub(super) const MAX_CONCURRENT_CONNECTION_READS: usize =
 /// registry, route cache, or cancellation table of its own.
 pub(crate) struct ProductionMcpConnectionContext {
     server: Arc<McpServer>,
-    admission: Option<Arc<crate::daemon::ParkableConnectionAdmission>>,
     _activity: Option<DaemonActivity>,
 }
 
 impl ProductionMcpConnectionContext {
-    /// rmcp retains this context in its serve loop and in every spawned
-    /// request handler, and neither ends when the connection task is aborted.
-    /// Holding the daemon activity here keeps shutdown's client drain waiting
-    /// until the last of them releases the server and its store leases.
+    /// Holding the daemon activity for the session's lifetime keeps
+    /// shutdown's client drain waiting until the session releases the server
+    /// and its store leases.
     pub(crate) fn with_activity(
         server: Arc<McpServer>,
         activity: Option<DaemonActivity>,
     ) -> Arc<Self> {
         Arc::new(Self {
             server,
-            admission: crate::daemon::current_connection_admission(),
             _activity: activity,
         })
     }
@@ -88,20 +85,6 @@ impl tracedecay_mcp::server::McpConnectionContext for ProductionMcpConnectionCon
     fn cancellation_registered(&self) -> &tokio::sync::Notify {
         self.server.dispatch_authority.cancellation_registered()
     }
-
-    fn run_in_connection_admission<'a, T, F>(
-        &'a self,
-        future: F,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>
-    where
-        T: Send + 'a,
-        F: std::future::Future<Output = T> + Send + 'a,
-    {
-        Box::pin(crate::daemon::in_connection_admission(
-            self.admission.clone(),
-            future,
-        ))
-    }
 }
 
 /// A request line carrying the SEP-2575 per-request context the stdio proxy
@@ -123,15 +106,18 @@ fn with_stateless_request_context(line: String) -> String {
 #[cfg(all(unix, any(test, feature = "test-transport")))]
 fn connected_broker_pair() -> Result<(BrokerStream, tokio::net::UnixStream)> {
     let (daemon, client) = tokio::net::UnixStream::pair()?;
-    Ok((BrokerStream::Unix(daemon), client))
+    Ok((BrokerStream::from_tokio_unix(daemon)?, client))
 }
 
 #[cfg(all(not(unix), any(test, feature = "test-transport")))]
 async fn connected_broker_pair() -> Result<(BrokerStream, tokio::net::TcpStream)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
-    let (daemon, _) = listener.accept().await?;
-    Ok((BrokerStream::Tcp(daemon), client))
+    let (listener, endpoint) = tracedecay_daemon_protocol::BrokerListener::bind(
+        &tracedecay_daemon_protocol::default_loopback_endpoint(),
+    )
+    .await?;
+    let tracedecay_daemon_protocol::DaemonEndpoint::Loopback(address) = endpoint;
+    let client = tokio::net::TcpStream::connect(address).await?;
+    Ok((listener.accept().await?, client))
 }
 
 #[cfg(any(test, feature = "test-transport"))]
@@ -246,7 +232,7 @@ impl McpServer {
     /// explicitly afterwards without re-running the persistence logic.
     pub async fn shutdown(self: &Arc<Self>) {
         let deadline =
-            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
+            std::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
         let status = self.shutdown_until(deadline).await;
         if !status.is_clean() {
             tracing::warn!(?status, "MCP server shutdown did not complete cleanly");
@@ -256,14 +242,15 @@ impl McpServer {
     #[tracing::instrument(name = "mcp.server.shutdown", level = "trace", skip_all)]
     pub(crate) async fn shutdown_until(
         self: &Arc<Self>,
-        deadline: tokio::time::Instant,
+        deadline: impl Into<std::time::Instant>,
     ) -> ShutdownStatus {
+        let deadline = deadline.into();
         self.shutdown
             .coordinate_until(deadline, Arc::clone(self).run_shutdown(deadline))
             .await
     }
 
-    async fn run_shutdown(self: Arc<Self>, deadline: tokio::time::Instant) -> ShutdownStatus {
+    async fn run_shutdown(self: Arc<Self>, deadline: std::time::Instant) -> ShutdownStatus {
         let mut failures = self.shutdown_background_tasks_until(deadline).await;
 
         let uptime = self.stats.started_at.elapsed();
@@ -309,11 +296,22 @@ impl McpServer {
                                 .to_owned(),
                         ),
                         (Ok(upload_enabled), Some(profile)) => {
-                            if let Err(error) = super::ledger::persist_worldwide_delta(
-                                profile.data_dir(),
-                                delta,
-                                upload_enabled,
-                            ) {
+                            // The upload is a blocking HTTP call; it stays off
+                            // the native worker that runs shutdown.
+                            let profile_root = profile.data_dir().to_path_buf();
+                            let saved = tracedecay_runtime_core::native_runtime::spawn_blocking(
+                                move || {
+                                    super::ledger::persist_worldwide_delta(
+                                        &profile_root,
+                                        delta,
+                                        upload_enabled,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                },
+                            )
+                            .await
+                            .and_then(std::convert::identity);
+                            if let Err(error) = saved {
                                 failures
                                     .push(format!("worldwide counter delta not saved: {error}"));
                             }
@@ -346,7 +344,7 @@ impl McpServer {
     pub(crate) async fn shutdown_background_tasks(&self) {
         let failures = self
             .shutdown_background_tasks_until(
-                tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
+                std::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
             )
             .await;
         if !failures.is_empty() {
@@ -357,10 +355,7 @@ impl McpServer {
         }
     }
 
-    async fn shutdown_background_tasks_until(
-        &self,
-        _deadline: tokio::time::Instant,
-    ) -> Vec<String> {
+    async fn shutdown_background_tasks_until(&self, _deadline: std::time::Instant) -> Vec<String> {
         let mut failures = Vec::new();
         // Closing the same admission branch swaps check under the graph lock
         // makes this final snapshot stable even when a reopen is in flight.
@@ -378,7 +373,7 @@ impl McpServer {
         for outcome in futures_util::future::join_all(
             self._observation_journey_mount
                 .iter()
-                .map(|journey| journey.shutdown(_deadline)),
+                .map(|journey| journey.shutdown(tokio::time::Instant::from_std(_deadline))),
         )
         .await
         {
@@ -583,6 +578,7 @@ impl McpServer {
 #[cfg(test)]
 mod cancellable_queue_tests {
     use super::*;
+    use crate::test_support::git::git;
 
     static DELAYED_ROUTE_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -607,17 +603,11 @@ mod cancellable_queue_tests {
                 std::fs::create_dir_all(root.join("src")).expect("fixture source directory");
                 std::fs::write(root.join("src/lib.rs"), "pub fn route_fixture() {}\n")
                     .expect("fixture source");
-                super::super::writer_test_support::git(root, &["init", "-q", "-b", "main"]);
-                super::super::writer_test_support::git(
-                    root,
-                    &["config", "user.email", "route@test.invalid"],
-                );
-                super::super::writer_test_support::git(
-                    root,
-                    &["config", "user.name", "Route Test"],
-                );
-                super::super::writer_test_support::git(root, &["add", "."]);
-                super::super::writer_test_support::git(root, &["commit", "-q", "-m", "fixture"]);
+                git(root, &["init", "-q", "-b", "main"]);
+                git(root, &["config", "user.email", "route@test.invalid"]);
+                git(root, &["config", "user.name", "Route Test"]);
+                git(root, &["add", "."]);
+                git(root, &["commit", "-q", "-m", "fixture"]);
             }
             let harness = crate::daemon::ProductionProjectCompositionHarnessV1::open(
                 isolation.path(),
@@ -1104,14 +1094,11 @@ mod cancellable_queue_tests {
             std::fs::create_dir_all(root.join("src")).expect("fixture source directory");
             std::fs::write(root.join("src/lib.rs"), "pub fn route_fixture() {}\n")
                 .expect("fixture source");
-            super::super::writer_test_support::git(root, &["init", "-q", "-b", "main"]);
-            super::super::writer_test_support::git(
-                root,
-                &["config", "user.email", "route@test.invalid"],
-            );
-            super::super::writer_test_support::git(root, &["config", "user.name", "Route Test"]);
-            super::super::writer_test_support::git(root, &["add", "."]);
-            super::super::writer_test_support::git(root, &["commit", "-q", "-m", "fixture"]);
+            git(root, &["init", "-q", "-b", "main"]);
+            git(root, &["config", "user.email", "route@test.invalid"]);
+            git(root, &["config", "user.name", "Route Test"]);
+            git(root, &["add", "."]);
+            git(root, &["commit", "-q", "-m", "fixture"]);
         }
         let harness = crate::daemon::ProductionProjectCompositionHarnessV1::open(
             isolation.path(),

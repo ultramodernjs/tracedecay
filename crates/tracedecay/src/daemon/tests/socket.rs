@@ -1,6 +1,3 @@
-#[cfg(unix)]
-use std::process::Command;
-
 use super::*;
 #[cfg(unix)]
 use tracedecay_daemon_protocol::{FramePoll, FrameSend};
@@ -159,7 +156,7 @@ async fn dropping_lsp_client_closes_transport_without_spawning_detach() {
     .expect("loopback listener");
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept client");
-        let (reader, mut writer) = stream.into_split();
+        let (reader, mut writer) = tokio::io::split(stream);
         let mut lines = tokio::io::BufReader::new(reader).lines();
         super::read_authenticated_handshake(&mut lines, LSP_TEST_TOKEN).await;
         let open: Value = serde_json::from_str(
@@ -219,29 +216,18 @@ async fn dropping_lsp_client_closes_transport_without_spawning_detach() {
 #[cfg(unix)]
 enum LspOpenInterrupt {
     Cancel,
-    /// Jumps the frozen clock to the deadline instead of spending it in wall
-    /// time. Real time resumes before the client notifies cancellation and
-    /// closes its stream, so that I/O never races an auto-advanced timer.
+    /// Lets the open's own deadline run out.
     ExpireDeadline,
 }
 
 #[cfg(unix)]
 impl LspOpenInterrupt {
-    async fn fire(
-        self,
-        cancellation: &tracedecay_contracts::CancellationSignal,
-        expiry: tokio::time::Instant,
-    ) {
+    fn fire(self, cancellation: &tracedecay_contracts::CancellationSignal) {
         match self {
             Self::Cancel => {
                 cancellation.cancel(tracedecay_contracts::clock::now_micros());
             }
-            Self::ExpireDeadline => {
-                tokio::time::pause();
-                tokio::time::advance(expiry.saturating_duration_since(tokio::time::Instant::now()))
-                    .await;
-                tokio::time::resume();
-            }
+            Self::ExpireDeadline => {}
         }
     }
 }
@@ -286,7 +272,7 @@ async fn interrupt_unanswered_lsp_open(
         let Ok(stream) = tokio::time::timeout_at(expiry, listener.accept()).await else {
             return (None, None);
         };
-        let (reader, _writer) = stream.expect("accept client").into_split();
+        let (reader, _writer) = tokio::io::split(stream.expect("accept client"));
         let mut lines = tokio::io::BufReader::new(reader).lines();
         super::read_authenticated_handshake(&mut lines, LSP_TEST_TOKEN).await;
         let Some(open) = lines.next_line().await.expect("read open") else {
@@ -298,7 +284,7 @@ async fn interrupt_unanswered_lsp_open(
             "carries_deadline": open["deadline"]["expires_at"] == expected_deadline,
             "cancellation": open["cancellation"]["state"]["state"],
         });
-        interrupt.fire(&daemon_cancellation, expiry).await;
+        interrupt.fire(&daemon_cancellation);
         (
             Some(control),
             lines.next_line().await.expect("read after interruption"),
@@ -367,7 +353,7 @@ async fn lsp_gateway_open_returns_typed_unavailable_when_daemon_disconnects() {
     .expect("loopback listener");
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept client");
-        let (reader, _writer) = stream.into_split();
+        let (reader, _writer) = tokio::io::split(stream);
         let mut lines = tokio::io::BufReader::new(reader).lines();
         super::read_authenticated_handshake(&mut lines, LSP_TEST_TOKEN).await;
         lines
@@ -411,7 +397,7 @@ async fn stdio_bridge_session_reconnects_on_a_fresh_socket_and_resumes_frames() 
     .expect("loopback listener");
     let server = tokio::spawn(async move {
         let first = listener.accept().await.expect("accept first connection");
-        let (reader, mut writer) = first.into_split();
+        let (reader, mut writer) = tokio::io::split(first);
         let mut lines = tokio::io::BufReader::new(reader).lines();
         super::read_authenticated_handshake(&mut lines, LSP_TEST_TOKEN).await;
         let open: Value = serde_json::from_str(
@@ -454,7 +440,7 @@ async fn stdio_bridge_session_reconnects_on_a_fresh_socket_and_resumes_frames() 
         drop(writer);
 
         let second = listener.accept().await.expect("accept fresh connection");
-        let (reader, mut writer) = second.into_split();
+        let (reader, mut writer) = tokio::io::split(second);
         let mut lines = tokio::io::BufReader::new(reader).lines();
         super::read_authenticated_handshake(&mut lines, LSP_TEST_TOKEN).await;
         let reconnect: Value = serde_json::from_str(
@@ -684,22 +670,12 @@ async fn socket_client_requires_user_storage_scope_without_project() {
         enter_test_daemon_database_scope(&client_identity.profile_root, "projectless-socket-test");
     prewarm_test_profile_runtime(&engine.store_administration).await;
 
-    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(Box::pin(super::serve_authenticated_test_client(
-        server, engine,
-    )));
-
-    let (reader, mut writer) = client.into_split();
-    super::write_test_auth_preface(&mut writer).await;
     let handshake = DaemonHandshake {
         client_identity,
         ..test_handshake_defaults()
     };
-    writer
-        .write_all(handshake.to_line().expect("handshake").as_bytes())
-        .await
-        .expect("write handshake");
-    writer.write_all(b"\n").await.expect("newline");
+    let (reader, mut writer, server_task) =
+        super::handshake_authenticated_test_client(engine, &handshake).await;
     writer
         .write_all(
             serde_json::to_string(&json!({
@@ -760,22 +736,14 @@ async fn projectless_project_list_reads_the_empty_profile_registry() {
         &client_identity.profile_root,
         "projectless-registry-test",
     );
+    prewarm_test_profile_runtime(&engine.store_administration).await;
 
-    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(Box::pin(super::serve_authenticated_test_client(
-        server, engine,
-    )));
-    let (reader, mut writer) = client.into_split();
-    super::write_test_auth_preface(&mut writer).await;
     let handshake = DaemonHandshake {
         client_identity,
         ..test_handshake_defaults()
     };
-    writer
-        .write_all(handshake.to_line().expect("handshake").as_bytes())
-        .await
-        .expect("write handshake");
-    writer.write_all(b"\n").await.expect("newline");
+    let (reader, mut writer, server_task) =
+        super::handshake_authenticated_test_client(engine, &handshake).await;
     writer
         .write_all(
             serde_json::to_string(&json!({
@@ -905,22 +873,14 @@ async fn projectless_and_project_route_refusals_place_the_problem_identically() 
     let engine = test_daemon_engine_for_profile(&client_identity.profile_root);
     let _database_scope =
         enter_test_daemon_database_scope(&client_identity.profile_root, "problem-placement-test");
+    prewarm_test_profile_runtime(&engine.store_administration).await;
 
-    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(Box::pin(super::serve_authenticated_test_client(
-        server, engine,
-    )));
-    let (reader, mut writer) = client.into_split();
-    super::write_test_auth_preface(&mut writer).await;
     let handshake = DaemonHandshake {
         client_identity,
         ..test_handshake_defaults()
     };
-    writer
-        .write_all(handshake.to_line().expect("handshake").as_bytes())
-        .await
-        .expect("write handshake");
-    writer.write_all(b"\n").await.expect("newline");
+    let (reader, mut writer, server_task) =
+        super::handshake_authenticated_test_client(engine, &handshake).await;
     writer
         .write_all(
             serde_json::to_string(&json!({
@@ -1002,22 +962,14 @@ async fn projectless_tools_list_advertises_registry_tools() {
         &client_identity.profile_root,
         "projectless-tools-list-test",
     );
+    prewarm_test_profile_runtime(&engine.store_administration).await;
 
-    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(Box::pin(super::serve_authenticated_test_client(
-        server, engine,
-    )));
-    let (reader, mut writer) = client.into_split();
-    super::write_test_auth_preface(&mut writer).await;
     let handshake = DaemonHandshake {
         client_identity,
         ..test_handshake_defaults()
     };
-    writer
-        .write_all(handshake.to_line().expect("handshake").as_bytes())
-        .await
-        .expect("write handshake");
-    writer.write_all(b"\n").await.expect("newline");
+    let (reader, mut writer, server_task) =
+        super::handshake_authenticated_test_client(engine, &handshake).await;
     // First request must not be bootstrap-handled (`initialize` / `tools/list`),
     // or the connection never enters the projectless session loop Codex named.
     writer
@@ -1146,23 +1098,13 @@ async fn user_session_read_bypasses_unregistered_project_route() {
     let unregistered_project = home.join("unregistered-project");
     std::fs::create_dir_all(&unregistered_project).expect("unregistered project directory");
 
-    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(Box::pin(super::serve_authenticated_test_client(
-        server, engine,
-    )));
-
-    let (reader, mut writer) = client.into_split();
-    super::write_test_auth_preface(&mut writer).await;
     let handshake = DaemonHandshake {
         project_path: Some(unregistered_project),
         client_identity,
         ..test_handshake_defaults()
     };
-    writer
-        .write_all(handshake.to_line().expect("handshake").as_bytes())
-        .await
-        .expect("write handshake");
-    writer.write_all(b"\n").await.expect("newline");
+    let (reader, mut writer, server_task) =
+        super::handshake_authenticated_test_client(engine, &handshake).await;
     writer
         .write_all(
             serde_json::to_string(&json!({
@@ -1224,22 +1166,12 @@ async fn socket_client_routes_multiple_closed_invocations_without_falling_back_t
         "closed-invocation-socket-test",
     );
     prewarm_test_profile_runtime(&engine.store_administration).await;
-    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
-    let server_task = tokio::spawn(Box::pin(super::serve_authenticated_test_client(
-        server, engine,
-    )));
-
-    let (reader, mut writer) = client.into_split();
-    super::write_test_auth_preface(&mut writer).await;
     let handshake = DaemonHandshake {
         client_identity,
         ..test_handshake_defaults()
     };
-    writer
-        .write_all(handshake.to_line().expect("handshake").as_bytes())
-        .await
-        .expect("write handshake");
-    writer.write_all(b"\n").await.expect("newline");
+    let (reader, mut writer, server_task) =
+        super::handshake_authenticated_test_client(engine, &handshake).await;
     let mut lines = tokio::io::BufReader::new(reader).lines();
     for (request_id, request_handle) in [("request.1", "handle.1"), ("request.2", "handle.2")] {
         writer
@@ -1282,21 +1214,10 @@ async fn socket_client_routes_multiple_closed_invocations_without_falling_back_t
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn socket_git_preview_apply_replay_and_pre_admission_problems_are_canonical() {
-    use std::process::Command;
-
     use tracedecay_contracts::git::GitReadRequestV1;
     use tracedecay_contracts::{CancellationContext, Deadline, IdempotencyKey};
     use tracedecay_daemon_protocol::surface::GitReadSurfaceRequest;
     use tracedecay_domain::{GitIndexTransactionOperationV1, UtcMicros};
-
-    fn git(root: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git")
-            .current_dir(root)
-            .args(args)
-            .status()
-            .expect("run Git fixture command");
-        assert!(status.success(), "git {args:?}");
-    }
 
     let home = TempDir::new().expect("home");
     let home = home.path().canonicalize().expect("canonical home");
@@ -1345,18 +1266,9 @@ async fn socket_git_preview_apply_replay_and_pre_admission_problems_are_canonica
         Deadline::new(UtcMicros(observed_at.0.saturating_add(60_000_000))).expect("deadline");
     let cancellation = CancellationContext::active("cancel.socket-git").expect("cancellation");
 
-    let (client, server) = tokio::net::UnixStream::pair().expect("unix stream pair");
     let engine_for_test = engine.clone();
-    let server_task = tokio::spawn(Box::pin(super::serve_authenticated_test_client(
-        server, engine,
-    )));
-    let (reader, mut writer) = client.into_split();
-    super::write_test_auth_preface(&mut writer).await;
-    writer
-        .write_all(handshake.to_line().expect("handshake").as_bytes())
-        .await
-        .expect("write handshake");
-    writer.write_all(b"\n").await.expect("handshake newline");
+    let (reader, mut writer, server_task) =
+        super::handshake_authenticated_test_client(engine, &handshake).await;
     let mut lines = tokio::io::BufReader::new(reader).lines();
 
     async fn read_hunks(
@@ -1676,10 +1588,7 @@ async fn portable_broker_routes_multiple_closed_invocations_without_falling_back
         .await
     });
 
-    let stream = tracedecay_daemon_protocol::BrokerStream::connect(&endpoint)
-        .await
-        .expect("connect client");
-    let (reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = tokio::io::split(super::connect_loopback_test_peer(&endpoint).await);
     let preface = tracedecay_daemon_protocol::DaemonAuthPreface::new(TOKEN)
         .to_line()
         .expect("auth preface");
@@ -1741,22 +1650,6 @@ async fn daemon_linked_worktree_route_repairs_primary_identity_and_keeps_alias()
     let linked = root.join("linked");
     let profile_root = root.join("profile");
     std::fs::create_dir_all(&primary).expect("primary dir");
-    let git = |cwd: &std::path::Path, args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .env("GIT_AUTHOR_NAME", "TraceDecay Test")
-            .env("GIT_AUTHOR_EMAIL", "test@tracedecay.local")
-            .env("GIT_COMMITTER_NAME", "TraceDecay Test")
-            .env("GIT_COMMITTER_EMAIL", "test@tracedecay.local")
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
     git(&primary, &["init", "-b", "main", "--quiet"]);
     std::fs::create_dir_all(primary.join("src")).expect("fixture source dir");
     std::fs::write(primary.join("src/main.rs"), "fn main() {}\n").expect("fixture source");

@@ -1,15 +1,16 @@
 //! Bundled SQLite storage runtime.
 
 mod admission;
+mod allocator;
 mod authority;
 mod checkpoint;
 mod connection;
+pub mod schema_version;
 pub use connection::{
     ConnectionPolicyError, OpenedDatabaseFileError, VerifiedReader, VerifiedReaderError,
-    open_immutable_reader, open_verified_immutable_reader, open_verified_read_snapshot,
+    default_vfs_max_pathname, open_immutable_reader, open_verified_immutable_reader,
+    open_verified_read_snapshot,
 };
-mod content_digest;
-pub use content_digest::{CanonicalContentDigestError, canonical_session_domain_content_sha256};
 #[doc(hidden)]
 pub mod exact_sql;
 pub mod handoff;
@@ -17,15 +18,18 @@ mod ledger;
 /// Canonical schema for the runtime writer ledger installed in registered
 /// SQLite stores.
 pub mod runtime_ledger {
-    pub use crate::ledger::RUNTIME_LEDGER_SCHEMA;
+    pub use crate::ledger::{RETIRE_RUNTIME_EFFECTS_V1, RUNTIME_LEDGER_SCHEMA};
 }
-pub mod maintenance;
+pub mod native_runtime;
+#[cfg(test)]
+mod native_runtime_wake_tests;
 mod operation;
 mod persistence;
 pub mod reader;
 pub mod remote;
 pub mod repository;
 pub mod runtime;
+pub mod storage_pool;
 mod telemetry;
 #[cfg(test)]
 mod test_support;
@@ -38,24 +42,26 @@ pub mod work_run_control;
 pub mod workflow;
 mod writer;
 
+pub use allocator::{SqliteAllocatorMethodsV1, install_sqlite_allocator};
 pub use authority::{
     RuntimeWriteAuthority, RuntimeWriteAuthorityError, RuntimeWriteAuthorityStage,
 };
 pub use checkpoint::{
     CheckpointBlocker, CheckpointBlockers, CheckpointFrameReport, CheckpointInterruption,
     CheckpointKind, CheckpointOutcome, CheckpointPressure, CheckpointStatus, CheckpointWal,
-    MaintenanceCheckpointMode,
 };
-pub use operation::{StorageOperationError, StorageOperationExecutor};
+pub use operation::{
+    ExactSqlOnlyStorageOperationV1, StorageOperationError, StorageOperationExecutor,
+};
 pub use telemetry::{
-    ReaderAdmissionSnapshot, SqliteStoreSizeTelemetryPort, SqliteVmSnapshot, WalCheckpointSample,
-    WalCheckpointSnapshot, WriterBatchMetrics, WriterBatchTotals, WriterClientServiceSnapshot,
-    WriterCommitSnapshot, WriterLockWorkSnapshot, WriterOperationCounters, WriterQueueSnapshot,
-    WriterServiceCounts, WriterTelemetrySnapshot, WriterTransactionMetrics,
-    WriterTransactionOutcome, WriterTransactionTotals,
+    ReaderAdmissionSnapshot, SqliteVmSnapshot, WalCheckpointSample, WalCheckpointSnapshot,
+    WriterBatchMetrics, WriterBatchTotals, WriterClientServiceSnapshot, WriterCommitSnapshot,
+    WriterLockWorkSnapshot, WriterOperationCounters, WriterQueueSnapshot, WriterServiceCounts,
+    WriterTelemetrySnapshot, WriterTransactionMetrics, WriterTransactionOutcome,
+    WriterTransactionTotals,
 };
 pub use writer::{
     CheckpointControlError, CheckpointHandle, CheckpointRequest, CheckpointTicket,
-    ExistingWriterLocator, MaintenanceCheckpointRequest, PersistentWriter, WriterActorError,
+    ExistingWriterLocator, FILE_PROBE_INTERVAL, PersistentWriter, WriterActorError,
     WriterStartError, WriterState,
 };

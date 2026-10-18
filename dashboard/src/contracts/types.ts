@@ -792,13 +792,7 @@ export type CapabilityId = string;
 export type CatalogGenerationId = string;
 
 export type CodeCloneIndexBudgetsV1 = {
-  candidate_bodies: number;
-  hot_posting_rows: number;
   minimum_body_tokens: number;
-  minimum_directional_coverage_millionths: number;
-  posting_rows: number;
-  verification_bodies: number;
-  verification_token_work: number;
 };
 
 export type CodeCloneIndexCoverageV1 = {
@@ -808,10 +802,6 @@ export type CodeCloneIndexCoverageV1 = {
   excluded_incomplete_tokenization_bodies: number | null;
   excluded_too_large_bodies: number | null;
   excluded_too_small_bodies: number | null;
-  hot_posting_rows_skipped: number | null;
-  hot_postings_skipped: number | null;
-  near_fingerprint_bodies: number | null;
-  near_fingerprint_postings: number | null;
   payloads_reused: number | null;
   rename_normalized_bodies: number | null;
   rename_partial_bodies: number | null;
@@ -924,6 +914,7 @@ export type CodeIndexFreshnessCoverageV1 = "complete" | "partial_artifact_restor
 export type CodeIndexFreshnessPayloadV1 = {
   mount_failure?: CodeIndexMountFailureV1 | null | undefined;
   note: string;
+  refusal?: CodeIndexRouteRefusalV1 | null | undefined;
   worktrees: Array<CodeIndexWorktreeFreshnessV1>;
 };
 
@@ -957,6 +948,11 @@ export type CodeIndexRestoreProgressV1 = {
   authenticated_remaining: number;
   authenticated_total: number;
   generation_id: string;
+};
+
+export type CodeIndexRouteRefusalV1 = {
+  reason: string;
+  remediation: string;
 };
 
 export type CodeIndexSourceOmissionReasonV1 = 
@@ -1032,6 +1028,19 @@ export type ConfigurationRevisionId = string;
 export type ConfigurationSnapshotId = string;
 
 export type ContentDigest = string;
+
+export type ContextScoutIntentKindV1 = "atomic_edit" | "broad_read" | "build_diagnostics" | "call_graph" | "edit_redundancy" | "explore_subagent" | "file_lookup" | "file_read" | "impact" | "memory_store" | "project_context" | "review_changes" | "search" | "semantic_search" | "session_recall" | "subagent_start_context" | "symbol_lookup" | "tool_descriptor_read" | "type_orientation" | "unexpected_changes";
+
+export type ContextScoutIntentSettingsV1 = {
+  action_fact_score_permille: number;
+  enabled: boolean;
+  engine: DecisionEngineSettingsV1;
+  min_delivery_gap_secs: number;
+  prompt_lookup_deadline_ms: number;
+  questions: Array<IntentQuestionSettingsV1>;
+  ttl_secs: number;
+  window: IntentWindowSettingsV1;
+};
 
 export type CostsReadModelV1 = {
   authorized_scope_ref: string;
@@ -1196,6 +1205,14 @@ export type DecideWorkRelationReplanRequestV1 = {
   mutation: WorkProductMutationIdentityV1;
   proposal: WorkRelationReplanProposalV1;
   selection: WorkProductSelectionScopeV1;
+};
+
+export type DecisionEngineSettingsV1 = {
+  base_url: string;
+  max_concurrent: number;
+  max_state_bytes: number;
+  model: string | null;
+  timeout_ms: number;
 };
 
 export type DeliveryAgentUsageRowV1 = {
@@ -2069,7 +2086,7 @@ export type DoctorReportEntryV1 = {
   storage_kind: DoctorStorageFindingKindV1 | null;
 };
 
-export type DoctorStorageFindingKindV1 = "over_budget_store" | "orphan_store" | "incident_debris_present" | "retention_backlog" | "table_growth" | "pending_schema_migration";
+export type DoctorStorageFindingKindV1 = "over_budget_store" | "orphan_store" | "incident_debris_present" | "retention_backlog" | "table_growth" | "pending_schema_migration" | "wal_checkpoint_pinned";
 
 export type DuplicateEffectOutcomeV1 = "committed" | "not_applicable" | "prevented" | "unknown";
 
@@ -2858,6 +2875,21 @@ export type IncomingCallEdgeV1 = {
   line: number | null;
   source: string;
   target: string;
+};
+
+export type IntentQuestionSettingsV1 = {
+  instructions: string;
+  intent: ContextScoutIntentKindV1;
+  margin_permille: number | null;
+  threshold_permille: number;
+};
+
+export type IntentWindowSettingsV1 = {
+  freshen_budget_ms: number;
+  max_age_secs: number;
+  max_bytes: number;
+  max_messages: number;
+  max_user_turns: number;
 };
 
 export type JobDelivery = 
@@ -4158,6 +4190,7 @@ export type ProjectRepoGroup = {
 
 export type ProjectSettingsPatch = {
   context_scout?: boolean | null | undefined;
+  context_scout_intent?: ContextScoutIntentSettingsV1 | null | undefined;
   exclude?: Array<string> | null | undefined;
   expected_revision_id: string;
   extract_docstrings?: boolean | null | undefined;
@@ -4971,7 +5004,7 @@ export type SkillOutcomeRecord = {
   views_since_activation: number;
 };
 
-export type SkillOutcomeVerdict = "adopted" | "ignored" | "too_early";
+export type SkillOutcomeVerdict = "adopted" | "too_early" | "unknown";
 
 export type SourceSpan = {
   end_byte: number;

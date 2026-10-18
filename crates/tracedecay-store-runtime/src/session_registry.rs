@@ -379,6 +379,44 @@ impl ProjectRuntimeOwnerRegistryV1 {
         }
     }
 
+    /// Waits for the mounted project memory owner's background graph open to
+    /// settle. Returns `false` when this map holds no runtime for the project,
+    /// so no mount owns its graph shard.
+    async fn wait_for_memory_graph(&self, project_id: &ProjectId) -> Result<bool> {
+        let waiter = {
+            let entries = self.lock().map_err(|_| {
+                session_registry_error(
+                    "await project memory graph",
+                    "project runtime owner map lock is poisoned".to_owned(),
+                )
+            })?;
+            match entries.get(project_id) {
+                None => return Ok(false),
+                Some(ProjectRuntimeOwnerStateV1::Ready(owners)) => owners
+                    .memory
+                    .as_ref()
+                    .map(|owner| (Arc::clone(&owner.graph), Arc::clone(&owner.graph_settled))),
+                Some(_) => None,
+            }
+        };
+        let Some((graph, graph_settled)) = waiter else {
+            return Ok(true);
+        };
+        loop {
+            let notified = graph_settled.notified();
+            let warming = matches!(
+                &*graph
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                MemoryGraphAttachmentStateV1::Warming { .. }
+            );
+            if !warming {
+                return Ok(true);
+            }
+            notified.await;
+        }
+    }
+
     fn take_unattached_session_owner(
         &self,
         project_id: &ProjectId,
@@ -650,6 +688,7 @@ impl ProjectSessionRetirementOwnerV1 {
 struct MemoryStoreOwnerV1 {
     database: DatabaseOwnerWeakLeaseIssuerV1,
     graph: Arc<StdMutex<MemoryGraphAttachmentStateV1>>,
+    graph_settled: Arc<tokio::sync::Notify>,
     graph_open_task_key: String,
 }
 
@@ -978,6 +1017,106 @@ impl ProjectSessionTerminalProofV1 {
         }
     }
 }
+
+// These owner states nest a `BTreeMap` witness into retirement receipts. One
+// combined `Send` proof exceeds the recursion limit (rust-lang/rust#159228);
+// each field below is checked on its own.
+unsafe impl Send for ProjectSessionClosedRetirementProofV1 {}
+
+const _: fn(&ProjectSessionClosedRetirementProofV1) = |value| {
+    fn assert_send<T: Send>(_: &T) {}
+    let ProjectSessionClosedRetirementProofV1 {
+        binding,
+        locator,
+        graph,
+        store,
+    } = value;
+    assert_send(binding);
+    assert_send(locator);
+    assert_send(graph);
+    assert_send(store);
+};
+
+unsafe impl Send for ProjectSessionTerminalProofV1 {}
+
+const _: fn(&ProjectSessionTerminalProofV1) = |value| {
+    fn assert_send<T: Send>(_: &T) {}
+    match value {
+        ProjectSessionTerminalProofV1::Live(proof) => assert_send(proof),
+    }
+};
+
+unsafe impl Send for ProjectSessionRecoveryPhaseV1 {}
+
+const _: fn(&ProjectSessionRecoveryPhaseV1) = |value| {
+    fn assert_send<T: Send>(_: &T) {}
+    match value {
+        ProjectSessionRecoveryPhaseV1::ReservationAbandoned
+        | ProjectSessionRecoveryPhaseV1::GraphNativeBoundary => {}
+        ProjectSessionRecoveryPhaseV1::GraphTerminal(graph) => assert_send(graph),
+        ProjectSessionRecoveryPhaseV1::Terminal(proof) => assert_send(proof),
+    }
+};
+
+unsafe impl Send for ProjectSessionRecoveryRequiredV1 {}
+
+const _: fn(&ProjectSessionRecoveryRequiredV1) = |value| {
+    fn assert_send<T: Send>(_: &T) {}
+    let ProjectSessionRecoveryRequiredV1 {
+        sessions,
+        candidate_sessions,
+        memory,
+        phase,
+    } = value;
+    assert_send(sessions);
+    assert_send(candidate_sessions);
+    assert_send(memory);
+    assert_send(phase);
+};
+
+unsafe impl Send for ProjectRuntimeRetirementFaultV1 {}
+
+const _: fn(&ProjectRuntimeRetirementFaultV1) = |value| {
+    fn assert_send<T: Send>(_: &T) {}
+    match value {
+        ProjectRuntimeRetirementFaultV1::ReservationTargetConsumed => {}
+        ProjectRuntimeRetirementFaultV1::Reconciliation(terminal) => assert_send(terminal),
+        ProjectRuntimeRetirementFaultV1::GraphRefusal(error) => assert_send(error),
+        ProjectRuntimeRetirementFaultV1::StoreStart(error) => assert_send(error),
+        ProjectRuntimeRetirementFaultV1::Terminal { graph, store } => {
+            assert_send(graph);
+            assert_send(store);
+        }
+    }
+};
+
+unsafe impl Send for ProjectRuntimeFaultedOwnersV1 {}
+
+const _: fn(&ProjectRuntimeFaultedOwnersV1) = |value| {
+    fn assert_send<T: Send>(_: &T) {}
+    let ProjectRuntimeFaultedOwnersV1 {
+        retained,
+        sessions,
+        fault,
+    } = value;
+    assert_send(retained);
+    assert_send(sessions);
+    assert_send(fault);
+};
+
+unsafe impl Send for ProjectRuntimeOwnerStateV1 {}
+
+const _: fn(&ProjectRuntimeOwnerStateV1) = |value| {
+    fn assert_send<T: Send>(_: &T) {}
+    match value {
+        ProjectRuntimeOwnerStateV1::Opening
+        | ProjectRuntimeOwnerStateV1::ReplacingSessions
+        | ProjectRuntimeOwnerStateV1::Retiring => {}
+        ProjectRuntimeOwnerStateV1::Ready(owners) => assert_send(owners),
+        ProjectRuntimeOwnerStateV1::RecoveryRequired(recovery) => assert_send(recovery),
+        ProjectRuntimeOwnerStateV1::Faulted(faulted) => assert_send(faulted),
+    }
+};
 
 enum ProjectRuntimeRetirementFaultV1 {
     ReservationTargetConsumed,
@@ -2565,6 +2704,11 @@ pub struct DaemonSessionRuntimeRegistryV1 {
     /// The refused store stays unmounted, so every open re-runs admission and
     /// a reset store serves on its next open without a daemon restart.
     reset_required_stores: StdMutex<BTreeMap<StoreShardIdV1, StoreResetRequiredV1>>,
+    /// Store files deleted or replaced while this daemon held them open,
+    /// keyed by path. The writer's file probe closes the store's connections,
+    /// but the mounted owners keep their lease on the closed runtime until a
+    /// restart remounts them, so an entry lives as long as the registry.
+    lost_store_files: StdMutex<BTreeMap<std::path::PathBuf, StoreResetRequiredV1>>,
     retained_hook_tasks: RetainedHookTasks,
     session_sync_service:
         Arc<OnceLock<Arc<tracedecay_session_runtime::session_sync::DaemonSessionSyncService>>>,
@@ -2578,6 +2722,76 @@ pub struct DaemonSessionRuntimeRegistryV1 {
     #[cfg(any(test, feature = "test-helpers"))]
     session_graph_publication_gate: StdMutex<Option<Arc<SessionGraphPublicationTestGateState>>>,
 }
+
+// Each field is `Send + Sync`, but proving the registry walks those fields
+// through `Arc<Mutex<BTreeMap<...>>>` past the recursion limit
+// (rust-lang/rust#159228). The const is the field proof.
+unsafe impl Send for DaemonSessionRuntimeRegistryV1 {}
+unsafe impl Sync for DaemonSessionRuntimeRegistryV1 {}
+
+const _: fn(&DaemonSessionRuntimeRegistryV1) = |value| {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    let DaemonSessionRuntimeRegistryV1 {
+        identity,
+        incarnation,
+        resolver,
+        registry,
+        graph_registry,
+        graph_manifest_provider,
+        graph_lifecycle_cancelled,
+        operation_task_owner,
+        profile_pin,
+        profile_database_mount,
+        profile_database,
+        profile_memory,
+        profile_sessions_mount,
+        profile_sessions,
+        remote_nodes,
+        remote_credential_authority,
+        remote_replay_transaction,
+        remote_recovery_authorities,
+        project_owners,
+        code_graph_publication_gates,
+        registered_schema_convergence,
+        reset_required_stores,
+        lost_store_files,
+        retained_hook_tasks,
+        session_sync_service,
+        remote_recovery_project_lifecycle,
+        long_lived_session_maintenance,
+        #[cfg(any(test, feature = "test-helpers"))]
+        session_graph_publication_gate,
+    } = value;
+    assert_send_sync(identity);
+    assert_send_sync(incarnation);
+    assert_send_sync(resolver);
+    assert_send_sync(registry);
+    assert_send_sync(graph_registry);
+    assert_send_sync(graph_manifest_provider);
+    assert_send_sync(graph_lifecycle_cancelled);
+    assert_send_sync(operation_task_owner);
+    assert_send_sync(profile_pin);
+    assert_send_sync(profile_database_mount);
+    assert_send_sync(profile_database);
+    assert_send_sync(profile_memory);
+    assert_send_sync(profile_sessions_mount);
+    assert_send_sync(profile_sessions);
+    assert_send_sync(remote_nodes);
+    assert_send_sync(remote_credential_authority);
+    assert_send_sync(remote_replay_transaction);
+    assert_send_sync(remote_recovery_authorities);
+    assert_send_sync(project_owners);
+    assert_send_sync(code_graph_publication_gates);
+    assert_send_sync(registered_schema_convergence);
+    assert_send_sync(reset_required_stores);
+    assert_send_sync(lost_store_files);
+    assert_send_sync(retained_hook_tasks);
+    assert_send_sync(session_sync_service);
+    assert_send_sync(remote_recovery_project_lifecycle);
+    assert_send_sync(long_lived_session_maintenance);
+    #[cfg(any(test, feature = "test-helpers"))]
+    assert_send_sync(session_graph_publication_gate);
+};
 
 impl DaemonSessionRuntimeRegistryV1 {
     #[cfg(any(test, feature = "test-helpers"))]
@@ -2648,6 +2862,15 @@ impl DaemonSessionRuntimeRegistryV1 {
     )]
     pub async fn settle_project_session_graph(&self, project_id: &ProjectId) -> Result<()> {
         self.project_owners.wait_for_session_graph(project_id).await
+    }
+
+    /// Awaits settlement (attached or detached) of the project memory graph
+    /// that `project_memory` opens as bounded background work.
+    pub async fn settle_project_memory_graph(&self, project_id: &ProjectId) -> Result<()> {
+        self.project_owners
+            .wait_for_memory_graph(project_id)
+            .await
+            .map(drop)
     }
 
     /// Waits for the project's background relation-graph open and requires an

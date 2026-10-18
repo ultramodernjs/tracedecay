@@ -1,10 +1,14 @@
 //! Work and workflow application daemon invocation handlers.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use super::*;
 
 mod attempt_operations;
 mod evidence_retrieval;
 mod intelligence;
+mod job;
 mod leak_adjudication;
 mod outcome;
 mod preparation;
@@ -102,43 +106,65 @@ pub async fn execute_work_application(
     deadline: Deadline,
     cancellation: CancellationContext,
 ) -> DaemonInvocationResponse {
-    // Keep the Work dispatch and activity-publication frame out of invocation callers.
-    Box::pin(async move {
-        let activity_database = registered.database.clone();
-        let activity_root = project_root.clone();
-        let mutates = work_invocation_mutates(&request);
-        let response = request_dispatch::dispatch_work_application(
-            registered,
-            attempt_processes,
-            observability_producer,
-            project_root,
-            request_id,
-            request,
-            observed_at,
-            deadline,
-            cancellation,
-        )
-        .await;
-        if mutates
-            && matches!(
-                response.outcome,
-                DaemonInvocationOutcome::WorkApplication { .. }
-            )
-            && let Some(project_root) = activity_root.as_deref()
-        {
-            tracedecay_session_memory::event_lane::publish(
-                &activity_database,
-                tracedecay_session_memory::event_lane::ActivityFamilyV1::Task,
+    let refused_request_id = request_id.clone();
+    let activity_database = registered.database.clone();
+    let activity_root = project_root.clone();
+    let mutates = work_invocation_mutates(&request);
+    dispatch_outliving_caller(
+        refused_request_id,
+        Box::pin(async move {
+            let response = request_dispatch::dispatch_work_application(
+                registered,
+                attempt_processes,
+                observability_producer,
                 project_root,
-                None,
-                1,
-                work_activity_detail(&response.outcome),
+                request_id,
+                request,
+                observed_at,
+                deadline,
+                cancellation,
             )
             .await;
-        }
-        response
-    })
+            if mutates
+                && matches!(
+                    response.outcome,
+                    DaemonInvocationOutcome::WorkApplication { .. }
+                )
+                && let Some(project_root) = activity_root.as_deref()
+            {
+                tracedecay_session_memory::event_lane::publish(
+                    &activity_database,
+                    tracedecay_session_memory::event_lane::ActivityFamilyV1::Task,
+                    project_root,
+                    None,
+                    1,
+                    work_activity_detail(&response.outcome),
+                )
+                .await;
+            }
+            response
+        }),
+    )
     .await
+}
+
+async fn dispatch_outliving_caller(
+    request_id: String,
+    dispatch: Pin<Box<dyn Future<Output = DaemonInvocationResponse> + Send>>,
+) -> DaemonInvocationResponse {
+    let refused = |error: &dyn std::fmt::Display| {
+        tracing::error!(%error, "Work dispatch did not run to completion");
+        DaemonInvocationResponse::problem(request_id.clone(), DaemonInvocationProblem::Unavailable)
+    };
+    match tracedecay_runtime_core::native_runtime::NativeTask::spawn(dispatch) {
+        Ok(task) => match task.await {
+            tracedecay_runtime_core::native_runtime::NativeTaskOutcome::Completed(response) => {
+                response
+            }
+            outcome => refused(&format!("{outcome:?}")),
+        },
+        Err(error) => refused(&error),
+    }
 }
 
 fn publish_committed_task_activity_in_background(
@@ -146,7 +172,7 @@ fn publish_committed_task_activity_in_background(
     project_root: PathBuf,
     detail: Option<String>,
 ) {
-    tokio::spawn(async move {
+    let published = tracedecay_runtime_core::native_runtime::NativeTask::spawn(async move {
         tracedecay_session_memory::event_lane::publish(
             &database,
             tracedecay_session_memory::event_lane::ActivityFamilyV1::Task,
@@ -157,6 +183,9 @@ fn publish_committed_task_activity_in_background(
         )
         .await;
     });
+    if let Err(error) = published {
+        tracing::warn!(%error, "committed Work task activity was not published");
+    }
 }
 
 const fn work_invocation_mutates(request: &WorkApplicationInvocationV1) -> bool {
@@ -177,6 +206,9 @@ const fn work_invocation_mutates(request: &WorkApplicationInvocationV1) -> bool 
         | WorkApplicationInvocationV1::RunControl(_)
         | WorkApplicationInvocationV1::PlacementPreflight(_)
         | WorkApplicationInvocationV1::PlacementStatus(_) => false,
+        // Each step a guided job runs is its own Work invocation and publishes
+        // its own activity pulse when it commits.
+        WorkApplicationInvocationV1::AdvanceJob(_) => false,
         WorkApplicationInvocationV1::Create(_)
         | WorkApplicationInvocationV1::ReviewProposal(_)
         | WorkApplicationInvocationV1::AcceptProposal(_)
@@ -217,13 +249,18 @@ fn observe_placement_target(
             None => return Ok(unreadable),
         },
     };
-    let Ok(repository) =
-        tracedecay_runtime_core::git_repository::GitRepositoryAuthority::discover(&root)
-    else {
-        return Ok(unreadable);
-    };
-    let Ok(status) = repository.status() else {
-        return Ok(unreadable);
+    let status = tracedecay_runtime_core::git_repository::GitRepositoryAuthority::discover(&root)
+        .and_then(|repository| repository.status().map(|status| (repository, status)));
+    let (repository, status) = match status {
+        Ok(read) => read,
+        Err(error) => {
+            tracing::warn!(
+                root = %root.display(),
+                %error,
+                "work placement target is unreadable"
+            );
+            return Ok(unreadable);
+        }
     };
     let unique_commits = placement_unique_commits(&repository, &root);
     let mut dirty_tracked_paths = 0u32;
@@ -480,6 +517,64 @@ mod placement_observation_tests {
         assert_eq!(
             quarantined.blockers(),
             &std::collections::BTreeSet::from([WorkPlacementBlockerV1::UniqueCommits])
+        );
+    }
+}
+
+#[cfg(test)]
+mod native_activity_tests {
+    use std::time::Duration;
+
+    use tracedecay_runtime_core::native_runtime;
+    use tracedecay_session_memory::event_lane::ActivityFamilyV1;
+
+    use super::publish_committed_task_activity_in_background;
+
+    /// The fan-out reconcile page publishes committed task activity from a
+    /// thread with no Tokio runtime; the pulse must still reach the bus.
+    #[test]
+    fn background_task_activity_publishes_without_a_tokio_runtime() {
+        let profile = tempfile::tempdir().expect("profile root");
+        let project = tempfile::tempdir().expect("project root");
+        let writer_waits = tracedecay_rusqlite_runtime::exact_sql::native_thread_writer_waits();
+        native_runtime::block_on(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let host = tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
+                profile.path(),
+                project.path(),
+                tracedecay_domain::ProjectId::new("project.work.native-activity")
+                    .expect("project id"),
+            )
+            .await
+            .expect("registered project runtime");
+            let database = host
+                .registered_database_arc(tracedecay_sessions::admission::HostAdmissionScope::Project)
+                .expect("registered project database");
+            let mut pulses =
+                tracedecay_session_memory::event_lane::subscribe().expect("activity bus");
+            publish_committed_task_activity_in_background(
+                database,
+                project.path().to_path_buf(),
+                None,
+            );
+            let pulse = native_runtime::timeout(Duration::from_secs(30), async {
+                loop {
+                    let record = pulses.recv().await.expect("activity bus open");
+                    if record.pulse.project_root == project.path() {
+                        return record.pulse;
+                    }
+                }
+            })
+            .await
+            .expect("the background pulse must publish");
+            assert_eq!(pulse.family, ActivityFamilyV1::Task);
+            assert_eq!(pulse.units, 1);
+        })
+        .expect("native runtime");
+        assert_eq!(
+            tracedecay_rusqlite_runtime::exact_sql::native_thread_writer_waits(),
+            writer_waits,
+            "publishing must not park a native thread on a synchronous writer wait"
         );
     }
 }

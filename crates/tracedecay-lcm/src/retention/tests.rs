@@ -229,7 +229,7 @@ async fn run_apply(
     .map_err(|error| error.to_string())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn authority_loss_before_commit_rolls_back_retention_mutations() -> Result<(), String> {
     let store = test_store().await?;
     let durable = insert_message(&store.conn, 1, 90, "must survive").await?;
@@ -290,7 +290,7 @@ async fn authority_loss_before_commit_rolls_back_retention_mutations() -> Result
 // retention-expired (plan 23 hydration state); it is never confused with an
 // ownership violation, which would make every summary older than the window
 // unreadable under a misleading error.
-#[tokio::test]
+#[asupersync::test]
 async fn expansion_survives_sources_dropped_by_retention() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -347,7 +347,7 @@ async fn expansion_survives_sources_dropped_by_retention() -> Result<(), String>
 
 // A raw row that is present but owned by a different session is still a hard
 // ownership violation: degrading on absence must not weaken that boundary.
-#[tokio::test]
+#[asupersync::test]
 async fn expansion_still_rejects_foreign_session_sources() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -380,7 +380,7 @@ async fn expansion_still_rejects_foreign_session_sources() -> Result<(), String>
 
 // (b) retention window is honored: a projection-durable row inside the window
 // is not dropped.
-#[tokio::test]
+#[asupersync::test]
 async fn drop_honors_retention_window() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -398,7 +398,7 @@ async fn drop_honors_retention_window() -> Result<(), String> {
 }
 
 // (b) dry run counts eligible reclaim without mutating anything.
-#[tokio::test]
+#[asupersync::test]
 async fn dry_run_counts_without_mutating() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -430,7 +430,7 @@ async fn dry_run_counts_without_mutating() -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn backlog_read_reports_real_eligible_bytes_and_watermark() -> Result<(), String> {
     let store = test_store().await?;
     let durable = insert_message(&store.conn, 1, 90, "retention backlog bytes").await?;
@@ -460,7 +460,7 @@ async fn backlog_read_reports_real_eligible_bytes_and_watermark() -> Result<(), 
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn backlog_read_emits_clean_zero_record_for_configured_window() -> Result<(), String> {
     let store = test_store().await?;
     let records = read_session_retention_backlog(
@@ -481,7 +481,7 @@ async fn backlog_read_emits_clean_zero_record_for_configured_window() -> Result<
 
 // One content copy: a durable row's body is stored once, and dropping the row
 // removes its FTS entries with it.
-#[tokio::test]
+#[asupersync::test]
 async fn drop_removes_the_single_content_copy_and_its_index() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -521,7 +521,7 @@ async fn drop_removes_the_single_content_copy_and_its_index() -> Result<(), Stri
 // (a) offload only externalizes projection-durable rows AFTER durability; the
 // bulky inline content leaves the raw column, replaced by a recoverable
 // content-addressed placeholder (§4 one content copy).
-#[tokio::test]
+#[asupersync::test]
 async fn offload_externalizes_durable_content_after_durability() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -564,7 +564,7 @@ async fn offload_externalizes_durable_content_after_durability() -> Result<(), S
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn canonical_retention_preserves_shared_bytes() -> Result<(), String> {
     let store = test_store().await?;
     let content = "canonical shared body 界\n".repeat(512);
@@ -716,7 +716,7 @@ async fn canonical_retention_preserves_shared_bytes() -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn offload_cas_preserves_revived_row_and_rolls_back_payload() -> Result<(), String> {
     let store = test_store().await?;
     let original = "stale content".repeat(128);
@@ -785,7 +785,7 @@ async fn offload_cas_preserves_revived_row_and_rolls_back_payload() -> Result<()
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn scoped_retention_leaves_other_owners_eligible_for_global_passes() -> Result<(), String> {
     for (provider, session_id) in [(PROVIDER, None), ("all", Some(SESSION))] {
         for drop_rows in [false, true] {
@@ -899,7 +899,7 @@ async fn scoped_retention_leaves_other_owners_eligible_for_global_passes() -> Re
 /// A pass resumes from the previous one's cursors, yet still drops a durable
 /// row that aged past the window since, and an old row a summary first
 /// covered since.
-#[tokio::test]
+#[asupersync::test]
 async fn later_passes_act_on_rows_that_aged_or_became_durable_since() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -949,7 +949,7 @@ async fn later_passes_act_on_rows_that_aged_or_became_durable_since() -> Result<
 }
 
 // (e) reclaimed space is measurable via page/free-list metrics.
-#[tokio::test]
+#[asupersync::test]
 async fn reports_measurable_reclaim_metrics() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;
@@ -971,7 +971,7 @@ async fn reports_measurable_reclaim_metrics() -> Result<(), String> {
 }
 
 // Disabled config is an inert no-op even in Apply mode.
-#[tokio::test]
+#[asupersync::test]
 async fn disabled_config_is_a_no_op() -> Result<(), String> {
     let store = test_store().await?;
     let conn = &store.conn;

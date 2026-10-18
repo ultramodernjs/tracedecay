@@ -105,12 +105,12 @@ impl DatabaseRuntimeClientV1 {
             .await
     }
 
-    pub fn dispatch_read(
+    pub async fn dispatch_read(
         &self,
         request: tracedecay_store::RuntimeReadRequestV1,
-        probe: &dyn tracedecay_store::RuntimeRequestProbeV1,
+        probe: Arc<dyn tracedecay_store::RuntimeRequestProbeV1>,
     ) -> Result<tracedecay_store::RuntimeReadOutcomeV1, StoreRuntimeRegistryFailure> {
-        self.guard.runtime().dispatch_read(request, probe)
+        self.guard.runtime().dispatch_read(request, probe).await
     }
 
     /// Exact rusqlite writer/reader telemetry for this guarded client.
@@ -250,7 +250,7 @@ pub(super) struct DatabaseInner {
     /// Descriptor-derived identity reported by the physical attachment.
     pub(super) opened_file_identity: u64,
     /// Serializes logical writers sharing this canonical database slot.
-    pub(super) writer: tokio::sync::Mutex<()>,
+    pub(super) writer: Arc<asupersync::sync::Mutex<()>>,
     /// Coalesces and retains background memory-graph catch-up for this exact
     /// relational attachment.
     pub(super) memory_graph_reconciliation: MemoryGraphReconciliationCoordinatorV1,
@@ -277,6 +277,39 @@ pub(super) struct DatabaseInner {
     pub(super) memory_graph_source_watermark:
         std::sync::Mutex<Option<super::graph_binding::MemoryGraphSourceStampedWatermarkV1>>,
 }
+
+// One `Send` proof of every attachment field exceeds the recursion limit
+// (rust-lang/rust#159228). Each field below is a separate proof.
+unsafe impl Send for DatabaseInner {}
+unsafe impl Sync for DatabaseInner {}
+
+const _: fn(&DatabaseInner) = |value| {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    let DatabaseInner {
+        conn,
+        write_conn,
+        runtime,
+        opened_file_identity,
+        writer,
+        memory_graph_reconciliation,
+        memory_graph_reconciliation_telemetry,
+        canonical_path,
+        _authority,
+        memory_graph_runtime,
+        memory_graph_source_watermark,
+    } = value;
+    assert_send_sync(conn);
+    assert_send_sync(write_conn);
+    assert_send_sync(runtime);
+    assert_send_sync(opened_file_identity);
+    assert_send_sync(writer);
+    assert_send_sync(memory_graph_reconciliation);
+    assert_send_sync(memory_graph_reconciliation_telemetry);
+    assert_send_sync(canonical_path);
+    assert_send_sync(_authority);
+    assert_send_sync(memory_graph_runtime);
+    assert_send_sync(memory_graph_source_watermark);
+};
 
 impl DatabaseInner {
     /// Publishes an already-open canonical registry runtime without reopening
@@ -346,7 +379,7 @@ impl DatabaseInner {
             canonical_path: runtime.client().canonical_path().to_path_buf(),
             runtime,
             opened_file_identity,
-            writer: tokio::sync::Mutex::new(()),
+            writer: Arc::new(asupersync::sync::Mutex::new(())),
             memory_graph_reconciliation: MemoryGraphReconciliationCoordinatorV1::default(),
             memory_graph_reconciliation_telemetry: Arc::new(
                 ProjectMemoryReconciliationTelemetryV1::default(),

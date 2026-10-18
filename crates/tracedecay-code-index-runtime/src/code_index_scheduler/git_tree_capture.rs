@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use gix::bstr::ByteSlice;
-use tracedecay_application::code_index::open_production_code_index_owner_v1;
 use tracedecay_code_index::production::CodeIndexExecutionControlV1;
+use tracedecay_code_index::production::CodeIndexProductionOwnerV1;
 use tracedecay_contracts::now_micros;
 use tracedecay_domain::{
     CodeSourceOmissionReasonV1, OmittedCodeSourceV1, SanitizationReceiptId, SanitizedCodeFileV1,
@@ -16,18 +16,18 @@ use tracedecay_domain::{
 };
 use tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1;
 use tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1;
+use tracedecay_runtime_core::git_repository::resolve_tree_link;
 use tracedecay_runtime_core::resident_memory::ResidentMemoryReservationV1;
 
 use super::{
     CapturedCandidateV1, CapturedSnapshotV1, CodeIndexSchedulerErrorV1,
-    CodeIndexWorktreeSchedulerV1, DaemonCodeIndexPublicationStoreV1, DaemonProjectionSinkV1,
-    LatestCompleteCodeIndexV1, branch_generations, cancelled_code_index_reconcile,
-    file_occurrence_id, id, identity, omitted_file_occurrence_id, privacy, projection_key,
-    snapshot_content_identity,
+    CodeIndexWorktreeSchedulerV1, DaemonCodeIndexPublicationStoreV1, LatestCompleteCodeIndexV1,
+    branch_generations, cancelled_code_index_reconcile, file_occurrence_id, id, identity,
+    omitted_file_occurrence_id, privacy, projection_key, snapshot_content_identity,
 };
-use crate::code_index::chunks::content_digest;
-use crate::code_index::languages::{LanguageRegistry, StaticLanguageRegistry};
-use crate::code_index::production::{
+use tracedecay_code_index::chunks::content_digest;
+use tracedecay_code_index::languages::{LanguageRegistry, StaticLanguageRegistry};
+use tracedecay_code_index::production::{
     CodeIndexBuildRequestV1, CodeIndexCapturedFileV1, CodeIndexGenerationScopeV1,
     CodeIndexProductionErrorV1, CodeIndexPublicationStoreErrorV1, CodeIndexPublishedGenerationV1,
     CodeIndexRepositoryParseIdentityV1,
@@ -156,6 +156,17 @@ pub(super) fn representable_logical_path(git_path: &[u8]) -> Option<&str> {
     std::str::from_utf8(git_path)
         .ok()
         .filter(|path| validate_code_logical_path(path).is_ok())
+}
+
+/// Whether capture would parse `git_path` as source. A committed symlink at
+/// such a path is read through to its target, as a checkout reads it, so its
+/// link text never becomes source.
+fn is_source_path(registry: &StaticLanguageRegistry, git_path: &[u8]) -> bool {
+    representable_logical_path(git_path)
+        .and_then(|logical_path| Path::new(logical_path).extension())
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| registry.descriptor_for_extension(&extension.to_lowercase()))
+        .is_some()
 }
 
 impl CodeIndexExecutionControlV1 for branch_generations::BranchGenerationReadControlV1 {
@@ -381,6 +392,28 @@ impl CodeIndexWorktreeSchedulerV1 {
         source: &ExactGitTreeSourceV1,
         control: &branch_generations::BranchGenerationReadControlV1,
     ) -> Result<CapturedSnapshotV1, CodeIndexSearchUnavailableReasonV1> {
+        self.capture_git_tree_snapshot(source, control, false)
+    }
+
+    /// HEAD's tree standing in for a clean checkout. Git stores a symlink as
+    /// its target path, while worktree capture and every source sweep read
+    /// through the link, so a tree holding a source symlink would seal bytes
+    /// the next sweep disproves. That tree is `GenerationUnavailable` here and
+    /// the checkout is captured from disk instead.
+    pub(super) fn capture_clean_head_tree_snapshot(
+        &self,
+        source: &ExactGitTreeSourceV1,
+        control: &branch_generations::BranchGenerationReadControlV1,
+    ) -> Result<CapturedSnapshotV1, CodeIndexSearchUnavailableReasonV1> {
+        self.capture_git_tree_snapshot(source, control, true)
+    }
+
+    fn capture_git_tree_snapshot(
+        &self,
+        source: &ExactGitTreeSourceV1,
+        control: &branch_generations::BranchGenerationReadControlV1,
+        refuse_source_links: bool,
+    ) -> Result<CapturedSnapshotV1, CodeIndexSearchUnavailableReasonV1> {
         control.termination().map_or(Ok(()), Err)?;
         let repository = tracedecay_runtime_core::git_open::open(&self.project_root)
             .map_err(|_| CodeIndexSearchUnavailableReasonV1::GenerationUnavailable)?;
@@ -410,6 +443,14 @@ impl CodeIndexWorktreeSchedulerV1 {
             .files()
             .map_err(|_| CodeIndexSearchUnavailableReasonV1::GenerationUnavailable)?;
         entries.sort_by(|left, right| left.filepath.cmp(&right.filepath));
+        let registry = StaticLanguageRegistry::new();
+        if refuse_source_links
+            && entries.iter().any(|entry| {
+                entry.mode.is_link() && is_source_path(&registry, entry.filepath.as_ref())
+            })
+        {
+            return Err(CodeIndexSearchUnavailableReasonV1::GenerationUnavailable);
+        }
 
         self.capture_git_tree_blobs_snapshot(
             source.reference.clone(),
@@ -422,9 +463,21 @@ impl CodeIndexWorktreeSchedulerV1 {
                     if entry.mode.is_tree() || entry.mode.is_commit() {
                         continue;
                     }
-                    let blob = repository
+                    let mut blob = repository
                         .find_blob(entry.oid)
                         .map_err(|_| CodeIndexSearchUnavailableReasonV1::GenerationUnavailable)?;
+                    if entry.mode.is_link() && is_source_path(&registry, entry.filepath.as_ref()) {
+                        let Some(target) =
+                            resolve_tree_link(&tree, entry.filepath.as_ref(), &blob.data).map_err(
+                                |_| CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
+                            )?
+                        else {
+                            continue;
+                        };
+                        blob = repository.find_blob(target).map_err(|_| {
+                            CodeIndexSearchUnavailableReasonV1::GenerationUnavailable
+                        })?;
+                    }
                     visitor(entry.filepath.as_ref(), &blob.data)?;
                 }
                 Ok(())
@@ -450,13 +503,14 @@ impl CodeIndexWorktreeSchedulerV1 {
         if actual_tree.as_str() != expected_tree.as_str() {
             return Err(CodeIndexSearchUnavailableReasonV1::GenerationUnavailable);
         }
+        let registry = StaticLanguageRegistry::new();
         self.capture_git_tree_blobs_snapshot(
             reference,
             None,
             expected_tree.clone(),
             control,
             |visitor| {
-                candidate.visit_blobs(visitor).map_err(|error| match error {
+                candidate.visit_blobs(|path| is_source_path(&registry, path), visitor).map_err(|error| match error {
                     tracedecay_runtime_core::git_repository::GitNativeCandidateTreeVisitError::Repository(_) => {
                         control
                             .termination()
@@ -637,13 +691,10 @@ impl CodeIndexWorktreeSchedulerV1 {
             }
             None => self.publication.clone(),
         };
-        let mut owner = open_production_code_index_owner_v1(
-            self.production_config.clone(),
-            publication,
-            DaemonProjectionSinkV1,
-        )
-        .map_err(|_| CodeIndexSearchUnavailableReasonV1::Internal)?
-        .with_physical_artifact_pool(self.byte_pool.physical_artifacts.clone());
+        let mut owner =
+            CodeIndexProductionOwnerV1::new(self.production_config.clone(), publication)
+                .map_err(|_| CodeIndexSearchUnavailableReasonV1::Internal)?
+                .with_physical_artifact_pool(self.byte_pool.physical_artifacts.clone());
         let generation = owner
             .build_and_publish(
                 CodeIndexBuildRequestV1 {
@@ -661,10 +712,10 @@ impl CodeIndexWorktreeSchedulerV1 {
             )
             .map_err(|error| match error {
                 CodeIndexProductionErrorV1::Interrupted(
-                    crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+                    tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
                 ) => CodeIndexSearchUnavailableReasonV1::Cancelled,
                 CodeIndexProductionErrorV1::Interrupted(
-                    crate::code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
+                    tracedecay_code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
                 ) => CodeIndexSearchUnavailableReasonV1::TimedOut,
                 CodeIndexProductionErrorV1::Publication(error) => {
                     DaemonCodeIndexPublicationStoreV1::exact_read_error(error)
@@ -841,8 +892,7 @@ impl CodeIndexWorktreeSchedulerV1 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::process::Command;
+    use super::super::tests::{git, git_stdout};
     use std::sync::Arc;
 
     use tempfile::TempDir;
@@ -859,41 +909,6 @@ mod tests {
         NativeCandidateGenerationSourcesV1, branch_generations,
     };
     use crate::code_index_scheduler::SharedCodeIndexBytePoolV1;
-
-    fn git(root: &Path, arguments: &[&str]) {
-        let status = Command::new(
-            tracedecay_runtime_core::git::try_git_program()
-                .expect("absolute git executable should resolve"),
-        )
-        .current_dir(root)
-        .args(arguments)
-        .status()
-        .expect("run git fixture command");
-        assert!(
-            status.success(),
-            "git fixture command failed: {arguments:?}"
-        );
-    }
-
-    fn git_output(root: &Path, arguments: &[&str]) -> String {
-        let output = Command::new(
-            tracedecay_runtime_core::git::try_git_program()
-                .expect("absolute git executable should resolve"),
-        )
-        .current_dir(root)
-        .args(arguments)
-        .output()
-        .expect("run git fixture command");
-        assert!(
-            output.status.success(),
-            "git fixture command failed: {arguments:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("git output")
-            .trim()
-            .to_owned()
-    }
 
     fn generated_source_fixture() -> (TempDir, TempDir, CodeIndexWorktreeSchedulerV1) {
         let project = TempDir::new().expect("project root");
@@ -1016,8 +1031,8 @@ mod tests {
         .expect("superseded source");
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-qm", "superseded"]);
-        let superseded_revision = git_output(project.path(), &["rev-parse", "HEAD"]);
-        let superseded_tree = git_output(project.path(), &["rev-parse", "HEAD^{tree}"]);
+        let superseded_revision = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        let superseded_tree = git_stdout(project.path(), &["rev-parse", "HEAD^{tree}"]);
         std::fs::write(
             project.path().join("src/lib.rs"),
             "pub fn current_tip_value() -> usize { 2 }\n",
@@ -1026,7 +1041,7 @@ mod tests {
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-qm", "current"]);
         assert_ne!(
-            git_output(project.path(), &["rev-parse", "HEAD"]),
+            git_stdout(project.path(), &["rev-parse", "HEAD"]),
             superseded_revision,
             "the fixture must request a commit the reference no longer points at"
         );
@@ -1092,12 +1107,12 @@ mod tests {
         scheduler.reconcile_now().expect("publish immutable tree");
         let source = ExactGitTreeSourceV1 {
             reference: tracedecay_domain::RefId::new("refs/heads/main").expect("reference"),
-            revision: tracedecay_domain::CommitId::new(git_output(
+            revision: tracedecay_domain::CommitId::new(git_stdout(
                 project.path(),
                 &["rev-parse", "HEAD"],
             ))
             .expect("revision"),
-            tree: tracedecay_domain::TreeId::new(git_output(
+            tree: tracedecay_domain::TreeId::new(git_stdout(
                 project.path(),
                 &["rev-parse", "HEAD^{tree}"],
             ))
@@ -1164,12 +1179,12 @@ mod tests {
         .expect("open code-index scheduler");
         let source = ExactGitTreeSourceV1 {
             reference: tracedecay_domain::RefId::new("refs/heads/main").expect("reference"),
-            revision: tracedecay_domain::CommitId::new(git_output(
+            revision: tracedecay_domain::CommitId::new(git_stdout(
                 project.path(),
                 &["rev-parse", "HEAD"],
             ))
             .expect("revision"),
-            tree: tracedecay_domain::TreeId::new(git_output(
+            tree: tracedecay_domain::TreeId::new(git_stdout(
                 project.path(),
                 &["rev-parse", "HEAD^{tree}"],
             ))
@@ -1210,11 +1225,137 @@ mod tests {
         );
     }
 
+    /// Git stores a symlink as its target path. A branch capture reads
+    /// committed source links through to the blob they name, as a checkout
+    /// does, and drops a source link that names no file in the tree. Link
+    /// text is never captured as source; non-source links keep their row.
+    #[cfg(unix)]
+    #[test]
+    fn exact_capture_reads_committed_source_links_through_to_their_blobs() {
+        use std::os::unix::fs::symlink;
+
+        let project = TempDir::new().expect("project root");
+        let root = project.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "TraceDecay Test"]);
+        git(
+            root,
+            &["config", "user.email", "tracedecay@example.invalid"],
+        );
+        std::fs::create_dir_all(root.join("src/nested")).expect("source directories");
+        std::fs::write(
+            root.join("src/real.rs"),
+            "pub fn linked_target() -> u32 { 7 }\n",
+        )
+        .expect("link target");
+        std::fs::write(root.join("AGENTS.md"), "# Agent notes\n").expect("markdown target");
+        for (target, link) in [
+            ("real.rs", "src/alias.rs"),
+            ("../alias.rs", "src/nested/chained.rs"),
+            ("src", "linked"),
+            ("../linked/real.rs", "src/through_directory.rs"),
+            ("missing.rs", "src/dangling.rs"),
+            ("../../outside.rs", "src/escaping.rs"),
+            ("/nonexistent/absolute.rs", "src/absolute.rs"),
+            ("loop_b.rs", "src/loop_a.rs"),
+            ("loop_a.rs", "src/loop_b.rs"),
+            ("nested", "src/directory.rs"),
+            ("AGENTS.md", "CLAUDE.md"),
+            ("AGENTS.md", "notes.txt"),
+        ] {
+            symlink(target, root.join(link)).expect("committed symlink");
+        }
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "symlinks"]);
+        let store = TempDir::new().expect("code-index store");
+        let scheduler = CodeIndexWorktreeSchedulerV1::open(
+            ProjectId::new("project.exact-capture-source-links").expect("project id"),
+            root,
+            store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        )
+        .expect("open code-index scheduler");
+
+        let captured = scheduler
+            .capture_exact_git_tree_snapshot(
+                &ExactGitTreeSourceV1 {
+                    reference: tracedecay_domain::RefId::new("refs/heads/main").expect("reference"),
+                    revision: tracedecay_domain::CommitId::new(git_stdout(
+                        root,
+                        &["rev-parse", "HEAD"],
+                    ))
+                    .expect("revision"),
+                    tree: tracedecay_domain::TreeId::new(git_stdout(
+                        root,
+                        &["rev-parse", "HEAD^{tree}"],
+                    ))
+                    .expect("tree"),
+                },
+                &branch_generations::BranchGenerationReadControlV1 {
+                    deadline: None,
+                    cancellation: None,
+                },
+            )
+            .expect("capture a tree with committed symlinks");
+
+        let present = |snapshot: &tracedecay_domain::SanitizedCodeSnapshotV1| {
+            snapshot
+                .files
+                .iter()
+                .filter(|file| {
+                    file.disposition == tracedecay_domain::SnapshotFileDispositionV1::Present
+                })
+                .map(|file| (file.logical_path.clone(), file.content_digest.clone()))
+                .collect::<Vec<_>>()
+        };
+        let branch = present(&captured.snapshot);
+        assert_eq!(
+            branch
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "AGENTS.md",
+                "CLAUDE.md",
+                "src/alias.rs",
+                "src/nested/chained.rs",
+                "src/real.rs",
+                "src/through_directory.rs",
+            ],
+            "only source links that name a file in the tree are captured"
+        );
+        assert_eq!(
+            branch,
+            present(
+                &scheduler
+                    .capture_authoritative_snapshot_without_active_generation_reuse(None)
+                    .expect("capture the checkout from disk")
+                    .snapshot
+            ),
+            "a branch capture must index the bytes a checkout reads through each link"
+        );
+        let notes = captured
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.logical_path == "notes.txt")
+            .expect("non-source link keeps its row");
+        assert_eq!(
+            notes.disposition,
+            tracedecay_domain::SnapshotFileDispositionV1::UnsupportedLanguage
+        );
+        assert_eq!(
+            notes.content_digest,
+            tracedecay_code_index::chunks::content_digest(b"AGENTS.md"),
+            "a non-source link is recorded from its committed blob, as before"
+        );
+    }
+
     #[test]
     fn exact_git_capture_reuses_one_byte_owner_for_snapshot_and_production() {
         let (project, _store, scheduler) = generated_source_fixture();
-        let revision = git_output(project.path(), &["rev-parse", "HEAD"]);
-        let tree = git_output(project.path(), &["rev-parse", "HEAD^{tree}"]);
+        let revision = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        let tree = git_stdout(project.path(), &["rev-parse", "HEAD^{tree}"]);
 
         let captured = scheduler
             .capture_exact_git_tree_snapshot(
@@ -1275,7 +1416,7 @@ mod tests {
         .expect("destination source");
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-qm", "main"]);
-        let destination = git_output(project.path(), &["rev-parse", "HEAD"]);
+        let destination = git_stdout(project.path(), &["rev-parse", "HEAD"]);
         git(project.path(), &["switch", "-q", "feature"]);
         std::fs::write(
             project.path().join("src/feature.rs"),
@@ -1284,7 +1425,7 @@ mod tests {
         .expect("source source");
         git(project.path(), &["add", "."]);
         git(project.path(), &["commit", "-qm", "feature"]);
-        let source = git_output(project.path(), &["rev-parse", "HEAD"]);
+        let source = git_stdout(project.path(), &["rev-parse", "HEAD"]);
 
         let project_id = ProjectId::new("project.native-candidate").expect("project id");
         let store = TempDir::new().expect("code-index store");
@@ -1478,8 +1619,8 @@ mod tests {
     #[test]
     fn a_capture_still_refuses_a_reference_the_repository_does_not_have() {
         let (project, _store, scheduler) = generated_source_fixture();
-        let revision = git_output(project.path(), &["rev-parse", "HEAD"]);
-        let tree = git_output(project.path(), &["rev-parse", "HEAD^{tree}"]);
+        let revision = git_stdout(project.path(), &["rev-parse", "HEAD"]);
+        let tree = git_stdout(project.path(), &["rev-parse", "HEAD^{tree}"]);
 
         let captured = scheduler.capture_exact_git_tree_snapshot(
             &ExactGitTreeSourceV1 {
@@ -1515,12 +1656,12 @@ mod tests {
         );
         let source = ExactGitTreeSourceV1 {
             reference: tracedecay_domain::RefId::new("refs/heads/main").expect("reference"),
-            revision: tracedecay_domain::CommitId::new(git_output(
+            revision: tracedecay_domain::CommitId::new(git_stdout(
                 project.path(),
                 &["rev-parse", "HEAD"],
             ))
             .expect("revision"),
-            tree: tracedecay_domain::TreeId::new(git_output(
+            tree: tracedecay_domain::TreeId::new(git_stdout(
                 project.path(),
                 &["rev-parse", "HEAD^{tree}"],
             ))

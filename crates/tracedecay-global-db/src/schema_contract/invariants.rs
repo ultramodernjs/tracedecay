@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use tracedecay_store::SESSION_MESSAGE_PROJECTOR_VERSION;
 
 use super::super::global_db_operation_error;
@@ -530,9 +533,16 @@ async fn converge_authority_invariants(
         "validate mutable authority invariants",
         async |conn| {
             if exhaustive {
-                validate_invariant_rows(conn).await
+                let reads = ConvergenceReads(conn);
+                let rows: Pin<
+                    Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send>,
+                > = Box::pin(validate_invariant_rows(&reads));
+                rows.await
             } else {
-                validate_mutable_invariant_rows(conn).await
+                let rows: Pin<
+                    Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send>,
+                > = Box::pin(validate_mutable_invariant_rows(conn));
+                rows.await
             }
         },
     )
@@ -664,6 +674,25 @@ async fn converge_authority_invariants(
         },
     )
     .await
+}
+
+/// Reads for the exhaustive row audits. They stay inside the frontier
+/// repair's write step so a refusal rolls that repair back, and each is one
+/// whole-table statement that on a large store outlives the request
+/// statement deadline.
+struct ConvergenceReads<'a, 'b>(&'a DatabaseWriteTransaction<'b>);
+
+impl QueryExecutor for ConvergenceReads<'_, '_> {
+    async fn query<P>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> tracedecay_runtime_core::db::engine::Result<tracedecay_runtime_core::db::engine::Rows>
+    where
+        P: tracedecay_runtime_core::db::engine::IntoParams,
+    {
+        self.0.convergence_query(sql, params).await
+    }
 }
 
 pub(super) async fn validate_invariant_rows(
@@ -859,7 +888,7 @@ async fn foreign_key_violation_exists_read_only(
 }
 
 pub async fn validate_authority_rows_exhaustive(
-    conn: &impl QueryExecutor,
+    conn: &impl crate::observation_projection::SendProjectionDerive,
 ) -> tracedecay_domain::errors::Result<()> {
     validate_receipt_authority_rows(conn, 0).await?;
     validate_observation_authority_rows(conn, 0).await?;
@@ -881,19 +910,23 @@ pub async fn validate_authority_rows_exhaustive(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use asupersync::sync::Notify;
     use tempfile::TempDir;
-    use tokio::sync::{Notify, Semaphore};
 
     use super::{
         AUDIT_PAGE_ROWS, AuthorityInvariantTransactionProvider, FOREIGN_KEY_AUDIT_PROGRESS,
         INCOMPLETE_EXHAUSTIVE_PASS, OBSERVATION_AUDIT_PAGE_ROWS, ensure_authority_invariants,
         foreign_key_violation_exists_read_only, foreign_key_violation_exists_resumable,
-        global_db_operation_error,
     };
     use crate::global_db_operation_message;
     use crate::schema_contract::invariants::test_fixture::{
         authority_fixture, open_registered, seed_observation, write_cursor,
+    };
+    use crate::schema_stages::{
+        OBSERVATION_AUTHORITY_AUDIT_BUDGET, ObservationAuthorityAuditV1,
+        audit_observation_authority,
     };
     use tracedecay_runtime_core::db::engine::TestConnection;
     use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor};
@@ -926,7 +959,7 @@ mod tests {
         pause_at: usize,
         calls: AtomicUsize,
         paused: Notify,
-        release: Semaphore,
+        release: Notify,
     }
 
     impl PausingTransactionProvider<'_> {
@@ -937,7 +970,7 @@ mod tests {
         }
 
         fn release(&self) {
-            self.release.add_permits(1);
+            self.release.notify_one();
         }
     }
 
@@ -949,11 +982,7 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
             if call == self.pause_at {
                 self.paused.notify_waiters();
-                self.release
-                    .acquire()
-                    .await
-                    .map_err(|error| global_db_operation_error(operation, error))?
-                    .forget();
+                self.release.notified().await;
             }
             self.database.begin_bulk_write_transaction(operation).await
         }
@@ -979,7 +1008,7 @@ mod tests {
         (observation_rows, source_cursor_rows)
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn completed_audit_pages_survive_later_convergence_failure() {
         let (_directory, fixture) = open_registered().await;
         let transaction = fixture
@@ -1037,7 +1066,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn cursor_repair_resumes_after_observation_watermark_commits() {
         let (_directory, fixture) = open_registered().await;
         let transaction = fixture.database().begin_write_transaction().await.unwrap();
@@ -1103,7 +1132,7 @@ mod tests {
         assert_eq!(row.get::<i64>(3).unwrap(), 0);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn ordinary_write_completes_between_convergence_steps() {
         let (_directory, fixture) = open_registered().await;
         let transaction = fixture
@@ -1126,31 +1155,37 @@ mod tests {
             pause_at: 4,
             calls: AtomicUsize::new(0),
             paused: Notify::new(),
-            release: Semaphore::new(0),
+            release: Notify::new(),
         };
         let convergence = ensure_authority_invariants(&provider, true, false);
-        tokio::pin!(convergence);
-        tokio::select! {
-            result = &mut convergence => {
+        let mut convergence = std::pin::pin!(convergence);
+        let mut paused = std::pin::pin!(provider.wait_until_paused());
+        std::future::poll_fn(|context| {
+            if let std::task::Poll::Ready(result) = convergence.as_mut().poll(context) {
                 panic!("convergence completed before the controlled inter-step pause: {result:?}");
             }
-            () = provider.wait_until_paused() => {}
-        }
+            paused.as_mut().poll(context)
+        })
+        .await;
 
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            fixture
-                .database()
-                .writer_connection()
-                .expect("ordinary registered writer")
-                .execute(
-                    "INSERT INTO savings_ledger(
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_secs(3),
+            async {
+                fixture
+                    .database()
+                    .writer_connection()
+                    .expect("ordinary registered writer")
+                    .execute(
+                        "INSERT INTO savings_ledger(
                         ts, project_path, tool_name, before_tokens, after_tokens
                      ) VALUES (1, '/writer-availability', 'test', 2, 1)",
-                    (),
-                )
-                .await
-                .expect("ordinary write while convergence is between steps");
-        })
+                        (),
+                    )
+                    .await
+                    .expect("ordinary write while convergence is between steps");
+            },
+        )
         .await
         .expect("ordinary write must not wait for the full convergence pass");
 
@@ -1160,7 +1195,7 @@ mod tests {
             .expect("convergence resumes after ordinary admission");
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn stepped_convergence_preserves_single_transaction_checkpoint_result() {
         let (_directory, fixture) = open_registered().await;
         let transaction = fixture
@@ -1242,7 +1277,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn corruption_refuses_trust_after_durable_audit_progress() {
         let (_directory, fixture) = open_registered().await;
         let transaction = fixture
@@ -1299,7 +1334,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn stale_foreign_key_pages_cannot_advance_another_table_or_a_new_sweep() {
         let (_directory, fixture) = open_registered().await;
         let transaction = fixture.database().begin_write_transaction().await.unwrap();
@@ -1403,7 +1438,73 @@ mod tests {
         transaction.commit().await.unwrap();
     }
 
-    #[tokio::test]
+    /// On a store too large for the doctor budget, a whole-table audit
+    /// statement is interrupted. That says nothing about the rows, so Doctor
+    /// must not report it as a failed invariant.
+    #[asupersync::test]
+    async fn audit_past_its_budget_is_skipped_not_violated() {
+        let (_directory, fixture) = open_registered().await;
+        let transaction = fixture
+            .database()
+            .begin_write_transaction()
+            .await
+            .expect("begin budget fixture");
+        seed_multi_page_authority_fixture(&transaction).await;
+        transaction.commit().await.expect("commit budget fixture");
+        let database = fixture.database().runtime_database();
+
+        let audit = audit_observation_authority(database, Duration::ZERO).await;
+        assert!(
+            matches!(audit, ObservationAuthorityAuditV1::BudgetExceeded { .. }),
+            "an exhausted budget is not a verdict: {audit:?}"
+        );
+        assert_eq!(audit.verdict(), None);
+        assert_eq!(audit.reason(), Some("authority_audit_budget_exceeded"));
+
+        let audit = audit_observation_authority(database, OBSERVATION_AUTHORITY_AUDIT_BUDGET).await;
+        assert!(
+            matches!(audit, ObservationAuthorityAuditV1::Held),
+            "the same store audited within budget holds: {audit:?}"
+        );
+    }
+
+    #[asupersync::test]
+    async fn audit_within_its_budget_still_refuses_corrupt_rows() {
+        let (_directory, fixture) = open_registered().await;
+        let transaction = fixture
+            .database()
+            .begin_write_transaction()
+            .await
+            .expect("begin corrupt audit fixture");
+        seed_multi_page_authority_fixture(&transaction).await;
+        transaction
+            .execute(
+                "UPDATE source_cursors
+                 SET cursor_json = '{}'
+                 WHERE rowid = (SELECT MAX(rowid) FROM source_cursors)",
+                (),
+            )
+            .await
+            .expect("inject source cursor authority violation");
+        transaction
+            .commit()
+            .await
+            .expect("commit corrupt audit fixture");
+
+        let audit = audit_observation_authority(
+            fixture.database().runtime_database(),
+            OBSERVATION_AUTHORITY_AUDIT_BUDGET,
+        )
+        .await;
+        assert!(
+            matches!(&audit, ObservationAuthorityAuditV1::Violated(error)
+                if error.to_string().contains("invalid source cursor authority JSON")),
+            "corrupt rows inside the budget are a verdict: {audit:?}"
+        );
+        assert_eq!(audit.verdict(), Some(false));
+    }
+
+    #[asupersync::test]
     async fn foreign_key_audit_finds_violations_by_child_table() {
         let directory = TempDir::new().unwrap();
         let database_path = directory.path().join("sessions.db");
@@ -1429,7 +1530,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn foreign_key_audit_resumes_after_last_durable_table() {
         let directory = TempDir::new().unwrap();
         let database_path = directory.path().join("sessions.db");

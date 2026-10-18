@@ -6,20 +6,21 @@
 
 use std::path::Path;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::time::{Duration, timeout};
+use asupersync::io::{AsyncWriteExt, BufReader};
+use tracedecay_framing::BoundedLineReader;
 use tracedecay_hooks::core_events::{DaemonHookEvent, HOOK_EVENT_METHOD, HookEventNotifyOutcomeV1};
 
 use tracedecay_daemon_identity::{
     ResolvedDaemonConnection, client_connection, current_daemon_connection,
 };
-use tracedecay_daemon_protocol::SOCKET_ENV;
+use tracedecay_daemon_protocol::{DaemonClientStream, SOCKET_ENV};
 use tracedecay_mcp::server::attach_stateless_request_context;
 
-use super::{BrokerStream, JsonRpcRequest, write_daemon_preamble};
+use super::{JsonRpcRequest, write_daemon_preamble};
 
-pub(crate) const HOOK_EVENT_NOTIFY_TIMEOUT: Duration = Duration::from_millis(750);
-
+/// Delivers `event` and resolves once the daemon acknowledges it, however
+/// long admission takes. A host hook that must not block its agent bounds
+/// this call itself.
 #[tracing::instrument(name = "daemon.engine.hooks.notify", level = "trace", skip_all)]
 pub async fn notify_hook_event(
     profile: &tracedecay_runtime_core::config::ProfileRoot,
@@ -35,15 +36,7 @@ pub async fn notify_hook_event(
     let Ok(connection) = connection else {
         return HookEventNotifyOutcomeV1::Unavailable;
     };
-    match timeout(
-        HOOK_EVENT_NOTIFY_TIMEOUT,
-        notify_hook_event_to_connection(profile, project_path, event, connection),
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(_) => HookEventNotifyOutcomeV1::TimedOut,
-    }
+    notify_hook_event_to_connection(profile, project_path, event, connection).await
 }
 
 #[tracing::instrument(name = "daemon.engine.hooks.deliver", level = "trace", skip_all)]
@@ -80,10 +73,10 @@ async fn notify_hook_event_to_connection(
     let Ok(line) = serde_json::to_string(&request) else {
         return HookEventNotifyOutcomeV1::Malformed;
     };
-    let Ok(stream) = BrokerStream::connect(connection.endpoint()).await else {
+    let Ok(stream) = DaemonClientStream::connect(connection.endpoint()).await else {
         return HookEventNotifyOutcomeV1::Unavailable;
     };
-    let (reader, mut writer) = stream.into_owned_split();
+    let (reader, mut writer) = stream.into_split();
     if write_daemon_preamble(&mut writer, &connection, &handshake)
         .await
         .is_err()
@@ -99,14 +92,11 @@ async fn notify_hook_event_to_connection(
     if writer.flush().await.is_err() {
         return HookEventNotifyOutcomeV1::Unavailable;
     }
-    let mut reader = BufReader::new(reader);
-    let mut response = String::new();
+    let mut reader = BoundedLineReader::new(BufReader::new(reader));
     loop {
-        response.clear();
-        match reader.read_line(&mut response).await {
-            Ok(0) | Err(_) => return HookEventNotifyOutcomeV1::Unavailable,
-            Ok(_) => {}
-        }
+        let Ok(Some(response)) = reader.read_mcp_line().await else {
+            return HookEventNotifyOutcomeV1::Unavailable;
+        };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
             return HookEventNotifyOutcomeV1::Malformed;
         };
@@ -123,7 +113,9 @@ async fn notify_hook_event_to_connection(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use super::*;
 
@@ -157,5 +149,46 @@ mod tests {
             started.elapsed() < Duration::from_millis(250),
             "a missing socket must not consume the outer hook timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_reports_an_acknowledgement_that_outlasts_the_host_hook_bound() {
+        tracedecay_project::product_runtime::register_fixture_product_runtime();
+        let profile_dir = tempfile::tempdir().unwrap();
+        let profile = tracedecay_runtime_core::config::ProfileRoot::new(profile_dir.path());
+        let socket = profile.data_dir().join("daemon.sock");
+        let _authority = super::super::tests::seed_socket_authority(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).expect("fake daemon socket");
+        let admission = Duration::from_secs(2);
+        let daemon = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept hook client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.expect("read hook client") {
+                let request = serde_json::from_str::<serde_json::Value>(&line).ok();
+                if request.is_some_and(|request| request["method"] == HOOK_EVENT_METHOD) {
+                    break;
+                }
+            }
+            tokio::time::sleep(admission).await;
+            writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+                .await
+                .expect("acknowledge hook event");
+        });
+
+        let outcome = notify_hook_event(
+            &profile,
+            profile_dir.path(),
+            DaemonHookEvent::cursor_after_shell_execution(profile_dir.path().to_path_buf()),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            HookEventNotifyOutcomeV1::Delivered,
+            "a slow admission is still a delivered event"
+        );
+        daemon.await.expect("fake daemon");
     }
 }

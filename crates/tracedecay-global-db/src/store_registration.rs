@@ -37,21 +37,25 @@ struct RegistrationDigest {
     artifact_mtimes: Vec<Option<SystemTime>>,
 }
 
+/// One registered checkout of a project. Clones of one repository share a
+/// project id, so each clone is cached on its own.
+type RegistrationKey = (String, PathBuf);
+
 /// Process-global cache of the last digest successfully registered for each
-/// project id, so a redundant [`register_project_store`] call (every writable
+/// checkout, so a redundant [`register_project_store`] call (every writable
 /// open re-runs this) can skip straight to `Ok(())` instead of redoing
 /// branch-meta/git lookups and every upsert.
-static LAST_REGISTERED_DIGEST: LazyLock<StdMutex<HashMap<String, RegistrationDigest>>> =
+static LAST_REGISTERED_DIGEST: LazyLock<StdMutex<HashMap<RegistrationKey, RegistrationDigest>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 /// Pure equality check split out of the caching logic above so it can be
 /// unit tested against a synthetic cache without a real global database.
 fn registration_digest_matches(
-    cache: &HashMap<String, RegistrationDigest>,
-    project_id: &str,
+    cache: &HashMap<RegistrationKey, RegistrationDigest>,
+    key: &RegistrationKey,
     digest: &RegistrationDigest,
 ) -> bool {
-    cache.get(project_id) == Some(digest)
+    cache.get(key) == Some(digest)
 }
 
 /// Whether the cached registration may be honored: the digest cache proves
@@ -63,7 +67,7 @@ fn registration_digest_matches(
 /// still avoids the registry write lock and every upsert.
 async fn cached_registration_is_current(
     global_db: &RegisteredGlobalDb,
-    project_id: &str,
+    key: &RegistrationKey,
     digest: &RegistrationDigest,
     registration_root: &Path,
     project_root: &Path,
@@ -72,10 +76,11 @@ async fn cached_registration_is_current(
         let cache = LAST_REGISTERED_DIGEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !registration_digest_matches(&cache, project_id, digest) {
+        if !registration_digest_matches(&cache, key, digest) {
             return Ok(false);
         }
     }
+    let (project_id, _) = key;
     let registered_root = global_db
         .get_code_project(project_id)
         .await?
@@ -91,7 +96,7 @@ async fn cached_registration_is_current(
         .project_id_by_path_alias(project_root, ProjectIdentityAliasKind::ProjectRoot)
         .await?
         .as_deref()
-        == Some(project_id))
+        == Some(project_id.as_str()))
 }
 
 fn artifact_mtime(path: &Path) -> Option<SystemTime> {
@@ -105,7 +110,7 @@ pub async fn register_project_store(
     project_root: &Path,
     store_layout: &StoreLayout,
 ) -> Result<()> {
-    static REGISTRY_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static REGISTRY_WRITE_LOCK: futures_util::lock::Mutex<()> = futures_util::lock::Mutex::new(());
 
     let project_id = store_layout.identity.project_id.as_deref().ok_or_else(|| {
         registry_registration_error("profile-sharded store has no project identity")
@@ -138,8 +143,7 @@ pub async fn register_project_store(
 
             let tracked_branches: BTreeSet<String> = meta
                 .as_ref()
-                .map(|meta| meta.branches.keys().cloned().collect())
-                .unwrap_or_default();
+                .map_or_default(|meta| meta.branches.keys().cloned().collect());
             let artifact_mtimes = vec![
                 artifact_mtime(&store_layout.graph_db_path),
                 artifact_mtime(&store_layout.sessions_db_path),
@@ -167,9 +171,10 @@ pub async fn register_project_store(
     let default_branch = meta.as_ref().map(|meta| meta.default_branch.as_str());
     let registration_root = primary_root.as_deref().unwrap_or(project_root);
 
+    let registration_key = (project_id.to_string(), project_root.to_path_buf());
     if cached_registration_is_current(
         global_db,
-        project_id,
+        &registration_key,
         &digest,
         registration_root,
         project_root,
@@ -184,7 +189,7 @@ pub async fn register_project_store(
     // just registered the same digest while we were computing ours.
     if cached_registration_is_current(
         global_db,
-        project_id,
+        &registration_key,
         &digest,
         registration_root,
         project_root,
@@ -224,7 +229,7 @@ pub async fn register_project_store(
         // removed.
         .await?;
 
-    storage::write_repository_identity_marker(project_root, &project.project_id)?;
+    storage::claim_repository_identity_marker(project_root, &project.project_id, &profile_root)?;
 
     if let Some(primary_root) = primary_root.as_deref() {
         // The registry now points canonical_root/display_root at the
@@ -334,7 +339,7 @@ pub async fn register_project_store(
     LAST_REGISTERED_DIGEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(project_id.to_string(), digest);
+        .insert(registration_key, digest);
     Ok(())
 }
 
@@ -407,16 +412,35 @@ mod tests {
     /// counting how many times a "register" (the expensive upsert body)
     /// would actually run.
     fn simulate_call(
-        cache: &mut HashMap<String, RegistrationDigest>,
+        cache: &mut HashMap<RegistrationKey, RegistrationDigest>,
         project_id: &str,
         digest: &RegistrationDigest,
         register_calls: &mut u32,
     ) {
-        if registration_digest_matches(cache, project_id, digest) {
+        let key = (project_id.to_string(), digest.canonical_root.clone());
+        if registration_digest_matches(cache, &key, digest) {
             return;
         }
         *register_calls += 1;
-        cache.insert(project_id.to_string(), digest.clone());
+        cache.insert(key, digest.clone());
+    }
+
+    #[test]
+    fn clones_of_one_project_are_tracked_independently() {
+        let mut cache = HashMap::new();
+        let mut register_calls = 0;
+        let first = digest("/clone-a", &["main"]);
+        let second = digest("/clone-b", &["main"]);
+
+        for _ in 0..2 {
+            simulate_call(&mut cache, "proj-1", &first, &mut register_calls);
+            simulate_call(&mut cache, "proj-1", &second, &mut register_calls);
+        }
+
+        assert_eq!(
+            register_calls, 2,
+            "alternating opens of two clones must register each clone once"
+        );
     }
 
     #[test]

@@ -65,13 +65,22 @@ fn disagreeing_scope_pair() -> (ResolvedScope, ResolvedScope) {
 }
 
 fn grant(scope: &ResolvedScope, suffix: &str) -> CapabilityGrantSnapshot {
+    grant_issued(scope, suffix, UtcMicros(1), UtcMicros(10_000))
+}
+
+fn grant_issued(
+    scope: &ResolvedScope,
+    suffix: &str,
+    issued_at: UtcMicros,
+    expires_at: UtcMicros,
+) -> CapabilityGrantSnapshot {
     CapabilityGrantSnapshot::new(
         CapabilityGrantId::new(format!("grant.federated-pairing.{suffix}")).expect("grant id"),
         1,
         canonical_sha256(&("grant.federated-pairing", suffix)).expect("grant digest"),
         tracedecay_domain::ActorId::new("actor.federated-pairing").expect("actor"),
-        UtcMicros(1),
-        UtcMicros(10_000),
+        issued_at,
+        expires_at,
         scope.clone(),
         BTreeSet::from([
             CapabilityId::new(super::LSP_WORKSPACE_CAPABILITY_ID_V1).expect("capability")
@@ -103,6 +112,15 @@ async fn install_root(
     scope: &ResolvedScope,
     suffix: &str,
 ) -> (PathBuf, String, ResolvedScope, RegisteredRootLocatorV1) {
+    install_root_with_grant(service, scope, suffix, grant(scope, suffix)).await
+}
+
+async fn install_root_with_grant(
+    service: &DaemonInvocationService,
+    scope: &ResolvedScope,
+    suffix: &str,
+    scope_grant: CapabilityGrantSnapshot,
+) -> (PathBuf, String, ResolvedScope, RegisteredRootLocatorV1) {
     let project_root = fixture_root(&format!("federated-pairing-{suffix}"));
     let uri = fixture_root_uri(&project_root);
     service
@@ -114,7 +132,7 @@ async fn install_root(
                 scope.project_id.clone(),
                 project_root.clone(),
             )
-            .with_scope_grant(grant(scope, suffix)),
+            .with_scope_grant(scope_grant),
         )
         .await
         .expect("install the LSP owner");
@@ -245,5 +263,112 @@ async fn federated_workspace_authority_pairs_by_scope_digest_not_list_position()
             .await
             .is_none(),
         "a root missing from the authorized scope set must refuse the workspace"
+    );
+}
+
+/// Project open mints each LSP owner's scope grant once and nothing renews it,
+/// so owners registered one horizon and one hour ago must still admit a
+/// federated workspace and multi-root reads.
+#[tokio::test]
+async fn lsp_owners_admit_past_the_registration_horizon() {
+    let service = DaemonInvocationService::default();
+    let now = tracedecay_contracts::now_micros();
+    let horizon = i64::try_from(crate::GRANT_HORIZON.as_micros()).expect("grant horizon");
+    let opened_at = UtcMicros(now.0 - horizon - 3_600_000_000);
+    let (left_scope, right_scope) = disagreeing_scope_pair();
+    let mut roots = Vec::new();
+    for (scope, suffix) in [(&left_scope, "left"), (&right_scope, "right")] {
+        let day_old = grant_issued(scope, suffix, opened_at, UtcMicros(opened_at.0 + horizon));
+        roots.push(install_root_with_grant(&service, scope, suffix, day_old).await);
+    }
+
+    assert!(
+        service
+            .authorize_lsp_workspace(roots.clone(), now)
+            .await
+            .is_some(),
+        "day-old LSP owners must still admit a federated workspace"
+    );
+    let (context, _) = service
+        .multi_root_query_context(&roots[0].0, &roots[0].2, 0, now)
+        .await
+        .expect("a day-old LSP owner's multi-root query context");
+    assert_eq!(
+        context.admission_at(now),
+        tracedecay_contracts::RequestAdmission::Admitted
+    );
+}
+
+/// Issue #3934. A root's deferred advisory mount republishes its LSP owner,
+/// with a provider-backed factory and the same authority, once its first
+/// code-index generation seals. A multi-folder initialize authorized just
+/// before that republication must still open, on the live factory.
+#[tokio::test]
+async fn federated_workspace_survives_a_same_authority_owner_republication() {
+    let service = DaemonInvocationService::default();
+    let (left_scope, right_scope) = disagreeing_scope_pair();
+    let left = install_root(&service, &left_scope, "left").await;
+    let right = install_root(&service, &right_scope, "right").await;
+    let workspace = service
+        .authorize_lsp_workspace(vec![left.clone(), right.clone()], UtcMicros(10))
+        .await
+        .expect("two registered roots under one profile store are a federated workspace");
+
+    let republished = unavailable_lsp_session_factory();
+    service
+        .install_lsp_owner(
+            right.0.clone(),
+            DaemonLspInvocationOwner::for_test_project(
+                republished.clone(),
+                UserProfileId::new(PROFILE).expect("profile id"),
+                right_scope.project_id.clone(),
+                right.0.clone(),
+            )
+            .with_scope_grant(grant(&right_scope, "right")),
+        )
+        .await
+        .expect("republish the right root's LSP owner");
+
+    let active = service
+        .lsp_owner(Some(&left.0))
+        .await
+        .expect("the left root's owner");
+    let Some(CurrentLspWorkspaceAuthorityV1::Federated(current)) = service
+        .current_lsp_workspace_authority(&workspace, Some(&active))
+        .await
+    else {
+        panic!("a same-authority owner republication must not revoke the workspace");
+    };
+    let right_digest = &right_scope.scope_digest;
+    let (_, right_factory) = current
+        .factories
+        .iter()
+        .find(|(root, _)| root.scope_digest() == Some(right_digest))
+        .expect("the right root stays in the workspace");
+    assert!(
+        std::sync::Arc::ptr_eq(right_factory, &republished),
+        "the session must open on the republished owner's factory"
+    );
+
+    // A republication under another scope is a different authority.
+    service
+        .install_lsp_owner(
+            right.0.clone(),
+            DaemonLspInvocationOwner::for_test_project(
+                unavailable_lsp_session_factory(),
+                UserProfileId::new(PROFILE).expect("profile id"),
+                right_scope.project_id.clone(),
+                right.0.clone(),
+            )
+            .with_scope_grant(grant(&scope_for(999), "right")),
+        )
+        .await
+        .expect("republish the right root under another scope");
+    assert!(
+        service
+            .current_lsp_workspace_authority(&workspace, Some(&active))
+            .await
+            .is_none(),
+        "an owner republished under another scope must refuse the workspace"
     );
 }

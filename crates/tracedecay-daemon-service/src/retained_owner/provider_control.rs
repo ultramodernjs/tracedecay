@@ -880,45 +880,61 @@ impl RetainedProviderControlExecutionPortV1 for ProjectProviderControlPortV1 {
         request: &'a ProviderControlRequestV1,
     ) -> RetainedSurfaceExecutionFutureV1<'a> {
         Box::pin(async move {
-            let result = async {
-                let invocation = ControlInvocationV1::new(&context, request)?;
-                self.validate_invocation(&invocation)?;
-                invocation
-                    .run_controlled(async {
-                        match request {
-                            ProviderControlRequestV1::Feedback(request) => {
-                                source_controls::feedback(self, &invocation, request).await
+            let runtime =
+                tracedecay_runtime_core::native_runtime::tokio_handle("memory_provider.control")
+                    .ok_or_else(|| {
+                        RetainedSurfaceExecutionErrorV1::unavailable(
+                            "memory provider Tokio runtime unavailable".to_owned(),
+                        )
+                    })?;
+            tracedecay_runtime_core::native_runtime::in_tokio_context(runtime, async move {
+                let result = async {
+                    let invocation = ControlInvocationV1::new(&context, request)?;
+                    self.validate_invocation(&invocation)?;
+                    invocation
+                        .run_controlled(async {
+                            match request {
+                                ProviderControlRequestV1::Feedback(request) => {
+                                    source_controls::feedback(self, &invocation, request).await
+                                }
+                                ProviderControlRequestV1::Correction(request) => {
+                                    source_controls::correction(self, &invocation, request).await
+                                }
+                                ProviderControlRequestV1::DeleteBySource(request) => {
+                                    source_controls::delete_by_source(self, &invocation, request)
+                                        .await
+                                }
+                                ProviderControlRequestV1::Health(request) => {
+                                    state_controls::health(self, &invocation, request).await
+                                }
+                                ProviderControlRequestV1::Inspection(request) => {
+                                    state_controls::inspection(self, &invocation, request).await
+                                }
+                                ProviderControlRequestV1::Maintenance(request) => {
+                                    state_controls::maintenance(self, &invocation, request).await
+                                }
+                                ProviderControlRequestV1::SnapshotExport(request) => {
+                                    portability::snapshot_export(self, &invocation, request).await
+                                }
+                                ProviderControlRequestV1::SnapshotRestore(request) => {
+                                    portability::snapshot_restore(self, &invocation, request).await
+                                }
+                                ProviderControlRequestV1::Replay(request) => {
+                                    portability::replay(self, &invocation, request).await
+                                }
                             }
-                            ProviderControlRequestV1::Correction(request) => {
-                                source_controls::correction(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::DeleteBySource(request) => {
-                                source_controls::delete_by_source(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::Health(request) => {
-                                state_controls::health(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::Inspection(request) => {
-                                state_controls::inspection(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::Maintenance(request) => {
-                                state_controls::maintenance(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::SnapshotExport(request) => {
-                                portability::snapshot_export(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::SnapshotRestore(request) => {
-                                portability::snapshot_restore(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::Replay(request) => {
-                                portability::replay(self, &invocation, request).await
-                            }
-                        }
-                    })
-                    .await
-            }
-            .await;
-            outcome::assemble_outcome(&context, request, result, &self.inputs.configuration_digest)
+                        })
+                        .await
+                }
+                .await;
+                outcome::assemble_outcome(
+                    &context,
+                    request,
+                    result,
+                    &self.inputs.configuration_digest,
+                )
+            })
+            .await
         })
     }
 }
@@ -1111,6 +1127,42 @@ mod tests {
             continued.maximum_duration_millis
         );
         assert_eq!(first.dry_run, continued.dry_run);
+    }
+
+    #[test]
+    fn provider_control_without_a_tokio_runtime_returns_unavailable() {
+        let (request_context, signal) = context("actor.one", "request.one", "worktree.one");
+        let request = health_request();
+        let operation =
+            tracedecay_contracts::retained_surface_application_operation(request.operation())
+                .unwrap();
+        let scope = request_context.scope().clone();
+        let port = ProjectProviderControlPortV1 {
+            inputs: ProviderControlMountInputsV1 {
+                authority: None,
+                journeys: Vec::new(),
+                profile_id: UserProfileId::new("profile.control").unwrap(),
+                authoritative_project_id: scope.project_id.clone(),
+                mounted_scope: scope,
+                configuration_digest: ManifestDigest::new(format!("sha256:{}", "a".repeat(64)))
+                    .unwrap(),
+            },
+        };
+        let mut work = port.execute_provider_control(
+            RetainedSurfaceExecutionContextV1 {
+                request_context: &request_context,
+                cancellation_signal: &signal,
+                operation: &operation,
+                observed_at: tracedecay_contracts::now_micros(),
+            },
+            &request,
+        );
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            work.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Err(RetainedSurfaceExecutionErrorV1::Unavailable { detail }))
+                if detail == "memory provider Tokio runtime unavailable"
+        ));
     }
 
     #[tokio::test]

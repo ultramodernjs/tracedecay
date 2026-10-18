@@ -1655,7 +1655,7 @@ pub(super) fn mint_observation_id(
 ) -> Result<ObservationIdV1, ObservationJournalError> {
     let unix_millis = u64::try_from(admitted_at_unix_micros.max(0) / 1_000).unwrap_or(0);
     let mut entropy = [0u8; 10];
-    if getrandom::getrandom(&mut entropy).is_err() {
+    if getrandom::fill(&mut entropy).is_err() {
         return Err(ObservationJournalError::InvalidObservationId {
             detail: "system entropy is unavailable for observation identity".to_owned(),
         });
@@ -3172,7 +3172,7 @@ fn readiness_handshake_request(
     control: OperationControl,
 ) -> Result<HandshakeRequest, ObservationJourneyError> {
     let mut challenge_nonce = [0u8; 32];
-    if getrandom::getrandom(&mut challenge_nonce).is_err() {
+    if getrandom::fill(&mut challenge_nonce).is_err() {
         return Err(ObservationJourneyError::EntropyUnavailable);
     }
     HandshakeRequest::new(HandshakeRequestParts {
@@ -5849,6 +5849,7 @@ mod tests {
     const EFFECT_DIGEST: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
     mod control_dispatch;
+    mod journal_replay;
 
     /// Seeded crash and restart fuzzing of this mount. It lives
     /// beside the journey's own suite because it reuses these fixtures to

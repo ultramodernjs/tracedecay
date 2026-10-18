@@ -7,7 +7,6 @@ use tracedecay_code_index_retention::code_index_generations::{
 };
 use tracedecay_code_index_runtime::code_index_scheduler;
 
-use super::bootstrap::run_git;
 use super::*;
 
 async fn notify_workspace_open(
@@ -96,16 +95,16 @@ fn create_linked_worktree_fixture(root: &Path) -> (PathBuf, PathBuf) {
     let primary = root.join("primary");
     let linked = root.join("linked");
     std::fs::create_dir_all(&primary).expect("create primary repository");
-    run_git(&primary, &["init", "-b", "main", "--quiet"]);
+    git(&primary, &["init", "-b", "main", "--quiet"]);
     std::fs::write(primary.join("README.md"), "shared authority\n").expect("fixture");
     std::fs::write(
         primary.join("primary.rs"),
         "pub fn primary_snapshot_only() -> u8 { 1 }\n",
     )
     .expect("primary-only source");
-    run_git(&primary, &["add", "."]);
-    run_git(&primary, &["commit", "-m", "fixture", "--quiet"]);
-    run_git(
+    git(&primary, &["add", "."]);
+    git(&primary, &["commit", "-m", "fixture", "--quiet"]);
+    git(
         &primary,
         &[
             "worktree",
@@ -457,13 +456,25 @@ async fn concurrent_same_identity_worktrees_keep_exact_server_and_scheduler_bind
             .publication_id,
         "reopening an exact linked route must not publish a second database owner"
     );
-    {
+    let detached_primary = {
         let mut servers = engine.store_administration.project_servers().lock().await;
         assert_eq!(servers.servers.len(), 2);
         assert_eq!(servers.aliases.len(), 2);
         assert_reopened_linked_route_is_not_degraded(&servers, &linked_key);
-        assert!(servers.remove(&primary_key).is_some());
-    }
+        servers
+            .remove(&primary_key)
+            .expect("primary route must remain registered until retirement")
+    };
+    // Production eviction hands the removed server to a tracked retirement.
+    // Dropping it here would leave its hook replay consumer holding a session
+    // store lease until the next sweep, past the bounded shutdown below.
+    super::super::project_server_lifecycle::schedule_project_server_retirement(
+        &engine.store_administration,
+        primary_key.owner.clone(),
+        vec![detached_primary],
+        None,
+    )
+    .await;
 
     assert!(matches!(
         engine
@@ -492,6 +503,13 @@ async fn concurrent_same_identity_worktrees_keep_exact_server_and_scheduler_bind
             .is_none(),
         "a linked worktree without the watch opt-in must never mount a code-index scheduler"
     );
+    drop((
+        primary_server,
+        primary_graph,
+        linked_graph,
+        reopened_linked_server,
+        reopened_linked_graph,
+    ));
     tokio::time::timeout(std::time::Duration::from_secs(5), engine.shutdown_all())
         .await
         .expect("linked-worktree shutdown must remain bounded");
@@ -679,6 +697,12 @@ async fn opted_in_linked_worktree_indexes_reopens_and_shuts_down_beside_primary(
         // the daemon. Name the published level so that degradation fails here.
         assert_reopened_linked_route_is_not_degraded(&servers, &linked_key);
     }
+    drop((
+        primary_server,
+        primary_graph,
+        reopened_linked_server,
+        reopened_linked_graph,
+    ));
     tokio::time::timeout(std::time::Duration::from_secs(5), engine.shutdown_all())
         .await
         .expect("opted-in linked-worktree shutdown must remain bounded");
@@ -773,7 +797,7 @@ async fn maintenance_reclaims_a_removed_linked_worktree_and_the_text_artifact_on
     // Put a refresh in flight so the linked scheduler is writing when its
     // root disappears.
     std::fs::write(linked.join("late.rs"), "pub fn late() {}\n").expect("edit linked worktree");
-    run_git(
+    git(
         &primary,
         &[
             "worktree",
@@ -868,10 +892,8 @@ async fn maintenance_reclaims_a_removed_linked_worktree_and_the_text_artifact_on
     assert!(primary_scope.is_dir());
     assert!(shared.join(&primary_artifact).is_file());
 
-    drop(linked_graph);
-    drop(primary_graph);
-    drop(linked_server);
-    drop(primary_server);
+    drop((lease, linked_lease, linked_graph, primary_graph));
+    drop((linked_server, primary_server));
     tokio::time::timeout(std::time::Duration::from_secs(5), engine.shutdown_all())
         .await
         .expect("shutdown after scope retention must remain bounded");
@@ -926,7 +948,8 @@ async fn retiring_observability_owner_reopens_same_route_without_cached_degradat
             .project_runtimes
             .quiesce_roots(&roots)
             .await
-            .is_none()
+            .is_some(),
+        "the root's runtime retires while its store owner still awaits the writer"
     );
     // Remove the initial published route to model a capacity reopen. From the
     // first refusal onward, only production open/retry logic may change it.
@@ -996,4 +1019,38 @@ async fn retiring_observability_owner_reopens_same_route_without_cached_degradat
     drop(producer);
     drop(db);
     engine.shutdown_all().await;
+}
+
+/// A handshake's profile-identity binding runs on the native runtime: with no
+/// Tokio runtime it opens the cold profile runtime and binds the client to it.
+#[test]
+fn profile_identity_binding_opens_a_cold_profile_runtime_without_a_tokio_runtime() {
+    let temp = TempDir::new().expect("temp dir");
+    let profile_root = temp.path().join("profile");
+    let store_administration = test_store_administration_for_profile(&profile_root);
+    let _database_scope =
+        enter_test_daemon_database_scope(&profile_root, "profile-binding-off-tokio");
+    let mut handshake = DaemonHandshake {
+        client_identity: test_client_identity_for(profile_root.clone()),
+        ..test_handshake_defaults()
+    };
+
+    let hazards = crate::test_support::native_runtime_hazards();
+    tracedecay_runtime_core::native_runtime::block_on(async {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        super::super::connection_serving::bind_authenticated_profile_identity_within_deadline(
+            &mut handshake,
+            &store_administration,
+        )
+        .await
+    })
+    .expect("native runtime runs the binding")
+    .expect("bind the client's profile identity");
+
+    assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
+    assert_eq!(
+        handshake.client_identity.profile_root,
+        profile_root.canonicalize().expect("canonical profile root"),
+        "the binding returns the canonical bound identity"
+    );
 }

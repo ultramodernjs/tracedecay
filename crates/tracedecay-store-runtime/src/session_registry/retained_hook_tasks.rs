@@ -1,18 +1,15 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-#[cfg(test)]
-use std::future::poll_fn;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll, Waker};
 
+use tracedecay_runtime_core::native_runtime::{NativeTask, NativeTaskOutcome};
 use tracedecay_sessions::observation::ObservationCancellation;
 
 struct RetainedHookTask {
     key: String,
     generation: u64,
     cancellation: ObservationCancellation,
-    join: Arc<RetainedHookTaskJoin>,
+    join: Arc<NativeTask<()>>,
 }
 
 #[derive(Default)]
@@ -46,9 +43,6 @@ impl RetainedHookTasks {
         F: FnOnce(ObservationCancellation) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return false;
-        };
         let key = format!("{provider}\0{session_id}");
         {
             let Ok(mut state) = self.state.lock() else {
@@ -65,17 +59,19 @@ impl RetainedHookTasks {
             let task_cancellation = cancellation.clone();
             let weak_state = Arc::downgrade(&self.state);
             let task_key = key.clone();
-            let task = handle.spawn(async move {
+            let Ok(join) = NativeTask::spawn(async move {
                 operation(task_cancellation).await;
                 finish_retained_hook_task(weak_state, &task_key, generation);
-            });
+            }) else {
+                return false;
+            };
             let previous = state.tasks.insert(
                 key.clone(),
                 RetainedHookTask {
                     key,
                     generation,
                     cancellation,
-                    join: Arc::new(RetainedHookTaskJoin::new(task)),
+                    join: Arc::new(join),
                 },
             );
             if let Some(previous) = previous {
@@ -147,7 +143,7 @@ impl RetainedHookTasks {
                 .collect::<Vec<_>>()
         };
         for (generation, join) in joins {
-            let result = join.wait().await;
+            let result = join_result(join.wait().await);
             let mut state = self
                 .state
                 .lock()
@@ -178,66 +174,14 @@ impl RetainedHookTasks {
     }
 }
 
-// One retained join state per existing task. Concurrent drains share its
-// terminal result; cancelling a waiter never moves out or detaches the handle.
-pub(super) struct RetainedHookTaskJoin {
-    state: tokio::sync::Mutex<RetainedHookTaskJoinState>,
-    abort: tokio::task::AbortHandle,
-}
-
-enum RetainedHookTaskJoinState {
-    Running(tokio::task::JoinHandle<()>),
-    Finished(Result<(), String>),
-}
-
-impl RetainedHookTaskJoin {
-    pub(super) fn new(handle: tokio::task::JoinHandle<()>) -> Self {
-        Self {
-            abort: handle.abort_handle(),
-            state: tokio::sync::Mutex::new(RetainedHookTaskJoinState::Running(handle)),
-        }
-    }
-
-    pub(super) async fn wait(&self) -> Result<(), String> {
-        let mut state = self.state.lock().await;
-        match &mut *state {
-            RetainedHookTaskJoinState::Finished(result) => result.clone(),
-            RetainedHookTaskJoinState::Running(handle) => {
-                let result = Self::outcome(handle.await);
-                *state = RetainedHookTaskJoinState::Finished(result.clone());
-                result
-            }
-        }
-    }
-
-    pub(super) fn abort(&self) {
-        self.abort.abort();
-    }
-
-    fn try_finished(&self) -> Option<Result<(), String>> {
-        if !self.abort.is_finished() {
-            return None;
-        }
-        let mut state = self.state.try_lock().ok()?;
-        if let RetainedHookTaskJoinState::Running(handle) = &mut *state {
-            let mut cx = Context::from_waker(Waker::noop());
-            let Poll::Ready(result) = Pin::new(handle).poll(&mut cx) else {
-                return None;
-            };
-            *state = RetainedHookTaskJoinState::Finished(Self::outcome(result));
-        }
-        match &*state {
-            RetainedHookTaskJoinState::Finished(result) => Some(result.clone()),
-            RetainedHookTaskJoinState::Running(_) => None,
-        }
-    }
-
-    fn outcome(result: Result<(), tokio::task::JoinError>) -> Result<(), String> {
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(error) => Err(format!("retained hook task join failed: {error}")),
-        }
+/// A retained task that was aborted or dropped by its runtime stopped
+/// cleanly; only a panic fails its join.
+pub(super) fn join_result(outcome: NativeTaskOutcome<()>) -> Result<(), String> {
+    match outcome {
+        NativeTaskOutcome::Completed(()) | NativeTaskOutcome::Cancelled => Ok(()),
+        NativeTaskOutcome::Panicked(payload) => Err(format!(
+            "retained hook task join failed: task panicked: {payload}"
+        )),
     }
 }
 
@@ -252,7 +196,7 @@ impl RetainedHookTaskState {
     fn reap_finished(&mut self) {
         let mut index = 0;
         while index < self.retiring.len() {
-            if let Some(result) = self.retiring[index].join.try_finished() {
+            if let Some(result) = self.retiring[index].join.try_finished().map(join_result) {
                 self.finish_join(index, result);
             } else {
                 index += 1;
@@ -299,12 +243,24 @@ impl Drop for RetainedHookTasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::yield_now;
+    use std::future::poll_fn;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
     use tokio::sync::Notify;
 
-    #[tokio::test]
+    async fn assert_pending<F: Future + Unpin>(future: &mut F, message: &str) {
+        poll_fn(|cx| {
+            assert!(Pin::new(&mut *future).poll(cx).is_pending(), "{message}");
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[asupersync::test]
     async fn shutdown_fences_new_tasks_and_joins_active_task() {
-        let tasks = Arc::new(RetainedHookTasks::new());
+        let tasks = RetainedHookTasks::new();
         let started = Arc::new(Notify::new());
         let cancelled = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -315,7 +271,7 @@ mod tests {
             move |cancellation| async move {
                 started.notify_one();
                 while !cancellation.is_cancelled() {
-                    tokio::task::yield_now().await;
+                    yield_now().await;
                 }
                 cancelled.notify_one();
                 release.notified().await;
@@ -323,38 +279,24 @@ mod tests {
         }));
         started.notified().await;
 
-        let shutdown = tokio::spawn({
-            let tasks = Arc::clone(&tasks);
-            async move { tasks.shutdown().await }
-        });
+        let mut shutdown = Box::pin(tasks.shutdown());
+        assert_pending(&mut shutdown, "shutdown must join the active task").await;
         cancelled.notified().await;
-        assert!(
-            !shutdown.is_finished(),
-            "shutdown must join the active task"
-        );
+        assert_pending(&mut shutdown, "shutdown must join the active task").await;
         assert!(
             !tasks.retain("codex", "session-2", |_| async {}),
             "shutdown must fence later admission"
         );
 
-        shutdown.abort();
-        assert!(
-            shutdown
-                .await
-                .expect_err("first drain is cancelled")
-                .is_cancelled()
-        );
+        drop(shutdown);
         let mut retry = Box::pin(tasks.shutdown());
         // Poll the canonical task-owner drain itself: there is no later
         // blocking lifecycle cleanup that could make a lost-handle retry
         // appear pending. The acknowledged task cannot finish until release.
-        poll_fn(|cx| {
-            assert!(
-                retry.as_mut().poll(cx).is_pending(),
-                "cancelled shutdown must retain the acknowledged live task for retry"
-            );
-            Poll::Ready(())
-        })
+        assert_pending(
+            &mut retry,
+            "cancelled shutdown must retain the acknowledged live task for retry",
+        )
         .await;
         release.notify_one();
         retry
@@ -362,7 +304,28 @@ mod tests {
             .expect("retried task-owner drain joins the released task");
     }
 
-    #[tokio::test]
+    #[test]
+    fn retained_tasks_run_without_a_caller_runtime() {
+        let tasks = RetainedHookTasks::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(
+            tasks.retain("codex", "session-1", move |_| async move {
+                let _ = sender.send(std::thread::current().name().map(str::to_owned));
+            }),
+            "a caller outside any runtime must still admit retained work"
+        );
+        let thread = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("retained task ran");
+        assert!(
+            thread
+                .as_deref()
+                .is_some_and(|name| name.starts_with("tracedecay-native")),
+            "retained task must run on the native process runtime, ran on {thread:?}"
+        );
+    }
+
+    #[asupersync::test]
     async fn targeted_retirement_preserves_failure_without_failing_other_keys() {
         let tasks = RetainedHookTasks::new();
         assert!(tasks.retain("memory-graph", "failed", |_| async {
@@ -385,7 +348,7 @@ mod tests {
         assert_eq!(tasks.shutdown().await.unwrap_err(), error);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn shutdown_retry_preserves_failed_join() {
         let tasks = RetainedHookTasks::new();
         assert!(tasks.retain("codex", "failed-session", |_| async {
@@ -405,9 +368,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn shutdown_joins_superseded_task() {
-        let tasks = Arc::new(RetainedHookTasks::new());
+        let tasks = RetainedHookTasks::new();
         let first_started = Arc::new(Notify::new());
         let first_cancelled = Arc::new(Notify::new());
         let first_release = Arc::new(Notify::new());
@@ -418,7 +381,7 @@ mod tests {
             move |cancellation| async move {
                 started.notify_one();
                 while !cancellation.is_cancelled() {
-                    tokio::task::yield_now().await;
+                    yield_now().await;
                 }
                 cancelled.notify_one();
                 release.notified().await;
@@ -428,26 +391,22 @@ mod tests {
         assert!(tasks.retain("codex", "session-1", |_| async {}));
         first_cancelled.notified().await;
 
-        let shutdown = tokio::spawn({
-            let tasks = Arc::clone(&tasks);
-            async move { tasks.shutdown().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !shutdown.is_finished(),
-            "shutdown must retain and join the cancelled predecessor"
-        );
+        let mut shutdown = Box::pin(tasks.shutdown());
+        assert_pending(
+            &mut shutdown,
+            "shutdown must retain and join the cancelled predecessor",
+        )
+        .await;
 
         first_release.notify_one();
         shutdown
             .await
-            .expect("shutdown task remains joinable")
             .expect("retained hook tasks shut down cleanly");
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn retiring_one_task_cancels_and_joins_only_that_key() {
-        let tasks = Arc::new(RetainedHookTasks::new());
+        let tasks = RetainedHookTasks::new();
         let first_started = Arc::new(Notify::new());
         let first_cancelled = Arc::new(Notify::new());
         let first_release = Arc::new(Notify::new());
@@ -459,7 +418,7 @@ mod tests {
             move |cancellation| async move {
                 started.notify_one();
                 while !cancellation.is_cancelled() {
-                    tokio::task::yield_now().await;
+                    yield_now().await;
                 }
                 cancelled.notify_one();
                 release.notified().await;
@@ -469,40 +428,30 @@ mod tests {
             let second_cancelled = Arc::clone(&second_cancelled);
             move |cancellation| async move {
                 while !cancellation.is_cancelled() {
-                    tokio::task::yield_now().await;
+                    yield_now().await;
                 }
                 second_cancelled.store(true, Ordering::Release);
             }
         }));
         first_started.notified().await;
 
-        let retire = tokio::spawn({
-            let tasks = Arc::clone(&tasks);
-            async move { tasks.retire("memory-graph", "project-1").await }
-        });
+        let mut retire = Box::pin(tasks.retire("memory-graph", "project-1"));
+        assert_pending(&mut retire, "retirement must join its task").await;
         first_cancelled.notified().await;
-        assert!(!retire.is_finished(), "retirement must join its task");
+        assert_pending(&mut retire, "retirement must join its task").await;
         assert!(!second_cancelled.load(Ordering::Acquire));
 
-        retire.abort();
-        assert!(
-            retire
-                .await
-                .expect_err("first retirement cancelled")
-                .is_cancelled()
-        );
+        drop(retire);
         assert!(tasks.retain("memory-graph", "project-3", |_| async {}));
         let mut retry = Box::pin(tasks.retire("memory-graph", "project-1"));
-        poll_fn(|cx| {
-            assert!(
-                retry.as_mut().poll(cx).is_pending(),
-                "retry must retain the acknowledged task until release"
-            );
-            Poll::Ready(())
-        })
+        assert_pending(
+            &mut retry,
+            "retry must retain the acknowledged task until release",
+        )
         .await;
         assert!(!second_cancelled.load(Ordering::Acquire));
-        tokio::time::timeout(
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
             std::time::Duration::from_secs(2),
             tasks.retire("memory-graph", "project-2"),
         )
@@ -510,14 +459,7 @@ mod tests {
         .expect("independent B retirement must complete while A remains held")
         .expect("independent B retirement succeeds");
         assert!(second_cancelled.load(Ordering::Acquire));
-        poll_fn(|cx| {
-            assert!(
-                retry.as_mut().poll(cx).is_pending(),
-                "A remains held after B retirement completes"
-            );
-            Poll::Ready(())
-        })
-        .await;
+        assert_pending(&mut retry, "A remains held after B retirement completes").await;
         first_release.notify_one();
         retry
             .await

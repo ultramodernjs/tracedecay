@@ -39,6 +39,36 @@ and the release descriptor is
 The descriptor's revision digest is bound to the canonical backend receipt at
 `product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json`.
 
+## Memory namespaces
+
+The `memory.provider_ncm_observer.v1` setting accepts two namespace modes:
+
+```json
+{
+  "mode": "enabled",
+  "worker_binary": "/absolute/path/to/tracedecay-ncm-worker",
+  "state_root": "/absolute/path/to/ncm-state",
+  "namespace_binding": "checkout_observations_v1"
+}
+```
+
+`checkout_observations_v1` shares ordinary observations across agent sessions
+of the same profile, project, repository, worktree and branch. Each observation
+keeps its canonical source identity. Recall reads current canonical content and
+dispositions from the host; this mode does not grant access to original session
+history or bypass existing source controls. New `ncm install` configurations
+explicitly select this mode. NCM participation and recall routing still require
+their existing opt-ins.
+
+`exact_session_v1` retains the original namespace hash, state directories and
+receipts, including the agent session and scope resolution identity. Existing
+enabled documents that omit `namespace_binding` select this mode, and worker
+updates preserve the configured choice. To select legacy session namespaces,
+omit `namespace_binding`; explicitly writing `"exact_session_v1"` is rejected
+as noncanonical because the canonical serializer omits this default field.
+Changing modes requires a daemon restart and selects a separate namespace; it does not migrate, rename or delete previous memory.
+Existing snapshots and journals must keep their original namespace identities.
+
 ## Installed release verification
 
 Run the portable regression gate from a checkout of the release source:

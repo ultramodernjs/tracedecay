@@ -37,6 +37,7 @@ pub(crate) use text_file_transaction::{
     TextFileMutation, update_text_file_transactionally, update_two_config_files_transactionally,
 };
 pub mod roo_code;
+pub mod serve_args;
 pub mod vibe;
 pub mod zed;
 
@@ -88,8 +89,8 @@ pub(crate) use host_config_io::{
     JsonConfigMutation, collect_regular_files, emptied_text_mutation,
     ensure_project_local_safe_path, ensure_project_local_safe_paths, hook_command,
     host_home_override, lifecycle_created_container, lifecycle_created_file,
-    note_created_container, record_host_config_observation_bytes, root_relative_path,
-    update_json_config_transactionally, update_toml_config_transactionally,
+    note_created_container, read_optional_config_bytes, record_host_config_observation_bytes,
+    root_relative_path, update_json_config_transactionally, update_toml_config_transactionally,
     with_host_config_creations,
 };
 #[cfg(test)]
@@ -99,11 +100,13 @@ use host_config_io::{
 };
 #[cfg(test)]
 pub(crate) use host_config_io::{recorded_install_then_uninstall, recorded_lifecycle};
-pub(crate) use mcp_registration::doctor_check_prompt_contains_tracedecay;
 pub use mcp_registration::{
     McpDoctorLabels, doctor_check_mcp_registration, install_mcp_server_entry,
     mcp_config_has_tracedecay, mcp_registration_entry, mcp_servers_registration_state,
     read_only_tool_names, report_mcp_registration, tool_names, uninstall_mcp_server_entry,
+};
+pub(crate) use mcp_registration::{
+    doctor_check_prompt_contains_tracedecay, serve_entry_registration_state,
 };
 
 #[tracing::instrument(
@@ -618,6 +621,9 @@ pub struct InstallContext {
     /// --no-dashboard` opts out and removes a previous deploy). Other agents
     /// ignore this field.
     pub dashboard: bool,
+    /// This agent's resolved MCP launch args; every registration writer
+    /// renders `serve` from it.
+    pub serve_args: serve_args::ServeArgs,
 }
 
 /// Context passed to [`AgentIntegration::healthcheck`].
@@ -625,6 +631,8 @@ pub struct HealthcheckContext {
     pub home: PathBuf,
     pub profile: ProfileRoot,
     pub project_path: PathBuf,
+    /// Every agent's expected MCP launch args; probes read their own entry.
+    pub catalog_profiles: serve_args::HostCatalogProfiles,
 }
 
 /// Where an MCP server registration is being written.
@@ -775,6 +783,12 @@ impl host_bundle::HostBundleRegistrationInspectorV1 for AgentRegistrationInspect
         get_integration(integration_id_for_host(host))
             .ok()
             .and_then(|integration| integration.interactive_activation_guidance())
+    }
+
+    fn serve_args(&self, host: host_bundle::HostKindV1) -> serve_args::ServeArgs {
+        self.context
+            .catalog_profiles
+            .serve_args(integration_id_for_host(host))
     }
 }
 
@@ -1217,6 +1231,7 @@ mod managed_skill_prompt_index_doctor_tests {
                 profile: tracedecay_runtime_core::config::ProfileRoot::under_home(home),
                 home: home.to_path_buf(),
                 project_path: project.to_path_buf(),
+                catalog_profiles: Default::default(),
             };
             let index = (row.index_path)(home, project);
             write_index_block(&index, row.slug, "");

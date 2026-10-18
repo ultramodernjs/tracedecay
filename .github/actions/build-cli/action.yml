@@ -25,6 +25,9 @@ inputs:
     description: Save MODULE.bazel.lock right after a successful build when its exact key missed.
     required: false
     default: 'false'
+  tailscale-client-id:
+    description: Restricted OIDC client for compatible trusted CI builds.
+    default: ""
 
 outputs:
   path:
@@ -38,6 +41,7 @@ runs:
       id: bazel
       with:
         cache-key: ${{ inputs.cache-key }}
+        tailscale-client-id: ${{ inputs.tailscale-client-id }}
 
     - name: Build and stage the binary
       id: stage
@@ -58,6 +62,16 @@ runs:
           false) ;;
           *) echo "::error::ncm-worker must be true or false"; exit 1 ;;
         esac
+        # A cold repository cache downloads every external repository. Bazel
+        # retries a 5xx for only ~17 s, and a longer GitHub release-host outage
+        # failed beta.86's macOS build (#3756). Analysis fetches every
+        # repository and the next command refetches a failed one, so retry
+        # only that phase, over about six minutes.
+        for attempt in 1 2 3 4; do
+          bazel build --nobuild --config="$CONFIG" --config=ci "${targets[@]}" && break
+          (( attempt < 4 )) || exit 1
+          sleep $((attempt * 60))
+        done
         bazel build --config="$CONFIG" --config=ci "${targets[@]}"
         bazel_bin="$(bazel info --config="$CONFIG" --config=ci bazel-bin)"
         mkdir -p "$DEST"

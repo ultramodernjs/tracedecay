@@ -1,14 +1,16 @@
 //! Canonical project-memory add, update, and remove commands.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use super::super::envelope::{
     ProjectMemoryOperationReceiptV1, project_memory_digest,
     project_memory_lookup_operation_receipt_tx, project_memory_receipt_u64,
     project_memory_record_operation_receipt_tx,
 };
 use super::super::primitives::{
-    OwnerKey, PROJECT_MEMORY_WRITE_OPERATION, from_json, project_memory_category_label,
-    project_memory_event_time, project_memory_now, row_exists, row_string, storage_error,
-    storage_message,
+    OwnerKey, PROJECT_MEMORY_WRITE_OPERATION, from_json, project_memory_event_time,
+    project_memory_now, row_exists, row_string, storage_error, storage_message,
 };
 use super::super::projection::load_project_memory_projection_tx;
 use super::add::{ProjectMemoryAddClassification, classify_project_memory_add_tx};
@@ -19,7 +21,7 @@ use super::{
 };
 use serde_json::{Value, json};
 use tracedecay_domain::{
-    ActorId, Confidence, FactAssertionId, FactAssertionKindV1, FactAssertionV1,
+    ActorId, Confidence, FactAssertionId, FactAssertionKindV1, FactAssertionV1, FactCategoryV1,
     FactCurationActionV1, FactEventId, FactId, FactLineageEventKindV1, FactLineageEventV1,
     FactOwnerV1, FactPayloadV1, PayloadAccessState, UtcMicros,
 };
@@ -646,11 +648,15 @@ pub(in crate::fact_store) async fn update_project_memory_fact_tx(
     update_project_memory_fact_with_cas_tx(transaction, request, false).await
 }
 
-pub(in crate::fact_store) async fn update_project_memory_fact_after_curation_review_tx(
-    transaction: &Transaction<'_>,
-    request: &ProjectMemoryFactUpdateCommandV1,
-) -> FactStoreResult<ProjectMemoryFactUpdateOutcomeV1> {
-    update_project_memory_fact_with_cas_tx(transaction, request, true).await
+pub(in crate::fact_store) fn update_project_memory_fact_after_curation_review_tx<'a>(
+    transaction: &'a Transaction<'_>,
+    request: &'a ProjectMemoryFactUpdateCommandV1,
+) -> Pin<Box<dyn Future<Output = FactStoreResult<ProjectMemoryFactUpdateOutcomeV1>> + Send + 'a>> {
+    Box::pin(update_project_memory_fact_with_cas_tx(
+        transaction,
+        request,
+        true,
+    ))
 }
 
 async fn update_project_memory_fact_with_cas_tx(
@@ -662,7 +668,7 @@ async fn update_project_memory_fact_with_cas_tx(
         "fact_id": request.target().fact_id().as_str(),
         "expected_last_event_id": request.expected_last_event_id().map(FactEventId::as_str),
         "content": request.patch().content(),
-        "category": request.patch().category().map(project_memory_category_label),
+        "category": request.patch().category().map(FactCategoryV1::as_str),
         "source_label": match request.patch().source_label() {
             None => json!({"changed": false}),
             Some(value) => json!({"changed": true, "value": value}),
@@ -832,11 +838,15 @@ pub(in crate::fact_store) async fn remove_project_memory_fact_tx(
     remove_project_memory_fact_with_cas_tx(transaction, request, false).await
 }
 
-pub(in crate::fact_store) async fn remove_project_memory_fact_after_curation_review_tx(
-    transaction: &Transaction<'_>,
-    request: &ProjectMemoryFactRemoveCommandV1,
-) -> FactStoreResult<ProjectMemoryFactRemoveOutcomeV1> {
-    remove_project_memory_fact_with_cas_tx(transaction, request, true).await
+pub(in crate::fact_store) fn remove_project_memory_fact_after_curation_review_tx<'a>(
+    transaction: &'a Transaction<'_>,
+    request: &'a ProjectMemoryFactRemoveCommandV1,
+) -> Pin<Box<dyn Future<Output = FactStoreResult<ProjectMemoryFactRemoveOutcomeV1>> + Send + 'a>> {
+    Box::pin(remove_project_memory_fact_with_cas_tx(
+        transaction,
+        request,
+        true,
+    ))
 }
 
 async fn remove_project_memory_fact_with_cas_tx(

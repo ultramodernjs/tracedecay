@@ -18,11 +18,13 @@ use crate::research::{
     ProjectId, UtcMicros, canonical_sha256,
 };
 
+mod context_scout_intent;
 mod lcm_summarizer_executables;
 pub mod topology;
 mod work_executable_bindings;
 mod work_expertise_consent;
 
+pub use context_scout_intent::*;
 pub use lcm_summarizer_executables::*;
 pub use topology::*;
 pub use work_executable_bindings::*;
@@ -1006,6 +1008,24 @@ impl MemoryProviderRecallDegradationV1 {
     }
 }
 
+/// Stable provider-state namespace selected explicitly for NCM participation.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProviderNcmNamespaceBindingV1 {
+    /// Retain the original session-specific namespace and its existing state.
+    #[default]
+    ExactSessionV1,
+    /// Share ordinary observations across sessions of the same checkout.
+    CheckoutObservationsV1,
+}
+
+impl MemoryProviderNcmNamespaceBindingV1 {
+    /// Omit the legacy default from serialized settings to preserve old documents.
+    pub const fn is_exact_session(&self) -> bool {
+        matches!(self, Self::ExactSessionV1)
+    }
+}
+
 /// Independently enabled real NCM participation. Changing this setting requires
 /// a daemon restart. The legacy observer type/key/JSON remain stable: enabled
 /// means observer unless recall routing explicitly selects NCM as active.
@@ -1022,6 +1042,12 @@ pub enum MemoryProviderNcmObserverV1 {
         worker_binary: std::path::PathBuf,
         /// Absolute admitted root containing models and provider namespaces.
         state_root: std::path::PathBuf,
+        /// Namespace policy. Existing documents without this field retain session state.
+        #[serde(
+            default,
+            skip_serializing_if = "MemoryProviderNcmNamespaceBindingV1::is_exact_session"
+        )]
+        namespace_binding: MemoryProviderNcmNamespaceBindingV1,
     },
 }
 
@@ -1047,6 +1073,7 @@ impl MemoryProviderNcmObserverV1 {
         if let Self::Enabled {
             worker_binary,
             state_root,
+            ..
         } = self
         {
             for (path, field) in [
@@ -1308,6 +1335,11 @@ pub struct ContextScoutSettingsV1 {
     pub model_path: Option<ContextScoutConfiguredModelPathV1>,
     pub model_id: Option<String>,
     pub model_timeout_secs: Option<u64>,
+    /// Session intent pass. Absent means the Scout runs no intent pass; the
+    /// field is omitted from the canonical encoding so settings written before
+    /// it existed keep their behavior digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<ContextScoutIntentSettingsV1>,
 }
 
 impl ContextScoutSettingsV1 {
@@ -1322,6 +1354,7 @@ impl ContextScoutSettingsV1 {
             model_path: None,
             model_id: None,
             model_timeout_secs: None,
+            intent: None,
         }
     }
 
@@ -1350,6 +1383,9 @@ impl ContextScoutSettingsV1 {
         }
         if let Some(model_id) = self.model_id.as_deref() {
             validate_canonical_label(model_id, "context scout model id")?;
+        }
+        if let Some(intent) = &self.intent {
+            intent.validate()?;
         }
         self.limits.validate()
     }
@@ -2530,6 +2566,7 @@ mod memory_provider_selection_tests {
         MemoryProviderNcmObserverV1::Enabled {
             worker_binary: root.join("worker"),
             state_root: root.join("state"),
+            namespace_binding: Default::default(),
         }
     }
 
@@ -2552,6 +2589,65 @@ mod memory_provider_selection_tests {
         let selected = MemoryProviderSelectionV1::resolve(false, &ncm, &route).unwrap();
         assert!(selected.is_disabled());
         assert_eq!(selected.active_provider(), None);
+    }
+
+    #[test]
+    fn omitted_ncm_namespace_binding_preserves_legacy_document_and_selection() {
+        let legacy = serde_json::to_value(enabled_ncm()).unwrap();
+        assert!(legacy.get("namespace_binding").is_none());
+        let decoded: MemoryProviderNcmObserverV1 = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            MemoryProviderNcmObserverV1::Enabled {
+                namespace_binding: MemoryProviderNcmNamespaceBindingV1::ExactSessionV1,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+        let selected = MemoryProviderSelectionV1::resolve(false, &decoded, &routing(None)).unwrap();
+        assert_eq!(selected.ncm, MemoryProviderParticipationV1::Observer);
+        assert_eq!(selected.active_provider(), None);
+    }
+
+    #[test]
+    fn ncm_namespace_bindings_decode_and_canonicalize_without_selecting_recall() {
+        for (wire, binding) in [
+            (
+                "exact_session_v1",
+                MemoryProviderNcmNamespaceBindingV1::ExactSessionV1,
+            ),
+            (
+                "checkout_observations_v1",
+                MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1,
+            ),
+        ] {
+            let mut document = serde_json::to_value(enabled_ncm()).unwrap();
+            document["namespace_binding"] = serde_json::json!(wire);
+            let decoded: MemoryProviderNcmObserverV1 = serde_json::from_value(document).unwrap();
+            assert!(matches!(
+                &decoded,
+                MemoryProviderNcmObserverV1::Enabled { namespace_binding, .. }
+                    if *namespace_binding == binding
+            ));
+            decoded.validate().unwrap();
+            let serialized = serde_json::to_value(&decoded).unwrap();
+            if binding == MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1 {
+                assert_eq!(serialized["namespace_binding"], wire);
+            }
+            assert_eq!(
+                serde_json::from_value::<MemoryProviderNcmObserverV1>(serialized).unwrap(),
+                decoded,
+            );
+            assert_eq!(
+                MemoryProviderSelectionV1::resolve(false, &decoded, &routing(None))
+                    .unwrap()
+                    .active_provider(),
+                None,
+            );
+        }
+        let mut invalid = serde_json::to_value(enabled_ncm()).unwrap();
+        invalid["namespace_binding"] = serde_json::json!("checkout_observations_v2");
+        assert!(serde_json::from_value::<MemoryProviderNcmObserverV1>(invalid).is_err());
     }
 
     #[test]

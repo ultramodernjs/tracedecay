@@ -56,7 +56,6 @@ impl DaemonLspOwnerRegistrar {
         code_index: Arc<
             tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
         >,
-        runtime: tokio::runtime::Handle,
         diagnostic_broker: Arc<Mutex<DiagnosticBroker>>,
         languages: &[String],
         root_uri: String,
@@ -95,7 +94,6 @@ impl DaemonLspOwnerRegistrar {
         let mut gateway_capabilities = gateway_capabilities;
         gateway_capabilities.supports_workspace_folders = true;
         let semantics = production_semantic_authorities(
-            runtime.clone(),
             diagnostic_broker.clone(),
             languages,
             project_root.clone(),
@@ -123,7 +121,6 @@ impl DaemonLspOwnerRegistrar {
             .await;
         let factory = Arc::new(
             lsp_session_factory(
-                runtime,
                 feedback_runtime,
                 registered_database.clone(),
                 code_index.clone() as Arc<dyn LspCodeIndexProjectionIdentityPort>,

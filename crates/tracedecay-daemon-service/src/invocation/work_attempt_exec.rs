@@ -53,7 +53,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex as ProcessMapMutex;
 
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tracedecay_application::observability::{
     BoundedObservabilityProducerV1, WorkNoProgressObservationV1, WorkOwnerObservationResultV1,
@@ -61,8 +60,8 @@ use tracedecay_application::observability::{
     record_work_operation_resource,
 };
 use tracedecay_contracts::{
-    WorkAttemptEffectDispatchOutcomeV1, WorkAttemptEffectResolutionV1, WorkAttemptEffectServiceV1,
-    WorkAttemptEffectStoragePortV1, WorkAttemptEvidenceRecordV1, WorkAttemptProviderOutcomeV1,
+    ApplicationProblem, WorkAttemptEffectDispatchOutcomeV1, WorkAttemptEffectHolderV1,
+    WorkAttemptEffectResolutionV1, WorkAttemptEvidenceRecordV1, WorkAttemptProviderOutcomeV1,
     WorkProviderAvailabilityV1, WorkProviderFallbackRecordV1, WorkflowArtifactPayload,
     WorkflowArtifactStorePort, workflow_artifact_payload_digest,
 };
@@ -78,26 +77,27 @@ use tracedecay_sessions::runtime::hosts::codex_app_server::{
 };
 
 use tracedecay_configuration::config::work_executable_binding::{
-    WorkExecutableBindingError, WorkExecutableBindingResolver,
+    PinnedWorkExecutableBindingResolver, WorkExecutableBindingError,
 };
 
 use super::types::RegisteredWorkRuntime;
 use super::work::work_background_context;
 use super::{Arc, RequestContext};
 use tracedecay_contracts::now_micros;
+use tracedecay_runtime_core::native_runtime;
 
 mod operation_resource;
 mod provider_launch;
 mod provider_output;
 
 use operation_resource::{AttemptAdmissionTimingV1, work_operation_resource_observation};
-use provider_launch::spawn_provider;
-use provider_output::{overflow_outcome, provider_session, read_capped, stream_summary};
+use provider_launch::ProviderProcess;
+use provider_output::{overflow_outcome, provider_session, stream_summary};
 
-fn provider_stdout_artifacts<S: WorkflowArtifactStorePort>(
+async fn provider_stdout_artifacts(
     identity: &WorkAttemptIdentityV1,
     captured: Option<&(Vec<u8>, u64)>,
-    store: Option<&S>,
+    store: Option<&tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority>,
 ) -> Result<Vec<WorkArtifactRefV1>, ()> {
     let Some((bytes, total)) = captured.filter(|(bytes, total)| {
         !bytes.is_empty() && *total == u64::try_from(bytes.len()).unwrap_or(u64::MAX)
@@ -141,22 +141,183 @@ fn provider_stdout_artifacts<S: WorkflowArtifactStorePort>(
                 "work attempt provider stdout payload could not be verified"
             );
         })?;
-    store.persist(&payload).map_err(|error| {
-        tracing::warn!(
-            task = identity.task_id().as_str(),
-            ?error,
-            "work attempt provider stdout payload could not be persisted"
-        );
-    })?;
+    store
+        .transact(move |storage| storage.persist(&payload))
+        .await
+        .unwrap_or(Err(
+            tracedecay_contracts::WorkflowArtifactStoreError::Unavailable,
+        ))
+        .map_err(|error| {
+            tracing::warn!(
+                task = identity.task_id().as_str(),
+                ?error,
+                "work attempt provider stdout payload could not be persisted"
+            );
+        })?;
     Ok(vec![artifact])
 }
 
 #[cfg(test)]
 mod tests;
 
+/// The durable attempt and effect-holder steps the provider driver awaits
+/// between process events. The registered Work services run each one as a
+/// writer job, so a step never parks the task's thread on the writer.
+pub(super) trait AttemptStepsV1: Sync {
+    fn mark_running(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        actual_route: WorkProviderRouteV1,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send;
+
+    fn mark_provider_unavailable(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        observed_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send;
+
+    fn fail_recovery(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        evidence: &WorkAttemptEvidenceRecordV1,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send;
+
+    fn acknowledge_cancellation(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        acknowledged_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send;
+
+    fn escalate_cancellation(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        escalated_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send;
+
+    fn settle_with_artifacts(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        evidence: &WorkAttemptEvidenceRecordV1,
+        artifacts: Vec<WorkArtifactRefV1>,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send;
+
+    fn record_dispatch(
+        &self,
+        context: &RequestContext,
+        attempt: &WorkAttemptV1,
+        dispatched_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptEffectDispatchOutcomeV1, ApplicationProblem>> + Send;
+
+    fn settle_dispatch(
+        &self,
+        context: &RequestContext,
+        attempt: &WorkAttemptIdentityV1,
+        resolution: WorkAttemptEffectResolutionV1,
+        resolved_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptEffectHolderV1, ApplicationProblem>> + Send;
+}
+
+impl AttemptStepsV1 for tracedecay_application::work::RegisteredWorkApplicationServicesV1 {
+    fn mark_running(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        actual_route: WorkProviderRouteV1,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send {
+        self.mark_running(context.clone(), identity.clone(), actual_route)
+    }
+
+    fn mark_provider_unavailable(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        observed_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send {
+        self.mark_provider_unavailable(context.clone(), identity.clone(), observed_at)
+    }
+
+    fn fail_recovery(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        evidence: &WorkAttemptEvidenceRecordV1,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send {
+        self.fail_recovery(context.clone(), identity.clone(), evidence.clone())
+    }
+
+    fn acknowledge_cancellation(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        acknowledged_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send {
+        self.acknowledge_cancellation(context.clone(), identity.clone(), acknowledged_at)
+    }
+
+    fn escalate_cancellation(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        escalated_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send {
+        self.escalate_cancellation(context.clone(), identity.clone(), escalated_at)
+    }
+
+    fn settle_with_artifacts(
+        &self,
+        context: &RequestContext,
+        identity: &WorkAttemptIdentityV1,
+        evidence: &WorkAttemptEvidenceRecordV1,
+        artifacts: Vec<WorkArtifactRefV1>,
+    ) -> impl Future<Output = Result<WorkAttemptV1, ApplicationProblem>> + Send {
+        self.settle_with_artifacts(
+            context.clone(),
+            identity.clone(),
+            evidence.clone(),
+            artifacts,
+        )
+    }
+
+    fn record_dispatch(
+        &self,
+        context: &RequestContext,
+        attempt: &WorkAttemptV1,
+        dispatched_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptEffectDispatchOutcomeV1, ApplicationProblem>> + Send
+    {
+        self.record_effect_dispatch(
+            context.clone(),
+            attempt.identity().clone(),
+            attempt.execution().effect_state(),
+            dispatched_at,
+            attempt.execution().deadline(),
+        )
+    }
+
+    fn settle_dispatch(
+        &self,
+        context: &RequestContext,
+        attempt: &WorkAttemptIdentityV1,
+        resolution: WorkAttemptEffectResolutionV1,
+        resolved_at: UtcMicros,
+    ) -> impl Future<Output = Result<WorkAttemptEffectHolderV1, ApplicationProblem>> + Send {
+        self.settle_effect_dispatch(context.clone(), attempt.clone(), resolution, resolved_at)
+    }
+}
+
 /// How long an acknowledged cancellation may run before escalation to
 /// forced termination.
 const CANCELLATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a killed provider group may take to close its pipes before the
+/// attempt abandons them. Descendants that left the group keep the pipes open.
+const KILLED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Joined process owners for provider attempts owned by this daemon process.
 /// This is runtime plumbing only, the durable cancellation request lives in
@@ -194,7 +355,15 @@ struct WorkAttemptProcessHolderV1 {
     cancellation: Arc<Notify>,
     lifecycle: tracedecay_runtime_core::cancellation::CancellationToken,
     generation: u64,
-    handle: Option<tokio::task::JoinHandle<()>>,
+    task: Option<native_runtime::NativeTask<()>>,
+}
+
+impl Drop for WorkAttemptProcessHolderV1 {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 impl WorkAttemptProcessRegistryV1 {
@@ -248,13 +417,13 @@ impl WorkAttemptProcessRegistryV1 {
                 cancellation: Arc::clone(&notify),
                 lifecycle: tracedecay_runtime_core::cancellation::CancellationToken::new(),
                 generation,
-                handle: None,
+                task: None,
             },
         );
         Some(notify)
     }
 
-    fn spawn_for_worktree<F, Fut>(
+    pub(super) fn spawn_for_worktree<F, Fut>(
         self: &Arc<Self>,
         identity: &WorkAttemptIdentityV1,
         worktree_id: &WorktreeId,
@@ -284,7 +453,7 @@ impl WorkAttemptProcessRegistryV1 {
         let task_key = key.clone();
         let (start, started) = tokio::sync::oneshot::channel();
         let future = task(Arc::clone(&cancellation));
-        let handle = tokio::spawn(async move {
+        let Ok(task) = native_runtime::NativeTask::spawn(async move {
             let admitted = tokio::select! {
                 result = started => result.is_ok(),
                 () = task_lifecycle.cancelled() => false,
@@ -295,14 +464,16 @@ impl WorkAttemptProcessRegistryV1 {
                     () = &mut future => {}
                     () = task_lifecycle.cancelled() => {
                         task_cancellation.notify_one();
-                        let _ = tokio::time::timeout(CANCELLATION_GRACE, &mut future).await;
+                        let _ = native_runtime::timeout(CANCELLATION_GRACE, &mut future).await;
                     }
                 }
             }
             if let Some(registry) = task_registry.upgrade() {
                 registry.release_generation(&task_key, generation);
             }
-        });
+        }) else {
+            return false;
+        };
         state.processes.insert(
             key.clone(),
             WorkAttemptProcessHolderV1 {
@@ -310,7 +481,7 @@ impl WorkAttemptProcessRegistryV1 {
                 cancellation,
                 lifecycle,
                 generation,
-                handle: Some(handle),
+                task: Some(task),
             },
         );
         drop(state);
@@ -334,7 +505,7 @@ impl WorkAttemptProcessRegistryV1 {
             .is_some_and(|holder| holder.worktree_id.as_ref() == Some(worktree_id))
     }
 
-    pub(super) fn holds_worktree(&self, worktree_id: &WorktreeId) -> bool {
+    pub fn holds_worktree(&self, worktree_id: &WorktreeId) -> bool {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -435,18 +606,18 @@ impl WorkAttemptProcessRegistryV1 {
             process.lifecycle.cancel();
         }
         let deadline =
-            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_TASK_ABORT_DEADLINE;
+            std::time::Instant::now() + tracedecay_runtime_core::DAEMON_TASK_ABORT_DEADLINE;
         let mut clean = true;
         for process in processes.into_values() {
-            let Some(mut handle) = process.handle else {
+            let Some(task) = process.task.as_ref() else {
                 continue;
             };
-            match tokio::time::timeout_at(deadline, &mut handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => clean = false,
+            match native_runtime::timeout_at(deadline, task.wait()).await {
+                Ok(native_runtime::NativeTaskOutcome::Completed(())) => {}
+                Ok(_) => clean = false,
                 Err(_) => {
-                    handle.abort();
-                    let _ = handle.await;
+                    task.abort();
+                    let _ = task.wait().await;
                     clean = false;
                 }
             }
@@ -473,9 +644,6 @@ impl Drop for WorkAttemptProcessRegistryV1 {
         for process in state.processes.values() {
             process.cancellation.notify_one();
             process.lifecycle.cancel();
-            if let Some(handle) = &process.handle {
-                handle.abort();
-            }
         }
     }
 }
@@ -517,7 +685,8 @@ pub(super) fn spawn_attempt_execution(
             &project_root,
             &identity,
             observability_producer,
-        );
+        )
+        .await;
     });
 }
 
@@ -550,15 +719,17 @@ async fn run_attempt(
             return;
         }
     };
-    let attempts = services.attempts();
-    let attempt_effects = services.attempt_effects();
-    let workflow_artifacts = registered.database.workflow_storage().map_err(|error| {
-        tracing::warn!(
-            task = attempt.identity().task_id().as_str(),
-            ?error,
-            "work attempt provider output store could not be attached"
-        );
-    });
+    let workflow_artifacts = registered
+        .database
+        .workflow_storage()
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                task = attempt.identity().task_id().as_str(),
+                ?error,
+                "work attempt provider output store could not be attached"
+            );
+        });
     let identity = attempt.identity().clone();
     // The registration-pinned work topology policy carries the concurrency
     // policy this attempt was admitted under; its canonical digest is the
@@ -575,15 +746,29 @@ async fn run_attempt(
         }
     };
 
-    match select_with_resolver(
-        &registered.proposal_routing.executable_binding_resolver,
-        &attempt,
-    ) {
+    let resolver = registered
+        .proposal_routing
+        .executable_binding_resolver
+        .clone();
+    let resolving = attempt.clone();
+    let selection =
+        native_runtime::spawn_blocking(move || select_with_resolver(&resolver, &resolving))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    task = identity.task_id().as_str(),
+                    %error,
+                    "work provider binding could not be resolved on the blocking pool"
+                );
+                Err(ProviderDenial::preferred(
+                    WorkProviderAvailabilityV1::Unavailable,
+                ))
+            });
+    match selection {
         Ok(selection) => match selection.provider.protocol {
             WorkProviderProtocol::CodexAppServerJsonRpc => {
                 execute_app_server(
-                    attempts,
-                    attempt_effects,
+                    &services,
                     workflow_artifacts.as_ref().ok(),
                     &context,
                     &attempt,
@@ -598,8 +783,7 @@ async fn run_attempt(
             }
             _ => {
                 execute_provider_with_environment(
-                    attempts,
-                    attempt_effects,
+                    &services,
                     workflow_artifacts.as_ref().ok(),
                     &context,
                     &attempt,
@@ -615,7 +799,7 @@ async fn run_attempt(
         },
         Err(denial) => {
             settle_unstarted(
-                attempts,
+                &services,
                 &context,
                 &identity,
                 &attempt,
@@ -624,7 +808,8 @@ async fn run_attempt(
                 },
                 denial.fallback,
                 observability_producer.as_deref(),
-            );
+            )
+            .await;
         }
     }
 }
@@ -694,8 +879,8 @@ fn provider_arguments(
 }
 
 /// The preference gate proper, over an already-built binding authority.
-fn select_with_resolver<R: WorkExecutableBindingResolver>(
-    resolver: &R,
+fn select_with_resolver(
+    resolver: &PinnedWorkExecutableBindingResolver,
     attempt: &WorkAttemptV1,
 ) -> Result<ProviderSelection, ProviderDenial> {
     let snapshot = attempt.execution().execution_snapshot();
@@ -753,8 +938,8 @@ fn select_with_resolver<R: WorkExecutableBindingResolver>(
 
 /// Probes one pinned binding: capability admission, path canonicalization,
 /// and a byte-exact digest match against the snapshot's pinned artifact.
-fn resolve_binding<R: WorkExecutableBindingResolver>(
-    resolver: &R,
+fn resolve_binding(
+    resolver: &PinnedWorkExecutableBindingResolver,
     executable: &WorkExecutableReference,
     backend: WorkProviderBackendV1,
     protocol: WorkProviderProtocol,
@@ -785,32 +970,34 @@ fn availability_state(error: WorkExecutableBindingError) -> WorkProviderAvailabi
 
 /// Seals a terminal denial for an attempt whose provider never started:
 /// fence to `RecoveryRequired`, then fail recovery with the typed outcome.
-fn settle_unstarted<S>(
-    attempts: &tracedecay_contracts::WorkAttemptService<S>,
+async fn settle_unstarted(
+    steps: &impl AttemptStepsV1,
     context: &RequestContext,
     identity: &WorkAttemptIdentityV1,
     attempt: &WorkAttemptV1,
     outcome: WorkAttemptProviderOutcomeV1,
     provider_fallback: Option<WorkProviderFallbackRecordV1>,
     observability_producer: Option<&BoundedObservabilityProducerV1>,
-) where
-    S: tracedecay_contracts::WorkAttemptStoragePort,
-{
+) {
     let observed_at = now_micros();
-    if let Err(problem) = attempts.mark_provider_unavailable(context, identity, observed_at) {
+    if let Err(problem) = steps
+        .mark_provider_unavailable(context, identity, observed_at)
+        .await
+    {
         tracing::warn!(
             task = identity.task_id().as_str(),
             ?problem,
             "work attempt could not be fenced for provider unavailability"
         );
         seal_cancellation_before_running(
-            attempts,
+            steps,
             context,
             attempt,
             None,
             provider_fallback,
             observability_producer,
-        );
+        )
+        .await;
         return;
     }
     let evidence = WorkAttemptEvidenceRecordV1 {
@@ -824,7 +1011,7 @@ fn settle_unstarted<S>(
         provider_fallback,
         observed_at,
     };
-    match attempts.fail_recovery(context, identity, &evidence) {
+    match steps.fail_recovery(context, identity, &evidence).await {
         Ok(settled) => {
             let _ = record_terminal_attempt_product_views(observability_producer, &settled);
         }
@@ -842,20 +1029,19 @@ fn settle_unstarted<S>(
 /// the race: the row is `CancellationRequested`, which cannot become
 /// `Running`, and no provider is left to exit. Seal it here as `Cancelled`.
 /// Any other refusal leaves the durable row as the authority.
-fn seal_cancellation_before_running<S>(
-    attempts: &tracedecay_contracts::WorkAttemptService<S>,
+async fn seal_cancellation_before_running(
+    steps: &impl AttemptStepsV1,
     context: &RequestContext,
     attempt: &WorkAttemptV1,
     actual_route: Option<WorkProviderRouteV1>,
     provider_fallback: Option<WorkProviderFallbackRecordV1>,
     observability_producer: Option<&BoundedObservabilityProducerV1>,
-) where
-    S: tracedecay_contracts::WorkAttemptStoragePort,
-{
+) {
     let identity = attempt.identity();
     let observed_at = now_micros();
-    if attempts
+    if steps
         .acknowledge_cancellation(context, identity, observed_at)
+        .await
         .is_err()
     {
         return;
@@ -871,7 +1057,10 @@ fn seal_cancellation_before_running<S>(
         provider_fallback,
         observed_at,
     };
-    match attempts.settle_with_artifacts(context, identity, &evidence, Vec::new()) {
+    match steps
+        .settle_with_artifacts(context, identity, &evidence, Vec::new())
+        .await
+    {
         Ok(settled) => {
             let _ = record_terminal_attempt_product_views(observability_producer, &settled);
         }
@@ -891,21 +1080,12 @@ enum EffectDispatchAdmission {
     Unavailable,
 }
 
-fn record_effect_dispatch<S>(
-    effects: &WorkAttemptEffectServiceV1<S>,
+async fn record_effect_dispatch(
+    steps: &impl AttemptStepsV1,
     context: &RequestContext,
     attempt: &WorkAttemptV1,
-) -> EffectDispatchAdmission
-where
-    S: WorkAttemptEffectStoragePortV1,
-{
-    match effects.record_dispatch(
-        context,
-        attempt.identity().clone(),
-        attempt.execution().effect_state(),
-        now_micros(),
-        attempt.execution().deadline(),
-    ) {
+) -> EffectDispatchAdmission {
+    match steps.record_dispatch(context, attempt, now_micros()).await {
         Ok(WorkAttemptEffectDispatchOutcomeV1::Recorded(_)) => EffectDispatchAdmission::Recorded,
         Ok(WorkAttemptEffectDispatchOutcomeV1::Replayed(_)) => {
             tracing::warn!(
@@ -925,15 +1105,12 @@ where
     }
 }
 
-fn settle_effect_dispatch<S>(
-    effects: &WorkAttemptEffectServiceV1<S>,
+async fn settle_effect_dispatch(
+    steps: &impl AttemptStepsV1,
     context: &RequestContext,
     attempt: &WorkAttemptV1,
     provider_started: bool,
-) -> bool
-where
-    S: WorkAttemptEffectStoragePortV1,
-{
+) -> bool {
     let resolution = if !provider_started
         || attempt.execution().effect_state() == tracedecay_domain::WorkEffectStateV1::Observational
     {
@@ -941,7 +1118,10 @@ where
     } else {
         WorkAttemptEffectResolutionV1::Unknown
     };
-    if let Err(problem) = effects.settle(context, attempt.identity(), resolution, now_micros()) {
+    if let Err(problem) = steps
+        .settle_dispatch(context, attempt.identity(), resolution, now_micros())
+        .await
+    {
         tracing::warn!(
             task = attempt.identity().task_id().as_str(),
             ?problem,
@@ -975,9 +1155,8 @@ fn admitted_provider_environment(
     level = "trace",
     skip_all
 )]
-async fn execute_provider_with_environment<S>(
-    attempts: &tracedecay_contracts::WorkAttemptService<S>,
-    attempt_effects: &WorkAttemptEffectServiceV1<S>,
+async fn execute_provider_with_environment(
+    steps: &impl AttemptStepsV1,
     workflow_artifacts: Option<&tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority>,
     context: &RequestContext,
     attempt: &WorkAttemptV1,
@@ -987,33 +1166,30 @@ async fn execute_provider_with_environment<S>(
     observability_producer: Option<&BoundedObservabilityProducerV1>,
     topology_policy_digest: Option<&TopologyPolicyDigestV1>,
     timing: AttemptAdmissionTimingV1,
-) where
-    S: tracedecay_contracts::WorkAttemptStoragePort + WorkAttemptEffectStoragePortV1,
-{
+) {
     let identity = attempt.identity().clone();
     let envelope = attempt.execution();
     let resolved = &selection.provider;
-    let mut command = tokio::process::Command::new(&resolved.executable);
+    let mut command = std::process::Command::new(&resolved.executable);
     command
         .args(&resolved.arguments)
         .current_dir(envelope.worktree_root())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_clear()
-        .kill_on_drop(true);
+        .env_clear();
     #[cfg(unix)]
-    command.process_group(0);
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     for (key, value) in admitted_environment {
         command.env(key, value);
     }
 
-    match record_effect_dispatch(attempt_effects, context, attempt) {
+    match record_effect_dispatch(steps, context, attempt).await {
         EffectDispatchAdmission::Recorded => {}
         EffectDispatchAdmission::Replayed => return,
         EffectDispatchAdmission::Unavailable => {
             settle_unstarted(
-                attempts,
+                steps,
                 context,
                 &identity,
                 attempt,
@@ -1022,35 +1198,47 @@ async fn execute_provider_with_environment<S>(
                 },
                 selection.fallback.clone(),
                 observability_producer,
-            );
+            )
+            .await;
             return;
         }
     }
 
-    let (mut child, _lifeline) = match spawn_provider(command).await {
-        Ok(launched) => launched,
+    let budget = envelope.budget();
+    let spawned = ProviderProcess::spawn(
+        command,
+        budget.max_stdout_bytes(),
+        budget.max_stderr_bytes(),
+    )
+    .await;
+    let mut process = match spawned {
+        Ok(process) => process,
         Err(error) => {
             tracing::warn!(
                 task = identity.task_id().as_str(),
                 ?error,
                 "work attempt provider process could not be spawned"
             );
-            if !settle_effect_dispatch(attempt_effects, context, attempt, false) {
+            if !settle_effect_dispatch(steps, context, attempt, false).await {
                 return;
             }
             settle_unstarted(
-                attempts,
+                steps,
                 context,
                 &identity,
                 attempt,
                 WorkAttemptProviderOutcomeV1::LaunchFailed,
                 selection.fallback.clone(),
                 observability_producer,
-            );
+            )
+            .await;
             return;
         }
     };
-    let running = match attempts.mark_running(context, &identity, selection.actual_route.clone()) {
+    let running = match steps
+        .mark_running(context, &identity, selection.actual_route.clone())
+        .await
+    {
         Ok(running) => running,
         Err(problem) => {
             // The lease no longer admits this task (fenced by recovery or a
@@ -1061,56 +1249,47 @@ async fn execute_provider_with_environment<S>(
                 ?problem,
                 "work attempt could not be marked running; terminating provider"
             );
-            terminate(&mut child, TerminationSignal::Kill);
-            let _ = child.wait().await;
-            if settle_effect_dispatch(attempt_effects, context, attempt, true) {
+            process.signal(TerminationSignal::Kill);
+            let _ = process.wait().await;
+            if settle_effect_dispatch(steps, context, attempt, true).await {
                 seal_cancellation_before_running(
-                    attempts,
+                    steps,
                     context,
                     attempt,
                     Some(selection.actual_route.clone()),
                     selection.fallback.clone(),
                     observability_producer,
-                );
+                )
+                .await;
             }
             return;
         }
     };
     let started = std::time::Instant::now();
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let instructions = envelope.instructions().as_bytes().to_vec();
-        if let Err(error) = stdin.write_all(&instructions).await {
-            tracing::debug!(
-                task = identity.task_id().as_str(),
-                ?error,
-                "work attempt provider closed stdin early"
-            );
-        }
-        drop(stdin);
-    }
-
-    let budget = envelope.budget();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_task =
-        tokio::spawn(async move { read_capped(stdout, budget.max_stdout_bytes()).await });
-    let stderr_task =
-        tokio::spawn(async move { read_capped(stderr, budget.max_stderr_bytes()).await });
+    process.start(envelope.instructions().as_bytes().to_vec());
 
     let deadline_micros =
         u64::try_from(envelope.deadline().0.saturating_sub(now_micros().0)).unwrap_or(0);
     let wall = std::time::Duration::from_micros(deadline_micros);
 
-    let outcome = tokio::select! {
-        status = child.wait() => match status {
-            Ok(status) => exit_outcome(status),
-            Err(_) => WorkAttemptProviderOutcomeV1::LaunchFailed,
-        },
-        () = tokio::time::sleep(wall) => {
+    // The deadline and cancellation cover the provider's exit and the drain of
+    // every pipe a descendant may still hold.
+    let ending = native_runtime::timeout(wall, async {
+        tokio::select! {
+            status = process.finish() => Some(status),
+            () = cancel.notified() => None,
+        }
+    })
+    .await;
+    let outcome = match ending {
+        Ok(Some(Ok(status))) => exit_outcome(status),
+        Ok(Some(Err(_))) => WorkAttemptProviderOutcomeV1::LaunchFailed,
+        Ok(None) => cancel_ladder(steps, context, &identity, &mut process).await,
+        // An unavailable timer fails closed as an elapsed wall budget.
+        Err(_) => {
             let stalled_for = started.elapsed();
-            terminate(&mut child, TerminationSignal::Kill);
-            let _ = child.wait().await;
+            kill_and_drain(&mut process).await;
             offer_no_progress_observation(
                 observability_producer,
                 &identity,
@@ -1121,18 +1300,16 @@ async fn execute_provider_with_environment<S>(
             );
             WorkAttemptProviderOutcomeV1::TimedOut
         }
-        () = cancel.notified() => {
-            cancel_ladder(attempts, context, &identity, &mut child).await
-        }
     };
 
-    let captured_stdout = stdout_task.await.ok().flatten();
+    let (captured_stdout, captured_stderr) = process.output();
     let provider_session = provider_session(resolved.protocol, captured_stdout.as_ref());
     let stdout = stream_summary(captured_stdout.clone());
-    let stderr = stream_summary(stderr_task.await.ok().flatten());
+    let stderr = stream_summary(captured_stderr);
     let mut outcome = overflow_outcome(outcome, &stdout, &stderr);
     let artifacts =
         provider_stdout_artifacts(&identity, captured_stdout.as_ref(), workflow_artifacts)
+            .await
             .unwrap_or_else(|()| {
                 outcome = WorkAttemptProviderOutcomeV1::ProtocolFailed;
                 Vec::new()
@@ -1149,10 +1326,13 @@ async fn execute_provider_with_environment<S>(
         provider_fallback: selection.fallback.clone(),
         observed_at: now_micros(),
     };
-    if !settle_effect_dispatch(attempt_effects, context, attempt, true) {
+    if !settle_effect_dispatch(steps, context, attempt, true).await {
         return;
     }
-    match attempts.settle_with_artifacts(context, &identity, &evidence, artifacts) {
+    match steps
+        .settle_with_artifacts(context, &identity, &evidence, artifacts)
+        .await
+    {
         Ok(settled) => {
             let _ = record_terminal_attempt_product_views(observability_producer, &settled);
             if let Some(observation) =
@@ -1176,7 +1356,7 @@ async fn execute_provider_with_environment<S>(
 /// result is carried through so the terminal classification stays in one
 /// place.
 enum AppServerEnding {
-    Session(Result<Result<AppServerSessionOutput, String>, tokio::task::JoinError>),
+    Session(Result<Result<AppServerSessionOutput, String>, String>),
     TimedOut,
     Cancelled,
 }
@@ -1205,9 +1385,8 @@ struct AppServerSessionOutput {
     level = "trace",
     skip_all
 )]
-async fn execute_app_server<S>(
-    attempts: &tracedecay_contracts::WorkAttemptService<S>,
-    attempt_effects: &WorkAttemptEffectServiceV1<S>,
+async fn execute_app_server(
+    steps: &impl AttemptStepsV1,
     workflow_artifacts: Option<&tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority>,
     context: &RequestContext,
     attempt: &WorkAttemptV1,
@@ -1217,19 +1396,17 @@ async fn execute_app_server<S>(
     observability_producer: Option<&BoundedObservabilityProducerV1>,
     topology_policy_digest: Option<&TopologyPolicyDigestV1>,
     timing: AttemptAdmissionTimingV1,
-) where
-    S: tracedecay_contracts::WorkAttemptStoragePort + WorkAttemptEffectStoragePortV1,
-{
+) {
     let identity = attempt.identity().clone();
     let envelope = attempt.execution();
     let snapshot = envelope.execution_snapshot();
 
-    match record_effect_dispatch(attempt_effects, context, attempt) {
+    match record_effect_dispatch(steps, context, attempt).await {
         EffectDispatchAdmission::Recorded => {}
         EffectDispatchAdmission::Replayed => return,
         EffectDispatchAdmission::Unavailable => {
             settle_unstarted(
-                attempts,
+                steps,
                 context,
                 &identity,
                 attempt,
@@ -1238,7 +1415,8 @@ async fn execute_app_server<S>(
                 },
                 selection.fallback.clone(),
                 observability_producer,
-            );
+            )
+            .await;
             return;
         }
     }
@@ -1246,7 +1424,10 @@ async fn execute_app_server<S>(
     // The launch and the protocol session are one indivisible blocking call
     // here, so the attempt is marked Running before it starts; a launch that
     // never happens surfaces as a typed failure on the settle path instead.
-    let running = match attempts.mark_running(context, &identity, selection.actual_route.clone()) {
+    let running = match steps
+        .mark_running(context, &identity, selection.actual_route.clone())
+        .await
+    {
         Ok(running) => running,
         Err(problem) => {
             tracing::warn!(
@@ -1254,15 +1435,16 @@ async fn execute_app_server<S>(
                 ?problem,
                 "work attempt could not be marked running; app-server was not started"
             );
-            if settle_effect_dispatch(attempt_effects, context, attempt, false) {
+            if settle_effect_dispatch(steps, context, attempt, false).await {
                 seal_cancellation_before_running(
-                    attempts,
+                    steps,
                     context,
                     attempt,
                     None,
                     selection.fallback.clone(),
                     observability_producer,
-                );
+                )
+                .await;
             }
             return;
         }
@@ -1271,11 +1453,16 @@ async fn execute_app_server<S>(
     let deadline_micros =
         u64::try_from(envelope.deadline().0.saturating_sub(now_micros().0)).unwrap_or(0);
     let wall = std::time::Duration::from_micros(deadline_micros);
+    // The coordinator's `wall` timeout is the authoritative deadline and seals
+    // `TimedOut`. The session's own timeout is only a backstop for a
+    // coordinator that is gone; at the same instant it would race the
+    // coordinator and seal a wall-exhausted attempt as a protocol failure.
+    let session_wall = wall.saturating_add(CANCELLATION_GRACE);
     let cancellation = CodexAppServerCancellation::default();
     let config = CodexAppServerSummaryConfig {
         codex_bin: selection.provider.executable.to_string_lossy().into_owned(),
         model: Some(snapshot.model().to_owned()),
-        timeout: wall,
+        timeout: session_wall,
     };
     let prompt = envelope.instructions().to_owned();
     let cwd = PathBuf::from(envelope.worktree_root());
@@ -1292,7 +1479,7 @@ async fn execute_app_server<S>(
         .clone();
     let launch_receipt = CodexAppServerLaunchReceipt::default();
     let blocking_launch_receipt = launch_receipt.clone();
-    let mut session = tokio::task::spawn_blocking(move || {
+    let mut session = std::pin::pin!(native_runtime::spawn_blocking(move || {
         run_work_with_codex_app_server(
             &prompt,
             &config,
@@ -1300,7 +1487,7 @@ async fn execute_app_server<S>(
             CodexAppServerWorkExecution {
                 cancellation: &session_cancellation,
                 cwd: &cwd,
-                timeout: wall,
+                timeout: session_wall,
                 admitted_environment: &admitted_environment,
                 launch_receipt: &blocking_launch_receipt,
                 approval,
@@ -1328,46 +1515,51 @@ async fn execute_app_server<S>(
             })
         })
         .map_err(|error| error.to_string())
-    });
+    }));
 
     // The terminal arms only decide *how* the session ended; draining the
-    // blocking worker happens after the select, where the join handle is no
+    // blocking worker happens after the select, where the session future is no
     // longer borrowed by it.
-    let ending = tokio::select! {
-        joined = &mut session => AppServerEnding::Session(joined),
-        () = tokio::time::sleep(wall) => {
-            let stalled_for = attempt_started.elapsed();
-            // Cancelling the app-server session SIGKILLs its whole process
-            // tree; the escalation observed here is the same kill rung as the
-            // stdio path.
-            cancellation.cancel();
-            offer_no_progress_observation(
-                observability_producer,
-                &identity,
-                envelope.deadline(),
-                topology_policy_digest,
-                deadline_micros,
-                stalled_for,
-            );
-            AppServerEnding::TimedOut
-        }
-        () = cancel.notified() => {
-            // The app-server has no graceful rung: cancelling terminates the
-            // whole process tree, so the ladder acknowledges and stops there
-            // rather than pretending an interrupt was survived.
-            if let Err(problem) =
-                attempts.acknowledge_cancellation(context, &identity, now_micros())
-            {
-                tracing::warn!(
-                    task = identity.task_id().as_str(),
-                    ?problem,
-                    "work attempt cancellation could not be acknowledged"
-                );
+    let ending = native_runtime::timeout(wall, async {
+        tokio::select! {
+            joined = &mut session => AppServerEnding::Session(joined),
+            () = cancel.notified() => {
+                // The app-server has no graceful rung: cancelling terminates
+                // the whole process tree, so the ladder acknowledges and stops
+                // there rather than pretending an interrupt was survived.
+                if let Err(problem) =
+                    steps
+                        .acknowledge_cancellation(context, &identity, now_micros())
+                        .await
+                {
+                    tracing::warn!(
+                        task = identity.task_id().as_str(),
+                        ?problem,
+                        "work attempt cancellation could not be acknowledged"
+                    );
+                }
+                cancellation.cancel();
+                AppServerEnding::Cancelled
             }
-            cancellation.cancel();
-            AppServerEnding::Cancelled
         }
-    };
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let stalled_for = attempt_started.elapsed();
+        // Cancelling the app-server session SIGKILLs its whole process tree;
+        // the escalation observed here is the same kill rung as the stdio
+        // path. An unavailable timer fails closed the same way.
+        cancellation.cancel();
+        offer_no_progress_observation(
+            observability_producer,
+            &identity,
+            envelope.deadline(),
+            topology_policy_digest,
+            deadline_micros,
+            stalled_for,
+        );
+        AppServerEnding::TimedOut
+    });
 
     let mut text = None;
     let mut provider_session = None;
@@ -1409,6 +1601,7 @@ async fn execute_app_server<S>(
     let mut outcome = overflow_outcome(outcome, &stdout, &None);
     let artifacts =
         provider_stdout_artifacts(&identity, captured_stdout.as_ref(), workflow_artifacts)
+            .await
             .unwrap_or_else(|()| {
                 outcome = WorkAttemptProviderOutcomeV1::ProtocolFailed;
                 Vec::new()
@@ -1428,14 +1621,19 @@ async fn execute_app_server<S>(
         observed_at: now_micros(),
     };
     if !settle_effect_dispatch(
-        attempt_effects,
+        steps,
         context,
         attempt,
         launch_receipt.started_at().is_some(),
-    ) {
+    )
+    .await
+    {
         return;
     }
-    match attempts.settle_with_artifacts(context, &identity, &evidence, artifacts) {
+    match steps
+        .settle_with_artifacts(context, &identity, &evidence, artifacts)
+        .await
+    {
         Ok(settled) => {
             let _ = record_terminal_attempt_product_views(observability_producer, &settled);
             if let Some(observation) = launch_receipt.started_at().and_then(|started| {
@@ -1508,38 +1706,54 @@ fn offer_no_progress_observation(
     level = "trace",
     skip_all
 )]
-async fn cancel_ladder<S>(
-    attempts: &tracedecay_contracts::WorkAttemptService<S>,
+async fn cancel_ladder(
+    steps: &impl AttemptStepsV1,
     context: &RequestContext,
     identity: &WorkAttemptIdentityV1,
-    child: &mut tokio::process::Child,
-) -> WorkAttemptProviderOutcomeV1
-where
-    S: tracedecay_contracts::WorkAttemptStoragePort,
-{
-    if let Err(problem) = attempts.acknowledge_cancellation(context, identity, now_micros()) {
+    process: &mut ProviderProcess,
+) -> WorkAttemptProviderOutcomeV1 {
+    if let Err(problem) = steps
+        .acknowledge_cancellation(context, identity, now_micros())
+        .await
+    {
         tracing::warn!(
             task = identity.task_id().as_str(),
             ?problem,
             "work attempt cancellation could not be acknowledged"
         );
     }
-    terminate(child, TerminationSignal::Interrupt);
-    if tokio::time::timeout(CANCELLATION_GRACE, child.wait())
+    process.signal(TerminationSignal::Interrupt);
+    if native_runtime::timeout(CANCELLATION_GRACE, process.wait())
+        .await
+        .is_err()
+        && let Err(problem) = steps
+            .escalate_cancellation(context, identity, now_micros())
+            .await
+    {
+        tracing::warn!(
+            task = identity.task_id().as_str(),
+            ?problem,
+            "work attempt cancellation could not be escalated"
+        );
+    }
+    // Cancellation ends every member of the provider's group, including
+    // descendants that outlived a provider that exited on the interrupt.
+    kill_and_drain(process).await;
+    WorkAttemptProviderOutcomeV1::Cancelled
+}
+
+/// SIGKILLs the provider's group, then waits for its pipes to close. Pipes a
+/// survivor outside the group still holds are abandoned after
+/// [`KILLED_DRAIN_GRACE`].
+async fn kill_and_drain(process: &mut ProviderProcess) {
+    process.signal(TerminationSignal::Kill);
+    if native_runtime::timeout(KILLED_DRAIN_GRACE, process.finish())
         .await
         .is_err()
     {
-        if let Err(problem) = attempts.escalate_cancellation(context, identity, now_micros()) {
-            tracing::warn!(
-                task = identity.task_id().as_str(),
-                ?problem,
-                "work attempt cancellation could not be escalated"
-            );
-        }
-        terminate(child, TerminationSignal::Kill);
-        let _ = child.wait().await;
+        process.abandon_output();
+        let _ = process.finish().await;
     }
-    WorkAttemptProviderOutcomeV1::Cancelled
 }
 
 /// Cancellation-ladder rung, kept platform-neutral so call sites compile on
@@ -1548,29 +1762,6 @@ where
 enum TerminationSignal {
     Interrupt,
     Kill,
-}
-
-#[cfg(unix)]
-fn terminate(child: &mut tokio::process::Child, signal: TerminationSignal) {
-    let signal = match signal {
-        TerminationSignal::Interrupt => libc::SIGINT,
-        TerminationSignal::Kill => libc::SIGKILL,
-    };
-    if let Some(pid) = child.id() {
-        let pid = pid as libc::pid_t;
-        // The child leads its own process group; signal the whole group so
-        // provider-spawned descendants observe the ladder too.
-        // SAFETY: killpg with a pid owned by this daemon and a constant
-        // signal number has no memory-safety obligations.
-        if unsafe { libc::killpg(pid, signal) } != 0 {
-            let _ = child.start_kill();
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn terminate(child: &mut tokio::process::Child, _signal: TerminationSignal) {
-    let _ = child.start_kill();
 }
 
 #[cfg(unix)]

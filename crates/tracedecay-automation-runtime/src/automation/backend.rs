@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
 use tracedecay_automation::backend as leaf_backend;
 pub use tracedecay_automation::backend::{
     AgentBackendAvailability, AgentTaskBackend, AgentTaskContract, AgentTaskError,
@@ -13,7 +12,6 @@ pub use tracedecay_automation::backend::{
 };
 pub use tracedecay_contracts::automation::AgentTaskRetryAttempt;
 use tracedecay_domain::configuration::LcmSummarizerExecutableV1;
-use tracedecay_domain::errors::Result;
 
 use super::config::{AutomationBackend, AutomationConfig};
 use crate::ports::codex_app_server::{
@@ -187,17 +185,19 @@ pub async fn run_agent_task_with_retry_report(
                 if !should_retry {
                     return Err(error);
                 }
-                if !backoff.is_zero() {
-                    tokio::time::sleep(backoff).await;
+                if !backoff.is_zero()
+                    && let Err(timer_error) = tracedecay_runtime_core::native_runtime::sleep_until(
+                        Instant::now() + backoff,
+                    )
+                    .await
+                {
+                    tracing::warn!(%timer_error, "agent task retry backoff could not wait");
+                    return Err(error);
                 }
                 attempt += 1;
             }
         }
     }
-}
-
-pub fn extract_json_object_prefix(text: &str) -> Result<Value> {
-    leaf_backend::extract_json_object_prefix(text).map_err(Into::into)
 }
 
 /// The Codex app-server backend bound to the project's configured executable.

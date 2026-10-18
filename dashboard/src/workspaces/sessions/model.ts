@@ -36,10 +36,6 @@ export interface SessionSelection {
   readonly sessionId: string;
 }
 
-export function selectionKey(selection: SessionSelection): string {
-  return `${selection.provider ?? ''}\u0000${selection.sessionId}`;
-}
-
 export function sameSelection(
   left: SessionSelection | null,
   right: SessionSelection | null,
@@ -89,7 +85,7 @@ const PARAM = {
   window: 'sessionsWindow',
 } as const;
 
-export const DEFAULT_VIEW_STATE: SessionsViewState = {
+const DEFAULT_VIEW_STATE: SessionsViewState = {
   selection: null,
   page: 1,
   rows: 25,
@@ -103,16 +99,31 @@ function oneOf<T extends number>(raw: string | null, options: readonly T[], fall
   return (options as readonly number[]).includes(parsed) ? (parsed as T) : fallback;
 }
 
-export function readViewState(params: URLSearchParams): SessionsViewState {
+export function readSessionSelection(params: URLSearchParams): SessionSelection | null {
   const sessionId = params.get(PARAM.sessionId);
   const provider = params.get(PARAM.provider);
+  return sessionId !== null && sessionId !== ''
+    ? { sessionId, provider: provider === null || provider === '' ? null : provider }
+    : null;
+}
+
+export function writeSessionSelection(
+  params: URLSearchParams,
+  selection: SessionSelection | null,
+): URLSearchParams {
+  const next = new URLSearchParams(params);
+  if (selection === null) next.delete(PARAM.sessionId);
+  else next.set(PARAM.sessionId, selection.sessionId);
+  if (selection?.provider) next.set(PARAM.provider, selection.provider);
+  else next.delete(PARAM.provider);
+  return next;
+}
+
+export function readViewState(params: URLSearchParams): SessionsViewState {
   const rawPage = Number(params.get(PARAM.page) ?? '1');
   const rawBucket = params.get(PARAM.bucket);
   return {
-    selection:
-      sessionId !== null && sessionId !== ''
-        ? { sessionId, provider: provider === null || provider === '' ? null : provider }
-        : null,
+    selection: readSessionSelection(params),
     page: Number.isInteger(rawPage) && rawPage >= 1 ? rawPage : 1,
     rows: oneOf(params.get(PARAM.rows), ROWS_PER_PAGE_OPTIONS, DEFAULT_VIEW_STATE.rows),
     bucket: rawBucket === 'hour' ? 'hour' : 'day',
@@ -129,13 +140,11 @@ export function writeViewState(
   params: URLSearchParams,
   state: SessionsViewState,
 ): URLSearchParams {
-  const next = new URLSearchParams(params);
+  const next = writeSessionSelection(params, state.selection);
   const set = (key: string, value: string | null) => {
     if (value === null) next.delete(key);
     else next.set(key, value);
   };
-  set(PARAM.sessionId, state.selection?.sessionId ?? null);
-  set(PARAM.provider, state.selection?.provider ?? null);
   set(PARAM.page, state.page === 1 ? null : String(state.page));
   set(PARAM.rows, state.rows === DEFAULT_VIEW_STATE.rows ? null : String(state.rows));
   set(PARAM.bucket, state.bucket === 'day' ? null : state.bucket);
@@ -147,7 +156,7 @@ export function writeViewState(
  * Index paging
  * ------------------------------------------------------------------------ */
 
-export interface PageBounds {
+interface PageBounds {
   /** 1-based ordinal of the first loaded row, or null when the page is empty. */
   readonly first: number | null;
   readonly last: number | null;
@@ -207,19 +216,19 @@ export function recordedModels(row: LoomSessionRowV1): { models: string[]; unrec
  * Selection → index row join
  * ------------------------------------------------------------------------ */
 
-export type IndexJoin =
-  | { kind: 'exact'; row: LoomSessionRowV1 }
+type IndexJoin<R> =
+  | { kind: 'exact'; row: R }
   /** More than one loaded row answers to the id; a selection without a
    * provider cannot pick between providers and does not. */
-  | { kind: 'ambiguous'; rows: readonly LoomSessionRowV1[] }
+  | { kind: 'ambiguous'; rows: readonly R[] }
   /** The loaded index page holds no such row. Not "the session does not
    * exist", the page is one window over the store. */
   | { kind: 'absent' };
 
-export function joinIndexRow(
-  rows: readonly LoomSessionRowV1[],
+export function joinIndexRow<R extends { provider: string; session_id: string }>(
+  rows: readonly R[],
   selection: SessionSelection,
-): IndexJoin {
+): IndexJoin<R> {
   const candidates = rows.filter(
     (row) =>
       row.session_id === selection.sessionId &&
@@ -244,7 +253,7 @@ export interface SessionRelations {
 }
 
 /** The daemon's own source ids (`loom_api.rs`). */
-export const SOURCE_STATUS_ID = {
+const SOURCE_STATUS_ID = {
   commit: 'session_commit',
   file: 'session_file',
   branch: 'branch_worktree',
@@ -274,7 +283,7 @@ export function relationsFor(
 
 /** The daemon's closed commit-evidence vocabulary
  * (`tracedecay_sessions::runtime::git_correlation::CommitEvidence`). */
-export type CommitEvidenceClass =
+type CommitEvidenceClass =
   | 'tool_result'
   | 'host_event'
   | 'head_observation'
@@ -364,7 +373,7 @@ export function bucketStart(key: string): number | null {
   return Number.isFinite(millis) ? millis / 1000 : null;
 }
 
-export interface ProvenanceTally {
+interface ProvenanceTally {
   /** Messages the store counted with a named tokenizer. */
   readonly known: number;
   /** Messages whose token count the store disclaims. */

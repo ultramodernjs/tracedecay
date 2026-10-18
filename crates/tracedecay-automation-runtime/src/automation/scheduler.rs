@@ -113,17 +113,34 @@ pub fn project_open_backoff(consecutive_failures: u32) -> std::time::Duration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutomationScheduleDecision {
     skip_reason: Option<AutomationSkipReasonV1>,
+    activity_gate: Option<SessionActivityGate>,
+}
+
+/// The two timestamps a `no_new_session_activity` skip compared, so a starved
+/// gate is visible from the scheduler journal instead of looking idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionActivityGate {
+    pub last_activity_secs: Option<i64>,
+    pub cadence_started_at: Option<i64>,
 }
 
 impl AutomationScheduleDecision {
     pub fn due() -> Self {
-        Self { skip_reason: None }
+        Self {
+            skip_reason: None,
+            activity_gate: None,
+        }
     }
 
     pub fn skipped(reason: AutomationSkipReasonV1) -> Self {
         Self {
             skip_reason: Some(reason),
+            activity_gate: None,
         }
+    }
+
+    pub const fn activity_gate(&self) -> Option<SessionActivityGate> {
+        self.activity_gate
     }
 
     pub const fn skip_reason(&self) -> Option<AutomationSkipReasonV1> {
@@ -189,7 +206,8 @@ pub fn scheduler_control_path(dashboard_root: &Path) -> PathBuf {
 #[tracing::instrument(name = "automation.scheduler.load_control", level = "trace", skip_all)]
 pub async fn load_scheduler_control(dashboard_root: &Path) -> Result<AutomationSchedulerControl> {
     let path = scheduler_control_path(dashboard_root);
-    match tokio::fs::read(&path).await {
+    let read_path = path.clone();
+    match crate::automation::blocking_fs(move || std::fs::read(read_path)).await {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| TraceDecayError::Config {
             message: format!(
                 "failed to parse automation scheduler control '{}': {e}",
@@ -215,7 +233,8 @@ pub async fn save_scheduler_control(
 ) -> Result<()> {
     let path = scheduler_control_path(dashboard_root);
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
+        let directory = parent.to_path_buf();
+        crate::automation::blocking_fs(move || std::fs::create_dir_all(directory))
             .await
             .map_err(|e| TraceDecayError::Config {
                 message: format!(
@@ -227,7 +246,8 @@ pub async fn save_scheduler_control(
     let bytes = serde_json::to_vec_pretty(control).map_err(|e| TraceDecayError::Config {
         message: format!("failed to encode automation scheduler control: {e}"),
     })?;
-    tokio::fs::write(&path, bytes)
+    let write_path = path.clone();
+    crate::automation::blocking_fs(move || std::fs::write(write_path, bytes))
         .await
         .map_err(|e| TraceDecayError::Config {
             message: format!(
@@ -266,7 +286,7 @@ impl AutomationTaskLock {
         let path = lock_dir.join(format!("{key}.lock"));
         let ownership_token = new_automation_task_lock_token()?;
         let error_path = path.clone();
-        tokio::task::spawn_blocking(move || {
+        tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             try_acquire_task_lock_blocking(&path, &ownership_token, stale_after_secs, now_secs)
         })
         .await
@@ -624,9 +644,15 @@ fn schedule_decision_for_trigger(
         let has_activity_authority = activity.last_activity_secs.is_some();
         let requires_fresh_activity = latest_cadence.is_some() && !retryable_cadence_terminal;
         if !has_activity_authority || (requires_fresh_activity && !fresh_session_activity) {
-            return Ok(AutomationScheduleDecision::skipped(
-                AutomationSkipReasonV1::NoNewSessionActivity,
-            ));
+            return Ok(AutomationScheduleDecision {
+                skip_reason: Some(AutomationSkipReasonV1::NoNewSessionActivity),
+                activity_gate: Some(SessionActivityGate {
+                    last_activity_secs: activity.last_activity_secs,
+                    cadence_started_at: latest_cadence
+                        .map(|(record, _)| parse_started_at(record))
+                        .transpose()?,
+                }),
+            });
         }
     }
 
@@ -840,7 +866,7 @@ pub(crate) fn elapsed_secs(completed_at: i64, now_secs: i64) -> u64 {
 
 fn new_automation_task_lock_token() -> Result<String> {
     let mut random = [0_u8; AUTOMATION_TASK_LOCK_TOKEN_BYTES];
-    getrandom::getrandom(&mut random).map_err(|error| TraceDecayError::Config {
+    getrandom::fill(&mut random).map_err(|error| TraceDecayError::Config {
         message: format!("failed to generate automation task-lock ownership token: {error}"),
     })?;
     Ok(hex::encode(random))
@@ -2207,6 +2233,37 @@ evidence about it",
     }
 
     #[test]
+    fn no_new_activity_skip_reports_the_timestamps_it_compared() {
+        let config = session_evidence_config();
+        let anchor = scheduler_ledger_record(
+            "run-anchor",
+            AgentTaskKind::SessionReflector,
+            AutomationRunStatus::Succeeded,
+            None,
+            2_000,
+        );
+        let decision = schedule_decision(
+            &config,
+            None,
+            AgentTaskKind::SessionReflector,
+            &[anchor],
+            SessionActivity::at(1_500),
+            10_000,
+        );
+        assert_eq!(
+            decision.skip_reason(),
+            Some(AutomationSkipReasonV1::NoNewSessionActivity)
+        );
+        assert_eq!(
+            decision.activity_gate(),
+            Some(SessionActivityGate {
+                last_activity_secs: Some(1_500),
+                cadence_started_at: Some(2_000),
+            })
+        );
+    }
+
+    #[test]
     fn cron_admission_uses_the_leaf_schedule_type() {
         let AutomationSchedule::Cron(cron) = parse_schedule(Some("*/15 * * * *")).unwrap() else {
             panic!("expected cron schedule");
@@ -2602,10 +2659,11 @@ evidence about it",
         // Acquire the way production does (spawn_blocking), then move the guard
         // back onto an async worker so its drop runs on the runtime.
         let acquire_path = lock_path.clone();
-        let guard =
-            tokio::task::spawn_blocking(move || acquire_lock_for_release_test(&acquire_path))
-                .await
-                .unwrap();
+        let guard = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
+            acquire_lock_for_release_test(&acquire_path)
+        })
+        .await
+        .unwrap();
         assert!(lock_path.exists());
 
         drop(guard);
@@ -2708,7 +2766,7 @@ evidence about it",
         // drops the guard entirely inside spawn_blocking, which is where callers
         // that cannot afford to block a worker are expected to release it.
         let owned_path = lock_path.clone();
-        tokio::task::spawn_blocking(move || {
+        tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             let guard = acquire_lock_for_release_test(&owned_path);
             assert!(owned_path.exists());
             drop(guard);

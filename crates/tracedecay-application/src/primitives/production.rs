@@ -41,8 +41,8 @@ use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_graph_query::SourceReadContext;
 use tracedecay_graph_query::queries::{GraphQueryManager, is_test_marker};
 use tracedecay_graph_query::{
-    CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadRequest,
-    code_graph_read_error_from_runtime,
+    CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadRequest, GraphQueryError,
+    GraphQueryResult,
 };
 use tracedecay_session_temporal_store::{SessionTemporalAccess, SessionTemporalCursorKeyProvider};
 use tracedecay_temporal_query::cursor::SessionCursorAuthenticator;
@@ -65,8 +65,6 @@ mod managed_test_scope;
 #[path = "production/managed_test_scope_tests.rs"]
 mod managed_test_scope_tests;
 mod retrieval_ports;
-#[cfg(test)]
-mod storage_table_detail_tests;
 mod symbol_graph_snapshot;
 mod test_primitive;
 #[cfg(test)]
@@ -323,6 +321,51 @@ fn refused<T>(
     )
 }
 
+fn health_delta_outcome<T>(
+    error: &crate::graph_health_delta::HealthDeltaError,
+    finished_at: UtcMicros,
+) -> RetrievalPortOutcome<T> {
+    use crate::graph_health_delta::HealthDeltaError;
+    let domain = EvidenceDomain::Operational;
+    let (kind, code, message) = match error {
+        HealthDeltaError::InvalidPathPrefix => (
+            PrimitiveFailureKind::InvalidRequest,
+            "application.health-delta.invalid-path-prefix",
+            "path_prefix must be one canonical project-relative path.",
+        ),
+        HealthDeltaError::MalformedCursor => (
+            PrimitiveFailureKind::CursorRefused,
+            "application.health-delta.invalid-cursor",
+            "before_cursor is not a health-delta cursor.",
+        ),
+        HealthDeltaError::UnknownCursor => (
+            PrimitiveFailureKind::CursorRefused,
+            "application.health-delta.cursor-unknown",
+            "before_cursor names no retained point for this scope. Omit before_cursor to record a new baseline.",
+        ),
+        HealthDeltaError::DefinitionMismatch { .. } => (
+            PrimitiveFailureKind::CursorRefused,
+            "application.health-delta.definition-mismatch",
+            "before_cursor was measured under another health definition. Omit before_cursor to record a new baseline.",
+        ),
+        HealthDeltaError::DefinitionUnrecorded => (
+            PrimitiveFailureKind::CursorRefused,
+            "application.health-delta.definition-unrecorded",
+            "before_cursor predates recorded health definitions. Omit before_cursor to record a new baseline.",
+        ),
+        HealthDeltaError::CorruptPoint => (
+            PrimitiveFailureKind::Unavailable,
+            "application.health-delta.point-corrupt",
+            "A retained health-delta point failed identity validation.",
+        ),
+        HealthDeltaError::Graph(error) => return graph_query_outcome(error, domain, finished_at),
+        HealthDeltaError::Storage(_) => {
+            return evidence_unavailable(domain, finished_at, OmissionReason::Unavailable, 0);
+        }
+    };
+    refused(kind, code, message, domain, finished_at)
+}
+
 /// Refuses a file-scoped read of a path the admitted generation never
 /// published. `symbols_in_logical_file` answers such a path with an empty
 /// list, which would otherwise read as a complete account of a real file.
@@ -353,13 +396,20 @@ fn unpublished_file_outcome<T>(
 /// same typed state an open failure reports when the query surfaced a
 /// code-graph read error, and a failed read otherwise.
 fn graph_query_outcome<T>(
-    error: &tracedecay_domain::errors::TraceDecayError,
+    error: &GraphQueryError,
     domain: EvidenceDomain,
     finished_at: UtcMicros,
 ) -> RetrievalPortOutcome<T> {
-    match code_graph_read_error_from_runtime(error) {
-        Some(read_error) => graph_read_outcome(&read_error, domain, finished_at),
-        None => failed(domain, finished_at),
+    match error {
+        GraphQueryError::Read(read_error) => graph_read_outcome(read_error, domain, finished_at),
+        GraphQueryError::EvidenceUnavailable { detail, .. } => graph_read_outcome(
+            &CodeGraphReadError::Unavailable {
+                detail: detail.clone(),
+            },
+            domain,
+            finished_at,
+        ),
+        GraphQueryError::Runtime(_) => failed(domain, finished_at),
     }
 }
 
@@ -726,7 +776,7 @@ async fn open_code_graph(
 fn all_code_graph_symbols(
     graph: &CodeGraphInteractiveReader,
     cancellation: Arc<dyn tracedecay_graph_db::GraphCancellation>,
-) -> tracedecay_domain::errors::Result<Vec<CodeGraphSymbolSummaryV1>> {
+) -> GraphQueryResult<Vec<CodeGraphSymbolSummaryV1>> {
     const PAGE_SIZE: usize = 4_096;
     GraphQueryManager::new(graph, cancellation).page_all_symbols(
         PAGE_SIZE,
@@ -953,14 +1003,4 @@ pub fn admitted_root_uri_for_project(
             field: "application primitive admitted root URI",
         })?;
     Ok(uri.to_string())
-}
-
-pub fn locator_digest_for_project(
-    project_root: &Path,
-) -> Result<ManifestDigest, ApplicationContractError> {
-    tracedecay_runtime_core::worktree::locator_digest_for_project(project_root).map_err(|_| {
-        ApplicationContractError::Inconsistent {
-            field: "application primitive project locator digest",
-        }
-    })
 }

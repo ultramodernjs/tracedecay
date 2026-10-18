@@ -15,6 +15,7 @@ pub enum Error {
         target: &'static str,
         value: i64,
     },
+    RuntimeContextUnavailable,
     Runtime(String),
     Sqlite {
         operation: &'static str,
@@ -23,6 +24,9 @@ pub enum Error {
         message: String,
     },
     Busy,
+    /// Every reader was leased for the whole admission wait. Nothing failed;
+    /// the same read can succeed once a reader returns.
+    ReaderSaturated,
     InvalidOperation(String),
     StatementBatch {
         index: usize,
@@ -30,6 +34,9 @@ pub enum Error {
     },
     TransactionClosed,
     TransactionExpired,
+    /// A write job's body awaited something other than its own statements,
+    /// so the job rolled back instead of holding the writer across the wait.
+    JobAwaitedForeignFuture,
 }
 
 impl fmt::Display for Error {
@@ -52,11 +59,15 @@ impl fmt::Display for Error {
                 formatter,
                 "column {column} integer {value} is out of range for {target}"
             ),
+            Self::RuntimeContextUnavailable => {
+                formatter.write_str("SQLite operation requires an Asupersync runtime context")
+            }
             Self::Runtime(message) => write!(formatter, "SQLite runtime failed: {message}"),
             Self::Sqlite {
                 operation, message, ..
             } => write!(formatter, "SQLite {operation} failed: {message}"),
             Self::Busy => formatter.write_str("SQLite runtime is busy"),
+            Self::ReaderSaturated => formatter.write_str("exact SQL reader lane is saturated"),
             Self::InvalidOperation(message) => formatter.write_str(message),
             Self::StatementBatch { index, source } => {
                 write!(
@@ -66,6 +77,9 @@ impl fmt::Display for Error {
             }
             Self::TransactionClosed => formatter.write_str("SQLite transaction is closed"),
             Self::TransactionExpired => formatter.write_str("SQLite transaction lease expired"),
+            Self::JobAwaitedForeignFuture => {
+                formatter.write_str("SQLite write job awaited a future other than its statements")
+            }
         }
     }
 }
@@ -92,6 +106,7 @@ impl From<tracedecay_rusqlite_runtime::exact_sql::ExactSqlError> for Error {
             ),
             ExactSqlError::TransactionClosed => Self::TransactionClosed,
             ExactSqlError::TransactionExpired => Self::TransactionExpired,
+            ExactSqlError::JobAwaitedForeignFuture => Self::JobAwaitedForeignFuture,
             ExactSqlError::RequestLimitExceeded => {
                 Self::InvalidOperation("SQL request exceeds migration limits".to_owned())
             }
@@ -114,6 +129,9 @@ impl From<tracedecay_rusqlite_runtime::exact_sql::ExactSqlError> for Error {
                 message,
             },
             ExactSqlError::Busy => Self::Busy,
+            ExactSqlError::ReaderRefused(
+                tracedecay_rusqlite_runtime::exact_sql::ExactSqlReaderRefusalV1::Saturated,
+            ) => Self::ReaderSaturated,
             error => Self::Runtime(error.to_string()),
         }
     }

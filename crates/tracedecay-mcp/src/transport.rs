@@ -5,6 +5,7 @@
 //! replay transports plus the split read/write halves stay with this crate
 //! because they apply host-admission frame bounds and target tokio I/O types.
 
+use crate::analysis::skip_ascii_whitespace;
 pub use crate::jsonrpc::{
     ErrorCode, JsonRpcDecodeError, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpTransport,
 };
@@ -71,18 +72,24 @@ impl<T: McpTransport + Send> ReplayTransport<T> {
     /// Rejects oversized lines before enqueue so the replay deque never retains
     /// attacker payload bytes.
     pub fn push_replay(&mut self, line: String) -> std::io::Result<()> {
-        if line.len() > tracedecay_framing::MAX_MCP_JSONRPC_FRAME_BYTES {
-            let prefix = line.as_bytes()[..line
-                .len()
-                .min(tracedecay_framing::MCP_OVERSIZE_ID_INSPECT_BYTES)]
-                .to_vec();
-            return Err(tracedecay_framing::wire_oversized_io_error_with_prefix(
-                prefix,
-            ));
-        }
+        reject_oversized_line(&line)?;
         self.replay.push_back(line);
         Ok(())
     }
+}
+
+/// Refuses a frame over the wire bound, retaining only the bounded prefix
+/// used to recover its request id.
+pub(crate) fn reject_oversized_line(line: &str) -> std::io::Result<()> {
+    if line.len() > tracedecay_framing::MAX_MCP_JSONRPC_FRAME_BYTES {
+        let inspect = line
+            .len()
+            .min(tracedecay_framing::MCP_OVERSIZE_ID_INSPECT_BYTES);
+        return Err(tracedecay_framing::wire_oversized_io_error_with_prefix(
+            line.as_bytes()[..inspect].to_vec(),
+        ));
+    }
+    Ok(())
 }
 
 impl<T: McpTransport + Send> McpTransport for ReplayTransport<T> {
@@ -108,83 +115,70 @@ impl<T: McpTransport + Send> McpTransport for ReplayTransport<T> {
     }
 }
 
-/// Read half of the stdio transport.
-///
-/// The frame accumulator lives in the reader, not in the `read_line` future, so
-/// a read dropped by a lost `tokio::select!` race resumes rather than truncating
-/// the frame. See [`tracedecay_framing::BoundedLineReader`].
-type StdinLineReader =
-    tracedecay_framing::BoundedLineReader<tokio::io::BufReader<tokio::io::Stdin>>;
+type StdinLines = tracedecay_framing::pump::ReadPump<std::io::Result<String>>;
+type Stdout = tracedecay_framing::pump::WritePump;
 
-/// Real stdio transport, reads from stdin, writes to stdout.
+/// Real stdio transport. Dedicated threads own stdin and stdout, so the
+/// transport runs on any executor; see [`tracedecay_framing::pump`].
 pub struct StdioTransport {
-    reader: StdinLineReader,
-    writer: tokio::io::Stdout,
-}
-
-impl Default for StdioTransport {
-    fn default() -> Self {
-        Self {
-            reader: tracedecay_framing::BoundedLineReader::new(tokio::io::BufReader::new(
-                tokio::io::stdin(),
-            )),
-            writer: tokio::io::stdout(),
-        }
-    }
+    reader: StdinLines,
+    writer: Stdout,
 }
 
 impl StdioTransport {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new() -> std::io::Result<Self> {
+        Self::over(std::io::stdin(), std::io::stdout())
+    }
+
+    fn over(
+        input: impl std::io::Read + Send + 'static,
+        output: impl std::io::Write + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: StdinLines::mcp_lines("tracedecay-mcp-stdin", input)?,
+            writer: Stdout::spawn("tracedecay-mcp-stdout", output)?,
+        })
     }
 }
 
 impl McpTransport for StdioTransport {
     #[tracing::instrument(name = "mcp.server.read", level = "trace", skip_all)]
     async fn read_line(&mut self) -> std::io::Result<Option<String>> {
-        self.reader.read_mcp_line().await
+        self.reader.recv().await.transpose()
     }
 
     async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        self.writer.write_all(line.as_bytes()).await
+        self.writer.write_flushed(line.as_bytes().to_vec()).await
     }
 
-    async fn flush(&mut self) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
-        self.writer.flush().await
+    /// Every line is flushed before `write_line` resolves.
+    fn flush(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        std::future::ready(Ok(()))
     }
 }
 
-/// Any resumable bounded reader is a transport read half. The blanket impl
-/// keeps the split read path on the same cancellation-safe accumulator the
-/// unsplit transport uses; a bare `&mut BufReader` would put the partial frame
-/// back on the future's stack.
-impl<R> McpTransportReader for &mut tracedecay_framing::BoundedLineReader<R>
-where
-    R: tokio::io::AsyncBufRead + Unpin + Send,
-{
+impl McpTransportReader for &StdinLines {
     async fn read_line(&mut self) -> std::io::Result<Option<String>> {
-        (**self).read_mcp_line().await
+        self.recv().await.transpose()
     }
 }
 
-impl McpTransportWriter for &mut tokio::io::Stdout {
+impl McpTransportWriter for &Stdout {
     async fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        tokio::io::AsyncWriteExt::write_all(&mut **self, line.as_bytes()).await
+        self.write_flushed(line.as_bytes().to_vec()).await
     }
 
-    async fn flush(&mut self) -> std::io::Result<()> {
-        tokio::io::AsyncWriteExt::flush(&mut **self).await
+    fn flush(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> {
+        std::future::ready(Ok(()))
     }
 }
 
 impl McpDuplexTransport for StdioTransport {
-    type Reader<'a> = &'a mut StdinLineReader;
-    type Writer<'a> = &'a mut tokio::io::Stdout;
+    type Reader<'a> = &'a StdinLines;
+    type Writer<'a> = &'a Stdout;
 
     fn split(&mut self) -> (Self::Reader<'_>, Self::Writer<'_>) {
-        (&mut self.reader, &mut self.writer)
+        (&self.reader, &self.writer)
     }
 }
 
@@ -221,18 +215,11 @@ impl ChannelTransport {
 #[cfg(any(test, feature = "test-transport"))]
 impl McpTransport for ChannelTransport {
     async fn read_line(&mut self) -> std::io::Result<Option<String>> {
-        match self.rx.recv().await {
-            Some(line) if line.len() > tracedecay_framing::MAX_MCP_JSONRPC_FRAME_BYTES => {
-                let prefix = line.as_bytes()[..line
-                    .len()
-                    .min(tracedecay_framing::MCP_OVERSIZE_ID_INSPECT_BYTES)]
-                    .to_vec();
-                Err(tracedecay_framing::wire_oversized_io_error_with_prefix(
-                    prefix,
-                ))
-            }
-            other => Ok(other),
+        let line = self.rx.recv().await;
+        if let Some(line) = &line {
+            reject_oversized_line(line)?;
         }
+        Ok(line)
     }
 
     fn write_line(&mut self, line: &str) -> impl std::future::Future<Output = std::io::Result<()>> {
@@ -253,18 +240,11 @@ impl McpTransport for ChannelTransport {
 #[cfg(any(test, feature = "test-transport"))]
 impl McpTransportReader for &mut tokio::sync::mpsc::UnboundedReceiver<String> {
     async fn read_line(&mut self) -> std::io::Result<Option<String>> {
-        match self.recv().await {
-            Some(line) if line.len() > tracedecay_framing::MAX_MCP_JSONRPC_FRAME_BYTES => {
-                let prefix = line.as_bytes()[..line
-                    .len()
-                    .min(tracedecay_framing::MCP_OVERSIZE_ID_INSPECT_BYTES)]
-                    .to_vec();
-                Err(tracedecay_framing::wire_oversized_io_error_with_prefix(
-                    prefix,
-                ))
-            }
-            other => Ok(other),
+        let line = self.recv().await;
+        if let Some(line) = &line {
+            reject_oversized_line(line)?;
         }
+        Ok(line)
     }
 }
 
@@ -332,24 +312,19 @@ pub async fn write_wire_oversized_rejection(
 pub fn peek_jsonrpc_request_id(prefix: &[u8]) -> Option<serde_json::Value> {
     use tracedecay_framing::MCP_OVERSIZE_ID_INSPECT_BYTES;
 
-    let prefix = if prefix.len() > MCP_OVERSIZE_ID_INSPECT_BYTES {
+    let bytes = if prefix.len() > MCP_OVERSIZE_ID_INSPECT_BYTES {
         &prefix[..MCP_OVERSIZE_ID_INSPECT_BYTES]
     } else {
         prefix
     };
-    let bytes = prefix;
     let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
+    i = skip_ascii_whitespace(bytes, i);
     if i >= bytes.len() || bytes[i] != b'{' {
         return None;
     }
     i += 1;
     loop {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        i = skip_ascii_whitespace(bytes, i);
         if i >= bytes.len() || bytes[i] == b'}' {
             return None;
         }
@@ -359,22 +334,16 @@ pub fn peek_jsonrpc_request_id(prefix: &[u8]) -> Option<serde_json::Value> {
             return None;
         };
         i = i.checked_add(key_bytes)?;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        i = skip_ascii_whitespace(bytes, i);
         if i >= bytes.len() || bytes[i] != b':' {
             return None;
         }
         i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        i = skip_ascii_whitespace(bytes, i);
 
         let (value, value_bytes) = parse_prefix_value(&bytes[i..])?;
         i = i.checked_add(value_bytes)?;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
+        i = skip_ascii_whitespace(bytes, i);
         if i >= bytes.len() || !matches!(bytes[i], b',' | b'}') {
             return None;
         }
@@ -437,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn channel_transport_rejects_oversized_line_without_returning_payload() {
         // ChannelTransport receives already-allocated Strings (test harness).
-        // Product stdio/daemon paths use read_bounded_line before allocation;
+        // Product stdio/daemon paths use BoundedLineReader before allocation;
         // this asserts the harness still maps oversized to the typed IO error
         // without returning payload bytes on the Result::Ok path.
         let (mut transport, tx, _rx) = ChannelTransport::new();
@@ -460,11 +429,11 @@ mod tests {
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
-        use tokio::io::{AsyncRead, BufReader, ReadBuf};
+        use asupersync::io::{AsyncRead, BufReader, ReadBuf};
 
         use tracedecay_framing::{
-            MAX_MCP_JSONRPC_FRAME_BYTES, WIRE_RECORD_TOO_LARGE, line_outcome_to_io,
-            read_bounded_line, wire_oversized_io_error,
+            BoundedLineReader, MAX_MCP_JSONRPC_FRAME_BYTES, WIRE_RECORD_TOO_LARGE,
+            wire_oversized_io_error,
         };
 
         /// Streams `total` hostile bytes in chunks, then a fixed suffix, without
@@ -498,29 +467,20 @@ mod tests {
             }
         }
 
-        let max = 64;
         let stream = AsyncHostileThenSuffix {
-            remaining: max + 256 * 1024,
-            chunk: vec![b'z'; 1024],
+            remaining: MAX_MCP_JSONRPC_FRAME_BYTES + 256 * 1024,
+            chunk: vec![b'z'; 64 * 1024],
             suffix: b"\n{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n",
             suffix_offset: 0,
         };
-        let mut reader = BufReader::new(stream);
+        let mut reader = BoundedLineReader::new(BufReader::new(stream));
 
-        // Exercises the shared bounded-line primitive at a small cap; the
-        // dedicated MCP helper's exact production cap is covered in wire tests.
-        let first = line_outcome_to_io(read_bounded_line(&mut reader, max).await.unwrap());
-        let err = first.unwrap_err();
+        let err = reader.read_mcp_line().await.unwrap_err();
         assert!(tracedecay_framing::is_wire_oversized_io_error(&err));
         assert_eq!(err.to_string(), WIRE_RECORD_TOO_LARGE);
         assert!(!err.to_string().contains('z'));
 
-        let second = line_outcome_to_io(
-            read_bounded_line(&mut reader, MAX_MCP_JSONRPC_FRAME_BYTES)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let second = reader.read_mcp_line().await.unwrap();
         assert_eq!(
             second.as_deref(),
             Some(r#"{"jsonrpc":"2.0","method":"ping"}"#)
@@ -640,5 +600,55 @@ mod tests {
             serde_json::from_str(rx.recv().await.unwrap().trim()).unwrap();
         assert!(rejection["id"].is_null());
         assert_eq!(rejection["error"]["code"], json!(-32700));
+    }
+
+    /// Polls with a no-op waker, so the transport is proven to need no runtime.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedOutput(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stdio_transport_pumps_lines_without_a_runtime() {
+        let output = SharedOutput::default();
+        let input = std::io::Cursor::new(b"first\nsecond\n".to_vec());
+        let mut transport = StdioTransport::over(input, output.clone()).unwrap();
+
+        assert_eq!(
+            block_on(transport.read_line()).unwrap().as_deref(),
+            Some("first")
+        );
+        block_on(transport.write_line("one\n")).unwrap();
+        {
+            let (mut reader, mut writer) = transport.split();
+            assert_eq!(
+                block_on(reader.read_line()).unwrap().as_deref(),
+                Some("second")
+            );
+            block_on(writer.write_line("two\n")).unwrap();
+            assert_eq!(block_on(reader.read_line()).unwrap(), None);
+        }
+        assert_eq!(block_on(transport.read_line()).unwrap(), None);
+        assert_eq!(*output.0.lock().unwrap(), b"one\ntwo\n");
     }
 }

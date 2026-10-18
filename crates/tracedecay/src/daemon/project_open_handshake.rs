@@ -79,9 +79,10 @@ pub(super) async fn open_project_for_handshake_with_hook_recovery(
     // the registry registration below is its durable home. TraceDecay never
     // creates files inside a project's working tree.
     if first_touch {
-        tracedecay_runtime_core::storage::write_repository_identity_marker(
+        tracedecay_runtime_core::storage::claim_repository_identity_marker(
             project_path,
             project_id,
+            &handshake.client_identity.profile_root,
         )?;
     }
     let configuration_database = Box::pin(
@@ -184,10 +185,10 @@ pub(super) async fn write_project_open_error(
                 .unwrap_or(serde_json::Value::Null);
             project_open_error_response(id, error)
         });
-    write_json_rpc_response(transport, &response).await
+    write_daemon_response(transport, &response).await
 }
 
-/// A `tools/call` refused at project open answers on the MCP tool surface
+/// A `tools/call` refused at project open answers on the MCP tool interface
 /// when the refusal is the reset-required terminal, matching the canonical
 /// problem envelope CLI and HTTP callers receive for the same operation.
 /// Non-application tools and every other open failure keep the raw shape.

@@ -1,14 +1,14 @@
-use rusqlite::Savepoint;
+use std::fs::OpenOptions;
+
 use tempfile::TempDir;
 use tracedecay_domain::LocatorDigest;
 use tracedecay_rusqlite_runtime::{
-    ExistingWriterLocator, PersistentWriter, StorageOperationExecutor,
+    ExactSqlOnlyStorageOperationV1, ExistingWriterLocator, PersistentWriter,
     exact_sql::ExactSqlHandle,
-    reader::{ExistingReaderLocator, ReaderPool, ReaderQueryExecutor},
+    reader::{ExactSqlOnlyReaderV1, ExistingReaderLocator, ReaderPool},
 };
 use tracedecay_store::{
-    AdmissionConfigV1, RepositoryWritePayloadV1, RuntimeReadOutcomeV1, RuntimeReadRequestV1,
-    StoreIncarnationV1, StoreRuntimeBindingV1, VerifiedStoreLocatorV1,
+    AdmissionConfigV1, StoreIncarnationV1, StoreRuntimeBindingV1, VerifiedStoreLocatorV1,
 };
 
 use super::{
@@ -49,7 +49,7 @@ fn params_preserve_order_nulls_and_owned_values() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn owned_rows_decode_the_engine_value_set() {
     let row = Row::from_values(vec![
         Value::Text("node".to_string()),
@@ -69,7 +69,7 @@ async fn owned_rows_decode_the_engine_value_set() {
     assert!(rows.next().await.unwrap().is_none());
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn dropping_unpolled_row_read_preserves_the_next_row() {
     let mut rows = Rows::from_rows(vec![Row::from_values(vec![Value::Integer(7)])]);
     drop(rows.next());
@@ -78,7 +78,7 @@ async fn dropping_unpolled_row_read_preserves_the_next_row() {
     assert!(rows.next().await.unwrap().is_none());
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn runtime_rows_preserve_column_metadata_without_materialized_rows() {
     let fixture = runtime_fixture();
     let assert_columns = |rows: &Rows| {
@@ -129,35 +129,10 @@ fn row_decode_rejects_wrong_types_and_invalid_indexes() {
     assert_eq!(row.get::<i64>(1), Err(Error::InvalidColumn(1)));
 }
 
-struct NoWrites;
-
-impl StorageOperationExecutor for NoWrites {
-    fn execute(
-        &mut self,
-        _savepoint: &Savepoint<'_>,
-        _payload: &RepositoryWritePayloadV1,
-    ) -> rusqlite::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-struct NoReads;
-
-impl ReaderQueryExecutor for NoReads {
-    fn execute_read(
-        &mut self,
-        _snapshot: &rusqlite::Transaction<'_>,
-        _request: &RuntimeReadRequestV1,
-    ) -> Result<RuntimeReadOutcomeV1, tracedecay_store::StorageRuntimeErrorV1> {
-        unreachable!("engine exact SQL does not use the product read contract")
-    }
-}
-
 struct Fixture {
     connection: Connection,
     path: std::path::PathBuf,
-    _readers: ReaderPool<NoReads>,
+    _readers: ReaderPool<ExactSqlOnlyReaderV1>,
     _writer: PersistentWriter,
     _directory: TempDir,
 }
@@ -165,7 +140,12 @@ struct Fixture {
 fn runtime_fixture() -> Fixture {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("engine.sqlite3");
-    rusqlite::Connection::open(&path).unwrap();
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
     let path = path.canonicalize().unwrap();
     let binding: StoreRuntimeBindingV1 = serde_json::from_value(serde_json::json!({
         "shard_id": {
@@ -182,16 +162,18 @@ fn runtime_fixture() -> Fixture {
         StoreIncarnationV1::new(1).unwrap(),
         LocatorDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
     );
+    let runtime = asupersync::runtime::Runtime::current_handle().unwrap();
     let writer = PersistentWriter::start(
+        &runtime,
         ExistingWriterLocator::new(binding.clone(), locator.clone(), path.clone()).unwrap(),
         AdmissionConfigV1::default(),
-        NoWrites,
+        ExactSqlOnlyStorageOperationV1,
     )
     .unwrap();
     let readers = ReaderPool::start(
         ExistingReaderLocator::new(binding, locator, path.clone()).unwrap(),
         AdmissionConfigV1::default().readers,
-        NoReads,
+        ExactSqlOnlyReaderV1,
     )
     .unwrap();
     let connection = Connection::attach(ExactSqlHandle::attach(&writer, &readers).unwrap());
@@ -204,7 +186,7 @@ fn runtime_fixture() -> Fixture {
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn runtime_connection_and_transactions_preserve_sqlite_semantics() {
     let fixture = runtime_fixture();
     let connection = &fixture.connection;
@@ -434,7 +416,7 @@ async fn runtime_connection_and_transactions_preserve_sqlite_semantics() {
     assert!(connection.prepare("SELEC invalid syntax").await.is_err());
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn default_transaction_is_deferred_and_does_not_take_the_write_lock() {
     let fixture = runtime_fixture();
     let deferred = fixture.connection.transaction().await.unwrap();
@@ -448,7 +430,25 @@ async fn default_transaction_is_deferred_and_does_not_take_the_write_lock() {
     deferred.rollback().await.unwrap();
 }
 
-#[tokio::test]
+#[asupersync::test]
+async fn health_snapshot_admits_once_a_concurrent_health_probe_releases_the_lane() {
+    let fixture = runtime_fixture();
+    let sibling = fixture.connection.health_read_snapshot().await.unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(sibling);
+    });
+
+    let admitted = fixture.connection.health_read_snapshot().await;
+
+    release.join().unwrap();
+    assert!(
+        admitted.is_ok(),
+        "a health probe must wait out a bounded sibling probe on the reserved lane"
+    );
+}
+
+#[asupersync::test]
 async fn transaction_statement_batch_reports_the_exact_failed_statement() {
     let fixture = runtime_fixture();
     fixture
@@ -576,7 +576,7 @@ fn busy_or_locked_is_the_sqlite_lock_codes_not_their_text() {
     assert!(!Error::Runtime("exact SQL reader lane is busy".to_owned()).is_busy_or_locked());
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn returned_insert_ids_remain_bound_to_their_rows_after_reopen() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("returned-ids.sqlite3");

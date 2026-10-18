@@ -5,7 +5,7 @@
 
 use std::future::Future;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -49,26 +49,21 @@ pub use dispatch::worktree_id_for_layout as hook_worktree_id_for_layout;
 pub use tracedecay_hooks::NativeContextScoutLifecycleV1;
 
 pub use claude::{
-    evaluate_hook_decision, hook_claude_post_compact, hook_claude_post_tool_use,
-    hook_claude_session_start, hook_stop,
+    hook_claude_post_compact, hook_claude_post_tool_use, hook_claude_session_start, hook_stop,
 };
 pub use codex::{
-    codex_apply_patch_rel_paths, codex_project_root_from_event, codex_subagent_start_log_line,
-    codex_user_prompt_submit_context_for_event, codex_workspace_status_from_event,
-    evaluate_codex_subagent_start, hook_codex_post_compact, hook_codex_post_tool_use,
-    hook_codex_session_start, hook_codex_user_prompt_submit, record_codex_subagent_start,
+    codex_project_root_from_event, codex_user_prompt_submit_context_for_event,
+    codex_workspace_status_from_event, hook_codex_post_compact, hook_codex_post_tool_use,
+    hook_codex_session_start, hook_codex_user_prompt_submit,
 };
 pub use cursor::{
     CURSOR_CATCH_UP_INGEST_MAX_BYTES, cursor_project_root_from_event, cursor_session_start_json,
-    evaluate_cursor_subagent_start, hook_cursor_post_tool_use, hook_cursor_session_start,
+    hook_cursor_post_tool_use, hook_cursor_session_start,
 };
 pub use cursor_compact::{CursorPreCompactOutcome, cursor_pre_compact_via_daemon};
-pub use kiro::{evaluate_kiro_pre_tool_use, hook_kiro_prompt_submit, kiro_post_tool_use_rel_paths};
-pub use steering::{
-    CODEX_SESSION_CONTEXT_BUDGET, CURSOR_PLUGIN_SKILLS, CURSOR_SESSION_CONTEXT_BUDGET,
-    HookWorkspaceStatus, build_codex_session_context, build_codex_session_context_for_workspace,
-    build_cursor_session_context, cursor_staleness_hint,
-};
+pub use kiro::hook_kiro_prompt_submit;
+pub use steering::HookWorkspaceStatus;
+pub(crate) use steering::SKILL_MANDATE;
 
 #[cfg(test)]
 use analytics::HOOK_ANALYTICS_FILENAME;
@@ -78,9 +73,9 @@ pub use analytics::{
     measure_host_event_payload_bytes,
 };
 use analytics::{
-    HookStdinRefusal, record_hint_analytics, record_hint_emitted, record_hook_analytics,
-    record_hook_invoked, record_hook_invoked_parsed, record_hook_stdin_refused,
-    record_native_hook_invoked_parsed, record_workspace_status_analytics,
+    HookStdinRefusal, record_hint_analytics, record_hint_emitted, record_hook_invoked,
+    record_hook_invoked_parsed, record_hook_stdin_refused, record_native_hook_invoked_parsed,
+    record_workspace_status_analytics,
 };
 
 pub fn aggregate_hook_completed_readiness(rows: &[Value]) -> HookCompletedReadinessDistributions {
@@ -689,11 +684,11 @@ pub(crate) async fn ingest_user_session(
     provider: &str,
     session_id: Option<String>,
     telemetry: Option<&analytics::HookTimingSpan>,
-) -> bool {
+) {
     if session_id.is_none() {
-        return false;
+        return;
     }
-    match daemon_hook_action(
+    if let Err(error) = daemon_hook_action(
         runtime,
         None,
         HookRuntimeSurfaceRequestV1::IngestTranscript(HookIngestTranscriptRequestV1 {
@@ -708,68 +703,8 @@ pub(crate) async fn ingest_user_session(
     )
     .await
     {
-        Ok(result) => result
-            .get("messages_upserted")
-            .and_then(Value::as_u64)
-            .is_some_and(|count| count > 0),
-        Err(error) => {
-            tracing::warn!(provider, %error, "user transcript ingest daemon call failed");
-            false
-        }
+        tracing::warn!(provider, %error, "user transcript ingest daemon call failed");
     }
-}
-
-/// Fail-open transcript ingest shared by Cursor and Kiro catch-up hooks.
-///
-/// Daemon errors and budget timeouts are typed here. They must not collapse
-/// into a zero-counter success that hosts would treat as "nothing to review".
-#[derive(Default)]
-pub(crate) struct TranscriptIngestOutcome {
-    user_scope: bool,
-    messages_upserted: u64,
-    failed: bool,
-    timed_out: bool,
-}
-
-impl TranscriptIngestOutcome {
-    fn from_daemon_result(result: &Value) -> Self {
-        Self {
-            user_scope: result
-                .get("user_scope")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            messages_upserted: result
-                .get("messages_upserted")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            failed: false,
-            timed_out: false,
-        }
-    }
-
-    fn failed() -> Self {
-        Self {
-            failed: true,
-            ..Self::default()
-        }
-    }
-
-    fn timed_out() -> Self {
-        Self {
-            timed_out: true,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn should_schedule_user_review(&self) -> bool {
-        !self.failed && !self.timed_out && self.user_scope && self.messages_upserted > 0
-    }
-}
-
-enum IngestAttempt {
-    Succeeded(Value),
-    Failed,
-    TimedOut,
 }
 
 pub(crate) async fn await_within_stop_budget<T>(
@@ -781,7 +716,7 @@ pub(crate) async fn await_within_stop_budget<T>(
     if let Some(telemetry) = telemetry {
         telemetry.note_timeout_budget(budget);
     }
-    match tokio::time::timeout(budget, work).await {
+    match asupersync::time::timeout(asupersync::time::wall_now(), budget, work).await {
         Ok(value) => {
             if let Some(telemetry) = telemetry {
                 telemetry.note_timed_out(false);
@@ -806,7 +741,7 @@ pub(crate) async fn ingest_transcript_for_event(
     max_new_bytes: Option<u64>,
     budget: Duration,
     telemetry: Option<&analytics::HookTimingSpan>,
-) -> TranscriptIngestOutcome {
+) {
     let args = HookRuntimeSurfaceRequestV1::IngestTranscript(HookIngestTranscriptRequestV1 {
         provider: provider.to_owned(),
         user_scope: project_root.is_none(),
@@ -815,29 +750,17 @@ pub(crate) async fn ingest_transcript_for_event(
         messages: None,
         max_new_bytes,
     });
-    match await_within_stop_budget(
+    await_within_stop_budget(
         async {
-            match daemon_hook_action(runtime, project_root, args, telemetry).await {
-                Ok(result) => IngestAttempt::Succeeded(result),
-                Err(error) => {
-                    tracing::warn!(provider, %error, "transcript ingest daemon call failed");
-                    IngestAttempt::Failed
-                }
+            if let Err(error) = daemon_hook_action(runtime, project_root, args, telemetry).await {
+                tracing::warn!(provider, %error, "transcript ingest daemon call failed");
             }
         },
         budget,
         telemetry,
-        || {
-            tracing::warn!(provider, "transcript ingest daemon call timed out");
-            IngestAttempt::TimedOut
-        },
+        || tracing::warn!(provider, "transcript ingest daemon call timed out"),
     )
-    .await
-    {
-        IngestAttempt::Succeeded(result) => TranscriptIngestOutcome::from_daemon_result(&result),
-        IngestAttempt::Failed => TranscriptIngestOutcome::failed(),
-        IngestAttempt::TimedOut => TranscriptIngestOutcome::timed_out(),
-    }
+    .await;
 }
 
 pub(crate) async fn reset_counter_for_project(
@@ -875,10 +798,11 @@ pub(crate) async fn notify_hook_event_with_telemetry(
     project_root: &Path,
     event: DaemonHookEvent,
     telemetry: &analytics::HookTimingSpan,
-) {
+) -> tracedecay_hooks::HookEventNotifyOutcomeV1 {
     let payload_bytes = analytics::measure_json_payload_bytes(&event);
-    (runtime.event_notifier)(&runtime.profile, project_root, event).await;
+    let outcome = (runtime.event_notifier)(&runtime.profile, project_root, event).await;
     telemetry.note_completed_daemon_notification(payload_bytes);
+    outcome
 }
 
 #[tracing::instrument(
@@ -980,42 +904,6 @@ pub async fn hook_hermes_terminal_receipt(runtime: &HookRuntimeV1) -> i32 {
         return 1;
     }
     0
-}
-
-pub async fn schedule_user_session_review(
-    runtime: &HookRuntimeV1,
-    provider: &str,
-    session_id: Option<&str>,
-) {
-    let hint = daemon_hook_action(
-        runtime,
-        None,
-        HookRuntimeSurfaceRequestV1::UserReview {
-            provider: provider.to_owned(),
-            session_id: session_id.map(str::to_owned),
-        },
-        None,
-    );
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(25), hint).await;
-}
-
-const TRACEDECAY_RESEARCH_BLOCK_REASON: &str = "STOP: Use tracedecay MCP tools \
-(tracedecay_context, tracedecay_grep, tracedecay_search, tracedecay_callees, \
-tracedecay_callers, tracedecay_impact, tracedecay_files, tracedecay_affected) \
-instead of agents for code research. Route literal/regex text to tracedecay_grep, \
-symbol names to tracedecay_search, and concepts to tracedecay_context. TraceDecay \
-is faster and more precise for symbol relationships, call paths, and code structure. \
-Only use agents for code exploration if you have already tried tracedecay and it \
-cannot answer the question.";
-
-fn research_block_reason(hint: Option<ToolHint>) -> String {
-    let base = std::env::var("TRACEDECAY_RESEARCH_BLOCK_REASON")
-        .ok()
-        .unwrap_or_else(|| TRACEDECAY_RESEARCH_BLOCK_REASON.to_string());
-    hint.map_or_else(
-        || base.clone(),
-        |hint| format!("{}\n\n{}", base, format_tool_hint(&hint)),
-    )
 }
 
 #[cfg(test)]
@@ -1253,22 +1141,6 @@ fn project_marker_exists(dir: &Path) -> bool {
         "tsconfig.json",
     ];
     MARKERS.iter().any(|marker| dir.join(marker).exists())
-}
-
-fn rel_under_root(root: &Path, abs: &Path) -> Option<String> {
-    let stripped = abs.strip_prefix(root).ok()?;
-    if stripped.as_os_str().is_empty() {
-        return None;
-    }
-    if stripped.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        return None;
-    }
-    Some(stripped.to_string_lossy().replace('\\', "/"))
 }
 
 fn text_field(value: &Value, keys: &[&str]) -> Option<String> {

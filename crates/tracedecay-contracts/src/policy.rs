@@ -6,6 +6,7 @@
 //! static availability into capability routing.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use tracedecay_domain::configuration::{ConfigurationRevisionId, ConfigurationSnapshotV1};
@@ -19,9 +20,9 @@ use tracedecay_policy::analyzer::{
 use tracedecay_policy::identity::PolicyIdentifierV1;
 use tracedecay_policy::routing::{
     CapabilityAvailabilityV1, CapabilityEffectClassV1, CapabilityRouteCandidateV1,
-    CapabilityRoutingCancellationV1, CapabilityRoutingDecisionV1, CapabilityRoutingEvaluator,
-    CapabilityRoutingEvaluatorV1, CapabilityRoutingGrantStateV1, CapabilityRoutingGrantV1,
-    CapabilityRoutingRequestV1, ScopeMatchV1, TruthFreshnessRequirementV1, TruthSourceStateV1,
+    CapabilityRoutingCancellationV1, CapabilityRoutingDecisionV1, CapabilityRoutingEvaluatorV1,
+    CapabilityRoutingGrantStateV1, CapabilityRoutingGrantV1, CapabilityRoutingRequestV1,
+    ScopeMatchV1, TruthFreshnessRequirementV1, TruthSourceStateV1,
     TruthSourceStateV1::{Fresh, Partial, Stale, Unavailable, Unknown},
 };
 use tracedecay_tool_catalog::{AvailabilityContract, EffectClass, UseCaseId};
@@ -191,28 +192,6 @@ pub struct RegisteredPolicyCapabilityV1 {
     capability_digest: ManifestDigest,
 }
 
-impl RegisteredPolicyCapabilityV1 {
-    pub fn capability_id(&self) -> &str {
-        &self.capability_id
-    }
-
-    pub const fn effect_class(&self) -> EffectClass {
-        self.effect_class
-    }
-
-    pub const fn catalog_availability(&self) -> CapabilityAvailabilityV1 {
-        self.catalog_availability
-    }
-
-    pub fn use_case_id(&self) -> &str {
-        &self.use_case_id
-    }
-
-    pub fn capability_digest(&self) -> &ManifestDigest {
-        &self.capability_digest
-    }
-}
-
 /// Production composition of existing pure evaluators.
 ///
 /// This is ordinary typed application wiring, not a policy engine or generic
@@ -230,11 +209,19 @@ impl PolicyEvaluatorCompositionV1 {
     /// Builds the routing projection from the canonical catalog and matching
     /// application handlers. Static unavailability remains a policy fact even
     /// though transport/profile composition keeps the operation inert.
+    ///
+    /// Every descriptor behind it is `const`, so the process composes it once,
+    /// like `application_catalog_snapshot`, instead of on every project open.
     pub fn from_application_catalog() -> Result<Self, ApplicationContractError> {
-        let contributions = application_catalog_contributions()?;
-        let handlers = application_handler_descriptors()?;
-        handlers.validate_against(&contributions)?;
-        Self::from_catalog(&handlers, &contributions)
+        static COMPOSITION: LazyLock<
+            Result<PolicyEvaluatorCompositionV1, ApplicationContractError>,
+        > = LazyLock::new(|| {
+            let contributions = application_catalog_contributions()?;
+            let handlers = application_handler_descriptors()?;
+            handlers.validate_against(&contributions)?;
+            PolicyEvaluatorCompositionV1::from_catalog(&handlers, &contributions)
+        });
+        COMPOSITION.clone()
     }
 
     pub fn from_catalog(

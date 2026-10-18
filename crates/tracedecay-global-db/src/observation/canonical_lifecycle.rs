@@ -804,7 +804,7 @@ mod tests {
         panic!("bounded fixture work must exhaust");
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn shared_bodies_and_captures_survive_until_every_owner_releases() {
         let (_directory, conn) = fixture().await;
         let original = "shared canonical text ".repeat(4096);
@@ -897,7 +897,7 @@ mod tests {
         assert!(final_release.stored_body_bytes_deleted < final_release.decoded_body_bytes_deleted);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn root_map_precedence_and_typed_missing_corruption_survive_collection() {
         let (_directory, conn) = fixture().await;
         let live = body(&conn, "canonical root content").await;
@@ -969,7 +969,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn raw_hash_replacement_releases_only_the_previous_hash() {
         let (_directory, conn) = fixture().await;
         let old = body(&conn, "old body").await;
@@ -1003,7 +1003,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn legacy_dangling_refs_and_lower_keys_added_during_backfill_stay_pinned() {
         let (_directory, conn) = fixture().await;
         for index in 1..=PAGE + 1 {
@@ -1049,7 +1049,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn collection_bounds_retained_pages_resets_and_revisits_later_release() {
         let (_directory, conn) = fixture().await;
         for index in 1..=2 * PAGE + 1 {
@@ -1099,7 +1099,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn resource_families_finish_independently_without_restarting_smaller_sweep() {
         let (_directory, conn) = fixture().await;
         for index in 1..=2 * PAGE {
@@ -1160,7 +1160,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn malformed_legacy_backfill_and_missing_guards_bar_collection() {
         let (_directory, conn) = fixture().await;
         body(&conn, "unreferenced but unsafe to collect").await;
@@ -1218,7 +1218,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn reference_reset_cursor_failure_rolls_back_both_owner_pages() {
         let harness = crate::tests::harness::RegisteredGlobalDbHarness::open(
             "canonical-reference-reset-rollback",
@@ -1309,7 +1309,7 @@ mod tests {
         assert_reference_counts(&snapshot, 0).await;
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn registered_collector_refuses_damaged_observation_immutability_guard() {
         let harness = crate::tests::harness::RegisteredGlobalDbHarness::open(
             "canonical-immutable-owner-guard",
@@ -1338,7 +1338,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn registered_guard_refusal_invalidates_trust_before_in_place_repair() {
         let harness =
             crate::tests::harness::RegisteredGlobalDbHarness::open("canonical-guard-repair").await;
@@ -1416,7 +1416,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn registered_readmission_invalidates_completed_reference_trust_before_reconstruction() {
         for damage in [
             "DROP TRIGGER lcm_raw_canonical_refs_insert",
@@ -1451,7 +1451,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn registered_observation_writer_pins_replay_and_rolls_back_collision() {
         use tracedecay_domain::{
             ComponentVersion, DurableObservationV1, PayloadReferenceV1, ProjectionGenerationId,
@@ -1513,7 +1513,7 @@ mod tests {
         transaction.commit().await.unwrap();
         // Whichever writer wins, collection and insertion share the canonical
         // lane. A later insert recreates a collected body and pins it atomically.
-        let (collected, committed) = tokio::join!(
+        let (collected, committed) = futures_util::join!(
             harness.registered.run_canonical_content_gc(),
             store.persist_observation(write.clone()),
         );

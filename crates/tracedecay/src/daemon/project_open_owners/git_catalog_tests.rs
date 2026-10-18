@@ -88,7 +88,6 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
             project_root.clone(),
             access.clone(),
             tracedecay_contracts::now_micros(),
-            tokio::runtime::Handle::current(),
         )
         .await
         .unwrap();
@@ -107,6 +106,23 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
             .to_string()
     );
     assert_eq!(initial.scope, scope);
+    // The authority blocks on the configuration store from whichever thread
+    // rechecks policy, so it must not need that thread's Tokio runtime.
+    let off_runtime = std::thread::scope(|threads| {
+        let plain = threads.spawn(|| owner.current_authority(operation));
+        let current_thread = threads.spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async { owner.current_authority(operation) })
+        });
+        [plain.join().unwrap(), current_thread.join().unwrap()]
+    });
+    for authority in off_runtime {
+        let authority = authority.unwrap();
+        assert_eq!(authority.policy_digest, initial.policy_digest);
+        assert_eq!(authority.configuration_digest, initial.configuration_digest);
+    }
 
     // A separate owner can refuse its own provider without replacing the
     // canonical dependency already retained by the first owner.
@@ -117,7 +133,6 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
             project_root.clone(),
             access.clone(),
             tracedecay_contracts::now_micros(),
-            tokio::runtime::Handle::current(),
         )
         .await
         .unwrap();
@@ -138,8 +153,8 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
     let before = git(&project_root, &["rev-parse", "HEAD"]);
     std::fs::write(project_root.join("file.txt"), "accepted\n").unwrap();
     let index_tree_before = git(&project_root, &["write-tree"]);
-    let accepted = transaction_preview(&owner, "accepted", operation);
-    let accepted_result = owner.service.apply(&accepted).unwrap();
+    let accepted = transaction_preview(&owner, "accepted", operation).await;
+    let accepted_result = owner.service.apply(&accepted).await.unwrap();
     assert_eq!(
         accepted_result.receipt.outcome,
         GitIndexReceiptOutcomeV1::Committed
@@ -149,13 +164,13 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
     assert_eq!(git(&project_root, &["rev-parse", "HEAD"]), before);
 
     std::fs::write(project_root.join("file.txt"), "previewed\n").unwrap();
-    let stale = transaction_preview(&owner, "stale", operation);
+    let stale = transaction_preview(&owner, "stale", operation).await;
     std::fs::write(project_root.join("file.txt"), "changed\n").unwrap();
     let head_before_stale = git(&project_root, &["rev-parse", "HEAD"]);
     let index_before_stale = std::fs::read(project_root.join(".git/index")).unwrap();
     // Repository revalidation happens after durable admission, so refusal
     // must return a terminal no-change receipt.
-    let stale_result = owner.service.apply(&stale).unwrap();
+    let stale_result = owner.service.apply(&stale).await.unwrap();
     stale_result.validate_for(&stale).unwrap();
     assert_eq!(
         stale_result.receipt.outcome,
@@ -177,7 +192,7 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
         std::fs::read(project_root.join("file.txt")).unwrap(),
         b"changed\n"
     );
-    let denied = transaction_preview(&owner, "revoked", operation);
+    let denied = transaction_preview(&owner, "revoked", operation).await;
     let before_denial = git(&project_root, &["rev-parse", "HEAD"]);
     let index_before_denial = std::fs::read(project_root.join(".git/index")).unwrap();
     let mut revoked = access.clone();
@@ -188,7 +203,6 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
             project_root.clone(),
             revoked,
             tracedecay_contracts::now_micros(),
-            tokio::runtime::Handle::current(),
         )
         .await
         .unwrap();
@@ -196,7 +210,7 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
         owner.current_authority(operation),
         Err(GitIndexTransactionPortError::PolicyDenied)
     ));
-    let denied_result = owner.service.apply(&denied).unwrap();
+    let denied_result = owner.service.apply(&denied).await.unwrap();
     denied_result.validate_for(&denied).unwrap();
     assert_eq!(
         denied_result.receipt.outcome,
@@ -211,28 +225,34 @@ async fn git_owner_uses_explicit_canonical_catalog_and_rechecks_authorization() 
         std::fs::read(project_root.join(".git/index")).unwrap(),
         index_before_denial
     );
+    // Project open snapshots this access once and nothing renews it, so an
+    // owner mounted one horizon and one hour ago must still serve.
     let observed_at = tracedecay_contracts::now_micros();
-    let issued_at =
-        UtcMicros(observed_at.0 - i64::try_from(GRANT_HORIZON.as_micros()).unwrap() - 1);
-    let expired =
-        daemon_owned_project_source_access_at(&scope, &project_root, &configuration, issued_at)
+    let horizon = i64::try_from(GRANT_HORIZON.as_micros()).unwrap();
+    let opened_at = UtcMicros(observed_at.0 - horizon - 3_600_000_000);
+    let day_old =
+        daemon_owned_project_source_access_at(&scope, &project_root, &configuration, opened_at)
             .unwrap();
-    assert!(issued_at < expired.grant_expires_at);
-    assert!(expired.grant_expires_at < observed_at);
+    assert!(day_old.grant_expires_at < observed_at);
     registry
-        .mount(
-            database,
-            project_root.clone(),
-            expired,
-            tracedecay_contracts::now_micros(),
-            tokio::runtime::Handle::current(),
-        )
+        .mount(database, project_root.clone(), day_old, opened_at)
         .await
         .unwrap();
-    assert!(matches!(
-        owner.current_authority(operation),
-        Err(GitIndexTransactionPortError::PolicyDenied)
-    ));
+    let current = owner
+        .current_authority(operation)
+        .expect("the Git owner must still authorize a route opened a day ago");
+    assert!(
+        current.grant_expires_at > current.evaluated_at
+            && current.grant_expires_at.0 <= current.evaluated_at.0 + horizon,
+        "an authorized request keeps a finite grant expiry: {current:?}"
+    );
+    let day_old_preview = transaction_preview(&owner, "day-old", operation).await;
+    let day_old_result = owner.service.apply(&day_old_preview).await.unwrap();
+    assert_eq!(
+        day_old_result.receipt.outcome,
+        GitIndexReceiptOutcomeV1::Committed
+    );
+    assert_eq!(git(&project_root, &["show", ":file.txt"]), b"changed\n");
 }
 
 fn git(root: &std::path::Path, arguments: &[&str]) -> Vec<u8> {
@@ -246,19 +266,19 @@ fn git(root: &std::path::Path, arguments: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn transaction_preview(
+async fn transaction_preview(
     owner: &tracedecay_code_index_runtime::git_transactions::DaemonGitInvocationOwner,
     suffix: &str,
     operation: GitIndexTransactionOperationV1,
 ) -> tracedecay_contracts::GitIndexApplyRequestV1 {
-    let current = owner.current_authority(operation).unwrap();
+    let captured = owner.current_authority(operation).unwrap();
     let binding = GitIndexOperationBindingV1::for_operation(operation).unwrap();
     let snapshot = tracedecay_code_index_runtime::git_transactions::capture_exact_snapshot(
         &owner.repository_root,
-        current.scope.project_id.clone(),
-        current.scope.repository_id.clone(),
-        current.scope.worktree_id.clone(),
-        current.evaluated_at,
+        captured.scope.project_id.clone(),
+        captured.scope.repository_id.clone(),
+        captured.scope.worktree_id.clone(),
+        captured.evaluated_at,
         None,
     )
     .unwrap();
@@ -266,8 +286,8 @@ fn transaction_preview(
     let hunks = if operation == GitIndexTransactionOperationV1::StageHunks {
         let hunks = NativeGitIntelligence::new(
             owner.repository_root.clone(),
-            current.scope.repository_id.clone(),
-            current.scope.worktree_id.clone(),
+            captured.scope.repository_id.clone(),
+            captured.scope.worktree_id.clone(),
         )
         .hunk_refs(
             &GitDiffScopeV1::WorkingTree,
@@ -280,6 +300,10 @@ fn transaction_preview(
     } else {
         Vec::new()
     };
+    // The preview input lives 30 s from the authority evaluation that admits
+    // it. Evaluate that authority after the Git capture, which takes seconds
+    // on a loaded host, so the lifetime covers only the transaction itself.
+    let current = owner.current_authority(operation).unwrap();
     let expires_at =
         UtcMicros(current.evaluated_at.0 + MAX_GIT_INDEX_PREVIEW_INPUT_LIFETIME_MICROS);
     let input = GitIndexPreviewInputV1::new_hunk_selection(
@@ -291,7 +315,7 @@ fn transaction_preview(
         expires_at,
     )
     .unwrap();
-    owner.service.save_preview_input(input).unwrap();
+    owner.service.save_preview_input(input).await.unwrap();
     let grant = CapabilityGrantSnapshot::new(
         CapabilityGrantId::new(format!("grant.catalog.{suffix}")).unwrap(),
         current.policy_revision,
@@ -337,6 +361,7 @@ fn transaction_preview(
             selected_hunks: hunks,
             observed_at: current.evaluated_at,
         })
+        .await
         .unwrap()
         .preview;
     assert_eq!(

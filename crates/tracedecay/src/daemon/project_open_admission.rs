@@ -16,6 +16,7 @@ use tracedecay_contracts::project_open::{
 };
 use tracedecay_daemon_identity::authority;
 use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
+use tracedecay_runtime_core::native_runtime::{self, TimeoutError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ProjectServerKey {
@@ -77,6 +78,10 @@ struct ProjectOpenTaskRegistry {
     routes: HashMap<ProjectRouteKey, ProjectOpenTaskEntry>,
     retiring: HashMap<ProjectRouteKey, ProjectOpenTaskEntry>,
     closed_profiles: BTreeSet<PathBuf>,
+    /// Claims that joined an open already in flight. A test waits on this to
+    /// know a request reached the join, which no wall-clock window can show.
+    #[cfg(test)]
+    joins: tokio::sync::watch::Sender<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -417,7 +422,7 @@ impl ProjectOpenFailure {
     }
 
     /// Records a failed open for its route. A `ResetRequired` refusal
-    /// additionally captures the refused store's on-disk fingerprint so a
+    /// also captures the refused store's on-disk fingerprint so a
     /// later retry can distinguish "still the refused files" from "the
     /// operator reset the store on disk".
     fn recorded_for_route(error: &TraceDecayError, route: &ProjectRouteKey) -> Self {
@@ -618,6 +623,8 @@ impl ProjectOpenTasks {
                     return ProjectOpenTaskClaim::Failed(failure);
                 }
                 ProjectOpenTaskState::Opening | ProjectOpenTaskState::Ready => {
+                    #[cfg(test)]
+                    registry.joins.send_modify(|joins| *joins += 1);
                     return ProjectOpenTaskClaim::InFlight(receiver);
                 }
             }
@@ -625,15 +632,26 @@ impl ProjectOpenTasks {
         if registry.active_task_count() >= MAX_TRACKED_PROJECT_OPEN_TASKS {
             return ProjectOpenTaskClaim::Saturated;
         }
+        // The open reaches `project_server_lifecycle`, whose timers are Tokio's.
+        let Some(runtime) =
+            tracedecay_runtime_core::native_runtime::tokio_handle("daemon.project_open.task")
+        else {
+            return ProjectOpenTaskClaim::Failed(ProjectOpenFailure::untyped(
+                "project open refused: the daemon has no Tokio runtime".to_owned(),
+            ));
+        };
 
         let (updates, state) = tokio::sync::watch::channel(ProjectOpenTaskState::Opening);
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let (task_completion, completion) = tokio::sync::watch::channel(false);
         let failure_route = route.clone();
-        let task = tokio::spawn(tracing::Instrument::instrument(
-            async move {
-                let _completion = ProjectOpenTaskCompletionFinalizer(task_completion);
+        // An aborted open abandons its blocking waits, not their effects:
+        // completion fires once the task and the blocking work it owns end.
+        let completion_owner: Arc<dyn Send + Sync> =
+            Arc::new(ProjectOpenTaskCompletionFinalizer(task_completion));
+        let task = runtime.spawn(tracing::Instrument::instrument(
+            native_runtime::BLOCKING_WORK_OWNER.scope(completion_owner, async move {
                 let state = match open(task_cancellation).await {
                     Ok(()) => ProjectOpenTaskState::Ready,
                     Err(error) => ProjectOpenTaskState::Failed(
@@ -641,7 +659,7 @@ impl ProjectOpenTasks {
                     ),
                 };
                 updates.send_replace(state);
-            },
+            }),
             tracing::trace_span!("daemon.project.admit.task"),
         ));
         registry.routes.insert(
@@ -761,15 +779,20 @@ impl ProjectOpenTasks {
         route: &ProjectRouteKey,
         retry_available: &mut bool,
         error: Option<&TraceDecayError>,
-        deadline: tokio::time::Instant,
+        deadline: Instant,
     ) -> Result<bool> {
         if !*retry_available || !error.is_some_and(is_missing_index_error) {
             return Ok(false);
         }
         *retry_available = false;
-        tokio::time::timeout_at(deadline, self.wait_for_route_completion(route))
+        native_runtime::timeout_at(deadline, self.wait_for_route_completion(route))
             .await
-            .map_err(|_| project_warming_error(&route.project_path))?;
+            .map_err(|error| match error {
+                TimeoutError::Elapsed => project_warming_error(&route.project_path),
+                TimeoutError::TimerUnavailable(_) => TraceDecayError::Config {
+                    message: error.to_string(),
+                },
+            })?;
         Ok(true)
     }
 
@@ -812,25 +835,33 @@ impl ProjectOpenTasks {
             let Ok(remaining_micros) = u64::try_from(remaining_micros) else {
                 return ProjectOpenWaitOutcome::TimedOut;
             };
-            let sleep = tokio::time::sleep(Duration::from_micros(remaining_micros));
-            tokio::pin!(sleep);
-            tokio::select! {
-                biased;
-                () = request_cancellation.cancelled() => {
-                    return ProjectOpenWaitOutcome::Cancelled;
-                }
-                () = &mut sleep => {
-                    return ProjectOpenWaitOutcome::TimedOut;
-                }
-                changed = state.changed() => {
-                    if changed.is_err() {
-                        return ProjectOpenWaitOutcome::Failed(TraceDecayError::Config {
+            let woken = async {
+                tokio::select! {
+                    biased;
+                    () = request_cancellation.cancelled() => Some(ProjectOpenWaitOutcome::Cancelled),
+                    changed = state.changed() => changed.is_err().then(|| {
+                        ProjectOpenWaitOutcome::Failed(TraceDecayError::Config {
                             message: "project open task ended before reporting an outcome".to_owned(),
-                        });
-                    }
+                        })
+                    }),
+                }
+            };
+            match native_runtime::timeout(Duration::from_micros(remaining_micros), woken).await {
+                Ok(None) => {}
+                Ok(Some(outcome)) => return outcome,
+                Err(TimeoutError::Elapsed) => return ProjectOpenWaitOutcome::TimedOut,
+                Err(error @ TimeoutError::TimerUnavailable(_)) => {
+                    return ProjectOpenWaitOutcome::Failed(TraceDecayError::Config {
+                        message: error.to_string(),
+                    });
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn joins(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.lock_registry().joins.subscribe()
     }
 
     #[cfg(test)]
@@ -953,12 +984,19 @@ impl ProjectOpenTasks {
                 registry.retiring.insert(route, entry);
             }
         }
-        let routes = self
-            .lock_registry()
-            .retiring
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let (routes, _abort_unjoined) = {
+            let registry = self.lock_registry();
+            (
+                registry.retiring.keys().cloned().collect::<Vec<_>>(),
+                AbortTasksOnDrop(
+                    registry
+                        .retiring
+                        .values()
+                        .map(|entry| entry.task.abort_handle())
+                        .collect(),
+                ),
+            )
+        };
         if self
             .drain_retiring_routes(routes.clone(), cooperative_deadline)
             .await
@@ -982,7 +1020,7 @@ impl ProjectOpenTasks {
     }
 
     async fn drain_retiring_routes(&self, routes: Vec<ProjectRouteKey>, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
         let completions = {
             let mut registry = self.lock_registry();
             routes
@@ -997,7 +1035,8 @@ impl ProjectOpenTasks {
         let mut joined = Vec::new();
         let mut drained = true;
         for (route, completion) in completions {
-            match tokio::time::timeout_at(deadline, wait_for_project_open_task(completion)).await {
+            match native_runtime::timeout_at(deadline, wait_for_project_open_task(completion)).await
+            {
                 Ok(()) => joined.push(route),
                 Err(_) => drained = false,
             }

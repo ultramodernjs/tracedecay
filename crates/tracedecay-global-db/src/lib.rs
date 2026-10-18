@@ -58,7 +58,7 @@ pub use observability_rollup::{
     ObservabilityRollupFragmentPageV1, ObservabilityRollupFragmentQueryV1,
     ObservabilityRollupFragmentRecordV1, ObservabilityRollupFrontierV1,
     ObservabilityRollupRebuildReceiptV1, ObservabilityRollupRebuildV1,
-    ObservabilityRollupRetentionReceiptV1,
+    ObservabilityRollupRetentionReceiptV1, merge_coverage,
 };
 pub use observation_adapter::GlobalDbObservationStore;
 pub use observation_projection::{
@@ -134,8 +134,8 @@ pub use registered::{
     MAX_PENDING_RECEIPTED_DELIVERIES_V1, MAX_WORK_ATTEMPT_DELIVERY_FANOUTS_V1,
     PendingDeliverySourceReceiptV1, RegisteredGlobalDb, RegisteredGlobalDbLeaseV1,
     RegisteredGlobalDbOwnerV1, RegisteredGlobalDbWeakLeaseIssuerV1,
-    RegisteredGlobalDbWriteTransaction, RegisteredGlobalDbWriterConnection,
-    WorkAttemptDeliveryCensusReadV1,
+    RegisteredGlobalDbWriteTransaction, RegisteredGlobalDbWriteTx,
+    RegisteredGlobalDbWriterConnection, WorkAttemptDeliveryCensusReadV1,
 };
 pub use registered_analytics::ObservabilityRetentionReceiptV1;
 pub use registered_lcm_privacy::{LcmPrivacyRescanOutcomeV1, LcmPrivacyRescanReceiptV1};
@@ -156,10 +156,10 @@ pub use api_types::{
     ObservabilityEmissionClaimV1, ObservabilityEmissionOutboxRecordV1,
     ObservabilityOwnerEmissionWriteOutcomeV1, ObservabilityOwnerEmissionWriteV1,
     PreparedObservabilityEmissionV1, ProjectAliasRecord, ProjectRegistryContext,
-    ProjectStoreContext, ProjectStoreResolution, RegisteredProjectRootInventoryV1, SavingsDay,
-    SavingsTotal, SessionActivityRow, SessionIngestHealth, SessionProviderCoverage,
-    SessionProviderCoverageState, StoreArtifactRecord, StoreArtifactUpsert, StoreInstanceRecord,
-    StoreInstanceUpsert, registry_context_candidate_roots,
+    ProjectStoreContext, ProjectStoreResolution, SavingsDay, SavingsTotal, SessionActivityRow,
+    SessionIngestHealth, SessionProviderCoverage, SessionProviderCoverageState,
+    StoreArtifactRecord, StoreArtifactUpsert, StoreInstanceRecord, StoreInstanceUpsert,
+    registry_context_candidate_roots,
 };
 pub use support::{
     AccountingMode, env_flag, env_value_truthy, global_accounting_enabled, global_accounting_mode,

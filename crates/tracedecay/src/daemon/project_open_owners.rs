@@ -94,7 +94,6 @@ pub(super) async fn register_project_configuration_owner(
             scope.clone(),
             profile_id.clone(),
             access.requester,
-            access.grant_expires_at,
             None,
             policy_digest,
         )
@@ -337,6 +336,16 @@ pub(super) async fn register_project_open_production_owners(
     Box::pin(async move {
     let owner_registration_started = Instant::now();
     let mut owner_phase_started = owner_registration_started;
+    let mut owner_phase = |phase: &str| {
+        tracing::info!(
+            event = "project_open_owner_phase",
+            project = %project_root.display(),
+            phase,
+            step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
+            elapsed_ms = owner_registration_started.elapsed().as_millis(),
+        );
+        owner_phase_started = Instant::now();
+    };
     let project_id =
         ProjectId::new(project_id.to_owned()).map_err(|_| TraceDecayError::Config {
             message: "project-open owners require an authoritative project identity".to_owned(),
@@ -349,14 +358,7 @@ pub(super) async fn register_project_open_production_owners(
                 message: "project-open owners require the verified code-graph projection port"
                     .to_owned(),
             })?;
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "registered_project_storage_acquired",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
+    owner_phase("registered_project_storage_acquired");
     let database = graph.db().clone();
     let session_db = server
         .project_session_db()
@@ -369,27 +371,13 @@ pub(super) async fn register_project_open_production_owners(
             .map_err(|error| TraceDecayError::Config {
                 message: format!("project-open resolved scope denied: {error}"),
             })?;
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "owner_scope_resolved",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
+    owner_phase("owner_scope_resolved");
     let configuration = tracing::Instrument::instrument(graph.configuration_runtime().client().current(), tracing::trace_span!("daemon.project.open.owners.configuration_read"))
     .await
     .map_err(|error| TraceDecayError::Config {
         message: format!("project-open configuration currentness failed: {error}"),
     })?;
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "configuration_current",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
+    owner_phase("configuration_current");
     let scout_configuration =
         tracedecay_global_db::configuration::contracts::ports::ConfigurationCurrentStateV1 {
         revision_id: configuration.revision_id().clone(),
@@ -423,14 +411,7 @@ pub(super) async fn register_project_open_production_owners(
             });
         }
     };
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "context_scout_registered",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
+    owner_phase("context_scout_registered");
     let access =
         daemon_owned_project_source_access_at(&scope, project_root, &configuration, now_micros())
             .map_err(|error| TraceDecayError::Config {
@@ -450,14 +431,7 @@ pub(super) async fn register_project_open_production_owners(
         temporal,
     ))
     .await?;
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "code_read_owners_registered",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
+    owner_phase("code_read_owners_registered");
 
     // One worktree discovery serves both the Git transaction owner here and
     // the native-integration mount below.
@@ -470,7 +444,6 @@ pub(super) async fn register_project_open_production_owners(
                 repository_root.to_path_buf(),
                 access.clone(),
                 now_micros(),
-                tokio::runtime::Handle::current(),
             ), tracing::trace_span!("daemon.project.open.owners.git_transactions"))
         .await
         .map_err(|error| TraceDecayError::Config {
@@ -523,7 +496,6 @@ pub(super) async fn register_project_open_production_owners(
         let analysis = Arc::new(DaemonNativeIntegrationAnalysisV1::new(
             invocation.code_index_schedulers.clone(),
             scope.clone(),
-            tokio::runtime::Handle::current(),
         ));
         let native_owner = tracing::Instrument::instrument(async {
                 let native_owner = native_integration
@@ -675,14 +647,7 @@ pub(super) async fn register_project_open_production_owners(
             }, tracing::trace_span!("daemon.project.open.owners.work"))
         .await?;
     }
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "full_runtime_owners_registered",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
+    owner_phase("full_runtime_owners_registered");
     let mut mounted_providers = Vec::new();
     let mut lsp_session_factory = None;
     let diagnostic_broker = server.diagnostics_lsp();
@@ -702,18 +667,11 @@ pub(super) async fn register_project_open_production_owners(
         indexed_files.sort();
         let admitted_providers = {
             let mut broker = diagnostic_broker.lock().await;
-            let admitted = broker.admitted_providers_for_files(&indexed_files);
-            mounted_providers = broker.mounted_providers_for_files(&indexed_files);
+            let admitted = broker.admitted_providers_for_files(&indexed_files).await;
+            mounted_providers = broker.mounted_providers_for_files(&indexed_files).await;
             admitted
         };
-        tracing::info!(
-            event = "project_open_owner_phase",
-            project = %project_root.display(),
-            phase = "lsp_languages_discovered",
-            step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-            elapsed_ms = owner_registration_started.elapsed().as_millis(),
-        );
-        owner_phase_started = Instant::now();
+        owner_phase("lsp_languages_discovered");
 
         // Feedback runtime registration installed a typed unavailable cycle.
         // The LSP gateway publishes only against a real sealed file census.
@@ -736,13 +694,7 @@ pub(super) async fn register_project_open_production_owners(
             )
             .await?,
         );
-        tracing::info!(
-            event = "project_open_owner_phase",
-            project = %project_root.display(),
-            phase = "lsp_owner_registered",
-            step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-            elapsed_ms = owner_registration_started.elapsed().as_millis(),
-        );
+        owner_phase("lsp_owner_registered");
     } else {
         // Protocol sessions (initialize / shutdown / exit) must be admissible
         // as soon as the project route is published. Diagnostics still wait
@@ -969,7 +921,6 @@ async fn register_production_lsp_owner(
             registered_database,
             database,
             Arc::new(invocation.code_index_schedulers.clone()),
-            tokio::runtime::Handle::current(),
             diagnostic_broker,
             &languages,
             root_uri,

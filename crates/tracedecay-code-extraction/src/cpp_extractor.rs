@@ -104,8 +104,7 @@ impl<'s> ExtractionState<'s> {
             .or_else(|| find_direct_child_by_kind(node, "field_declaration_list"))
             .or_else(|| find_direct_child_by_kind(node, "declaration_list"))
             .or_else(|| find_direct_child_by_kind(node, "enumerator_list"))
-            .map(|body| body.start_byte())
-            .unwrap_or_else(|| node.end_byte());
+            .map_or_else(|| node.end_byte(), |body| body.start_byte());
         self.text_before(node, end)
             .trim()
             .trim_end_matches(';')
@@ -192,7 +191,7 @@ impl CppExtractor {
             "namespace_definition" => Self::visit_namespace(state, node),
             "template_declaration" => Self::visit_template(state, node),
             "using_declaration" => Self::visit_using_declaration(state, node),
-            "preproc_def" => Self::visit_preproc_def(state, node),
+            "preproc_def" => Self::visit_identifier_leaf(state, node, NodeKind::PreprocessorDef),
             "preproc_include" => Self::visit_preproc_include(state, node),
             "access_specifier" => Self::visit_access_specifier(state, node),
             // Comments are picked up as docstrings by the definitions they precede.

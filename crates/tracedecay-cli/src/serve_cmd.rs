@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use tracedecay_runtime_core::config::ProfileRoot;
 
+use tracedecay_contracts::catalog_composition::CatalogProfileName;
 use tracedecay_domain::errors::Result;
 use tracedecay_project::project::TraceDecay;
 
@@ -64,6 +65,16 @@ pub fn sanitize_serve_path_arg(path: Option<String>) -> Option<String> {
     None
 }
 
+/// Parses `--catalog-profile` against the catalog snapshot's own profiles.
+/// Only a serve given the flag composes the snapshot.
+pub(crate) fn parse_catalog_profile(
+    name: &str,
+) -> std::result::Result<CatalogProfileName, Box<dyn std::error::Error + Send + Sync>> {
+    let catalog =
+        tracedecay_daemon_service::application_surface::application_surface_binding_catalog_ref()?;
+    Ok(CatalogProfileName::parse(catalog, name)?)
+}
+
 /// Runs the `serve` command as a database-free proxy to the managed daemon.
 #[tracing::instrument(name = "cli.serve.proxy", level = "trace", skip_all)]
 pub async fn run_serve(
@@ -71,6 +82,7 @@ pub async fn run_serve(
     path_arg: Option<String>,
     timings: bool,
     full_tool_list: bool,
+    catalog_profile: Option<CatalogProfileName>,
 ) -> Result<()> {
     let original_cwd = std::env::current_dir().ok();
     let socket_path = tracedecay_daemon_control::default_socket_path(profile.data_dir())?;
@@ -85,22 +97,36 @@ pub async fn run_serve(
     // advisory must never delay or take down MCP, for example on a loaded
     // daemon or when serve and the daemon disagree on the configuration surface.
     let (hints_enabled, repeated_query_hints) = tokio::sync::watch::channel(false);
+    // The read composes the application catalog and its schemas, about 100 ms
+    // of CPU, so it gets its own thread: on a native worker it stalled the
+    // reactor that delivers the daemon's replies to this root.
     let hints_profile = profile.clone();
-    tokio::spawn(async move {
-        match crate::commands::repeated_query_hints_enabled(&hints_profile).await {
-            Ok(enabled) => {
-                hints_enabled.send_replace(enabled);
+    let hints_read = std::thread::Builder::new()
+        .name("tracedecay-serve-hints".to_owned())
+        .spawn(move || {
+            match tracedecay_runtime_core::native_runtime::block_on(Box::pin(
+                crate::commands::repeated_query_hints_enabled(&hints_profile),
+            )) {
+                Ok(Ok(enabled)) => {
+                    hints_enabled.send_replace(enabled);
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "repeated-query hints are off: setting read failed");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "repeated-query hints are off: setting read did not start");
+                }
             }
-            Err(error) => {
-                tracing::warn!(%error, "repeated-query hints are off: setting read failed");
-            }
-        }
-    });
+        });
+    if let Err(error) = hints_read {
+        tracing::warn!(%error, "repeated-query hints are off: setting read did not start");
+    }
     tracedecay::daemon::proxy_stdio_to_daemon(
         &socket_path,
         &handshake,
         None,
         full_tool_list,
+        catalog_profile.as_ref(),
         repeated_query_hints,
     )
     .await
@@ -197,6 +223,27 @@ fn serve_scope_prefix(original_cwd: Option<&Path>, project_root: &Path) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracedecay_runtime_core::native_runtime;
+
+    /// `serve` reads the hint setting on its own thread's native root, so the
+    /// read must settle with no Tokio runtime entered.
+    #[test]
+    fn repeated_query_hints_read_settles_without_an_entered_tokio_runtime() {
+        let home = tempfile::tempdir().expect("temporary home");
+        let profile = ProfileRoot::under_home(home.path());
+        let read_failed = native_runtime::block_on(Box::pin(async move {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            crate::commands::repeated_query_hints_enabled(&profile)
+                .await
+                .is_err()
+        }))
+        .expect("native runtime");
+
+        assert!(
+            read_failed,
+            "no daemon serves this profile, so the read fails without panicking"
+        );
+    }
 
     #[test]
     fn detects_template_variable_with_default_value_syntax() {

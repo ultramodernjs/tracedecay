@@ -209,24 +209,29 @@ async fn disconnect_reclamation_does_not_outlive_daemon_service() {
 
     service.disconnect_lsp_session(&registry, session).await;
     drop(service);
-    tokio::task::yield_now().await;
 
-    assert!(
-        retained_runtime_state.upgrade().is_none(),
-        "lease reclamation must be cancelled with its daemon owner"
-    );
+    // The aborted lease task drops its future on the native runtime, so the
+    // release lands on another thread.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while retained_runtime_state.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("lease reclamation must be cancelled with its daemon owner");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn abrupt_disconnect_reclaims_session_at_its_bounded_lease() {
     let service = DaemonInvocationService::default();
     let registry = Arc::new(Mutex::new(LspSessionRegistry::new(1)));
     let session = open_session(&service, &registry, "request.abrupt-drop").await;
 
     service.disconnect_lsp_session(&registry, session).await;
-    tokio::task::yield_now().await;
-    tokio::time::advance(std::time::Duration::from_millis(LSP_SESSION_TTL_MS)).await;
-    tokio::task::yield_now().await;
+    service
+        .lsp_lease_tasks
+        .expire_leases_through(now_millis() + LSP_SESSION_TTL_MS);
+    service.lsp_lease_tasks.wait_until_idle().await;
 
     assert_eq!(registry.lock().await.active_sessions(), 0);
     assert!(service.lsp_sessions.lock().await.is_empty());
@@ -463,7 +468,7 @@ async fn repeated_disconnect_preserves_the_existing_bounded_lease() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn reconnect_at_lease_expiry_joins_reclamation_before_rotating_credentials() {
     let service = Arc::new(DaemonInvocationService::default());
     let registry = Arc::new(Mutex::new(LspSessionRegistry::new(1)));
@@ -487,7 +492,9 @@ async fn reconnect_at_lease_expiry_joins_reclamation_before_rotating_credentials
             .await
     });
     tokio::task::yield_now().await;
-    tokio::time::advance(std::time::Duration::from_millis(LSP_SESSION_TTL_MS)).await;
+    service
+        .lsp_lease_tasks
+        .expire_leases_through(now_millis() + LSP_SESSION_TTL_MS);
     tokio::task::yield_now().await;
     drop(endpoint_guard);
 
@@ -610,7 +617,7 @@ async fn state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep() 
     let endpoint_guard = state.lsp_session_registry.lock().await;
     let shutdown_state = Arc::clone(&state);
     let shutdown = tokio::spawn(async move {
-        shutdown_state.shutdown().await;
+        shutdown_state.shutdown(None).await;
     });
     // The fence the open below must be queued behind is the closed admission
     // gate, so observe it directly: `begin_shutdown` closes the gate and then
@@ -721,7 +728,7 @@ async fn shutdown_fences_reconnect_before_lease_and_endpoint_expiry() {
     assert_eq!(service.active_lsp_runtime_count().await, 1);
     assert_eq!(service.lsp_lease_tasks.active_tasks(), 1);
 
-    service.expire_all().await;
+    service.expire_all(None).await;
     registry.lock().await.expire_at(u64::MAX);
     assert_eq!(registry.lock().await.active_sessions(), 0);
     assert_eq!(service.active_lsp_runtime_count().await, 0);
@@ -736,7 +743,7 @@ async fn shutdown_joins_pending_lease_reclamation() {
     let retained_runtime_state = Arc::downgrade(&service.lsp_sessions);
 
     service.disconnect_lsp_session(&registry, session).await;
-    service.expire_all().await;
+    service.expire_all(None).await;
     assert_eq!(
         service
             .lsp_lease_tasks

@@ -325,7 +325,7 @@ async fn cursor_agent_summary(
     let request = request.clone();
     let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
     let cancel_on_drop = CancelCursorSummaryOnDrop(cancellation.clone());
-    let text = tokio::task::spawn_blocking(move || {
+    let text = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         summarize_with_cursor_agent(&request, &config, &cancellation)
     })
     .await
@@ -383,7 +383,7 @@ async fn codex_app_server_summary(
         tracedecay_sessions::runtime::hosts::codex_app_server::CodexAppServerCancellation::default(
         );
     let cancel_on_drop = CancelCodexSummaryOnDrop(cancellation.clone());
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         tracedecay_sessions::runtime::hosts::codex_app_server::summarize_with_codex_app_server(
             &request,
             &config,

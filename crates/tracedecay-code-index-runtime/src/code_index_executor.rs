@@ -8,6 +8,7 @@ use tracedecay_query::code_search::{self, CodeIndexSearchDisplayV1};
 use tracedecay_query::retrieval::RetrievalPortError;
 use tracedecay_query::retrieval::hydrate::HydrationUnavailableV1;
 use tracedecay_query::retrieval::lexical::LexicalRouteReceiptV1;
+use tracedecay_runtime_core::native_runtime;
 
 use crate::code_index_scheduler;
 use crate::code_index_task_support;
@@ -328,7 +329,7 @@ pub struct CodeIndexDisplayPathIndexV1 {
 
 impl CodeIndexDisplayPathIndexV1 {
     pub fn for_generation(
-        generation: &crate::code_index::production::CodeIndexPublishedGenerationV1,
+        generation: &tracedecay_code_index::production::CodeIndexPublishedGenerationV1,
     ) -> std::result::Result<Self, tracedecay_query::retrieval::hydrate::HydrationUnavailableV1>
     {
         use tracedecay_query::retrieval::hydrate::HydrationUnavailableV1;
@@ -339,7 +340,7 @@ impl CodeIndexDisplayPathIndexV1 {
             if file.disposition != tracedecay_domain::SnapshotFileDispositionV1::Present {
                 continue;
             }
-            let identity = crate::code_index::chunks::code_file_identity(
+            let identity = tracedecay_code_index::chunks::code_file_identity(
                 snapshot.repository.as_str(),
                 &file.logical_path,
             )
@@ -355,7 +356,7 @@ impl CodeIndexDisplayPathIndexV1 {
 }
 
 pub fn code_index_search_display_binding(
-    generation: &crate::code_index::production::CodeIndexPublishedGenerationV1,
+    generation: &tracedecay_code_index::production::CodeIndexPublishedGenerationV1,
     display_paths: &CodeIndexDisplayPathIndexV1,
     request: &tracedecay_domain::RetrievalRequest,
     candidate: &tracedecay_domain::RankedCandidate,
@@ -735,7 +736,7 @@ fn serves_symbol_body(
 /// piece. A signature chunk is the opening line of that first piece, so a
 /// signature match serves the declaration it opens instead of one line.
 fn symbol_body_chunk<'g>(
-    generation: &'g crate::code_index::production::CodeIndexPublishedGenerationV1,
+    generation: &'g tracedecay_code_index::production::CodeIndexPublishedGenerationV1,
     occurrence: &tracedecay_domain::SymbolOccurrenceId,
     matched: Option<&'g tracedecay_domain::CodeSearchChunkV1>,
 ) -> Option<&'g tracedecay_domain::CodeSearchChunkV1> {
@@ -762,7 +763,7 @@ fn published_chunk_window(
 }
 
 fn code_index_symbol_display(
-    symbol: &crate::code_index::lineage::LineageSymbolRecordV1,
+    symbol: &tracedecay_code_index::lineage::LineageSymbolRecordV1,
     display_paths: &CodeIndexDisplayPathIndexV1,
     code_window: Option<code_search::CodeIndexSearchWindowV1>,
 ) -> std::result::Result<
@@ -838,6 +839,23 @@ impl<A: CodeIndexMcpReadAdmissionV1> tracedecay_query::retrieval::ports::Retriev
     }
 }
 
+/// Whether the linked-worktree watch policy refuses this read. The policy
+/// governs automatic indexing only: a generation an operator seated
+/// (`tracedecay sync`) serves search, similar, and clone reads as it serves
+/// graph reads and status, so the refusal holds only while nothing is seated.
+async fn linked_worktree_unindexed(
+    schedulers: &code_index_scheduler::CodeIndexSchedulerRegistryV1,
+    scope: &tracedecay_contracts::ResolvedScope,
+    project_root: &std::path::Path,
+) -> bool {
+    schedulers.automatic_admission_for_scope(scope)
+        == Some(code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled)
+        && schedulers
+            .latest_generation_id(project_root)
+            .await
+            .is_none()
+}
+
 pub fn code_index_search_executor<A, S>(
     schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
     project_id: tracedecay_domain::ProjectId,
@@ -870,11 +888,7 @@ where
                     request.source_revision.as_ref(),
                     request.source_tree.as_ref(),
                 );
-                if schedulers.automatic_admission_for_scope(&scope)
-                    == Some(
-                        code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled,
-                    )
-                {
+                if linked_worktree_unindexed(&schedulers, &scope, &request.project_root).await {
                     return code_index_search_unavailable(
                         code_search::CodeIndexSearchUnavailableReasonV1::LinkedWorktreeDisabled,
                         "linked_worktree_disabled",
@@ -1076,32 +1090,31 @@ where
                             request.query,
                             policy,
                         );
-                    let runtime = tokio::runtime::Handle::current();
                     let settlement_control = Arc::clone(&control);
-                    let execution = tokio::task::spawn_blocking(move || {
+                    let execution = native_runtime::spawn_blocking(move || {
                         let _execution_permit = execution_permit;
-                        runtime.block_on(async move {
-                        let work = async move {
-                        let Some(revision) = execution_source_revision else {
-                            return execution_schedulers
-                                .execute_controlled_query(
-                                    &execution_scope,
-                                    execution_request,
-                                    execution_control.clone(),
-                                )
-                                .await;
-                        };
-                        let tree = execution_source_tree.ok_or(
+                        native_runtime::block_on(async move {
+                            let work = async move {
+                                let Some(revision) = execution_source_revision else {
+                                    return execution_schedulers
+                                        .execute_controlled_query(
+                                            &execution_scope,
+                                            execution_request,
+                                            execution_control.clone(),
+                                        )
+                                        .await;
+                                };
+                                let tree = execution_source_tree.ok_or(
                             code_index_scheduler::query_runtime::QuerySearchExecutionErrorV1::GenerationUnavailable,
                         )?;
-                        let reference = execution_source_reference.ok_or(
+                                let reference = execution_source_reference.ok_or(
                             code_index_scheduler::query_runtime::QuerySearchExecutionErrorV1::ExactCursorInvalid,
                         )?;
-                        let control = code_index_scheduler::branch_generations::BranchGenerationReadControlV1 {
+                                let control = code_index_scheduler::branch_generations::BranchGenerationReadControlV1 {
                             deadline: execution_control.deadline.clone(),
                             cancellation: execution_control.cancellation.clone(),
                         };
-                        let generations = execution_schedulers
+                                let generations = execution_schedulers
                             .generations_for_revisions(
                                 &execution_scope,
                                 &reference,
@@ -1116,58 +1129,58 @@ where
                             .map_err(
                                 code_index_scheduler::query_runtime::QuerySearchExecutionErrorV1::ExactGenerationUnavailable,
                             )?;
-                        let exact_source = tracedecay_domain::CodeSourceCursorBindingV1 {
-                            reference,
-                            commit: revision,
-                            tree,
-                            generation: generations
-                                .base
-                                .generation()
-                                .manifest()
-                                .generation_id
-                                .clone(),
-                        };
-                        code_index_task_support::verify_exact_source_cursor(
-                            &execution_schedulers,
-                            &execution_scope,
-                            execution_cursor.as_ref(),
-                            &exact_source,
-                        )
-                        .await?;
-                        execution_schedulers
-                            .execute_query_search_on_generation(
-                                &execution_scope,
-                                execution_request,
-                                generations.base,
-                                execution_control.clone(),
-                            )
-                            .await
-                        };
-                        // The permit follows request settlement, not this
-                        // work's natural completion. `work` is polled first, so
-                        // an unsettled request behaves exactly as before; a
-                        // settled one is dropped where it stands, including
-                        // mid-`mounted.lock()` or mid-decode, the awaits that
-                        // no checkpoint covers, and `_execution_permit` is
-                        // released with the task. `settle_owned_blocking_task`
-                        // below normally names the precise terminal reason
-                        // first; this only keeps the typed state when it did
-                        // not.
-                        tokio::pin!(work);
-                        tokio::select! {
-                            biased;
-                            output = &mut work => output,
-                            _ = settlement_control.settled() => Err(
-                                code_index_scheduler::query_runtime::QuerySearchExecutionErrorV1::Retrieval(
-                                    tracedecay_query::retrieval::RetrievalPortError::Cancelled,
+                                let exact_source = tracedecay_domain::CodeSourceCursorBindingV1 {
+                                    reference,
+                                    commit: revision,
+                                    tree,
+                                    generation: generations
+                                        .base
+                                        .generation()
+                                        .manifest()
+                                        .generation_id
+                                        .clone(),
+                                };
+                                code_index_task_support::verify_exact_source_cursor(
+                                    &execution_schedulers,
+                                    &execution_scope,
+                                    execution_cursor.as_ref(),
+                                    &exact_source,
+                                )
+                                .await?;
+                                execution_schedulers
+                                    .execute_query_search_on_generation(
+                                        &execution_scope,
+                                        execution_request,
+                                        generations.base,
+                                        execution_control.clone(),
+                                    )
+                                    .await
+                            };
+                            // The permit follows request settlement, not this
+                            // work's natural completion. `work` is polled first, so
+                            // an unsettled request behaves exactly as before; a
+                            // settled one is dropped where it stands, including
+                            // mid-`mounted.lock()` or mid-decode, the awaits that
+                            // no checkpoint covers, and `_execution_permit` is
+                            // released with the task. `settle_owned_blocking_task`
+                            // below normally names the precise terminal reason
+                            // first; this only keeps the typed state when it did
+                            // not.
+                            tokio::pin!(work);
+                            tokio::select! {
+                                biased;
+                                output = &mut work => output,
+                                _ = settlement_control.settled() => Err(
+                                    code_index_scheduler::query_runtime::QuerySearchExecutionErrorV1::Retrieval(
+                                        tracedecay_query::retrieval::RetrievalPortError::Cancelled,
+                                    ),
                                 ),
-                            ),
-                        }
-                    })
+                            }
+                        })
                     });
                     match tracing::Instrument::instrument(
                         code_index_task_support::settle_owned_blocking_task(
-                            execution,
+                            async { execution.await.and_then(|executed| executed) },
                             std::time::Duration::from_millis(10),
                             || search_terminated(&control, &admission_provider, None),
                         ),
@@ -1723,9 +1736,7 @@ where
                 Ok(scope) => scope,
                 Err(error) => return unavailable(error.search_reason()),
             };
-            if schedulers.automatic_admission_for_scope(&scope)
-                == Some(code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled)
-            {
+            if linked_worktree_unindexed(&schedulers, &scope, &request.project_root).await {
                 return unavailable(
                     code_search::CodeIndexSearchUnavailableReasonV1::LinkedWorktreeDisabled,
                 );
@@ -1802,7 +1813,7 @@ where
                 }
             };
             let read_control = Arc::clone(&control);
-            let read = tokio::task::spawn_blocking(move || {
+            let read = native_runtime::spawn_blocking(move || {
                 let _permit = permit;
                 owners.similar(&request, read_control.as_ref())
             })
@@ -1893,9 +1904,7 @@ where
                     code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
                 );
             }
-            if schedulers.automatic_admission_for_scope(&scope)
-                == Some(code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled)
-            {
+            if linked_worktree_unindexed(&schedulers, &scope, &request.project_root).await {
                 return unavailable(
                     code_search::CodeIndexSearchUnavailableReasonV1::LinkedWorktreeDisabled,
                 );
@@ -1972,7 +1981,7 @@ where
                 }
             };
             let read_control = Arc::clone(&control);
-            let read = tokio::task::spawn_blocking(move || {
+            let read = native_runtime::spawn_blocking(move || {
                 let _permit = permit;
                 owners.redundancy(&request, read_control.as_ref())
             })

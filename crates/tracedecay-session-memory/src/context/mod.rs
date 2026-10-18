@@ -8,6 +8,11 @@ pub mod read_cache;
 mod registered_scope;
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
+
+use tracing::Instrument;
 
 use tracedecay_contracts::now_micros;
 use tracedecay_domain::{
@@ -409,35 +414,45 @@ pub fn application_request_interruption(
 
 /// Runs one awaitable application step against the exact immutable deadline
 /// and the live cancellation token owned by the transport/runtime boundary.
-#[tracing::instrument(name = "usecases.context.interruptible", level = "trace", skip_all)]
-pub async fn run_application_request_interruptible<T, F>(
-    context: &tracedecay_contracts::RequestContext,
-    cancellation: &CancellationToken,
-    future: impl std::future::Future<Output = T>,
+pub fn run_application_request_interruptible<'a, T, F>(
+    context: &'a tracedecay_contracts::RequestContext,
+    cancellation: &'a CancellationToken,
+    future: impl Future<Output = T> + Send + 'a,
     on_interruption: F,
-) -> Result<T, RequestInterruption>
+) -> Pin<Box<dyn Future<Output = Result<T, RequestInterruption>> + Send + 'a>>
 where
-    F: FnOnce(),
+    T: Send + 'a,
+    F: FnOnce() + Send + 'a,
 {
-    if let Some(interruption) = application_request_interruption(context, cancellation) {
-        on_interruption();
-        return Err(interruption);
-    }
+    // The awaited step is erased before this wait is built. Leaving the
+    // concrete step in the wait makes every caller re-prove `Send` through
+    // that step's whole state (rust-lang/rust#159228).
+    let future: Pin<Box<dyn Future<Output = T> + Send + 'a>> = Box::pin(future);
+    let span = tracing::trace_span!("usecases.context.interruptible");
+    Box::pin(
+        async move {
+            if let Some(interruption) = application_request_interruption(context, cancellation) {
+                on_interruption();
+                return Err(interruption);
+            }
 
-    let terminal_at = context
-        .deadline()
-        .expires_at
-        .0
-        .min(context.grant().expires_at.0);
-    let remaining_micros = terminal_at.saturating_sub(application_observed_at().0);
-    let remaining_micros = u64::try_from(remaining_micros).unwrap_or(0);
-    race_application_request_wait(
-        remaining_micros,
-        cancellation.cancelled(),
-        future,
-        on_interruption,
+            let terminal_at = context
+                .deadline()
+                .expires_at
+                .0
+                .min(context.grant().expires_at.0);
+            let remaining_micros = terminal_at.saturating_sub(application_observed_at().0);
+            let remaining_micros = u64::try_from(remaining_micros).unwrap_or(0);
+            race_application_request_wait(
+                remaining_micros,
+                cancellation.cancelled(),
+                future,
+                on_interruption,
+            )
+            .await
+        }
+        .instrument(span),
     )
-    .await
 }
 
 /// Races one awaitable step against a wall-clock deadline and a live
@@ -466,22 +481,29 @@ async fn race_application_request_wait<T>(
     future: impl std::future::Future<Output = T>,
     on_interruption: impl FnOnce(),
 ) -> Result<T, RequestInterruption> {
-    tokio::pin!(cancelled);
-    let deadline = tokio::time::sleep(std::time::Duration::from_micros(remaining_micros));
-    tokio::pin!(deadline);
-    tokio::pin!(future);
-    tokio::select! {
-        biased;
-        result = &mut future => Ok(result),
-        () = &mut cancelled => {
-            on_interruption();
-            Err(RequestInterruption::Cancelled)
+    let mut cancelled = std::pin::pin!(cancelled);
+    let mut deadline = std::pin::pin!(asupersync::time::sleep(
+        asupersync::time::wall_now(),
+        std::time::Duration::from_micros(remaining_micros),
+    ));
+    let mut future = std::pin::pin!(future);
+    let result = std::future::poll_fn(|task| {
+        if let Poll::Ready(value) = future.as_mut().poll(task) {
+            return Poll::Ready(Ok(value));
         }
-        () = &mut deadline => {
-            on_interruption();
-            Err(RequestInterruption::DeadlineExceeded)
+        if cancelled.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(RequestInterruption::Cancelled));
         }
+        if deadline.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(RequestInterruption::DeadlineExceeded));
+        }
+        Poll::Pending
+    })
+    .await;
+    if result.is_err() {
+        on_interruption();
     }
+    result
 }
 
 /// The explicit failure states when the root orchestration context crosses
@@ -823,8 +845,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn application_interruptible_observes_live_transport_cancellation() {
+    #[asupersync::test]
+    async fn application_interruptible_observes_live_transport_cancellation(cx: &asupersync::Cx) {
         let scope = project_identity().application_scope().unwrap();
         let application = application_context(
             scope.clone(),
@@ -834,10 +856,12 @@ mod tests {
         );
         let cancellation = CancellationToken::new();
         let trigger = cancellation.clone();
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            trigger.cancel();
-        });
+        let mut trigger_task = cx
+            .spawn(move |_cx| async move {
+                asupersync::runtime::yield_now().await;
+                trigger.cancel();
+            })
+            .expect("spawn cancellation trigger");
 
         let result = run_application_request_interruptible(
             &application,
@@ -847,6 +871,10 @@ mod tests {
         )
         .await;
 
+        trigger_task
+            .join(cx)
+            .await
+            .expect("join cancellation trigger");
         assert_eq!(result, Err(RequestInterruption::Cancelled));
         assert!(
             !application.cancellation().is_cancelled(),

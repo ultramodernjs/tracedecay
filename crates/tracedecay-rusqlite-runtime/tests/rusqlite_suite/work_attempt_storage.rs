@@ -15,12 +15,13 @@ use std::{
 use tracedecay_contracts::{
     VerifiedWorkRetryFailureV1, WorkAttemptAdmissionKind, WorkAttemptCapacityScopeV1,
     WorkAttemptCapacityVerdictV1, WorkAttemptEffectDispatchOutcomeV1, WorkAttemptEffectHolderV1,
-    WorkAttemptEffectResolutionV1, WorkAttemptEffectStorageErrorV1, WorkAttemptEffectStoragePortV1,
-    WorkAttemptEvidenceReadPort, WorkAttemptEvidenceRecordV1, WorkAttemptInsertOutcome,
-    WorkAttemptProviderOutcomeV1, WorkAttemptReceiptReadPortV1, WorkAttemptStorageError,
-    WorkAttemptStoragePort, WorkOwnerObservationMarkOutcomeV1, WorkOwnerObservationStoragePortV1,
-    WorkRetryAttemptOutcomeV1, WorkRetryCauseV1, WorkRetryFailureSelectorV1, WorkRetryReceiptV1,
-    WorkRetrySourceV1, WorkRetryStoragePortV1, WorkRetryWriteV1, WorkRunControlStoragePort,
+    WorkAttemptEffectReadPortV1, WorkAttemptEffectResolutionV1, WorkAttemptEffectStorageErrorV1,
+    WorkAttemptEffectStoragePortV1, WorkAttemptEvidenceReadPort, WorkAttemptEvidenceRecordV1,
+    WorkAttemptInsertOutcome, WorkAttemptProviderOutcomeV1, WorkAttemptReceiptReadPortV1,
+    WorkAttemptStorageError, WorkAttemptStoragePort, WorkOwnerObservationMarkOutcomeV1,
+    WorkOwnerObservationStoragePortV1, WorkRetryAttemptOutcomeV1, WorkRetryCauseV1,
+    WorkRetryFailureSelectorV1, WorkRetryReceiptV1, WorkRetrySourceV1, WorkRetryStoragePortV1,
+    WorkRetryWriteV1, WorkRunControlStoragePort, WorkRunControlTransitionPort,
     WorkSynthesisAdmissionRecordV1, WorkSynthesisAdmissionStoragePort, WorkSynthesisAdmissionV1,
     WorkSynthesisEvidenceGroupV1, WorkSynthesisInsertOutcome, WorkSynthesisSourceEnvelopeV1,
     WorkSynthesisSourceOutcomeV1, WorkSynthesisSourceSetV1, WorkflowSynthesisDraft,
@@ -42,6 +43,7 @@ use tracedecay_domain::{
 };
 
 use common::fixture_abs_root;
+use tracedecay_rusqlite_runtime::work_run_control::WorkSqliteJobStorage;
 use tracedecay_rusqlite_runtime::workflow::install_workflow_schema;
 use work_registered_store::RegisteredWorkStore;
 
@@ -252,6 +254,78 @@ fn bounded_insert_and_read_only_verdict_share_project_global_capacity() {
 }
 
 #[test]
+fn bounded_insert_refuses_a_route_at_its_snapshot_concurrency_limit() {
+    let store = RegisteredWorkStore::start("attempt-route-capacity");
+    let first_authority = authority_in_scope(
+        "project.attempt.route",
+        "repository.attempt.route.first",
+        "actor.attempt.route.first",
+        "worktree.attempt.route.first",
+    );
+    let peer_authority = authority_in_scope(
+        "project.attempt.route",
+        "repository.attempt.route.peer",
+        "actor.attempt.route.peer",
+        "worktree.attempt.route.peer",
+    );
+    let policy = concurrency(2, 2, 1);
+    let limited = route("route.attempt.limited.v1");
+    let on_route = |task: &str, route: &WorkProviderRouteV1| {
+        attempt_on_route(
+            WorkAttemptIdentityV1::new(
+                id::<TaskId>(task),
+                id::<RunId>(&format!("run.{task}")),
+                id::<AttemptId>(&format!("attempt.{task}")),
+            )
+            .unwrap(),
+            1,
+            WorkEffectStateV1::Observational,
+            route.clone(),
+            1,
+        )
+    };
+    let first = on_route("task.attempt.route.first", &limited);
+    let second = on_route("task.attempt.route.second", &limited);
+    let other_route = on_route("task.attempt.route.other", &route("route.attempt.other.v1"));
+
+    assert_eq!(
+        store
+            .storage()
+            .insert_bounded(&first_authority, &first, &policy)
+            .unwrap(),
+        WorkAttemptInsertOutcome::Inserted
+    );
+    let capacities = store
+        .storage()
+        .admission_capacities(
+            &peer_authority,
+            std::slice::from_ref(second.identity().task_id()),
+            &policy,
+        )
+        .unwrap();
+    assert_eq!(
+        capacities[second.identity().task_id()].verdict(),
+        WorkAttemptCapacityVerdictV1::Available,
+        "the topology caps alone admit a second attempt"
+    );
+    assert_eq!(
+        store
+            .storage()
+            .insert_bounded(&peer_authority, &second, &policy),
+        Err(WorkAttemptStorageError::CapacityExceeded),
+        "a route limit of one refuses a second concurrent attempt on that route"
+    );
+    assert_eq!(
+        store
+            .storage()
+            .insert_bounded(&peer_authority, &other_route, &policy)
+            .unwrap(),
+        WorkAttemptInsertOutcome::Inserted
+    );
+    assert_eq!(store.count("work_attempts_v1"), 2);
+}
+
+#[test]
 fn bounded_insert_counts_open_attempts_across_repository_worktrees() {
     let store = RegisteredWorkStore::start("attempt-bounded-insert");
     let root = authority_in_worktree("actor.attempt.bounded", "worktree.attempt.root");
@@ -395,10 +469,7 @@ fn retry_reservation_cannot_overbook_project_global_capacity() {
 
     let write = retry_write(&original);
     assert_eq!(
-        store
-            .storage()
-            .insert_retry_bounded(&retry_authority, &write, &concurrency(1, 1, 1))
-            .unwrap_err(),
+        insert_retry(&store, &retry_authority, &write, &concurrency(1, 1, 1)).unwrap_err(),
         WorkAttemptStorageError::CapacityExceeded
     );
     assert_eq!(store.count("work_attempts_v1"), 2);
@@ -424,10 +495,13 @@ fn recovery_retry_replaces_the_original_across_active_attempt_census() {
     ));
     store.storage().insert(&authority, &original).unwrap();
 
-    let outcome = store
-        .storage()
-        .insert_retry_bounded(&authority, &retry_write(&original), &concurrency(1, 1, 1))
-        .unwrap();
+    let outcome = insert_retry(
+        &store,
+        &authority,
+        &retry_write(&original),
+        &concurrency(1, 1, 1),
+    )
+    .unwrap();
     assert!(matches!(outcome, WorkRetryAttemptOutcomeV1::Created { .. }));
     let replacement = outcome.attempt().clone();
     assert_eq!(store.count("work_attempts_v1"), 2);
@@ -476,14 +550,7 @@ fn recovery_retry_replaces_the_original_across_active_attempt_census() {
         admission.live_attempts,
         vec![replacement.identity().attempt_id().clone()]
     );
-    let workflow_live = store
-        .storage()
-        .workflow_bound_live_attempts(
-            &authority,
-            original.identity().task_id(),
-            original.identity().run_id(),
-        )
-        .unwrap();
+    let workflow_live = workflow_bound_live_attempts(&store, &authority, original.identity());
     assert_eq!(workflow_live.len(), 1);
     assert_eq!(
         workflow_live[0].attempt_id,
@@ -555,17 +622,7 @@ fn recovery_retry_replaces_the_original_across_active_attempt_census() {
         .unwrap();
     assert_eq!(admission.total_attempts, 2);
     assert!(admission.live_attempts.is_empty());
-    assert!(
-        store
-            .storage()
-            .workflow_bound_live_attempts(
-                &authority,
-                original.identity().task_id(),
-                original.identity().run_id(),
-            )
-            .unwrap()
-            .is_empty()
-    );
+    assert!(workflow_bound_live_attempts(&store, &authority, original.identity()).is_empty());
 }
 
 #[test]
@@ -584,10 +641,7 @@ fn successful_retry_remains_pending_until_exact_durable_marker_cas() {
     ));
     store.storage().insert(&authority, &original).unwrap();
     let write = retry_write(&original);
-    store
-        .storage()
-        .insert_retry_bounded(&authority, &write, &concurrency(1, 1, 1))
-        .unwrap();
+    insert_retry(&store, &authority, &write, &concurrency(1, 1, 1)).unwrap();
 
     let pending = store
         .storage()
@@ -737,10 +791,7 @@ fn effect_holder_is_exact_replayable_and_reconciles_unknown_across_restart() {
     )
     .unwrap();
     assert_eq!(
-        store
-            .storage()
-            .begin_effect_dispatch(&exact_authority, &first)
-            .unwrap(),
+        begin_dispatch(&store, &exact_authority, &first).unwrap(),
         WorkAttemptEffectDispatchOutcomeV1::Recorded(first.clone())
     );
     let replay = WorkAttemptEffectHolderV1::dispatched(
@@ -751,10 +802,7 @@ fn effect_holder_is_exact_replayable_and_reconciles_unknown_across_restart() {
     )
     .unwrap();
     assert_eq!(
-        store
-            .storage()
-            .begin_effect_dispatch(&exact_authority, &replay)
-            .unwrap(),
+        begin_dispatch(&store, &exact_authority, &replay).unwrap(),
         WorkAttemptEffectDispatchOutcomeV1::Replayed(first),
         "an exact receipt replay never authorizes a second provider dispatch"
     );
@@ -766,36 +814,31 @@ fn effect_holder_is_exact_replayable_and_reconciles_unknown_across_restart() {
     )
     .unwrap();
     assert_eq!(
-        store
-            .storage()
-            .begin_effect_dispatch(&exact_authority, &conflicting_deadline)
-            .unwrap_err(),
+        begin_dispatch(&store, &exact_authority, &conflicting_deadline).unwrap_err(),
         WorkAttemptEffectStorageErrorV1::Conflict
     );
-    let unknown = store
-        .storage()
-        .settle_effect_dispatch(
-            &exact_authority,
-            attempt.identity(),
-            WorkAttemptEffectResolutionV1::Unknown,
-            UtcMicros(50),
-        )
-        .unwrap();
+    let unknown = settle_dispatch(
+        &store,
+        &exact_authority,
+        attempt.identity(),
+        WorkAttemptEffectResolutionV1::Unknown,
+        UtcMicros(50),
+    )
+    .unwrap();
     assert_eq!(
         unknown.resolution(),
         Some(WorkAttemptEffectResolutionV1::Unknown)
     );
 
     let restarted = store.restart("attempt-effect-holder");
-    let no_effect = restarted
-        .storage()
-        .settle_effect_dispatch(
-            &exact_authority,
-            attempt.identity(),
-            WorkAttemptEffectResolutionV1::NoEffect,
-            UtcMicros(60),
-        )
-        .unwrap();
+    let no_effect = settle_dispatch(
+        &restarted,
+        &exact_authority,
+        attempt.identity(),
+        WorkAttemptEffectResolutionV1::NoEffect,
+        UtcMicros(60),
+    )
+    .unwrap();
     assert_eq!(
         no_effect.resolution(),
         Some(WorkAttemptEffectResolutionV1::NoEffect)
@@ -831,20 +874,30 @@ fn lease(epoch: u64) -> WorkLeaseFenceV1 {
 }
 
 fn requested_route() -> WorkProviderRouteV1 {
+    route("route.attempt.claude-code.v1")
+}
+
+fn route(route_id: &str) -> WorkProviderRouteV1 {
     WorkProviderRouteV1::new(
         id::<ProviderId>("provider.work.claude-code-cli"),
-        id::<WorkProviderRouteId>("route.attempt.claude-code.v1"),
+        id::<WorkProviderRouteId>(route_id),
     )
     .unwrap()
 }
 
-fn execution_snapshot() -> WorkExecutionSnapshot {
+/// Generous enough that topology-focused tests never meet the route limit.
+const FIXTURE_ROUTE_CONCURRENCY: u32 = 64;
+
+fn execution_snapshot_on(
+    route: WorkProviderRouteV1,
+    max_concurrency: u32,
+) -> WorkExecutionSnapshot {
     WorkExecutionSnapshot::new(WorkExecutionSnapshotInput {
         configuration_revision_id: id::<ConfigurationRevisionId>("configuration-revision.att.1"),
         configuration_snapshot_id: id::<ConfigurationSnapshotId>("configuration-snapshot.att.1"),
         effective_behavior_digest: digest('c'),
         resolution_provenance_digest: digest('d'),
-        route: requested_route(),
+        route,
         backend: WorkProviderBackendV1::ClaudeCodeCli,
         protocol: WorkProviderProtocol::ClaudeStreamJson,
         model: "claude-test".to_owned(),
@@ -859,7 +912,8 @@ fn execution_snapshot() -> WorkExecutionSnapshot {
         egress: WorkEgressPolicy::Deny,
         environment_allowlist: BTreeSet::new(),
         credential_references: BTreeSet::new(),
-        limits: WorkExecutionLimits::new(128_000, 8_192, 16_384, 16_384, 65_536, 1).unwrap(),
+        limits: WorkExecutionLimits::new(128_000, 8_192, 16_384, 16_384, 65_536, max_concurrency)
+            .unwrap(),
         deadline: UtcMicros(1_000_000),
         fallback: WorkFallbackTopology::Disabled,
         topology: tracedecay_domain::safe_work_topology_policy_v1(),
@@ -892,6 +946,22 @@ fn attempt_with_effect(
     epoch: u64,
     effect_state: WorkEffectStateV1,
 ) -> WorkAttemptV1 {
+    attempt_on_route(
+        identity,
+        epoch,
+        effect_state,
+        requested_route(),
+        FIXTURE_ROUTE_CONCURRENCY,
+    )
+}
+
+fn attempt_on_route(
+    identity: WorkAttemptIdentityV1,
+    epoch: u64,
+    effect_state: WorkEffectStateV1,
+    route: WorkProviderRouteV1,
+    max_concurrency: u32,
+) -> WorkAttemptV1 {
     let binding = WorkAttemptProjectionBindingV1::new(
         WorkGraphVersionV1::new(3).unwrap(),
         WorkProductEventSequenceV1::new(7).unwrap(),
@@ -904,7 +974,7 @@ fn attempt_with_effect(
         identity.clone(),
         binding.clone(),
         id::<WorkflowOperationRef>("operation.attempt.execute-provider"),
-        execution_snapshot(),
+        execution_snapshot_on(route.clone(), max_concurrency),
         id::<ProjectId>("project.attempt.storage"),
         id::<RepositoryId>("repository.attempt.storage"),
         id::<WorktreeId>("worktree.attempt.storage"),
@@ -926,7 +996,7 @@ fn attempt_with_effect(
         Vec::new(),
         WorkCancellationStateV1::None,
         WorkRecoveryStateV1::Fresh,
-        requested_route(),
+        route,
         None,
         None,
     )
@@ -1027,6 +1097,92 @@ fn recovery_required(attempt: &WorkAttemptV1) -> WorkAttemptV1 {
         None,
     )
     .unwrap()
+}
+
+/// Runs one storage call as a writer job, which commits only when it returns
+/// `Ok`.
+fn in_job<R: Send + 'static, E: Send + 'static>(
+    store: &RegisteredWorkStore,
+    call: impl Fn(WorkSqliteJobStorage<'_>) -> Result<R, E> + Send + Sync + 'static,
+) -> Result<R, E> {
+    tracedecay_rusqlite_runtime::native_runtime::block_on(store.storage().transact(call))
+        .expect("native runtime")
+        .expect("the writer runs the job")
+}
+
+fn workflow_bound_live_attempts(
+    store: &RegisteredWorkStore,
+    authority: &WorkAuthority,
+    attempt: &WorkAttemptIdentityV1,
+) -> Vec<tracedecay_contracts::WorkRunLiveAttemptV1> {
+    let (authority, task_id, run_id) = (
+        authority.clone(),
+        attempt.task_id().clone(),
+        attempt.run_id().clone(),
+    );
+    in_job(store, move |storage| {
+        storage.workflow_bound_live_attempts(&authority, &task_id, &run_id)
+    })
+    .unwrap()
+}
+
+fn begin_dispatch(
+    store: &RegisteredWorkStore,
+    authority: &WorkAuthority,
+    holder: &WorkAttemptEffectHolderV1,
+) -> Result<WorkAttemptEffectDispatchOutcomeV1, WorkAttemptEffectStorageErrorV1> {
+    let (authority, holder) = (authority.clone(), holder.clone());
+    in_job(store, move |storage| {
+        storage.begin_effect_dispatch(&authority, &holder)
+    })
+}
+
+fn settle_dispatch(
+    store: &RegisteredWorkStore,
+    authority: &WorkAuthority,
+    attempt: &WorkAttemptIdentityV1,
+    resolution: WorkAttemptEffectResolutionV1,
+    resolved_at: UtcMicros,
+) -> Result<WorkAttemptEffectHolderV1, WorkAttemptEffectStorageErrorV1> {
+    let (authority, attempt) = (authority.clone(), attempt.clone());
+    in_job(store, move |storage| {
+        storage.settle_effect_dispatch(&authority, &attempt, resolution, resolved_at)
+    })
+}
+
+fn insert_retry(
+    store: &RegisteredWorkStore,
+    authority: &WorkAuthority,
+    write: &WorkRetryWriteV1,
+    concurrency: &TopologyConcurrencyPolicyV1,
+) -> Result<WorkRetryAttemptOutcomeV1, WorkAttemptStorageError> {
+    let (authority, write, concurrency) = (authority.clone(), write.clone(), concurrency.clone());
+    in_job(store, move |storage| {
+        storage.insert_retry_bounded(&authority, &write, &concurrency)
+    })
+}
+
+fn insert_synthesis(
+    store: &RegisteredWorkStore,
+    authority: &WorkAuthority,
+    record: &WorkSynthesisAdmissionRecordV1,
+    concurrency: &TopologyConcurrencyPolicyV1,
+) -> Result<WorkSynthesisInsertOutcome, WorkAttemptStorageError> {
+    let (authority, record, concurrency) = (authority.clone(), record.clone(), concurrency.clone());
+    in_job(store, move |storage| {
+        storage.insert_synthesis_bounded(&authority, &record, &concurrency)
+    })
+}
+
+fn load_synthesis(
+    store: &RegisteredWorkStore,
+    authority: &WorkAuthority,
+    identity: &WorkAttemptIdentityV1,
+) -> Result<WorkSynthesisAdmissionRecordV1, WorkAttemptStorageError> {
+    let (authority, identity) = (authority.clone(), identity.clone());
+    in_job(store, move |storage| {
+        storage.load_synthesis(&authority, &identity)
+    })
 }
 
 fn retry_write(original: &WorkAttemptV1) -> WorkRetryWriteV1 {
@@ -1183,10 +1339,7 @@ fn insert_replays_identical_admissions_and_refuses_divergent_ones() {
         WorkAttemptAdmissionKind::Ordinary
     );
     assert_eq!(
-        store
-            .storage()
-            .load_synthesis(&authority, first.identity())
-            .unwrap_err(),
+        load_synthesis(&store, &authority, first.identity()).unwrap_err(),
         WorkAttemptStorageError::AttemptConflict
     );
     // The same identity with different content is a conflict, not a refresh.
@@ -1233,17 +1386,11 @@ fn synthesis_admission_replays_one_durable_result_and_refuses_changed_requests()
     let policy = concurrency(1, 1, 1);
 
     assert_eq!(
-        store
-            .storage()
-            .insert_synthesis_bounded(&authority, &record, &policy)
-            .unwrap(),
+        insert_synthesis(&store, &authority, &record, &policy).unwrap(),
         WorkSynthesisInsertOutcome::Inserted
     );
     assert_eq!(
-        store
-            .storage()
-            .insert_synthesis_bounded(&authority, &record, &policy)
-            .unwrap(),
+        insert_synthesis(&store, &authority, &record, &policy).unwrap(),
         WorkSynthesisInsertOutcome::Replayed(Box::new(admission.clone()))
     );
     assert_eq!(store.count("work_attempts_v1"), 1);
@@ -1253,10 +1400,7 @@ fn synthesis_admission_replays_one_durable_result_and_refuses_changed_requests()
         result: admission,
     };
     assert_eq!(
-        store
-            .storage()
-            .insert_synthesis_bounded(&authority, &changed, &policy)
-            .unwrap_err(),
+        insert_synthesis(&store, &authority, &changed, &policy).unwrap_err(),
         WorkAttemptStorageError::AttemptConflict
     );
     assert_eq!(store.count("work_attempts_v1"), 1);
@@ -1280,19 +1424,13 @@ fn synthesis_admission_replays_one_durable_result_and_refuses_changed_requests()
         )
         .unwrap();
     assert_eq!(
-        store
-            .storage()
-            .load_synthesis(&authority, admitted_attempt.identity())
-            .unwrap(),
+        load_synthesis(&store, &authority, admitted_attempt.identity()).unwrap(),
         record
     );
 
     let store = store.restart("attempt-synthesis-insert");
     assert_eq!(
-        store
-            .storage()
-            .load_synthesis(&authority, admitted_attempt.identity())
-            .unwrap(),
+        load_synthesis(&store, &authority, admitted_attempt.identity()).unwrap(),
         record
     );
     assert_eq!(

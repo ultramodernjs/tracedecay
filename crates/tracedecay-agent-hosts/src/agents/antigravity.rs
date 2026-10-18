@@ -29,8 +29,10 @@ use tracedecay_domain::errors::Result;
 
 use super::host_bundle::{HostBundleRegistrationStateV1, HostComponentV1};
 use super::mcp_registration::{
-    McpRegistrationOutcome, remove_mcp_server_entry, set_mcp_server_entry,
+    McpRegistrationOutcome, launches_serve, remove_mcp_server_entry,
+    serve_entry_registration_state, set_mcp_server_entry,
 };
+use super::serve_args::ServeArgs;
 use super::{
     AgentIntegration, DoctorCounters, HealthcheckContext, InstallContext, JsonConfigDialect,
     McpDoctorLabels, TextFileMutation, report_mcp_registration,
@@ -63,6 +65,7 @@ impl AgentIntegration for AntigravityIntegration {
         doctor_check_registration(
             dc,
             &mcp_config_path(&ctx.home),
+            &ctx.catalog_profiles.serve_args(self.id()),
             "the Antigravity IDE",
             "IDE MCP server registered",
             "MCP server NOT registered",
@@ -70,6 +73,7 @@ impl AgentIntegration for AntigravityIntegration {
         doctor_check_registration(
             dc,
             &cli_plugin_path(&ctx.home),
+            &ctx.catalog_profiles.serve_args(self.id()),
             "the Antigravity CLI (#85)",
             "CLI plugin registered",
             "CLI plugin file exists but lacks `mcpServers.tracedecay`",
@@ -84,7 +88,7 @@ impl AgentIntegration for AntigravityIntegration {
         if component != HostComponentV1::ContextMcp {
             return HostBundleRegistrationStateV1::Missing;
         }
-        antigravity_registration_state(&ctx.home, None)
+        antigravity_registration_state(&ctx.home, None, &ctx.catalog_profiles.serve_args(self.id()))
     }
 
     fn host_component_registration_for_lifecycle(
@@ -96,7 +100,11 @@ impl AgentIntegration for AntigravityIntegration {
         if component != HostComponentV1::ContextMcp {
             return HostBundleRegistrationStateV1::Missing;
         }
-        antigravity_registration_state(&ctx.home, Some(&install.tracedecay_bin))
+        antigravity_registration_state(
+            &ctx.home,
+            Some(&install.tracedecay_bin),
+            &install.serve_args,
+        )
     }
 
     fn is_detected(&self, home: &Path) -> bool {
@@ -136,14 +144,26 @@ impl AgentIntegration for AntigravityIntegration {
         uninstall_mcp_if_selected(components, &ctx.home)
     }
 
+    /// Presence is profile-blind, so a host on another catalog profile stays
+    /// in reinstall sweeps.
     fn has_tracedecay(&self, home: &Path, _profile: &ProfileRoot) -> bool {
-        antigravity_registration_state(home, None) == HostBundleRegistrationStateV1::Current
+        [mcp_config_path(home), cli_plugin_path(home)]
+            .iter()
+            .all(|config| {
+                std::fs::read(config)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                    .is_some_and(|settings| {
+                        launches_serve(settings.pointer("/mcpServers/tracedecay/args"))
+                    })
+            })
     }
 }
 
 fn document_registration_state(
     config: &Path,
     expected_binary: Option<&str>,
+    serve_args: &ServeArgs,
 ) -> HostBundleRegistrationStateV1 {
     let Ok(bytes) = std::fs::read(config) else {
         return HostBundleRegistrationStateV1::Missing;
@@ -151,32 +171,20 @@ fn document_registration_state(
     let Ok(settings) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return HostBundleRegistrationStateV1::Corrupt;
     };
-    let Some(server) = settings.pointer("/mcpServers/tracedecay") else {
-        return HostBundleRegistrationStateV1::Missing;
-    };
-    let command_matches = server
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|command| {
-            expected_binary.map_or_else(|| !command.is_empty(), |expected| command == expected)
-        });
-    let serves_tracedecay = server
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|args| args.len() == 1 && args[0].as_str() == Some("serve"));
-    if server.is_object() && command_matches && serves_tracedecay {
-        HostBundleRegistrationStateV1::Current
-    } else {
-        HostBundleRegistrationStateV1::Repairable
-    }
+    settings
+        .pointer("/mcpServers/tracedecay")
+        .map_or(HostBundleRegistrationStateV1::Missing, |server| {
+            serve_entry_registration_state(server, expected_binary, serve_args)
+        })
 }
 
 fn antigravity_registration_state(
     home: &Path,
     expected_binary: Option<&str>,
+    serve_args: &ServeArgs,
 ) -> HostBundleRegistrationStateV1 {
-    let ide = document_registration_state(&mcp_config_path(home), expected_binary);
-    let cli = document_registration_state(&cli_plugin_path(home), expected_binary);
+    let ide = document_registration_state(&mcp_config_path(home), expected_binary, serve_args);
+    let cli = document_registration_state(&cli_plugin_path(home), expected_binary, serve_args);
     match (ide, cli) {
         (HostBundleRegistrationStateV1::Current, HostBundleRegistrationStateV1::Current) => {
             HostBundleRegistrationStateV1::Current
@@ -207,6 +215,7 @@ fn antigravity_registration_state(
 fn doctor_check_registration(
     dc: &mut DoctorCounters,
     config: &Path,
+    serve_args: &ServeArgs,
     product: &'static str,
     registered: &'static str,
     missing: &'static str,
@@ -222,7 +231,8 @@ fn doctor_check_registration(
     report_mcp_registration(
         dc,
         config,
-        document_registration_state(config, None) == HostBundleRegistrationStateV1::Current,
+        document_registration_state(config, None, serve_args)
+            == HostBundleRegistrationStateV1::Current,
         &McpDoctorLabels {
             agent_id: "antigravity",
             product,
@@ -232,11 +242,16 @@ fn doctor_check_registration(
     );
 }
 
-fn add_registration(config: &Path, existing: &str, binary: &str) -> Result<TextFileMutation> {
+fn add_registration(
+    config: &Path,
+    existing: &str,
+    binary: &str,
+    serve_args: &ServeArgs,
+) -> Result<TextFileMutation> {
     let mut settings = JsonConfigDialect::Json.parse_for_edit(config, existing)?;
     let entry = json!({
         "command": binary,
-        "args": ["serve"],
+        "args": serve_args.json(&[]),
         "env": {},
         "transport": "stdio",
     });
@@ -257,8 +272,8 @@ fn install_mcp_if_selected(components: &[HostComponentV1], ctx: &InstallContext)
     update_two_config_files_transactionally(&ide, &cli, |ide_existing, cli_existing| {
         Ok((
             (),
-            add_registration(&ide, ide_existing, &ctx.tracedecay_bin)?,
-            add_registration(&cli, cli_existing, &ctx.tracedecay_bin)?,
+            add_registration(&ide, ide_existing, &ctx.tracedecay_bin, &ctx.serve_args)?,
+            add_registration(&cli, cli_existing, &ctx.tracedecay_bin, &ctx.serve_args)?,
         ))
     })
 }
@@ -300,6 +315,7 @@ mod tests {
             tracedecay_bin: binary.to_string(),
             project_root: None,
             dashboard: false,
+            serve_args: Default::default(),
         }
     }
 
@@ -325,7 +341,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            antigravity_registration_state(home.path(), Some("/tmp/tracedecay")),
+            antigravity_registration_state(
+                home.path(),
+                Some("/tmp/tracedecay"),
+                &ServeArgs::default()
+            ),
             HostBundleRegistrationStateV1::Current
         );
         assert_eq!(
@@ -387,7 +407,11 @@ mod tests {
         );
 
         assert_eq!(
-            antigravity_registration_state(home.path(), Some("/tmp/tracedecay")),
+            antigravity_registration_state(
+                home.path(),
+                Some("/tmp/tracedecay"),
+                &ServeArgs::default()
+            ),
             HostBundleRegistrationStateV1::Repairable
         );
     }

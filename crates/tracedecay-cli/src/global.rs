@@ -5,10 +5,7 @@ use tracedecay_contracts::retrieval::{
     AdminCliRegistryListV1, AdminCliResultV1, AdminCliSurfaceRequestV1,
 };
 
-use crate::{
-    commands::{admin_cli_result, admin_cli_result_mismatch},
-    current_unix_timestamp,
-};
+use crate::commands::{admin_cli_result, admin_cli_result_mismatch};
 
 pub(crate) use tracedecay_runtime_core::storage::{ProjectStorageLocation, ProjectStorageStatus};
 
@@ -33,27 +30,6 @@ pub(crate) async fn classify_project_storage_with_registry(
     registry
         .classify_project_storage(project_root, profile_root)
         .await
-}
-
-#[cfg(test)]
-fn classify_registry_storage(
-    project_root: &Path,
-    profile_root: &Path,
-    store: &tracedecay_global_db::StoreInstanceRecord,
-) -> Option<ProjectStorageLocation> {
-    store.classify_storage(project_root, profile_root)
-}
-
-pub(crate) fn classify_registry_storage_value(
-    project_root: &Path,
-    profile_root: &Path,
-    store: &serde_json::Value,
-) -> Option<ProjectStorageLocation> {
-    tracedecay_runtime_core::storage::classify_registry_storage_value(
-        project_root,
-        profile_root,
-        store,
-    )
 }
 
 /// Returns how many seconds have elapsed since a persisted timestamp.
@@ -84,7 +60,7 @@ pub(crate) fn try_flush(
     if config.pending_upload == 0 || !upload_enabled {
         return;
     }
-    let now = current_unix_timestamp();
+    let now = tracedecay_runtime_core::tracedecay::current_timestamp();
 
     // Cooldown: skip if last flush attempt failed less than 60s ago
     if config.last_flush_attempt_at > config.last_upload_at
@@ -99,11 +75,9 @@ pub(crate) fn try_flush(
     }
 
     config.last_flush_attempt_at = now;
-    if let Some(worldwide_total) = crate::cloud::flush_pending(config.pending_upload) {
+    if crate::cloud::flush_pending(config.pending_upload).is_some() {
         config.pending_upload = 0;
         config.last_upload_at = now;
-        config.last_worldwide_total = worldwide_total;
-        config.last_worldwide_fetch_at = now;
     }
 }
 
@@ -581,7 +555,9 @@ mod gather_tests {
             last_write_at: None,
         };
 
-        let location = classify_registry_storage(&project_root, &profile_root, &store).unwrap();
+        let location = store
+            .classify_storage(&project_root, &profile_root)
+            .unwrap();
 
         assert_eq!(
             location.status,
@@ -599,8 +575,9 @@ mod gather_tests {
         {
             let symlinked_profile_root = dir.path().join("profile-link");
             symlink(&profile_root, &symlinked_profile_root).unwrap();
-            let location =
-                classify_registry_storage(&project_root, &symlinked_profile_root, &store).unwrap();
+            let location = store
+                .classify_storage(&project_root, &symlinked_profile_root)
+                .unwrap();
             assert_eq!(
                 location.status,
                 ProjectStorageStatus::ManifestReconstructable
@@ -609,39 +586,27 @@ mod gather_tests {
     }
 
     #[test]
-    fn skips_projects_inside_node_modules() {
-        let profile_dir = tempfile::tempdir().unwrap();
-        let profile = &ProfileRoot::new(profile_dir.path());
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().canonicalize().unwrap();
-        let buried = cwd.join("node_modules").join("pkg");
-        fs::create_dir_all(&buried).unwrap();
-        make_enrolled_project(profile, &buried, "proj_buried");
-
-        let out = gather_local_projects_from(profile, &cwd);
-        assert!(
-            !out.contains(&buried),
-            "projects inside node_modules must be skipped, got {out:?}"
-        );
-    }
-
-    #[test]
     fn skips_projects_inside_generated_directories() {
-        let profile_dir = tempfile::tempdir().unwrap();
-        let profile = &ProfileRoot::new(profile_dir.path());
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().canonicalize().unwrap();
         // `.worktrees` is in the canonical generated-dir list but was missing
         // from the hardcoded descendant skip set.
-        let buried = cwd.join(".worktrees").join("lane");
-        fs::create_dir_all(&buried).unwrap();
-        make_enrolled_project(profile, &buried, "proj_worktree");
+        for (generated, project_id) in [
+            ("node_modules", "proj_buried"),
+            (".worktrees", "proj_worktree"),
+        ] {
+            let profile_dir = tempfile::tempdir().unwrap();
+            let profile = &ProfileRoot::new(profile_dir.path());
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().canonicalize().unwrap();
+            let buried = cwd.join(generated).join("lane");
+            fs::create_dir_all(&buried).unwrap();
+            make_enrolled_project(profile, &buried, project_id);
 
-        let out = gather_local_projects_from(profile, &cwd);
-        assert!(
-            !out.contains(&buried),
-            "projects inside generated directories must be skipped, got {out:?}"
-        );
+            let out = gather_local_projects_from(profile, &cwd);
+            assert!(
+                !out.contains(&buried),
+                "projects inside {generated} must be skipped, got {out:?}"
+            );
+        }
     }
 
     #[test]

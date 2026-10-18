@@ -15,6 +15,7 @@ use tracedecay_store::observation::ObservationCoverageReason;
 
 use crate::admission::test_support::{MemoryHostAdmission, PanicHostAdmission};
 use crate::observation::ObservationCancellation;
+use crate::runtime::ingest::quarantine::SourceSweep;
 use crate::runtime::shared::StoredCursor;
 use tracedecay_privacy::{MAX_OBSERVATION_RECORD_BYTES, parse_normalized_observation_record_v1};
 
@@ -183,6 +184,8 @@ async fn cancelled_hermes_admission_stops_before_the_next_transactional_row() {
 
     let stats = admit_rows_with_admission_and_cancellation(
         &PanicHostAdmission,
+        &mut SourceSweep::new(PROVIDER, None),
+        std::path::Path::new("state.db"),
         &[fixture(1)],
         ObservationScopeV1::Project { project_id },
         ObservationSourceGenerationV1::new(1).unwrap(),
@@ -217,6 +220,7 @@ async fn cancelled_hermes_sweep_stops_before_opening_the_host_database() {
         dir.path(),
         tracedecay_domain::ProjectId::new("project.hermes-cancelled-read").unwrap(),
         &PanicHostAdmission,
+        &mut SourceSweep::new(PROVIDER, None),
         &mut budget,
         &cancellation,
     )
@@ -1160,7 +1164,7 @@ async fn batched_page_is_byte_identical_to_reference_projection() {
 }
 
 async fn explain_query_plan(
-    conn: &crate::runtime::shared::SqliteReadConn,
+    conn: &crate::runtime::host_sqlite::SqliteReadConn,
     sql: String,
     parameters: Vec<i64>,
 ) -> Vec<String> {
@@ -1541,105 +1545,6 @@ async fn multi_page_session_emits_one_usage_checkpoint_and_a_later_frontier_upda
     )));
 }
 
-mod destination_routing_tests {
-    use std::collections::HashMap;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use crate::runtime::shared::{ProjectRootMatcher, StoredCursor};
-    use tracedecay_runtime_core::git_discovery::{
-        GitDiscoveryUnknown, GitRepositoryIdentity, GitRepositoryIdentityOutcome,
-    };
-
-    use super::super::routing::turn_project_locations_for_destinations;
-    use super::super::rows::HermesRow;
-
-    static IDENTITY_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-
-    fn retrying_identity(path: &Path) -> GitRepositoryIdentityOutcome {
-        let root = path
-            .ancestors()
-            .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "repo"))
-            .unwrap_or(path);
-        if IDENTITY_ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            return GitRepositoryIdentityOutcome::Unknown(GitDiscoveryUnknown::DeadlineExceeded);
-        }
-        GitRepositoryIdentityOutcome::Resolved(GitRepositoryIdentity {
-            worktree_root: root.to_path_buf(),
-            git_dir: root.join(".git"),
-            common_dir: root.join(".git"),
-        })
-    }
-
-    fn row_with_cwd(cwd: &Path) -> HermesRow {
-        HermesRow {
-            id: 1,
-            session_id: "session".to_string(),
-            role: "user".to_string(),
-            content: Some("retry me".to_string()),
-            reasoning: None,
-            tool_name: None,
-            tool_calls: None,
-            timestamp: None,
-            session_model: None,
-            parent_session_id: None,
-            session_cwd: Some(cwd.to_string_lossy().to_string()),
-            session_source: None,
-            session_title: None,
-            session_started_at: None,
-            session_ended_at: None,
-            session_input_tokens: None,
-            session_output_tokens: None,
-            session_cache_read_tokens: None,
-            session_cache_write_tokens: None,
-            session_reasoning_tokens: None,
-            is_session_usage_frontier: false,
-            active: 1,
-            sql_value_oversized: false,
-            sql_measured_bytes: 0,
-        }
-    }
-
-    #[test]
-    fn unknown_destination_route_retries_without_advancing_cursor() {
-        IDENTITY_ATTEMPTS.store(0, Ordering::SeqCst);
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let project_root = temp.path().join("repo");
-        let cwd = project_root.join("packages/app");
-        std::fs::create_dir_all(&cwd).expect("cwd");
-        let rows = vec![row_with_cwd(&cwd)];
-        let previous = StoredCursor::default();
-        let mut persisted = previous;
-        let mut routes = HashMap::new();
-
-        let first_matchers = vec![ProjectRootMatcher::new_with_identity_resolver(
-            &project_root,
-            retrying_identity,
-        )];
-        assert!(
-            turn_project_locations_for_destinations(&rows, &first_matchers, &mut routes).is_err()
-        );
-        assert_eq!(persisted, previous);
-        assert!(routes.is_empty(), "unknown routes must not be cached");
-
-        let retry_matchers = vec![ProjectRootMatcher::new_with_identity_resolver(
-            &project_root,
-            retrying_identity,
-        )];
-        let locations =
-            turn_project_locations_for_destinations(&rows, &retry_matchers, &mut routes)
-                .expect("the same source rows should route after identity recovers");
-        assert_eq!(
-            locations[0].by_row_id.get(&1).copied(),
-            Some("session_cwd"),
-            "recovered identity must route the deferred row to its destination"
-        );
-        persisted.position = rows[0].id as u64;
-        assert!(persisted.position > previous.position);
-        assert_eq!(IDENTITY_ATTEMPTS.load(Ordering::SeqCst), 3);
-    }
-}
-
 /// A Hermes profile whose `state.db` cannot be opened is a skipped source, and
 /// a skipped source is a partial sweep. The outcome must say so; the provider
 /// turns it into a typed catch-up failure instead of reporting a clean pass.
@@ -1668,6 +1573,7 @@ async fn unreadable_state_db_is_a_counted_source_failure_not_a_clean_sweep() {
         &project_root,
         tracedecay_domain::ProjectId::new("project.hermes-unreadable-source").unwrap(),
         &admission,
+        &mut SourceSweep::new(PROVIDER, None),
         None,
         &ObservationCancellation::default(),
     )
@@ -1699,6 +1605,8 @@ mod deterministic_refusal_recovery {
         admission.refuse_captures_deterministically(reason);
         let stats = admit_rows_with_admission_and_cancellation(
             &admission,
+            &mut SourceSweep::new(PROVIDER, None),
+            std::path::Path::new("state.db"),
             &[fixture(1)],
             ObservationScopeV1::Profile,
             ObservationSourceGenerationV1::new(1).unwrap(),
@@ -1797,5 +1705,71 @@ fn hermes_timestamp_survives_the_json_boundary_into_one_identity() {
             tracedecay_privacy::ObservationSanitizationOutcomeV1::Durable { .. }
         ),
         "row must be durable, not refused"
+    );
+}
+
+/// A quarantined session is witnessed at its first uncovered row. Deleting
+/// that row makes the next row first, whose witness differs, so the session
+/// leaves quarantine instead of staying blocked behind a row that is gone.
+#[tokio::test]
+async fn deleting_a_refused_row_releases_its_session() {
+    crate::runtime::jsonl_observation_admission::install_test_shared_jsonl_preparation_authority();
+    let home = tempfile::tempdir().unwrap();
+    let state_db = home.path().join("state.db");
+    let hub = crate::runtime::hosts::codex::CodexDiscoveryHub::default();
+    hub.register("consumer", Some(home.path()));
+    let admission = MemoryHostAdmission::default();
+    admission.fail_captures_for_session(
+        "session-redacted",
+        crate::admission::HostAdmissionOutcome {
+            status: crate::admission::HostAdmissionStatus::Degraded,
+            retryable: false,
+            reason_code: Some("observation_cursor_advance_ledger_disagreement"),
+            recovery: None,
+            cause: None,
+        },
+    );
+    let pass = |rows: Vec<HermesRow>| {
+        let (admission, hub, state_db) = (&admission, &hub, &state_db);
+        async move {
+            let mut sweep = SourceSweep::new(PROVIDER, Some((hub, "consumer")));
+            admit_rows_with_admission_and_cancellation(
+                admission,
+                &mut sweep,
+                state_db,
+                &rows,
+                ObservationScopeV1::Profile,
+                ObservationSourceGenerationV1::new(1).unwrap(),
+                1,
+                1,
+                |_| Some(fixture_projection()),
+                &ObservationCancellation::default(),
+            )
+            .await
+            .expect("a refused session must not abandon the state.db");
+            let mut reports = crate::ProviderRunOutcome::skipped();
+            sweep.report_into(&mut reports);
+            reports.failures.len()
+        }
+    };
+
+    assert_eq!(pass(vec![fixture(1), fixture(2)]).await, 1);
+    assert_eq!(
+        admission.failed_session_capture_attempts(),
+        1,
+        "the refused session's later row is not attempted in the same pass"
+    );
+    assert_eq!(pass(vec![fixture(1), fixture(2)]).await, 0);
+    assert_eq!(
+        admission.failed_session_capture_attempts(),
+        1,
+        "the unchanged session stays quarantined"
+    );
+
+    assert_eq!(pass(vec![fixture(2)]).await, 1);
+    assert_eq!(
+        admission.failed_session_capture_attempts(),
+        2,
+        "deleting the refused row releases the session"
     );
 }

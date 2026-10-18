@@ -1,7 +1,7 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library")
 load("@npm//:defs.bzl", "npm_link_all_packages")
-load("@npm//sdks/typescript:@rslib/core/package_json.bzl", rslib_bin = "bin")
 load("@npm//sdks/typescript:vitest/package_json.bzl", vitest_bin = "bin")
+load("@npm//sdks/typescript:@rslib/core/package_json.bzl", rslib_bin = "bin")
 
 npm_link_all_packages(name = "node_modules")
 
@@ -32,9 +32,8 @@ js_binary(
 )
 
 vitest_bin.vitest_test(
-    name = "client_test",
-    args = ["run", "test/client.test.ts"],
+    name = "unit_test",
+    data = [":pkg", ":node_modules"] + glob(["test/**", "*.json", "*.ts"]),
+    args = ["run", "--exclude", "test/installed-package.test.ts"],
     chdir = package_name(),
-    data = [":pkg", ":node_modules", "test/client.test.ts", "tsconfig.json"],
-    visibility = ["//visibility:public"],
 )

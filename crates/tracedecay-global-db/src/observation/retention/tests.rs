@@ -242,7 +242,7 @@ async fn cursor(conn: &RetentionTestStore, pass: &str) -> Result<LedgerCursor, S
         .map_err(|error| error.to_string())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn active_ledger_pages_commit_progress_and_eventually_reach_late_releases()
 -> Result<(), String> {
     let conn = test_store().await;
@@ -285,7 +285,7 @@ async fn active_ledger_pages_commit_progress_and_eventually_reach_late_releases(
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn aging_releases_progress_while_appended_releases_fill_the_batch() -> Result<(), String> {
     let conn = test_store().await;
     let config = ObservationRetentionConfig {
@@ -334,7 +334,7 @@ async fn aging_releases_progress_while_appended_releases_fill_the_batch() -> Res
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn scoped_progress_reaches_late_evidence_without_changing_global_or_dry_run_cursors()
 -> Result<(), String> {
     let conn = test_store().await;
@@ -390,7 +390,7 @@ async fn scoped_progress_reaches_late_evidence_without_changing_global_or_dry_ru
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn failed_release_keeps_payload_and_cursor_retryable() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "retry-release", GEN, 4096).await?;
@@ -433,7 +433,7 @@ async fn failed_release_keeps_payload_and_cursor_retryable() -> Result<(), Strin
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn cursor_commit_failure_rolls_back_payload_release_and_immutable_guards()
 -> Result<(), String> {
     let conn = test_store().await;
@@ -481,7 +481,7 @@ async fn cursor_commit_failure_rolls_back_payload_release_and_immutable_guards()
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn payload_batches_drain_both_ledger_sources_before_cursors_advance() -> Result<(), String> {
     let conn = test_store().await;
     let config = ObservationRetentionConfig {
@@ -540,7 +540,7 @@ async fn payload_batches_drain_both_ledger_sources_before_cursors_advance() -> R
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn aged_scan_seeks_past_examined_rows_without_repeating_the_prefix() -> Result<(), String> {
     let store = test_store().await;
     seed_active_ledger(&store, 20000).await?;
@@ -594,7 +594,7 @@ async fn aged_scan_seeks_past_examined_rows_without_repeating_the_prefix() -> Re
 /// A run resumes from its ledger cursor: a later run releases evidence whose
 /// disposition was appended after the previous run, or aged past the window
 /// since, and leaves what earlier runs already released alone.
-#[tokio::test]
+#[asupersync::test]
 async fn later_runs_release_dispositions_appended_or_aged_since_the_last_run() -> Result<(), String>
 {
     let conn = test_store().await;
@@ -657,7 +657,7 @@ async fn later_runs_release_dispositions_appended_or_aged_since_the_last_run() -
 /// `effective_at` in microseconds. A tick at the real clock with the default
 /// 30-day windows releases the evidence whose deletion took effect 40 days ago
 /// and keeps the one deleted 5 days ago.
-#[tokio::test]
+#[asupersync::test]
 async fn production_dispositions_past_the_window_are_released_and_newer_ones_kept()
 -> Result<(), String> {
     let directory = tempfile::TempDir::new().map_err(|error| error.to_string())?;
@@ -761,7 +761,7 @@ async fn run_apply(
         .map_err(|error| error.to_string())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn revoked_daemon_scope_rejects_observation_retention_without_mutation() -> Result<(), String>
 {
     let mut conn = test_store().await;
@@ -801,7 +801,7 @@ async fn revoked_daemon_scope_rejects_observation_retention_without_mutation() -
 
 // superseded and deleted dispositions release their storage: all three fat
 // payloads collapse to the compact marker and the reclaim is measurable.
-#[tokio::test]
+#[asupersync::test]
 async fn superseded_and_deleted_dispositions_release_storage() -> Result<(), String> {
     for state in ["superseded", "deleted"] {
         let conn = test_store().await;
@@ -854,7 +854,7 @@ async fn superseded_and_deleted_dispositions_release_storage() -> Result<(), Str
 
 // Active and unavailable dispositions retain their storage even when old: live
 // and source-unavailable evidence is never released.
-#[tokio::test]
+#[asupersync::test]
 async fn active_and_unavailable_dispositions_retain_storage() -> Result<(), String> {
     for state in ["active", "unavailable"] {
         let conn = test_store().await;
@@ -879,7 +879,7 @@ async fn active_and_unavailable_dispositions_retain_storage() -> Result<(), Stri
 
 // The latest ledger entry governs: an anchor superseded then later re-activated
 // has a current 'active' state and is retained (append-only, max-sequence wins).
-#[tokio::test]
+#[asupersync::test]
 async fn latest_disposition_wins() -> Result<(), String> {
     let conn = test_store().await;
     insert_anchor(&conn, "successor", GEN, 8).await?;
@@ -906,7 +906,7 @@ async fn latest_disposition_wins() -> Result<(), String> {
 
 // The retention window is honored: a superseded disposition inside the window
 // is not released.
-#[tokio::test]
+#[asupersync::test]
 async fn window_is_honored() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "recent", GEN, 4096).await?;
@@ -938,7 +938,7 @@ async fn window_is_honored() -> Result<(), String> {
 }
 
 // A dry run counts eligible reclaim without mutating anything.
-#[tokio::test]
+#[asupersync::test]
 async fn dry_run_mutates_nothing() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "anchor-1", GEN, 4096).await?;
@@ -982,7 +982,7 @@ async fn dry_run_mutates_nothing() -> Result<(), String> {
 
 // Every observation has exactly one immutable anchor binding. Retention counts
 // and releases each eligible observation once.
-#[tokio::test]
+#[asupersync::test]
 async fn released_observations_are_counted_once_each() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "anchor-primary", GEN, 4096).await?;
@@ -1022,7 +1022,7 @@ async fn released_observations_are_counted_once_each() -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn active_observation_in_other_generation_remains_live() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "anchor-primary", GEN, 4096).await?;
@@ -1059,7 +1059,7 @@ async fn active_observation_in_other_generation_remains_live() -> Result<(), Str
 }
 
 // Reclaim is measurable via released-row and page/free-list metrics.
-#[tokio::test]
+#[asupersync::test]
 async fn reports_measurable_reclaim_metrics() -> Result<(), String> {
     let conn = test_store().await;
     for index in 0..8 {
@@ -1082,7 +1082,7 @@ async fn reports_measurable_reclaim_metrics() -> Result<(), String> {
 }
 
 // Retention is generation-scoped: only the targeted generation is released.
-#[tokio::test]
+#[asupersync::test]
 async fn retention_is_generation_scoped() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "gen-a", GEN, 4096).await?;
@@ -1111,7 +1111,7 @@ async fn retention_is_generation_scoped() -> Result<(), String> {
 }
 
 // Disabled config is an inert no-op even in Apply mode.
-#[tokio::test]
+#[asupersync::test]
 async fn disabled_config_is_a_no_op() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "anchor-1", GEN, 4096).await?;
@@ -1137,7 +1137,7 @@ async fn disabled_config_is_a_no_op() -> Result<(), String> {
 
 // A second run is idempotent: already-released rows carry the marker and are
 // skipped rather than re-acted.
-#[tokio::test]
+#[asupersync::test]
 async fn rerun_is_idempotent() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "anchor-1", GEN, 4096).await?;
@@ -1156,7 +1156,7 @@ async fn rerun_is_idempotent() -> Result<(), String> {
 // The immutability triggers are restored after a release: direct UPDATE/DELETE
 // on the anchor and provenance tables still ABORT, and the append-only
 // disposition ledger is left fully intact.
-#[tokio::test]
+#[asupersync::test]
 async fn immutability_and_ledger_are_preserved() -> Result<(), String> {
     let conn = test_store().await;
     seed_evidence(&conn, "anchor-1", GEN, 4096).await?;

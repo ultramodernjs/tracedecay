@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tracedecay_daemon_protocol::DaemonEndpoint;
 use tracedecay_domain::configuration::{
     ConfigurationRevisionId, ConfigurationValueV1, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
-    MemoryProviderNcmObserverV1, UserProfileId,
+    MemoryProviderNcmNamespaceBindingV1, MemoryProviderNcmObserverV1, UserProfileId,
 };
 use tracedecay_memory_ncm_runtime::platform::current_worker_platform_capability;
 use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
@@ -402,6 +402,7 @@ async fn handle_status(profile: &ProfileRoot, scope: NcmScopeArgs, json: bool) -
         MemoryProviderNcmObserverV1::Enabled {
             worker_binary,
             state_root,
+            ..
         } => (Some(worker_binary), Some(state_root)),
     };
     let manifest_path = worker_path
@@ -648,6 +649,19 @@ async fn handle_install_model(
     Ok(())
 }
 
+fn namespace_binding_for_install(
+    observer: &MemoryProviderNcmObserverV1,
+) -> MemoryProviderNcmNamespaceBindingV1 {
+    match observer {
+        MemoryProviderNcmObserverV1::Enabled {
+            namespace_binding, ..
+        } => *namespace_binding,
+        MemoryProviderNcmObserverV1::Disabled {} => {
+            MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1
+        }
+    }
+}
+
 async fn handle_install_or_update(
     profile: &ProfileRoot,
     operation: NcmControlOperation,
@@ -769,6 +783,7 @@ async fn handle_install_or_update(
     let after_observer = MemoryProviderNcmObserverV1::Enabled {
         worker_binary: worker_path.clone(),
         state_root: state_root.clone(),
+        namespace_binding: namespace_binding_for_install(&before_observer),
     };
     after_observer
         .validate()
@@ -781,6 +796,7 @@ async fn handle_install_or_update(
             MemoryProviderNcmObserverV1::Enabled {
                 worker_binary: configured_worker,
                 state_root: configured_state_root,
+                ..
             } if configured_worker == &worker_path
                 && configured_state_root == &state_root
                 && control_bundle_has_only_expected_entries(configured_worker).unwrap_or(false)
@@ -827,6 +843,7 @@ async fn handle_install_or_update(
             MemoryProviderNcmObserverV1::Enabled {
                 worker_binary: configured_worker,
                 state_root: configured_state_root,
+                ..
             } if configured_worker == &worker_path
                 && configured_state_root == &state_root
                 && before_worker_digest.as_deref() == Some(artifact.sha256())
@@ -1028,6 +1045,7 @@ async fn handle_uninstall(profile: &ProfileRoot, scope: NcmScopeArgs, json: bool
     let MemoryProviderNcmObserverV1::Enabled {
         worker_binary,
         state_root,
+        ..
     } = before_observer
     else {
         cleanup_orphaned_control_workers(&paths, resolved.project_id.as_str(), &[])?;
@@ -1289,6 +1307,7 @@ async fn handle_recover(profile: &ProfileRoot, scope: NcmScopeArgs, json: bool) 
         let MemoryProviderNcmObserverV1::Enabled {
             worker_binary,
             state_root,
+            ..
         } = observer
         else {
             return Err(config_error(format!(
@@ -1832,11 +1851,11 @@ fn validate_journal_document_binding(
                 after_observer,
                 &journal.worker_path,
                 journal_state_root,
-            ) || !same_state_root(before_observer, after_observer)
+            ) || !same_state_binding(before_observer, after_observer)
                 || !before_worker_is_distinct
             {
                 return Err(config_error(
-                    "NCM recovery refused: update journal changes its worker or state-root binding",
+                    "NCM recovery refused: update journal changes its worker, state-root or namespace binding",
                 ));
             }
         }
@@ -1872,6 +1891,7 @@ fn observer_binds_worker_and_state(
     let MemoryProviderNcmObserverV1::Enabled {
         worker_binary,
         state_root: observer_state_root,
+        ..
     } = observer
     else {
         return false;
@@ -1879,19 +1899,23 @@ fn observer_binds_worker_and_state(
     worker_binary == worker_path && Some(observer_state_root) == state_root
 }
 
-fn same_state_root(
+fn same_state_binding(
     before_observer: &MemoryProviderNcmObserverV1,
     after_observer: &MemoryProviderNcmObserverV1,
 ) -> bool {
     match (before_observer, after_observer) {
         (
             MemoryProviderNcmObserverV1::Enabled {
-                state_root: before, ..
+                state_root: before,
+                namespace_binding: before_binding,
+                ..
             },
             MemoryProviderNcmObserverV1::Enabled {
-                state_root: after, ..
+                state_root: after,
+                namespace_binding: after_binding,
+                ..
             },
-        ) => before == after,
+        ) => before == after && before_binding == after_binding,
         _ => false,
     }
 }
@@ -3547,18 +3571,43 @@ mod tests {
         TRUSTED_MODEL_ACQUISITION_MANIFEST, WORKER_MANIFEST_NAME, WORKER_NAME,
         before_observer_bundle_is_available, cleanup_previous_control_worker,
         daemon_endpoint_is_reachable, daemon_profile_has_live_owner, latest_receipt,
-        new_operation_id, now_unix, observer_document, operation_id_for_identity, publish_worker,
-        read_verified_model_acquisition_manifest, refuse_pending_journal,
-        remove_control_worker_bundle, remove_guarded, require_absolute_path, sha256_hex,
-        validate_journal, validate_journal_document_binding,
+        namespace_binding_for_install, new_operation_id, now_unix, observer_document,
+        operation_id_for_identity, publish_worker, read_verified_model_acquisition_manifest,
+        refuse_pending_journal, remove_control_worker_bundle, remove_guarded,
+        require_absolute_path, sha256_hex, validate_journal, validate_journal_document_binding,
     };
     use std::fs;
     use std::io::Write;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use tracedecay_domain::configuration::MemoryProviderNcmObserverV1;
+    use tracedecay_domain::configuration::{
+        MemoryProviderNcmNamespaceBindingV1, MemoryProviderNcmObserverV1,
+    };
 
     use tempfile::tempdir;
+
+    #[test]
+    fn new_ncm_install_uses_checkout_observations_and_updates_preserve_existing_binding() {
+        assert_eq!(
+            namespace_binding_for_install(&MemoryProviderNcmObserverV1::Disabled {}),
+            MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1,
+        );
+        for binding in [
+            MemoryProviderNcmNamespaceBindingV1::ExactSessionV1,
+            MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1,
+        ] {
+            let observer = MemoryProviderNcmObserverV1::Enabled {
+                worker_binary: PathBuf::from("/worker"),
+                state_root: PathBuf::from("/state"),
+                namespace_binding: binding,
+            };
+            // Old settings omit the default field. The install/update path
+            // must carry that decoded choice into its replacement document.
+            let document = observer_document(&observer).expect("observer document");
+            let decoded = serde_json::from_str(&document).expect("decode existing observer");
+            assert_eq!(namespace_binding_for_install(&decoded), binding);
+        }
+    }
 
     #[test]
     fn operation_ids_are_bounded_hex() {
@@ -3804,6 +3853,7 @@ mod tests {
         let observer = MemoryProviderNcmObserverV1::Enabled {
             worker_binary: old_worker.clone(),
             state_root: root.path().join("state"),
+            namespace_binding: Default::default(),
         };
         let journal = NcmControlJournalV1 {
             schema_version: 1,
@@ -3847,6 +3897,7 @@ mod tests {
         let tampered_observer = MemoryProviderNcmObserverV1::Enabled {
             worker_binary: tampered_worker.clone(),
             state_root: root.path().join("state"),
+            namespace_binding: Default::default(),
         };
         let tampered_journal = NcmControlJournalV1 {
             operation_id: "22222222222222222222222222222222".to_owned(),
@@ -3910,6 +3961,7 @@ mod tests {
         let observer = MemoryProviderNcmObserverV1::Enabled {
             worker_binary: old_worker.clone(),
             state_root: root.path().join("state"),
+            namespace_binding: Default::default(),
         };
         assert!(before_observer_bundle_is_available(
             &observer, &journal, &paths
@@ -3937,6 +3989,7 @@ mod tests {
         let before_observer = MemoryProviderNcmObserverV1::Enabled {
             worker_binary: worker_parent.join(WORKER_NAME),
             state_root: root.path().join("state"),
+            namespace_binding: Default::default(),
         };
         let after_observer = MemoryProviderNcmObserverV1::Disabled {};
         let journal = NcmControlJournalV1 {
@@ -4010,6 +4063,7 @@ mod tests {
                 MemoryProviderNcmObserverV1::Enabled {
                     worker_binary: worker_root.join("previous-operation").join(WORKER_NAME),
                     state_root: root.path().join("state"),
+                    namespace_binding: Default::default(),
                 }
             };
             let mut staged = NcmControlJournalV1 {
@@ -4028,6 +4082,21 @@ mod tests {
             validate_journal(&staged, &paths).expect("complete staged worker journal is accepted");
             validate_journal_document_binding(&staged, &staged_before, &before_observer)
                 .expect("staged worker retains its configuration binding");
+            if matches!(operation, NcmControlOperation::Update) {
+                let mut changed_namespace = before_observer.clone();
+                if let MemoryProviderNcmObserverV1::Enabled {
+                    namespace_binding, ..
+                } = &mut changed_namespace
+                {
+                    *namespace_binding =
+                        MemoryProviderNcmNamespaceBindingV1::CheckoutObservationsV1;
+                }
+                assert!(
+                    validate_journal_document_binding(&staged, &staged_before, &changed_namespace,)
+                        .is_err(),
+                    "a worker update cannot migrate provider namespaces"
+                );
+            }
             staged
                 .worker_path
                 .clone_from(&mismatched_worker.worker_path);

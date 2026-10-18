@@ -44,10 +44,13 @@ import {
 const S = 24;
 const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
 /** Gaussian kernel of the relief, in world units. */
-export const RELIEF_SIGMA = S * 1.1;
+const RELIEF_SIGMA = S * 1.1;
 const CELL = S / 3;
+const PACK_MAX_PASSES = 500;
+const PACK_MIN_PASSES = 100;
+const PACK_PAIR_BUDGET = 4_000_000;
 
-export interface ReliefModule {
+interface ReliefModule {
   readonly module: string;
   readonly count: number;
   readonly cx: number;
@@ -57,14 +60,14 @@ export interface ReliefModule {
   readonly hull: readonly { x: number; y: number }[];
 }
 
-export interface ContourLevel {
+interface ContourLevel {
   readonly level: number;
   readonly index: boolean;
   /** Flat x0,y0,x1,y1 segments in world units. */
   readonly segments: Float32Array;
 }
 
-export interface ReliefSurface {
+interface ReliefSurface {
   readonly cols: number;
   readonly rows: number;
   readonly x0: number;
@@ -76,7 +79,7 @@ export interface ReliefSurface {
 }
 
 /** Relations between one pair of directories, drawn as one trunk. */
-export interface ReliefTrunk {
+interface ReliefTrunk {
   readonly a: ReliefModule;
   readonly b: ReliefModule;
   readonly count: number;
@@ -98,6 +101,16 @@ export interface ReliefLayout {
 
 function moduleRadius(count: number): number {
   return S * 0.95 * Math.sqrt(count) + S * 0.9;
+}
+
+/**
+ * Relaxation passes for `n` directories. A pass is n(n-1)/2 pair steps, so the
+ * count falls as n grows to hold the total near PACK_PAIR_BUDGET: 500 passes
+ * up to ~125 directories, 128 at the 250-directory slice limit.
+ */
+export function packPasses(n: number): number {
+  const pairs = Math.max(1, (n * (n - 1)) / 2);
+  return Math.max(PACK_MIN_PASSES, Math.min(PACK_MAX_PASSES, Math.floor(PACK_PAIR_BUDGET / pairs)));
 }
 
 /** Module centres: packed without overlap, drawn together by shared relations. */
@@ -132,12 +145,13 @@ function packModules(
   const gx = 1 - 0.008 / stretch;
   const gy = 1 - 0.008 * stretch;
   const gap = S * 1.1;
-  for (let iteration = 0; iteration < 500; iteration += 1) {
+  const passes = packPasses(n);
+  for (let iteration = 0; iteration < passes; iteration += 1) {
     for (let i = 0; i < n; i += 1) {
       for (let j = i + 1; j < n; j += 1) {
         const dx = x[j]! - x[i]!;
         const dy = y[j]! - y[i]!;
-        const d = Math.max(1e-3, Math.hypot(dx, dy));
+        const d = Math.max(1e-3, Math.sqrt(dx * dx + dy * dy));
         const rest = radius[i]! + radius[j]! + gap;
         let move = 0;
         if (d < rest) move = -(rest - d) / 2;
@@ -206,7 +220,7 @@ function placeMembers(
           const b = positions.get(members[j]!.id)!;
           const dx = b.x - a.x;
           const dy = b.y - a.y;
-          const d = Math.max(1e-3, Math.hypot(dx, dy));
+          const d = Math.max(1e-3, Math.sqrt(dx * dx + dy * dy));
           if (d < S) {
             const push = (S - d) / 2;
             a.x -= (dx / d) * push;

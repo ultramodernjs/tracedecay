@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::time::Instant;
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_runtime_core::cancellation::CancellationToken;
+use tracedecay_runtime_core::native_runtime;
 
 use crate::daemon::branch_admin::StoreAdministration;
 use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
@@ -25,7 +25,7 @@ const BASE_TICK: Duration = Duration::from_mins(1);
 /// before joining the task.
 pub(crate) struct PrAutotrackTask {
     cancellation: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
+    task: native_runtime::NativeTask<()>,
 }
 
 impl PrAutotrackTask {
@@ -35,34 +35,44 @@ impl PrAutotrackTask {
 
     pub(crate) async fn shutdown(self) {
         self.cancellation.cancel();
-        if let Err(error) = self.task.await {
-            log_daemon_event(
-                "pr_autotrack",
-                &[
-                    ("action", "shutdown".to_string()),
-                    ("outcome", "task_join_failed".to_string()),
-                    ("reason", error.to_string()),
-                ],
-            );
-        }
+        let reason = match self.task.wait().await {
+            native_runtime::NativeTaskOutcome::Completed(()) => return,
+            native_runtime::NativeTaskOutcome::Cancelled => "task cancelled".to_string(),
+            native_runtime::NativeTaskOutcome::Panicked(panic) => panic.to_string(),
+        };
+        log_daemon_event(
+            "pr_autotrack",
+            &[
+                ("action", "shutdown".to_string()),
+                ("outcome", "task_join_failed".to_string()),
+                ("reason", reason),
+            ],
+        );
+    }
+}
+
+impl Drop for PrAutotrackTask {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
 /// Spawns the PR-autotrack poll loop with the daemon's shared store coordinator
 /// and the retained code-index scheduler used for PR-head worktree activation.
+/// The loop runs on the native runtime; the error is that runtime's refusal.
 pub(crate) fn spawn_with_administration(
     administration: StoreAdministration,
     schedulers: CodeIndexSchedulerRegistryV1,
-) -> PrAutotrackTask {
+) -> Result<PrAutotrackTask, String> {
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
-    let task = tokio::spawn(tracing::Instrument::instrument(
+    let task = native_runtime::NativeTask::spawn(tracing::Instrument::instrument(
         async move {
             run(administration, schedulers, task_cancellation).await;
         },
         tracing::trace_span!("daemon.pr_autotrack.loop"),
-    ));
-    PrAutotrackTask { cancellation, task }
+    ))?;
+    Ok(PrAutotrackTask { cancellation, task })
 }
 
 async fn run(
@@ -88,7 +98,13 @@ async fn run(
         .await;
         tokio::select! {
             () = cancellation.cancelled() => return,
-            () = tokio::time::sleep(BASE_TICK) => {}
+            slept = native_runtime::sleep_until(Instant::now() + BASE_TICK) => {
+                if let Err(error) = slept {
+                    // Without a timer every park would return at once and spin.
+                    tracing::error!(event = "pr_autotrack_timer_unavailable", %error);
+                    return;
+                }
+            }
         }
     }
 }
@@ -195,7 +211,7 @@ async fn poll_project(
     let command_control = PrCommandControl::with_cancellation(cancellation.clone());
     let repo_for_discovery = repo_root.clone();
     let discovery_control = command_control.clone();
-    let discovery = match tokio::task::spawn_blocking(move || {
+    let discovery = match tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         discover_open_prs_with_control(&repo_for_discovery, &discovery_control)
     })
     .await

@@ -39,7 +39,11 @@ mod mcp_rendering_test;
 #[cfg(feature = "test-transport")]
 mod mcp_server_test;
 mod multi_mcp_coordination_test;
+#[cfg(unix)]
+mod native_root_daemon_test;
 mod serve_harness;
+#[cfg(unix)]
+mod serve_protocol_revision_test;
 #[cfg(unix)]
 mod serve_repeat_read_test;
 mod serve_template_path_test;

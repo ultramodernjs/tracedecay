@@ -114,17 +114,7 @@ pub enum ProjectMemoryGraphReconciliationScheduleV1 {
     AlreadyScheduled,
     Retiring,
     LifecycleClosed,
-}
-
-/// Internal daemon mount/write hook for derived verified-graph catch-up.
-///
-/// Product callers mutate canonical facts through [`ProjectMemoryFactStore`];
-/// they never reconcile topology directly.
-#[doc(hidden)]
-pub fn schedule_project_memory_graph_reconciliation(
-    db: Database,
-) -> ProjectMemoryGraphReconciliationScheduleV1 {
-    graph::schedule_project_memory_graph_reconciliation(db)
+    RuntimeUnavailable,
 }
 
 impl<'a> DatabaseFactStore<'a> {
@@ -144,18 +134,14 @@ impl FactStore for DatabaseFactStore<'_> {
             Some(retained) => {
                 let db = (*self.db).clone();
                 let write_control = write_control.clone();
-                // The task owns the retained-dispatch receipt path so caller
-                // cancellation cannot strand a durable commit before its
-                // derived graph reconciliation trigger is recorded.
-                tokio::spawn(async move {
+                envelope::settle_fact_write(COMMIT_OPERATION, move |cx| async move {
                     let outcome = runtime::commit_fact(&retained, batch, &write_control).await?;
                     if matches!(&outcome, FactCommitOutcome::Committed(_)) {
-                        graph::publish_project_memory_graph_after_write(db.clone()).await;
+                        graph::publish_project_memory_graph_after_write(&cx, db.clone()).await;
                     }
                     Ok(outcome)
                 })
                 .await
-                .map_err(|error| storage_error(COMMIT_OPERATION, error))?
             }
             None => self.commit_batch(&batch, write_control).await,
         }
@@ -179,7 +165,7 @@ impl FactStore for DatabaseFactStore<'_> {
         query: FactCurrentQuery,
     ) -> FactStoreResult<Option<StoredFactV1>> {
         if let Some(runtime) = runtime::retained_fact_runtime(self.db)? {
-            return runtime::query_fact_current(&runtime, query);
+            return runtime::query_fact_current(&runtime, query).await;
         }
         let snapshot = self
             .db
@@ -200,7 +186,7 @@ impl FactStore for DatabaseFactStore<'_> {
             // measured from the retained client with the database's exact
             // binding and verified locator, rather than reported as constants
             // that no read ever observed.
-            let fact = runtime::query_fact_current(&runtime, query.clone())?;
+            let fact = runtime::query_fact_current(&runtime, query.clone()).await?;
             let snapshot = self
                 .db
                 .begin_memory_read_transaction(QUERY_OPERATION)
@@ -253,7 +239,7 @@ impl FactStore for DatabaseFactStore<'_> {
         query: FactLineageQuery,
     ) -> FactStoreResult<Vec<FactLineageEventV1>> {
         if let Some(runtime) = runtime::retained_fact_runtime(self.db)? {
-            return runtime::query_fact_lineage(&runtime, query);
+            return runtime::query_fact_lineage(&runtime, query).await;
         }
         let snapshot = self
             .db
@@ -277,7 +263,7 @@ impl FactStore for DatabaseFactStore<'_> {
             // As in `query_fact_current_response`: the runtime answers the
             // lineage page, and the accompanying coverage and contradiction are
             // measured from the retained authority rather than fabricated.
-            let events = runtime::query_fact_lineage(&runtime, query.clone())?;
+            let events = runtime::query_fact_lineage(&runtime, query.clone()).await?;
             let snapshot = self
                 .db
                 .begin_memory_read_transaction(QUERY_OPERATION)

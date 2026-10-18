@@ -48,6 +48,8 @@ mod sql;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 
 use tracedecay_contracts::retrieval::{
     SessionRetrievalBudgetAccountingV1, SessionRetrievalBudgetObservationV1,
@@ -108,7 +110,10 @@ use tracedecay_lcm::payload::read_verified_payload_content_with_checkpoint;
 pub use doctor_health::{
     SessionTemporalHealthFindingKind, SessionTemporalHealthReport, SessionTemporalHealthStatus,
 };
-pub use projection::{record_canonical_observation_effect, request_session_temporal_reset};
+pub use projection::{
+    record_canonical_observation_effect, request_session_temporal_reset,
+    request_session_temporal_reset_if_materialized,
+};
 pub use refresh::{
     SessionRefreshBeginBatchItemV1, SessionRefreshBeginBatchOutcomeV1, SessionRefreshBeginPlanV1,
     SessionRefreshCompletionStage, SessionRefreshRecoveryV1, SessionRefreshRestartStateV1,
@@ -116,32 +121,17 @@ pub use refresh::{
 pub use store::SessionTemporalStore;
 
 impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
-    /// Resolves a Git filter through the store's Git evidence rows.
+    /// Resolves a Git filter through the store's Git evidence rows, reading at
+    /// most `maximum` sessions.
     ///
     /// `None` means the request is unscoped. A non-empty filter always returns
     /// `Some`, including an authoritative empty set when no recorded session
     /// matches. A store that never recorded Git evidence answers typed
     /// unavailable: it cannot prove that no durable session matches.
-    pub async fn git_scope_session_ids(
-        &self,
-        filter: &GitScopeFilter,
-    ) -> Result<Option<Vec<(String, String)>>, GitCorrelationError> {
-        self.git_scope_session_ids_with_bound(filter, None).await
-    }
-
     pub async fn git_scope_session_ids_bounded(
         &self,
         filter: &GitScopeFilter,
         maximum: usize,
-    ) -> Result<Option<Vec<(String, String)>>, GitCorrelationError> {
-        self.git_scope_session_ids_with_bound(filter, Some(maximum))
-            .await
-    }
-
-    async fn git_scope_session_ids_with_bound(
-        &self,
-        filter: &GitScopeFilter,
-        maximum: Option<usize>,
     ) -> Result<Option<Vec<(String, String)>>, GitCorrelationError> {
         if filter.is_empty() {
             return Ok(None);
@@ -155,15 +145,14 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                 "Git evidence has not been recorded for this project".to_owned(),
             ));
         };
-        let session_ids = match maximum {
-            Some(maximum) => view.session_ids_for_scope_bounded(filter, maximum).await,
-            None => view.session_ids_for_scope(filter).await,
-        }?
-        .ok_or_else(|| {
-            GitCorrelationError::Contract(
-                "Git scope resolution requires a non-empty filter".to_owned(),
-            )
-        })?;
+        let session_ids = view
+            .session_ids_for_scope_bounded(filter, maximum)
+            .await?
+            .ok_or_else(|| {
+                GitCorrelationError::Contract(
+                    "Git scope resolution requires a non-empty filter".to_owned(),
+                )
+            })?;
         Ok(Some(session_ids))
     }
 
@@ -960,52 +949,65 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         control.checkpoint().map_err(map_control_error)?;
         let read = self.open_read_snapshot().await?;
         let temporal_read = TemporalSqlRead::registered(&read);
-        let (participants, watermarks, cursor_key, prepared, readiness) =
-            match request.snapshot_request().retrieval_scope() {
-                TemporalRetrievalScope::Session(_) => {
-                    let (participants, watermarks, cursor_key) =
-                        freeze_participants(&temporal_read, request).await?;
-                    (participants, watermarks, cursor_key, None, None)
-                }
-                TemporalRetrievalScope::AllSessionsInAuthorizedRoot => {
-                    let relation_authority = self.db.session_relation_store().ok();
-                    let candidate_read = match &relation_authority {
-                        Some((relation_scope, relation_store)) => {
-                            SessionTemporalReadPort::new_registered_with_relations(
-                                &read,
-                                relation_scope,
-                                relation_store.clone(),
-                            )
-                        }
-                        None => SessionTemporalReadPort::new_registered(&read),
-                    };
-                    let plan = tracedecay_temporal_query::plan_temporal_candidates(
-                        request.query(),
-                        request.direct_anchor(),
-                        request.snapshot_request().semantic_filter().goals,
-                    );
-                    let prepared = candidate_read
-                        .prepare_root_candidate_cohort(request.snapshot_request(), &plan)
-                        .await
-                        .map_err(map_control_error)?;
-                    let readiness = root_readiness(&temporal_read, request).await?;
-                    if prepared.candidates().is_empty() {
-                        return Err(SessionTemporalExecutionError::Empty {
-                            freshness: readiness,
-                        });
+        let (participants, watermarks, cursor_key, prepared, readiness) = match request
+            .snapshot_request()
+            .retrieval_scope()
+        {
+            TemporalRetrievalScope::Session(_) => {
+                let (participants, watermarks, cursor_key) =
+                    freeze_participants(&temporal_read, request).await?;
+                (participants, watermarks, cursor_key, None, None)
+            }
+            TemporalRetrievalScope::AllSessionsInAuthorizedRoot => {
+                let relation_authority = self.db.session_relation_store().ok();
+                let candidate_read = match &relation_authority {
+                    Some((relation_scope, relation_store)) => {
+                        SessionTemporalReadPort::new_registered_with_relations(
+                            &read,
+                            relation_scope,
+                            relation_store.clone(),
+                        )
                     }
-                    let (participants, watermarks, cursor_key) =
-                        freeze_prepared_candidate_participants(&temporal_read, request, &prepared)
-                            .await?;
-                    (
-                        participants,
-                        watermarks,
-                        cursor_key,
-                        Some(prepared),
-                        Some(readiness),
-                    )
+                    None => SessionTemporalReadPort::new_registered(&read),
+                };
+                let plan = tracedecay_temporal_query::plan_temporal_candidates(
+                    request.query(),
+                    request.direct_anchor(),
+                    request.snapshot_request().semantic_filter().goals,
+                );
+                let prepared_cohort: Pin<
+                        Box<
+                            dyn Future<
+                                    Output = Result<
+                                        tracedecay_temporal_query::snapshot::TemporalPreparedCandidateCohort,
+                                        tracedecay_temporal_query::execution::TemporalPortError,
+                                    >,
+                                > + Send
+                                + '_,
+                        >,
+                    > = Box::pin(candidate_read.prepare_root_candidate_cohort(
+                        request.snapshot_request(),
+                        &plan,
+                    ));
+                let prepared = prepared_cohort.await.map_err(map_control_error)?;
+                let readiness = root_readiness(&temporal_read, request).await?;
+                if prepared.candidates().is_empty() {
+                    return Err(SessionTemporalExecutionError::Empty {
+                        freshness: readiness,
+                    });
                 }
-            };
+                let (participants, watermarks, cursor_key) =
+                    freeze_prepared_candidate_participants(&temporal_read, request, &prepared)
+                        .await?;
+                (
+                    participants,
+                    watermarks,
+                    cursor_key,
+                    Some(prepared),
+                    Some(readiness),
+                )
+            }
+        };
         control.checkpoint().map_err(map_control_error)?;
         let mut snapshot = TemporalExecutionSnapshot::new_authorized(
             request.snapshot_request().clone(),

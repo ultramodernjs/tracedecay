@@ -121,15 +121,14 @@ fn transaction_scope(metadata: &StoreOperationMetadataV1) -> RuntimeTransactionS
     }
 }
 
-fn outbox_payload() -> RepositoryWritePayloadV1 {
-    RepositoryWritePayloadV1::EnqueueOutbox(Box::new(TransactionalOutboxEntryV1 {
-        identity: effect_identity(),
-        effect: RepositoryEffectV1::PublishObservation,
-        state: OutboxEffectStateV1::Pending,
-        acknowledgement: None,
-        enqueued_at: UtcMicros(1),
-        updated_at: UtcMicros(1),
-    }))
+fn diagnostics_payload() -> RepositoryWritePayloadV1 {
+    RepositoryWritePayloadV1::Diagnostics(Box::new(
+        SanitizedCleanDiagnosticSnapshotV1::new(
+            id::<CodeGenerationId>("generation.fixture"),
+            vec![],
+        )
+        .unwrap(),
+    ))
 }
 
 fn submit_request(metadata: StoreOperationMetadataV1) -> RuntimeSubmitRequestV1 {
@@ -137,7 +136,7 @@ fn submit_request(metadata: StoreOperationMetadataV1) -> RuntimeSubmitRequestV1 
     RuntimeSubmitRequestV1::new(
         RepositoryOperationEnvelopeV1 {
             metadata,
-            payload: outbox_payload(),
+            payload: diagnostics_payload(),
         },
         scope,
         control(),
@@ -269,7 +268,6 @@ fn consistency_status_is_derived_from_full_fenced_watermarks() {
         coverage.status_for(&sessions),
         WatermarkCoverageStatusV1::Stale
     );
-    assert!(coverage.is_partial());
     assert!(!coverage.is_complete());
 
     let wrong_epoch = ShardWatermarkV1 {
@@ -300,16 +298,6 @@ fn consistency_status_is_derived_from_full_fenced_watermarks() {
         unavailable.status_for(&project),
         WatermarkCoverageStatusV1::Unavailable
     );
-
-    let lease = SnapshotLeaseV1 {
-        lease_id: SnapshotLeaseIdV1::new("lease.fixture").unwrap(),
-        snapshot_id: StoreSnapshotIdV1::new("snapshot.fixture").unwrap(),
-        watermark: required_sessions,
-        acquired_at: UtcMicros(50),
-        expires_at: UtcMicros(100),
-    };
-    assert!(!lease.is_expired_at(UtcMicros(99)));
-    assert!(lease.is_expired_at(UtcMicros(100)));
 }
 
 /// A shard may only be observed once, or coverage would double count it and
@@ -342,13 +330,7 @@ fn frozen_coverage_rejects_a_shard_observed_twice() {
 fn operation_envelopes_enforce_scope_and_per_operation_durability() {
     let valid = RepositoryOperationEnvelopeV1 {
         metadata: metadata(project_shard("project.one"), DurabilityClassV1::Full),
-        payload: RepositoryWritePayloadV1::Diagnostics(Box::new(
-            SanitizedCleanDiagnosticSnapshotV1::new(
-                id::<CodeGenerationId>("generation.fixture"),
-                vec![],
-            )
-            .unwrap(),
-        )),
+        payload: diagnostics_payload(),
     };
     valid.validate().unwrap();
 
@@ -375,152 +357,12 @@ fn operation_envelopes_enforce_scope_and_per_operation_durability() {
 
     let immutable_snapshot = RepositoryOperationEnvelopeV1 {
         metadata: metadata(code_snapshot_shard("project.one"), DurabilityClassV1::Full),
-        payload: outbox_payload(),
+        payload: diagnostics_payload(),
     };
     assert!(matches!(
         immutable_snapshot.validate(),
         Err(StorageRuntimeContractErrorV1::ImmutableShard { .. })
     ));
-
-    let invalid_payload = RepositoryOperationEnvelopeV1 {
-        metadata: metadata(project_shard("project.one"), DurabilityClassV1::Full),
-        payload: RepositoryWritePayloadV1::EnqueueOutbox(Box::new(TransactionalOutboxEntryV1 {
-            identity: effect_identity(),
-            effect: RepositoryEffectV1::PublishObservation,
-            state: OutboxEffectStateV1::Acknowledged,
-            acknowledgement: None,
-            enqueued_at: UtcMicros(1),
-            updated_at: UtcMicros(2),
-        })),
-    };
-    assert!(matches!(
-        invalid_payload.validate(),
-        Err(StorageRuntimeContractErrorV1::AcknowledgementReceiptRequired)
-    ));
-    let invalid_scope = transaction_scope(&invalid_payload.metadata);
-    assert!(matches!(
-        RuntimeSubmitRequestV1::new(invalid_payload, invalid_scope, control()),
-        Err(StorageRuntimeContractErrorV1::AcknowledgementReceiptRequired)
-    ));
-}
-
-fn effect_identity() -> EffectIdentityV1 {
-    let source = project_shard("project.one");
-    let target = session_shard("project.one");
-    EffectIdentityV1 {
-        effect_id: StoreEffectIdV1::new("effect.fixture").unwrap(),
-        command_digest: digest('d'),
-        ordering_key: StoreEffectOrderingKeyV1::new("project.one.observations").unwrap(),
-        source_watermark: watermark(source, 30),
-        target_watermark: watermark(target, 40),
-    }
-}
-
-#[test]
-fn outbox_identity_and_acknowledgements_bind_target_history() {
-    let identity = effect_identity();
-    identity.validate().unwrap();
-    identity.enforce_epochs(epoch(7), epoch(7)).unwrap();
-    identity
-        .enforce_histories(
-            &ShardWatermarkV1 {
-                commit_sequence: CommitSequenceV1(31),
-                ..identity.source_watermark.clone()
-            },
-            &ShardWatermarkV1 {
-                commit_sequence: CommitSequenceV1(40),
-                ..identity.target_watermark.clone()
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        identity.enforce_epochs(epoch(8), epoch(7)),
-        Err(StorageRuntimeContractErrorV1::EffectEpochMismatch { side: "source" })
-    );
-
-    let mut outbox = TransactionalOutboxEntryV1 {
-        identity: identity.clone(),
-        effect: RepositoryEffectV1::PublishObservation,
-        state: OutboxEffectStateV1::Pending,
-        acknowledgement: None,
-        enqueued_at: UtcMicros(1),
-        updated_at: UtcMicros(1),
-    };
-    outbox
-        .transition(OutboxEffectStateV1::Dispatched, UtcMicros(2))
-        .unwrap();
-    outbox
-        .transition(OutboxEffectStateV1::EffectUnknown, UtcMicros(3))
-        .unwrap();
-    assert_eq!(outbox.state, OutboxEffectStateV1::EffectUnknown);
-    assert!(
-        outbox
-            .transition(OutboxEffectStateV1::Dispatched, UtcMicros(2))
-            .is_err()
-    );
-    assert_eq!(outbox.state, OutboxEffectStateV1::EffectUnknown);
-    assert!(
-        outbox
-            .transition(OutboxEffectStateV1::Pending, UtcMicros(4))
-            .is_err()
-    );
-
-    let receipt = TransactionalInboxReceiptV1 {
-        target_commit_watermark: ShardWatermarkV1 {
-            commit_sequence: CommitSequenceV1(41),
-            ..identity.target_watermark.clone()
-        },
-        identity: identity.clone(),
-        disposition: InboxEffectDispositionV1::Applied,
-        committed_at: UtcMicros(5),
-    };
-    receipt.validate().unwrap();
-    assert!(
-        TransactionalInboxReceiptV1 {
-            target_commit_watermark: identity.target_watermark.clone(),
-            ..receipt.clone()
-        }
-        .validate()
-        .is_err()
-    );
-    let acknowledgement = OutboxAcknowledgementReceiptV1 {
-        identity: identity.clone(),
-        inbox_receipt: receipt.clone(),
-        source_commit_watermark: ShardWatermarkV1 {
-            commit_sequence: CommitSequenceV1(31),
-            ..identity.source_watermark.clone()
-        },
-        acknowledged_at: UtcMicros(6),
-    };
-    acknowledgement.validate().unwrap();
-    assert!(
-        OutboxAcknowledgementReceiptV1 {
-            source_commit_watermark: identity.source_watermark.clone(),
-            ..acknowledgement.clone()
-        }
-        .validate()
-        .is_err()
-    );
-    outbox.acknowledge(acknowledgement).unwrap();
-    assert_eq!(outbox.state, OutboxEffectStateV1::Acknowledged);
-    assert!(outbox.acknowledgement.is_some());
-
-    let wrong_target_history = TransactionalInboxReceiptV1 {
-        target_commit_watermark: ShardWatermarkV1 {
-            incarnation: incarnation(2),
-            commit_sequence: CommitSequenceV1(41),
-            ..identity.target_watermark.clone()
-        },
-        identity,
-        disposition: InboxEffectDispositionV1::Applied,
-        committed_at: UtcMicros(5),
-    };
-    assert!(matches!(
-        wrong_target_history.validate(),
-        Err(StorageRuntimeContractErrorV1::EffectIncarnationMismatch { side: "target" })
-    ));
-    round_trip(&outbox);
-    round_trip(&receipt);
 }
 
 struct Probe {
@@ -641,108 +483,96 @@ fn runtime_submit_outcomes_validate_request_identity() {
 }
 
 #[test]
-fn read_outcomes_validate_exact_partial_stale_and_unavailable_coverage() {
+fn at_least_read_outcomes_validate_complete_stale_and_unavailable_coverage() {
+    let shard = project_shard("project.one");
     let at_least = read_request(
-        binding(project_shard("project.one")),
+        binding(shard.clone()),
         ConsistencyModeV1::AtLeast {
             commit_sequence: CommitSequenceV1(10),
         },
         RuntimeReadOperationV1::CurrentWatermark,
     );
-    let stale = single_shard_required_coverage_v1(
-        at_least.binding(),
-        CommitSequenceV1(10),
-        [watermark(project_shard("project.one"), 9)],
-    )
-    .unwrap();
-    let stale_outcome =
-        RuntimeReadOutcomeV1::new(None, RuntimeReadCoverageV1::Stale { coverage: stale }).unwrap();
-    assert_eq!(stale_outcome.validate_for(&at_least), Ok(()));
-
-    let exact_watermark = watermark(project_shard("project.one"), 8);
-    let exact = read_request(
-        binding(project_shard("project.one")),
-        ConsistencyModeV1::ExactSnapshot {
-            lease: Box::new(SnapshotLeaseV1 {
-                lease_id: SnapshotLeaseIdV1::new("snapshot.exact").unwrap(),
-                snapshot_id: StoreSnapshotIdV1::new("snapshot.exact").unwrap(),
-                watermark: exact_watermark.clone(),
-                acquired_at: UtcMicros(1),
-                expires_at: UtcMicros(10),
-            }),
-        },
-        RuntimeReadOperationV1::CurrentWatermark,
-    );
-    let exact_coverage = single_shard_required_coverage_v1(
-        exact.binding(),
-        CommitSequenceV1(8),
-        [exact_watermark.clone()],
-    )
-    .unwrap();
-    assert_eq!(
-        RuntimeReadOutcomeV1::new(
-            Some(RuntimeReadResultV1::CurrentWatermark {
-                watermark: exact_watermark,
-            }),
-            RuntimeReadCoverageV1::Complete {
-                coverage: exact_coverage,
-            },
+    let coverage_at = |required: u64, observed: Option<u64>| {
+        single_shard_required_coverage_v1(
+            at_least.binding(),
+            CommitSequenceV1(required),
+            observed.map(|sequence| watermark(shard.clone(), sequence)),
         )
         .unwrap()
-        .validate_for(&exact),
-        Ok(())
-    );
+    };
+
+    let complete = RuntimeReadOutcomeV1::new(
+        Some(RuntimeReadResultV1::CurrentWatermark {
+            watermark: watermark(shard.clone(), 11),
+        }),
+        RuntimeReadCoverageV1::Complete {
+            coverage: coverage_at(10, Some(11)),
+        },
+    )
+    .unwrap();
+    assert_eq!(complete.validate_for(&at_least), Ok(()));
+
+    let stale = RuntimeReadOutcomeV1::new(
+        None,
+        RuntimeReadCoverageV1::Stale {
+            coverage: coverage_at(10, Some(9)),
+        },
+    )
+    .unwrap();
+    assert_eq!(stale.validate_for(&at_least), Ok(()));
+
+    let unavailable = RuntimeReadOutcomeV1::new(
+        None,
+        RuntimeReadCoverageV1::Unavailable {
+            coverage: Some(coverage_at(10, None)),
+            reason: UnavailableReasonV1::MissingAuthority,
+        },
+    )
+    .unwrap();
+    assert_eq!(unavailable.validate_for(&at_least), Ok(()));
+
+    let stale_claimed_complete = RuntimeReadOutcomeV1::new(
+        Some(RuntimeReadResultV1::CurrentWatermark {
+            watermark: watermark(shard.clone(), 9),
+        }),
+        RuntimeReadCoverageV1::Complete {
+            coverage: coverage_at(10, Some(9)),
+        },
+    )
+    .unwrap();
     assert_eq!(
-        stale_outcome.validate_for(&exact),
+        stale_claimed_complete.validate_for(&at_least),
+        Err(StorageRuntimeContractErrorV1::ReceiptBindingMismatch {
+            field: "read coverage classification",
+        })
+    );
+
+    let weaker_requirement = RuntimeReadOutcomeV1::new(
+        None,
+        RuntimeReadCoverageV1::Stale {
+            coverage: coverage_at(9, Some(8)),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        weaker_requirement.validate_for(&at_least),
         Err(StorageRuntimeContractErrorV1::ReceiptBindingMismatch {
             field: "read coverage required vector",
         })
     );
 
-    let required = FrozenWatermarkVectorV1::new([
-        watermark(project_shard("project.one"), 10),
-        watermark(session_shard("project.one"), 20),
-    ])
-    .unwrap();
-    let frozen = read_request(
-        binding(project_shard("project.one")),
-        ConsistencyModeV1::FrozenWatermarkVector {
-            vector: required.clone(),
-        },
-        RuntimeReadOperationV1::FrozenCoverage,
-    );
-    let partial = FrozenWatermarkCoverageV1::new(
-        required.clone(),
-        [
-            watermark(project_shard("project.one"), 10),
-            watermark(session_shard("project.one"), 19),
-        ],
+    let unbounded = RuntimeReadOutcomeV1::new(
+        Some(RuntimeReadResultV1::CurrentWatermark {
+            watermark: watermark(shard, 11),
+        }),
+        RuntimeReadCoverageV1::Latest { observed: None },
     )
     .unwrap();
     assert_eq!(
-        RuntimeReadOutcomeV1::new(
-            Some(RuntimeReadResultV1::FrozenCoverage {
-                coverage: partial.clone(),
-            }),
-            RuntimeReadCoverageV1::Partial { coverage: partial },
-        )
-        .unwrap()
-        .validate_for(&frozen),
-        Ok(())
-    );
-
-    let unavailable = FrozenWatermarkCoverageV1::new(required, []).unwrap();
-    assert_eq!(
-        RuntimeReadOutcomeV1::new(
-            None,
-            RuntimeReadCoverageV1::Unavailable {
-                coverage: Some(unavailable),
-                reason: UnavailableReasonV1::MissingAuthority,
-            },
-        )
-        .unwrap()
-        .validate_for(&frozen),
-        Ok(())
+        unbounded.validate_for(&at_least),
+        Err(StorageRuntimeContractErrorV1::ReceiptBindingMismatch {
+            field: "bounded read coverage",
+        })
     );
 }
 
@@ -992,7 +822,7 @@ fn transaction_scope_deserialization_preserves_nested_and_structural_validation(
 }
 
 #[test]
-fn semantic_serde_boundaries_reject_scope_durability_history_and_receipt_mismatches() {
+fn semantic_serde_boundaries_reject_scope_durability_and_history_mismatches() {
     let mut invalid_control = serde_json::to_value(control()).unwrap();
     invalid_control["cancellation"]["generation"] = json!(0);
     assert_eq!(
@@ -1011,42 +841,6 @@ fn semantic_serde_boundaries_reject_scope_durability_history_and_receipt_mismatc
         "unknown field `expires_at`, expected `deadline_id`"
     );
 
-    let identity = effect_identity();
-    let receipt = TransactionalInboxReceiptV1 {
-        identity: identity.clone(),
-        disposition: InboxEffectDispositionV1::Applied,
-        target_commit_watermark: ShardWatermarkV1 {
-            commit_sequence: CommitSequenceV1(41),
-            ..identity.target_watermark.clone()
-        },
-        committed_at: UtcMicros(2),
-    };
-    let mut wrong_receipt = serde_json::to_value(&receipt).unwrap();
-    wrong_receipt["target_commit_watermark"]["authority_epoch"] = json!(8);
-    assert_eq!(
-        serde_json::from_value::<TransactionalInboxReceiptV1>(wrong_receipt)
-            .unwrap_err()
-            .to_string(),
-        "authority epoch mismatch for target effect sink"
-    );
-
-    let frozen_request = read_request(
-        binding(project_shard("project.one")),
-        ConsistencyModeV1::FrozenWatermarkVector {
-            vector: FrozenWatermarkVectorV1::new([watermark(project_shard("project.one"), 1)])
-                .unwrap(),
-        },
-        RuntimeReadOperationV1::FrozenCoverage,
-    );
-    let mut wrong_frozen_request = serde_json::to_value(&frozen_request).unwrap();
-    wrong_frozen_request["binding"]["authority_epoch"] = json!(8);
-    assert_eq!(
-        serde_json::from_value::<RuntimeReadRequestV1>(wrong_frozen_request)
-            .unwrap_err()
-            .to_string(),
-        "frozen watermark runtime binding does not bind to the request or effect identity"
-    );
-
     let health_lease = ReaderHealthLeaseV1 {
         lease_id: ReaderHealthLeaseIdV1::new("reader.health.serde").unwrap(),
         binding: binding(project_shard("project.one")),
@@ -1063,18 +857,71 @@ fn semantic_serde_boundaries_reject_scope_durability_history_and_receipt_mismatc
             .to_string(),
         "reader health leases require the reserved health lane"
     );
+}
 
-    let invalid_snapshot_lease = json!({
-        "lease_id": "snapshot.lease",
-        "snapshot_id": "snapshot.fixture",
-        "watermark": watermark(project_shard("project.one"), 1),
-        "acquired_at": 2,
-        "expires_at": 2,
-    });
-    assert_eq!(
-        serde_json::from_value::<SnapshotLeaseV1>(invalid_snapshot_lease)
-            .unwrap_err()
-            .to_string(),
-        "snapshot lease is not a valid lease interval"
-    );
+/// No attachment serves exact-snapshot or frozen-vector reads, so the wire
+/// refuses them instead of admitting a request no runtime can satisfy.
+#[test]
+fn unserved_exact_and_frozen_read_shapes_are_refused_on_the_wire() {
+    let project = watermark(project_shard("project.one"), 1);
+    let refused = [
+        (
+            serde_json::from_value::<ConsistencyModeV1>(json!({
+                "kind": "exact_snapshot",
+                "lease": {
+                    "lease_id": "snapshot.lease",
+                    "snapshot_id": "snapshot.fixture",
+                    "watermark": project,
+                    "acquired_at": 1,
+                    "expires_at": 2,
+                },
+            }))
+            .map(drop),
+            "unknown variant `exact_snapshot`, expected `latest_available` or `at_least`",
+        ),
+        (
+            serde_json::from_value::<ConsistencyModeV1>(json!({
+                "kind": "frozen_watermark_vector",
+                "vector": [project],
+            }))
+            .map(drop),
+            "unknown variant `frozen_watermark_vector`, expected `latest_available` or `at_least`",
+        ),
+        (
+            serde_json::from_value::<RuntimeReadOperationV1>(json!({
+                "kind": "snapshot_lease",
+                "lease_id": "snapshot.lease",
+            }))
+            .map(drop),
+            "unknown variant `snapshot_lease`",
+        ),
+        (
+            serde_json::from_value::<RuntimeReadOperationV1>(json!({ "kind": "frozen_coverage" }))
+                .map(drop),
+            "unknown variant `frozen_coverage`",
+        ),
+        (
+            serde_json::from_value::<RuntimeReadCoverageV1>(json!({
+                "kind": "partial",
+                "coverage": { "required": [project], "observed": [] },
+            }))
+            .map(drop),
+            "unknown variant `partial`",
+        ),
+    ];
+    for (result, expected) in refused {
+        let error = result.unwrap_err().to_string();
+        assert!(error.starts_with(expected), "{error}");
+    }
+
+    let at_least = ConsistencyModeV1::AtLeast {
+        commit_sequence: CommitSequenceV1(4),
+    };
+    for served in [ConsistencyModeV1::LatestAvailable, at_least] {
+        let wire = serde_json::to_value(&served).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ConsistencyModeV1>(wire).unwrap(),
+            served
+        );
+    }
 }

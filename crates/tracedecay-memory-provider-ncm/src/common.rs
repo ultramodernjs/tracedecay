@@ -18,8 +18,8 @@ use tracedecay_memory_provider_api::{
 };
 
 use crate::{
-    NcmNamespace, NcmRecallDiagnosticEvent, NcmRecallDiagnosticSink, NcmRecallDiagnosticStage,
-    digest_field, hex_digest, opaque_surface_id,
+    NcmNamespace, NcmNamespaceBinding, NcmRecallDiagnosticEvent, NcmRecallDiagnosticSink,
+    NcmRecallDiagnosticStage, digest_field, hex_digest, opaque_caller_id, opaque_surface_id,
 };
 
 mod lifecycle;
@@ -393,7 +393,7 @@ pub(crate) fn project_recall(
             "include_superseded": query.include_superseded, "include_revoked": query.include_revoked,
             "unknown_policy": value["temporal_query"]["unknown_validity_policy"], "exclusions": projected_exclusions,
             "maximum_candidates": maximum_candidates.min(MAX_RECALL_CANDIDATES),
-            "request_token": opaque_surface_id(namespace, b"recall-request", &call.request_id),
+            "request_token": opaque_caller_id(namespace, &call.exact_scope, b"recall-request", &call.request_id),
         }
     }))
 }
@@ -699,15 +699,16 @@ fn stable_reference(namespace: &NcmNamespace, record: u64, capsule_digest: &str)
 
 pub(crate) fn reconstruct_observation(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     reply: &mut ProviderReply,
 ) -> Option<()> {
     let mut payload: Value = serde_json::from_slice(&reply.payload.as_ref()?.bytes).ok()?;
     let metadata = payload.get("common_observation")?;
     let retained = decode_capsule(&metadata["provenance"])?;
     let delivery = decode_named_capsule(&metadata["provenance"], "delivery_capsule")?;
-    let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
     retained_source(
         call,
+        namespace,
         &retained,
         &metadata["provenance"],
         metadata["source"].as_str()?,
@@ -766,18 +767,27 @@ pub(crate) fn reconstruct_observation(
     Some(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn reconstruct_recall(
     call: &ProviderCall,
     instance: &str,
     reply: &mut ProviderReply,
     admission: Option<&CurrentAdvisoryAdmission>,
 ) -> Option<()> {
-    reconstruct_recall_with_diagnostics(call, instance, reply, admission, None, None)
+    reconstruct_recall_with_diagnostics(
+        call,
+        &NcmNamespace::from_exact_scope(&call.exact_scope),
+        instance,
+        reply,
+        admission,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn reconstruct_recall_with_diagnostics(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     instance: &str,
     reply: &mut ProviderReply,
     admission: Option<&CurrentAdvisoryAdmission>,
@@ -786,6 +796,7 @@ pub(crate) fn reconstruct_recall_with_diagnostics(
 ) -> Option<()> {
     let result = reconstruct_recall_inner(
         call,
+        namespace,
         instance,
         reply,
         admission,
@@ -799,6 +810,7 @@ pub(crate) fn reconstruct_recall_with_diagnostics(
             Some(sink),
             diagnostic_for_reconstruction_failure(
                 call,
+                namespace,
                 instance,
                 reply.state_generation,
                 admission,
@@ -811,6 +823,7 @@ pub(crate) fn reconstruct_recall_with_diagnostics(
 
 fn reconstruct_recall_inner(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     instance: &str,
     reply: &mut ProviderReply,
     admission: Option<&CurrentAdvisoryAdmission>,
@@ -828,6 +841,7 @@ fn reconstruct_recall_inner(
     let max_content = budgets["maximum_candidate_content_bytes"].as_u64()?;
     let max_total = budgets["maximum_total_content_bytes"].as_u64()?;
     let diagnostics = RecallDiagnostics {
+        namespace_binding: namespace.1,
         call,
         instance,
         request: &request,
@@ -850,9 +864,8 @@ fn reconstruct_recall_inner(
     let mut excluded = worker["common_recall"]["excluded_items"].as_u64()?;
     let mut truncated_items = 0_u64;
     for row in rows {
-        let (retained, source) = authorized_worker_row(call, row, admission)?;
+        let (retained, source) = authorized_worker_row(call, namespace, row, admission)?;
         let original = &retained["original_source"];
-        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         if row["key_text"] != retained["projection"]["key_text"]
             || row["value_text"] != retained["projection"]["value_text"]
         {
@@ -871,7 +884,12 @@ fn reconstruct_recall_inner(
         {
             return None;
         }
-        let request_token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
+        let request_token = opaque_caller_id(
+            &namespace,
+            &call.exact_scope,
+            b"recall-request",
+            &call.request_id,
+        );
         let mut candidate_digest = Sha256::new();
         for field in [request_token.as_bytes(), stable.as_bytes()] {
             candidate_digest.update((field.len() as u64).to_be_bytes());
@@ -962,7 +980,17 @@ fn reconstruct_recall_inner(
             Vec::new()
         };
         let mut candidate_scope = scope_value(&call.exact_scope);
-        candidate_scope["scope_binding"] = json!("exact_coding_scope");
+        candidate_scope["scope_binding"] = match &source {
+            RetainedSource::Original(_) => json!("exact_coding_scope"),
+            RetainedSource::Current { .. }
+                if namespace.1 == NcmNamespaceBinding::CheckoutObservationsV1 =>
+            {
+                candidate_scope["agent_session_id"] = json!("");
+                candidate_scope["resolved_scope_digest"] = json!("");
+                json!("checkout_observations")
+            }
+            RetainedSource::Current { .. } => json!("exact_coding_scope"),
+        };
         let original_sources = if matches!(source, RetainedSource::Original(_)) {
             json!([original])
         } else {
@@ -1095,6 +1123,7 @@ const RECALL_DIAGNOSTIC_EXACT_SCOPE_DOMAIN: &[u8] =
 const RECALL_DIAGNOSTIC_INSTANCE_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic.instance.v1\0";
 
 struct RecallDiagnostics<'a> {
+    namespace_binding: NcmNamespaceBinding,
     call: &'a ProviderCall,
     instance: &'a str,
     request: &'a Value,
@@ -1192,7 +1221,7 @@ impl RecallDiagnosticAccumulator {
             max_total,
             ..
         } = *diagnostics;
-        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+        let namespace = NcmNamespace::from_scope(&call.exact_scope, diagnostics.namespace_binding);
         let remaining_candidate_slots = u64::try_from(max_candidates)
             .unwrap_or(u64::MAX)
             .saturating_sub(self.admitted_candidate_count);
@@ -1358,7 +1387,8 @@ fn worker_budgeted_content_bytes(
     }
     validated_worker_activation(row)?;
     let content = row["value_text"].as_str()?;
-    let (retained, source) = authorized_worker_row(call, row, admission)?;
+    let namespace = NcmNamespace::from_scope(&call.exact_scope, diagnostics.namespace_binding);
+    let (retained, source) = authorized_worker_row(call, &namespace, row, admission)?;
     if row["key_text"] != retained["projection"]["key_text"]
         || row["value_text"] != retained["projection"]["value_text"]
     {
@@ -1373,7 +1403,6 @@ fn worker_budgeted_content_bytes(
     }
     let stable = row["stable_memory_ref"].as_str()?;
     let candidate_id = row["candidate_id"].as_str()?;
-    let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
     if stable
         != stable_reference(
             &namespace,
@@ -1383,7 +1412,12 @@ fn worker_budgeted_content_bytes(
     {
         return Some(0);
     }
-    let request_token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
+    let request_token = opaque_caller_id(
+        &namespace,
+        &call.exact_scope,
+        b"recall-request",
+        &call.request_id,
+    );
     let mut candidate_digest = Sha256::new();
     for field in [request_token.as_bytes(), stable.as_bytes()] {
         candidate_digest.update((field.len() as u64).to_be_bytes());
@@ -1547,6 +1581,7 @@ fn diagnostic_for_reconstructed(
 
 fn diagnostic_for_reconstruction_failure(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     instance: &str,
     state_generation: u64,
     admission: Option<&CurrentAdvisoryAdmission>,
@@ -1564,6 +1599,7 @@ fn diagnostic_for_reconstruction_failure(
     summary.history_source_count = diagnostic_history_source_count(admission);
     summary.finish(
         &RecallDiagnostics {
+            namespace_binding: namespace.1,
             call,
             instance,
             request: &request,
@@ -1584,6 +1620,7 @@ fn diagnostic_for_reconstruction_failure(
 /// observed after the surface has already returned.
 pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     instance: &str,
     reply: &ProviderReply,
     code: TerminalCode,
@@ -1603,6 +1640,7 @@ pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
         Some(sink),
         diagnostic_for_control_terminal(
             call,
+            namespace,
             instance,
             reply.state_generation,
             stage,
@@ -1614,6 +1652,7 @@ pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
 
 fn diagnostic_for_control_terminal(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     instance: &str,
     state_generation: u64,
     stage: NcmRecallDiagnosticStage,
@@ -1632,6 +1671,7 @@ fn diagnostic_for_control_terminal(
     summary.history_source_count = diagnostic_history_source_count(admission);
     summary.finish(
         &RecallDiagnostics {
+            namespace_binding: namespace.1,
             call,
             instance,
             request: &request,
@@ -1679,17 +1719,33 @@ impl RetainedSource {
     }
 }
 
+fn same_checkout(left: &OwnedExactScope, right: &OwnedExactScope) -> bool {
+    left.profile_id == right.profile_id
+        && left.project_id == right.project_id
+        && left.repository_identity == right.repository_identity
+        && left.worktree_identity == right.worktree_identity
+        && left.branch_identity == right.branch_identity
+}
+
 fn retained_source(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     retained: &Value,
     provenance: &Value,
     actual_source: &str,
     admission: Option<&CurrentAdvisoryAdmission>,
 ) -> Option<RetainedSource> {
-    if scope(&retained["delivery_scope"])? != call.exact_scope {
+    let delivery_scope = scope(&retained["delivery_scope"])?;
+    let current_checkout_recall = namespace.1 == NcmNamespaceBinding::CheckoutObservationsV1
+        && retained.get("original_source").is_none()
+        && call.operation == tracedecay_memory_provider_api::ProviderOperation::Recall;
+    if if current_checkout_recall {
+        !same_checkout(&delivery_scope, &call.exact_scope)
+    } else {
+        delivery_scope != call.exact_scope
+    } {
         return None;
     }
-    let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
     if let Some(original) = retained.get("original_source") {
         let source = attribution(original)?;
         validate_source_binding(&namespace, &source, provenance, actual_source)?;
@@ -1704,7 +1760,7 @@ fn retained_source(
     }
     validate_current_source_binding(
         &namespace,
-        &call.exact_scope,
+        &delivery_scope,
         retained,
         provenance,
         actual_source,
@@ -1727,18 +1783,20 @@ fn retained_source(
     let session = string(&retained["canonical_payload"]["relations"]["session_id"])?;
     Some(RetainedSource::Current {
         observation_id: observation_id.to_owned(),
-        source_key: call.exact_scope.session_forget_source_key(session),
+        source_key: delivery_scope.session_forget_source_key(session),
     })
 }
 
 fn authorized_worker_row(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     row: &Value,
     admission: Option<&CurrentAdvisoryAdmission>,
 ) -> Option<(Value, RetainedSource)> {
     let retained = decode_capsule_bounded(&row["provenance"], RECALL_DIAGNOSTIC_MAX_CAPSULE_BYTES)?;
     let source = retained_source(
         call,
+        namespace,
         &retained,
         &row["provenance"],
         row["source"].as_str()?,
@@ -1776,6 +1834,7 @@ mod recall_diagnostic_tests {
         diagnostic_key: Option<&'a [u8; 32]>,
     ) -> RecallDiagnostics<'a> {
         RecallDiagnostics {
+            namespace_binding: NcmNamespaceBinding::ExactSessionV1,
             call,
             instance: "private-provider-instance",
             request,
@@ -1883,7 +1942,12 @@ mod recall_diagnostic_tests {
         let retained_bytes = serde_json::to_vec(&retained).unwrap();
         let capsule_digest = hex_digest(&Sha256::digest(&retained_bytes));
         let stable = stable_reference(&namespace, sequence, &capsule_digest);
-        let request_token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
+        let request_token = opaque_caller_id(
+            &namespace,
+            &call.exact_scope,
+            b"recall-request",
+            &call.request_id,
+        );
         let mut candidate_digest = Sha256::new();
         for field in [request_token.as_bytes(), stable.as_bytes()] {
             candidate_digest.update((field.len() as u64).to_be_bytes());
@@ -2547,7 +2611,12 @@ mod recall_diagnostic_tests {
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let overbudget_stable = stable_reference(&namespace, 91_000_008, &overbudget_digest);
         overbudget["stable_memory_ref"] = json!(overbudget_stable);
-        let request_token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
+        let request_token = opaque_caller_id(
+            &namespace,
+            &call.exact_scope,
+            b"recall-request",
+            &call.request_id,
+        );
         let mut candidate_digest = Sha256::new();
         for field in [request_token.as_bytes(), overbudget_stable.as_bytes()] {
             candidate_digest.update((field.len() as u64).to_be_bytes());

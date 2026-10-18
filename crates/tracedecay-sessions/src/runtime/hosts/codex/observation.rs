@@ -24,8 +24,7 @@ use tracedecay_store::observation::ObservationCoverageReason;
 use super::PROVIDER;
 use super::context::CodexContextState;
 use super::meta::{CodexMetaWithProvenance, CodexMetadataRead, session_meta_with_provenance};
-use crate::admission::HostAdmission;
-use crate::host_ports::unregistered_admission;
+use crate::admission::{HostAdmission, HostAdmissionStatus};
 use crate::observation::ObservationCancellation;
 use crate::runtime::jsonl_observation_admission::{
     JsonlFrameAdmission, JsonlObservationAdmissionRequest, PersistedCursorUpdate,
@@ -201,7 +200,7 @@ async fn fill_codex_session_meta(
     let memory = reserve_shared_jsonl_page()?;
     let background_cpu = shared_jsonl_background_cpu()?;
     let parse_path = claim.key.path.clone();
-    let (parsed, mut memory) = tokio::task::spawn_blocking(move || {
+    let (parsed, mut memory) = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         let parsed = background_cpu.with_permit(|| session_meta_with_provenance(&parse_path));
         (parsed, memory)
     })
@@ -262,32 +261,6 @@ pub struct CodexJsonlAdmissionProgress {
     /// Bytes reread before the resume offset to recover the cwd the first
     /// new record inherits.
     pub prior_context_bytes: u64,
-}
-
-/// Admit a Codex rollout for one exact project identity.
-///
-/// The scheduler supplies the already-resolved project id; each complete record
-/// is routed by the rollout's current Codex cwd, including context reconstructed
-/// before a resumed byte cursor.
-pub async fn try_admit_codex_jsonl_observations_for_project(
-    path: &Path,
-    project_root: &Path,
-    project_id: ProjectId,
-    max_new_bytes: Option<u64>,
-) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
-    let Some(admission) =
-        unregistered_admission::create(unregistered_admission::Scope::Project(project_id.clone()))
-    else {
-        return Ok(CodexJsonlAdmissionProgress::default());
-    };
-    try_admit_codex_jsonl_observations_for_project_with_admission(
-        path,
-        project_root,
-        project_id,
-        admission.as_ref(),
-        max_new_bytes,
-    )
-    .await
 }
 
 /// Project admission with authority prepared by the caller.
@@ -388,30 +361,6 @@ pub async fn try_admit_codex_jsonl_observations_for_project_session_window(
         Some(crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW),
         Some(session_id),
         cancellation,
-    )
-    .await
-}
-
-/// Admit Codex records that are not attributable to any registered project.
-///
-/// A scheduler may constrain this pass to one session while it catches up a
-/// profile-owned rollout.
-pub async fn try_admit_codex_jsonl_observations_for_profile(
-    path: &Path,
-    session_id: Option<&str>,
-    registered_roots: &[PathBuf],
-    max_new_bytes: Option<u64>,
-) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
-    let Some(admission) = unregistered_admission::create(unregistered_admission::Scope::Profile)
-    else {
-        return Ok(CodexJsonlAdmissionProgress::default());
-    };
-    try_admit_codex_jsonl_observations_for_profile_with_admission(
-        path,
-        session_id,
-        registered_roots,
-        admission.as_ref(),
-        max_new_bytes,
     )
     .await
 }
@@ -563,7 +512,7 @@ async fn shared_session_meta_with_provenance(
     cancellation: &ObservationCancellation,
 ) -> TranscriptIngestResult<Arc<CodexMetaWithProvenance>> {
     let identity_path = path.to_path_buf();
-    let key = tokio::task::spawn_blocking(move || {
+    let key = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         let canonical = std::fs::canonicalize(&identity_path).map_err(|source| {
             TranscriptIngestError::ScanIo {
                 operation: "resolve Codex session metadata identity",
@@ -598,9 +547,15 @@ async fn shared_session_meta_with_provenance(
     };
     // The fill is detached from this request: cancelling the requester leaves
     // the owner to settle for every other waiter on the same key.
-    let fill = tokio::spawn(fill_codex_session_meta(claim, path.to_path_buf()));
+    let error_path = path.to_path_buf();
+    let mut fill = tracedecay_runtime_core::native_runtime::cx()
+        .and_then(|cx| {
+            cx.spawn(move |_cx| fill_codex_session_meta(claim, error_path))
+                .ok()
+        })
+        .ok_or(TranscriptIngestError::BlockingScanTaskFailed { provider: PROVIDER })?;
     tokio::select! {
-        settled = fill => {
+        settled = std::future::poll_fn(|context| fill.poll_join(context)) => {
             settled.map_err(|_| TranscriptIngestError::BlockingScanTaskFailed { provider: PROVIDER })?
         }
         () = cancellation.cancelled() => Err(TranscriptIngestError::Cancelled { provider: PROVIDER }),
@@ -669,6 +624,7 @@ async fn try_admit_codex_jsonl_observations(
             provider: PROVIDER,
             reason: "source_session_mismatch",
             retryable: false,
+            status: HostAdmissionStatus::Degraded,
             detail: None,
         });
     }
@@ -687,6 +643,7 @@ async fn try_admit_codex_jsonl_observations(
                         provider: PROVIDER,
                         reason: "project_identity_unavailable",
                         retryable: false,
+                        status: HostAdmissionStatus::Unavailable,
                         detail: Some(error.to_string()),
                     }
                 })?;
@@ -695,6 +652,7 @@ async fn try_admit_codex_jsonl_observations(
                     provider: PROVIDER,
                     reason: "project_identity_unavailable",
                     retryable: false,
+                    status: HostAdmissionStatus::Unavailable,
                     detail: Some("capture root does not name the enrolled project".to_owned()),
                 });
             };

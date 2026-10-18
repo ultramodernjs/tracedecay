@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Daemon invocation wire contract, authenticated client, and leaf transport.
 //!
 //! This crate sits below the composition root. It owns request/response
@@ -69,13 +70,13 @@ pub use application_surface::{
     separate_application_tool_request,
 };
 pub use client::{
-    AdapterInvocation, BindingResolution, BindingResolver, BoundInvocation, CanonicalInvocation,
-    CatalogBindingResolver, DaemonInvocationClient, DaemonInvocationDelivery,
-    DaemonInvocationError, DaemonInvocationExecutor, DaemonInvocationExecutorFuture,
-    DaemonInvocationResult, DaemonLspSessionClient, DispatchError, DispatchInput,
-    DispatchedInvocation, InvocationCancellationPolicy, InvocationControls, ResolvedBinding,
-    ScopeSelector, deadline_remaining, handshake_refusal_error, map_invocation_error,
-    resolve_dispatch, wait_for_cancellation,
+    AdapterInvocation, BindingResolution, BoundInvocation, CanonicalInvocation,
+    CatalogBindingResolver, DAEMON_AUTHENTICATION_REJECTED, DaemonInvocationClient,
+    DaemonInvocationDelivery, DaemonInvocationError, DaemonInvocationExecutor,
+    DaemonInvocationExecutorFuture, DaemonInvocationResult, DaemonLspSessionClient, DispatchError,
+    DispatchInput, DispatchedInvocation, InvocationCancellationPolicy, InvocationControls,
+    ResolvedBinding, ScopeSelector, deadline_remaining, handshake_refusal_error,
+    map_invocation_error, refusal_behind_failed_write, resolve_dispatch, wait_for_cancellation,
 };
 pub use client_identity::DaemonClientIdentity;
 pub use connection::{
@@ -115,7 +116,8 @@ pub use output_format::{RequestedOutputFormat, requested_output_format};
 pub use surface::GitReadSurfaceRequest;
 pub use transport::{
     AUTH_PREFACE_PROTOCOL, BrokerListener, BrokerReadHalf, BrokerStream, BrokerWriteHalf,
-    DaemonAuthPreface, DaemonEndpoint, SOCKET_ENV, default_loopback_endpoint,
+    DaemonAuthPreface, DaemonClientReadHalf, DaemonClientStream, DaemonClientWriteHalf,
+    DaemonEndpoint, SOCKET_ENV, default_loopback_endpoint,
 };
 #[cfg(unix)]
 pub use transport::{

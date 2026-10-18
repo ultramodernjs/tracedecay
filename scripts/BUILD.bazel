@@ -3,22 +3,26 @@ load("//scripts:bazel/rust_test.bzl", "compiler_fixture_test", "rust_test")
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
-py_test(
-    name = "native_provider_startup_test",
-    size = "small",
-    srcs = [
-        "work_provider_native_smoke.py",
-        "test-work-provider-native-smoke.py",
-    ],
-    main = "test-work-provider-native-smoke.py",
-    imports = ["."],
-    legacy_create_init = 0,
-)
-
 py_binary(
     name = "measure_unused_tool_context",
     srcs = ["measure-unused-tool-context.py"],
     main = "measure-unused-tool-context.py",
+)
+
+py_binary(
+    name = "check_rusqlite_storage_boundary",
+    srcs = ["check-rusqlite-storage-boundary.py"],
+    main = "check-rusqlite-storage-boundary.py",
+)
+
+py_test(
+    name = "rusqlite_storage_boundary_test",
+    size = "small",
+    srcs = [
+        "check-rusqlite-storage-boundary.py",
+        "test-check-rusqlite-storage-boundary.py",
+    ],
+    main = "test-check-rusqlite-storage-boundary.py",
 )
 
 py_test(
@@ -55,9 +59,36 @@ compiler_fixture_test(
     test_binary = ":distribution_feature_wiring_test__binary",
 )
 
+py_test(
+    name = "sqlite_plan_stability_check_test",
+    size = "small",
+    srcs = [
+        "check-sqlite-plan-stability.py",
+        "test-check-sqlite-plan-stability.py",
+    ],
+    main = "test-check-sqlite-plan-stability.py",
+)
+
+py_test(
+    name = "ambient_tokio_check_test",
+    size = "small",
+    srcs = [
+        "check-ambient-tokio.py",
+        "test-check-ambient-tokio.py",
+    ],
+    main = "test-check-ambient-tokio.py",
+)
+
 exports_files(
     [
         "bazel/rust_test.bzl",
+        "test-check-sdk-publish-workflow.py",
+        "check-sdk-publish-workflow.py",
+        "test-build-mcpb.py",
+        "test-package-release-archive.py",
+        "test-plan-release-recovery.py",
+        "test-check-release-artifacts.py",
+        "test-update-release-checksums.py",
         "bazel/gen_builds.py",
         "bazel/ncm_worker_bundle.bzl",
         "bazel/rust_test_environment_probe.txt",

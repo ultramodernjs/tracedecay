@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::handle::{SessionTemporalAccess, SessionTemporalRegisteredDb};
-use tracedecay_runtime_core::db::engine::Error as EngineError;
+use tracedecay_runtime_core::db::engine::{Error as EngineError, QueryExecutor};
+use tracedecay_runtime_core::db::schema_version::{self, SESSION_TEMPORAL_COMPONENT};
 
 use crate::schema_constants::{SESSION_TEMPORAL_SCHEMA_VERSION, TEMPORAL_TABLE_COLUMNS};
 
@@ -46,7 +47,7 @@ struct CachedSessionTemporalHealth {
 // The cache aliases keep the lock type at the alias site so a later
 // contention-instrumented wrapper can land in one place.
 type SessionDoctorCacheLock<T> = std::sync::Mutex<T>;
-type SessionDoctorLaneLock<T> = tokio::sync::Mutex<T>;
+type SessionDoctorLaneLock<T> = futures_util::lock::Mutex<T>;
 
 type SessionTemporalHealthCacheCell =
     Arc<SessionDoctorLaneLock<Option<CachedSessionTemporalHealth>>>;
@@ -72,7 +73,7 @@ fn session_temporal_health_cache_cell(path: &Path) -> SessionTemporalHealthCache
     Arc::clone(
         cache
             .entry(path.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
+            .or_insert_with(|| Arc::new(SessionDoctorLaneLock::new(None))),
     )
 }
 
@@ -845,7 +846,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
 
 #[tracing::instrument(name = "session_temporal.doctor.diagnose", level = "trace", skip_all)]
 async fn diagnose_snapshot(
-    conn: &impl crate::handle::SessionTemporalQuery,
+    conn: &(impl crate::handle::SessionTemporalQuery + QueryExecutor),
 ) -> SessionTemporalHealthReport {
     let inventory = match snapshot_schema_inventory(conn).await {
         Ok(inventory) => inventory,
@@ -1106,16 +1107,18 @@ fn normalize_sql(sql: &str) -> String {
     skip_all
 )]
 async fn snapshot_schema_version(
-    conn: &impl crate::handle::SessionTemporalQuery,
+    conn: &(impl QueryExecutor + Sync),
 ) -> tracedecay_runtime_core::db::engine::Result<Option<i64>> {
-    let mut rows = conn
-        .query(
-            "SELECT version FROM session_temporal_schema_migrations
-             WHERE name = 'session-temporal'",
-            (),
-        )
-        .await?;
-    rows.next().await?.map(|row| row.get(0)).transpose()
+    match schema_version::read_version(conn, SESSION_TEMPORAL_COMPONENT).await {
+        Ok(version) => Ok(version),
+        Err(error) if error.is_busy() => Err(EngineError::Busy),
+        Err(error) => Err(EngineError::Sqlite {
+            operation: "read schema version",
+            code: None,
+            extended_code: None,
+            message: error.to_string(),
+        }),
+    }
 }
 
 #[tracing::instrument(
@@ -1300,7 +1303,7 @@ mod probe_tests {
     use crate::handle::SessionTemporalExec;
     use tracedecay_runtime_core::db::engine::TestConnection;
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn row_probe_reports_observed_findings_when_its_page_is_incomplete() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let connection = TestConnection::open(&tmp.path().join("doctor-page.db"));
@@ -1359,7 +1362,7 @@ mod probe_tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn a_failed_probe_naming_a_locked_table_is_partial_not_locked() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let connection = TestConnection::open(&tmp.path().join("doctor-locked-name.db"));
@@ -1410,7 +1413,7 @@ mod registered_tests {
     use crate::handle::{SessionTemporalAccess, SessionTemporalExec, SessionTemporalRegisteredDb};
     use tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness;
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn oversized_session_temporal_store_still_reports_schema_findings() {
         const OLD_SYNCHRONOUS_HEALTH_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
         let harness =
@@ -1446,7 +1449,7 @@ mod registered_tests {
         }));
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn registered_doctor_reports_an_unbound_relation_graph_as_partial() {
         let harness =
             RegisteredGlobalDbHarness::open_without_relation_graph("doctor-unbound-relation-graph")

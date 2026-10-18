@@ -90,9 +90,9 @@ const COMPOSER_KEY_SCAN_FROM_START_SQL: &str = "SELECT key, octet_length(value) 
      ORDER BY key
      LIMIT ?3";
 
-/// Shared foreign-store read handle (see [`crate::runtime::shared`]),
+/// Shared foreign-store read handle,
 /// aliased locally for the Cursor composer reader signatures.
-pub(super) use crate::runtime::shared::SqliteReadConn as CursorConn;
+pub(super) use crate::runtime::host_sqlite::SqliteReadConn as CursorConn;
 
 /// A read-only connection bound to the path and physical identity verified
 /// across its immutable open.
@@ -111,7 +111,7 @@ pub(super) struct ReadOnlyDb {
 /// treat this as a no-op.
 pub(super) async fn open_readonly_immutable(db_path: &Path) -> Result<ReadOnlyDb, String> {
     let path = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         let opened = tracedecay_rusqlite_runtime::open_verified_immutable_reader(&path)
             .map_err(|error| format!("could not open '{}' read-only: {error}", path.display()))?;
         let (conn, canonical_path, file_identity) = opened.into_parts();

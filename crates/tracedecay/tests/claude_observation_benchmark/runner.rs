@@ -10,10 +10,10 @@ use tracedecay_store::{
 };
 
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay_runtime_core::sqlite_read_snapshot::open_immutable_read_only;
 use tracedecay_runtime_core::storage::{
     read_repository_identity_marker, write_repository_identity_marker,
 };
+use tracedecay_rusqlite_runtime::open_immutable_reader;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::observation::ObservationCancellation;
 use tracedecay_sessions::runtime::hosts::claude::ClaudeSource;
@@ -64,16 +64,18 @@ fn benchmark_tempdir(prefix: &str) -> TempDir {
     // Bazel's executable tree is read-only; TEST_TMPDIR is its writable,
     // per-test scratch authority. Native benchmark runs retain target locality.
     let root = std::env::var_os("TEST_TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let executable =
-                fs::canonicalize(std::env::current_exe().expect("resolve test executable"))
-                    .expect("canonicalize test executable");
-            executable
-                .parent()
-                .expect("test executable parent")
-                .to_path_buf()
-        })
+        .map_or_else(
+            || {
+                let executable =
+                    fs::canonicalize(std::env::current_exe().expect("resolve test executable"))
+                        .expect("canonicalize test executable");
+                executable
+                    .parent()
+                    .expect("test executable parent")
+                    .to_path_buf()
+            },
+            PathBuf::from,
+        )
         .join("tracedecay-benchmark-data");
     fs::create_dir_all(&root).expect("create benchmark scratch root");
     tempfile::Builder::new()
@@ -483,7 +485,7 @@ impl ProviderFixture {
             }
             ProviderKind::Hermes => {
                 let state_db = self.source_path.join("profiles/benchmark/state.db");
-                let connection = open_immutable_read_only(&state_db)
+                let connection = open_immutable_reader(&state_db)
                     .expect("open immutable Hermes parse-phase fixture database");
                 let count = connection
                     .query_row("SELECT COUNT(*) FROM messages", (), |row| {
@@ -567,14 +569,18 @@ impl ProviderFixture {
                 stats.messages_upserted
             }
             ProviderKind::Hermes => {
-                let stats = hermes::ingest_homes_capped_with_admission(
-                    std::slice::from_ref(&self.source_path),
-                    &self.project,
-                    self.project_id(),
-                    &admission,
-                    None,
+                let stats = tracedecay_sessions::runtime::with_transcript_source_profile(
+                    tracedecay_runtime_core::config::ProfileRoot::under_home(&self.home),
+                    hermes::ingest_for_project_capped_with_admission_and_cancellation(
+                        &self.project,
+                        self.project_id(),
+                        &admission,
+                        None,
+                        &cancellation,
+                    ),
                 )
-                .await;
+                .await
+                .expect("run Hermes production provider path");
                 stats.stats.messages_upserted
             }
             ProviderKind::Kiro => {

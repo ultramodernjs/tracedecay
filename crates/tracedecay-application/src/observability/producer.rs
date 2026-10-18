@@ -1,12 +1,10 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 use tracedecay_contracts::{
     ApplicationContractError, EXECUTION_TOPOLOGY_EVENT_KINDS_V1, now_micros,
 };
@@ -18,6 +16,9 @@ use tracedecay_global_db::{
     AnalyticsEventInsert, ObservabilityEmissionClaimV1, ObservabilityEmissionOutboxRecordV1,
     ObservabilityOwnerEmissionWriteOutcomeV1, ObservabilityOwnerEmissionWriteV1,
     PreparedObservabilityEmissionV1, RegisteredGlobalDb, RegisteredGlobalDbLeaseV1,
+};
+use tracedecay_runtime_core::native_runtime::{
+    NativeTask, NativeTaskOutcome, sleep_until, timeout, timeout_at,
 };
 
 use tracedecay_session_memory::observability_store::record_observability_batch;
@@ -209,8 +210,49 @@ struct ObservabilityProducerCoreV1 {
     durable_emission_lock: Arc<AsyncMutex<()>>,
     deadlines: ObservabilityProducerDeadlinesV1,
     emission_lock: Mutex<()>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    /// Abort drops the worker at its next poll. A rollup compaction parked in
+    /// native `spawn_blocking` abandons only its wait: the pure retention
+    /// check finishes on the blocking pool and its result is discarded.
+    worker: Mutex<Option<NativeTask<()>>>,
 }
+
+// Proving these fields `Send + Sync` walks the registered database lease past
+// the recursion limit (rust-lang/rust#159228). The const is that field proof;
+// the impls keep every registry that stores this producer from repeating it.
+unsafe impl Send for ObservabilityProducerCoreV1 {}
+unsafe impl Sync for ObservabilityProducerCoreV1 {}
+
+const _: fn(&ObservabilityProducerCoreV1) = |value| {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    let ObservabilityProducerCoreV1 {
+        db,
+        identity,
+        data,
+        control,
+        pending_drops,
+        total_dropped,
+        next_sequence,
+        state,
+        final_coverage_persisted,
+        durable_emission_lock,
+        deadlines,
+        emission_lock,
+        worker,
+    } = value;
+    assert_send_sync(db);
+    assert_send_sync(identity);
+    assert_send_sync(data);
+    assert_send_sync(control);
+    assert_send_sync(pending_drops);
+    assert_send_sync(total_dropped);
+    assert_send_sync(next_sequence);
+    assert_send_sync(state);
+    assert_send_sync(final_coverage_persisted);
+    assert_send_sync(durable_emission_lock);
+    assert_send_sync(deadlines);
+    assert_send_sync(emission_lock);
+    assert_send_sync(worker);
+};
 
 pub struct BoundedObservabilityProducerV1 {
     core: Arc<ObservabilityProducerCoreV1>,
@@ -253,9 +295,7 @@ impl BoundedObservabilityProducerV1 {
         let state = Arc::new(AtomicU8::new(PRODUCER_RUNNING));
         let final_coverage_persisted = Arc::new(AtomicBool::new(false));
         let durable_emission_lock = Arc::new(AsyncMutex::new(()));
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| "observability_producer_runtime_unavailable")?;
-        let worker = runtime.spawn(run_worker(
+        let worker = NativeTask::spawn(run_worker(
             db.clone(),
             identity.clone(),
             data_rx,
@@ -269,7 +309,8 @@ impl BoundedObservabilityProducerV1 {
                 durable_emission_lock: Arc::clone(&durable_emission_lock),
                 deadlines,
             },
-        ));
+        ))
+        .map_err(|_| "observability_producer_worker_unavailable")?;
         let core = Arc::new(ObservabilityProducerCoreV1 {
             db,
             identity: identity.clone(),
@@ -435,7 +476,20 @@ impl BoundedObservabilityProducerV1 {
     pub async fn shutdown(
         &self,
     ) -> Result<ObservabilityProducerSummaryV1, ApplicationContractError> {
-        self.core.stop(false).await
+        self.core
+            .stop(false, Instant::now() + self.core.deadlines.shutdown)
+            .await
+    }
+
+    /// Shutdown bounded by the caller's deadline instead of the producer's
+    /// own budget. A daemon shutdown phase can outlast that budget, and the
+    /// drain must finish its in-flight and terminal writes, each bounded by
+    /// the persistence deadline, before it can join.
+    pub async fn shutdown_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<ObservabilityProducerSummaryV1, ApplicationContractError> {
+        self.core.stop(false, deadline).await
     }
 
     /// Confirms worker join and the writer fence completed. Persistence
@@ -463,7 +517,9 @@ impl BoundedObservabilityProducerV1 {
     }
 
     pub async fn cancel(&self) -> Result<ObservabilityProducerSummaryV1, ApplicationContractError> {
-        self.core.stop(true).await
+        self.core
+            .stop(true, Instant::now() + self.core.deadlines.shutdown)
+            .await
     }
 }
 
@@ -478,8 +534,8 @@ impl ObservabilityProducerCoreV1 {
     async fn stop(
         &self,
         cancelled: bool,
+        shutdown_deadline: Instant,
     ) -> Result<ObservabilityProducerSummaryV1, ApplicationContractError> {
-        let shutdown_deadline = Instant::now() + self.deadlines.shutdown;
         if self
             .state
             .compare_exchange(
@@ -501,7 +557,7 @@ impl ObservabilityProducerCoreV1 {
         if worker_lock_poisoned {
             if let Some(worker) = worker.take() {
                 worker.abort();
-                let _ = worker.await;
+                worker.wait().await;
             }
             self.state.store(PRODUCER_STOPPED, Ordering::Release);
             return Err(ApplicationContractError::Domain(
@@ -525,7 +581,7 @@ impl ObservabilityProducerCoreV1 {
                 Err(()) => {
                     if let Some(worker) = worker.take() {
                         worker.abort();
-                        let _ = worker.await;
+                        worker.wait().await;
                     }
                     self.state.store(PRODUCER_STOPPED, Ordering::Release);
                     return Err(ApplicationContractError::Domain(
@@ -537,14 +593,15 @@ impl ObservabilityProducerCoreV1 {
                     if now >= shutdown_deadline {
                         if let Some(worker) = worker.take() {
                             worker.abort();
-                            let _ = worker.await;
+                            worker.wait().await;
                         }
                         self.state.store(PRODUCER_STOPPED, Ordering::Release);
                         return Err(ApplicationContractError::Domain(
                             "observability_shutdown_deadline".to_owned(),
                         ));
                     }
-                    sleep_until((now + Duration::from_millis(1)).min(shutdown_deadline)).await;
+                    let _ =
+                        sleep_until((now + Duration::from_millis(1)).min(shutdown_deadline)).await;
                 }
             }
         }
@@ -557,7 +614,7 @@ impl ObservabilityProducerCoreV1 {
                 Err(_) => {
                     if let Some(worker) = worker.take() {
                         worker.abort();
-                        let _ = worker.await;
+                        worker.wait().await;
                     }
                     self.state.store(PRODUCER_STOPPED, Ordering::Release);
                     return Err(ApplicationContractError::Domain(
@@ -574,7 +631,7 @@ impl ObservabilityProducerCoreV1 {
         {
             if let Some(worker) = worker.take() {
                 worker.abort();
-                let _ = worker.await;
+                worker.wait().await;
             }
             self.state.store(PRODUCER_STOPPED, Ordering::Release);
             return Err(ApplicationContractError::Domain(
@@ -585,7 +642,7 @@ impl ObservabilityProducerCoreV1 {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => {
                 if let Some(worker) = worker.take() {
-                    let _ = worker.await;
+                    worker.wait().await;
                 }
                 self.state.store(PRODUCER_STOPPED, Ordering::Release);
                 return Err(ApplicationContractError::Domain(
@@ -595,10 +652,7 @@ impl ObservabilityProducerCoreV1 {
             Err(_) => {
                 let joined = if let Some(worker) = worker.take() {
                     worker.abort();
-                    match worker.await {
-                        Ok(()) => true,
-                        Err(error) => error.is_cancelled(),
-                    }
+                    !matches!(worker.wait().await, NativeTaskOutcome::Panicked(_))
                 } else {
                     false
                 };
@@ -620,11 +674,19 @@ impl ObservabilityProducerCoreV1 {
             }
         };
         if let Some(worker) = worker.take() {
-            worker.await.map_err(|error| {
-                ApplicationContractError::Domain(format!(
-                    "observability worker join failed: {error}"
-                ))
-            })?;
+            match worker.wait().await {
+                NativeTaskOutcome::Completed(()) => {}
+                NativeTaskOutcome::Cancelled => {
+                    return Err(ApplicationContractError::Domain(
+                        "observability worker join failed: cancelled".to_owned(),
+                    ));
+                }
+                NativeTaskOutcome::Panicked(payload) => {
+                    return Err(ApplicationContractError::Domain(format!(
+                        "observability worker join failed: {payload}"
+                    )));
+                }
+            }
             if writer_settled {
                 self.state.store(PRODUCER_SETTLED, Ordering::Release);
                 return outcome;
@@ -692,51 +754,17 @@ async fn run_worker(
     // first tick is due immediately so an idle producer still initializes
     // the frontier and closes proved-quiet days promptly; a busy startup
     // drains control and observations first because the select is biased.
-    let rollup_tick = sleep_until(Instant::now());
-    tokio::pin!(rollup_tick);
+    // A native timer that cannot start disables only this pass's rollup arm.
+    let mut rollup_due = Instant::now();
     let mut rollup_source_persisted = false;
-    loop {
+    let command = loop {
         tokio::select! {
             biased;
-            command = control.recv() => {
-                let Some(ProducerControl::Shutdown { cancelled, reply }) = command else {
-                    settle_worker(
-                        &db,
-                        &identity,
-                        &mut data,
-                        &state,
-                        &mut progress,
-                        false,
-                        false,
-                    )
-                    .await;
-                    break;
-                };
-                let (dropped_count, writer_settled) = settle_worker(
-                    &db,
-                    &identity,
-                    &mut data,
-                    &state,
-                    &mut progress,
-                    cancelled,
-                    !cancelled,
-                )
-                .await;
-                state.lifecycle.store(PRODUCER_STOPPED, Ordering::Release);
-                let result = progress.first_error.map_or_else(
-                    || Ok(ObservabilityProducerSummaryV1 {
-                        persisted: progress.persisted,
-                        dropped: dropped_count,
-                        cancelled,
-                    }),
-                    Err,
-                );
-                let _ = reply.send((result, writer_settled));
-                break;
-            }
+            command = control.recv() => break command,
             observation = data.recv() => {
                 let Some(observation) = observation else {
-                    break;
+                    state.lifecycle.store(PRODUCER_STOPPED, Ordering::Release);
+                    return;
                 };
                 let mut observations = Vec::with_capacity(OBSERVABILITY_WRITE_BATCH);
                 observations.push(observation);
@@ -775,24 +803,66 @@ async fn run_worker(
                     // only after frontier init so persist does not pay the
                     // write-lock fight again.
                     rollup_source_persisted = false;
-                    rollup_tick.as_mut().reset(Instant::now());
+                    rollup_due = Instant::now();
                 }
             }
-            () = &mut rollup_tick => {
+            Ok(()) = sleep_until(rollup_due) => {
                 // Advance one dirty day at a bounded idle cadence. Control and
                 // ordinary observations remain prioritized above maintenance.
-                let outcome = run_one_rollup_maintenance(
+                // Control also preempts a pass in flight: each of its steps
+                // may wait a full persistence deadline, and shutdown owns its
+                // budget. A dropped step is a timed-out write that the
+                // terminal carrier or the writer fence settles.
+                let maintenance = run_one_rollup_maintenance(
                     &db,
                     &identity,
                     state.deadlines.persistence,
                     &mut progress.rollup_frontier_initialized,
-                )
-                .await;
-                rollup_tick
-                    .as_mut()
-                    .reset(Instant::now() + rollup_rebuild_delay(outcome));
+                );
+                tokio::select! {
+                    biased;
+                    command = control.recv() => break command,
+                    outcome = maintenance => {
+                        rollup_due = Instant::now() + rollup_rebuild_delay(outcome);
+                    }
+                }
             }
         }
+    };
+    if let Some(ProducerControl::Shutdown { cancelled, reply }) = command {
+        let (dropped_count, writer_settled) = settle_worker(
+            &db,
+            &identity,
+            &mut data,
+            &state,
+            &mut progress,
+            cancelled,
+            !cancelled,
+        )
+        .await;
+        state.lifecycle.store(PRODUCER_STOPPED, Ordering::Release);
+        let result = progress.first_error.map_or_else(
+            || {
+                Ok(ObservabilityProducerSummaryV1 {
+                    persisted: progress.persisted,
+                    dropped: dropped_count,
+                    cancelled,
+                })
+            },
+            Err,
+        );
+        let _ = reply.send((result, writer_settled));
+    } else {
+        settle_worker(
+            &db,
+            &identity,
+            &mut data,
+            &state,
+            &mut progress,
+            false,
+            false,
+        )
+        .await;
     }
     state.lifecycle.store(PRODUCER_STOPPED, Ordering::Release);
 }
@@ -906,12 +976,13 @@ async fn record_batch(
         return false;
     }
     let count = u64::try_from(envelopes.len()).unwrap_or(u64::MAX);
-    match timeout(
-        persistence_deadline,
+    // Erased so the worker's `Send` proof does not nest the batch write
+    // (rust-lang/rust#159228).
+    let recorded = tracedecay_runtime_core::erase_send!(
         record_observability_batch(db, envelopes),
-    )
-    .await
-    {
+        Result<Vec<String>, ApplicationContractError>
+    );
+    match timeout(persistence_deadline, recorded).await {
         Ok(Ok(_)) => {
             *persisted = persisted.saturating_add(count);
             true
@@ -981,10 +1052,10 @@ async fn settle_worker(
             for carried_drop in carried_drops {
                 push_drop_range(&mut ranges, carried_drop);
             }
-            let emission_identity = owner_fact
-                .as_ref()
-                .map(|owner| owner.emission_identity.clone())
-                .unwrap_or_else(|| identity_from_envelope(&envelope));
+            let emission_identity = owner_fact.as_ref().map_or_else(
+                || identity_from_envelope(&envelope),
+                |owner| owner.emission_identity.clone(),
+            );
             let sequence = if owner_fact.is_some() {
                 state.next_sequence.fetch_add(1, Ordering::AcqRel)
             } else {
@@ -1092,16 +1163,22 @@ async fn settle_worker(
             .final_coverage_persisted
             .store(clean_shutdown_observed && writer_settled, Ordering::Release);
         // The mandatory terminal precedes optional maintenance so its day
-        // can be rebuilt before shutdown. A deferred maintenance operation
-        // may still own a timed-out database command and requires the fence.
-        let maintenance = run_one_rollup_maintenance(
-            db,
-            identity,
-            state.deadlines.persistence,
-            &mut progress.rollup_frontier_initialized,
-        )
-        .await;
-        writer_settled &= maintenance != RollupAdvanceOutcome::Deferred;
+        // can be rebuilt before shutdown. After a persistence failure the
+        // writer has already missed a deadline, and maintenance would spend
+        // the shutdown budget that the reply and the writer fence need; the
+        // durable dirty day waits for the next producer. A deferred
+        // maintenance operation may still own a timed-out database command
+        // and requires the fence.
+        if progress.first_error.is_none() {
+            let maintenance = run_one_rollup_maintenance(
+                db,
+                identity,
+                state.deadlines.persistence,
+                &mut progress.rollup_frontier_initialized,
+            )
+            .await;
+            writer_settled &= maintenance != RollupAdvanceOutcome::Deferred;
+        }
     }
     (state.total_dropped.load(Ordering::Acquire), writer_settled)
 }
@@ -1322,15 +1399,12 @@ mod cheaper_frontier_tests {
 
 #[cfg(test)]
 mod shutdown_settlement_tests {
-    use super::{
-        BoundedObservabilityProducerV1, ObservabilityProducerDeadlinesV1,
-        ObservabilityProducerIdentityV1, ProducerControl,
-    };
+    use super::{BoundedObservabilityProducerV1, ObservabilityProducerIdentityV1, ProducerControl};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime;
+    use tracedecay_runtime_core::native_runtime::{NativeTask, NativeTaskOutcome};
 
     async fn fixture() -> (
         tempfile::TempDir,
@@ -1349,7 +1423,10 @@ mod shutdown_settlement_tests {
         .await
         .unwrap();
         let db = runtime.project_database_arc().unwrap();
-        let producer = BoundedObservabilityProducerV1::start_with_deadlines(
+        // Production deadlines: the worker's terminal write and its reply must
+        // fit the budget on a starved runner. A short budget fails these tests
+        // on scheduling delay while the producer settles correctly.
+        let producer = BoundedObservabilityProducerV1::start(
             db.clone(),
             ObservabilityProducerIdentityV1 {
                 authorized_scope_ref: project_id.as_str().to_owned(),
@@ -1359,10 +1436,6 @@ mod shutdown_settlement_tests {
                 policy_revision: "policy.v1".to_owned(),
             },
             1,
-            ObservabilityProducerDeadlinesV1 {
-                persistence: Duration::from_millis(50),
-                shutdown: Duration::from_millis(250),
-            },
         )
         .unwrap();
         (directory, runtime, producer)
@@ -1385,24 +1458,27 @@ mod shutdown_settlement_tests {
         let (blocker_ready, blocker_handle) = oneshot::channel();
         // Keep the real worker and its terminal write, but make its join
         // observe another writer already owning the database afterward.
-        *producer.core.worker.lock().unwrap() = Some(tokio::spawn(async move {
-            worker.await.unwrap();
+        let wrapped = NativeTask::spawn(async move {
+            assert_eq!(worker.wait().await, NativeTaskOutcome::Completed(()));
             let (acquired, acquired_rx) = oneshot::channel();
-            let blocker = tokio::spawn(async move {
+            let blocker = NativeTask::spawn(async move {
                 let transaction = db.begin_write_transaction().await.unwrap();
                 acquired.send(()).unwrap();
                 released.await.unwrap();
                 transaction.rollback().await.unwrap();
-            });
+            })
+            .unwrap();
             acquired_rx.await.unwrap();
-            blocker_ready.send(blocker).unwrap();
-        }));
+            assert!(blocker_ready.send(blocker).is_ok());
+        })
+        .unwrap();
+        *producer.core.worker.lock().unwrap() = Some(wrapped);
         let stopping = Arc::clone(&producer);
         let shutdown = tokio::spawn(async move { stopping.shutdown().await });
         let blocker = blocker_handle.await.unwrap();
         let outcome = shutdown.await.unwrap();
         release.send(()).unwrap();
-        blocker.await.unwrap();
+        assert_eq!(blocker.wait().await, NativeTaskOutcome::Completed(()));
         let summary = outcome.expect("completed producer never waits on the unrelated writer");
         assert_eq!(summary.persisted, 1);
         assert!(producer.shutdown_settled());

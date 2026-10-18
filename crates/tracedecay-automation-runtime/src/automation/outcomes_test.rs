@@ -71,7 +71,7 @@ fn skill_outcome_requires_an_activation_timestamp() {
     assert!(skill_outcome(&record, 100 * DAY).is_none());
     record.activated_at = Some(10 * DAY);
     let outcome = skill_outcome(&record, 100 * DAY).unwrap();
-    assert_eq!(outcome.verdict, SkillOutcomeVerdict::Ignored);
+    assert_eq!(outcome.verdict, SkillOutcomeVerdict::Unknown);
     assert_eq!(outcome.days_since_activation, 90);
 }
 
@@ -105,8 +105,8 @@ fn unused_skill_inside_window_is_too_early() {
 }
 
 #[test]
-fn unused_skill_past_window_is_ignored() {
-    let mut record = summary("ignored-skill");
+fn unused_skill_past_window_is_unknown() {
+    let mut record = summary("unmeasured-skill");
     record.activated_at = Some(10 * DAY);
     record.view_count_at_activation = Some(2);
     record.use_count_at_activation = Some(0);
@@ -114,7 +114,7 @@ fn unused_skill_past_window_is_ignored() {
     record.last_viewed_at = Some(12 * DAY);
 
     let outcome = skill_outcome(&record, 10 * DAY + SKILL_ACTIVATION_WINDOW_SECS).unwrap();
-    assert_eq!(outcome.verdict, SkillOutcomeVerdict::Ignored);
+    assert_eq!(outcome.verdict, SkillOutcomeVerdict::Unknown);
     assert_eq!(outcome.views_since_activation, 2);
     assert_eq!(outcome.uses_since_activation, 0);
 }
@@ -132,8 +132,32 @@ fn ledger_without_activation_baseline_uses_last_activity_fallback() {
 
     record.last_used_at = Some(9 * DAY);
     let outcome = skill_outcome(&record, 20 * DAY).unwrap();
-    assert_eq!(outcome.verdict, SkillOutcomeVerdict::Ignored);
+    assert_eq!(outcome.verdict, SkillOutcomeVerdict::Unknown);
     assert_eq!(outcome.uses_since_activation, 0);
+}
+
+#[test]
+fn stored_ignored_verdict_loads_and_reserializes_as_unknown() {
+    let stored = json!({
+        "schema_version": 3,
+        "skills": [{
+            "skill_id": "legacy-skill",
+            "activated_at": 10 * DAY,
+            "days_since_activation": 40,
+            "views_since_activation": 1,
+            "uses_since_activation": 0,
+            "verdict": "ignored",
+        }],
+        "facts": [],
+        "skills_refreshed_at": 50 * DAY,
+    });
+
+    let snapshot: AutomationOutcomesSnapshot = serde_json::from_value(stored).unwrap();
+    let reserialized = serde_json::to_value(&snapshot).unwrap();
+
+    assert_eq!(reserialized["skills"][0]["verdict"], "unknown");
+    assert_eq!(reserialized["skills"][0]["activated_at"], 10 * DAY);
+    assert_eq!(reserialized["skills_refreshed_at"], 50 * DAY);
 }
 
 #[test]
@@ -358,9 +382,9 @@ async fn malformed_snapshot_is_never_defaulted_or_overwritten() {
     let memory =
         MemoryApplication::new(FactOwnerV1::Profile, DatabaseFactStore::new(&database)).unwrap();
     let path = automation_outcomes_path(&dashboard_root);
-    tokio::fs::create_dir_all(&dashboard_root).await.unwrap();
+    std::fs::create_dir_all(&dashboard_root).unwrap();
     let malformed = b"{not-valid-json";
-    tokio::fs::write(&path, malformed).await.unwrap();
+    std::fs::write(&path, malformed).unwrap();
     let now = tracedecay_runtime_core::tracedecay::current_timestamp();
     let run_control = outcome_read_control();
 
@@ -368,12 +392,12 @@ async fn malformed_snapshot_is_never_defaulted_or_overwritten() {
         .await
         .unwrap_err();
     assert!(skill_error.to_string().contains("failed to parse"));
-    assert_eq!(tokio::fs::read(&path).await.unwrap(), malformed);
+    assert_eq!(std::fs::read(&path).unwrap(), malformed);
 
     let fact_error =
         refresh_fact_outcomes(&dashboard_root, &memory, now, run_control.read_control())
             .await
             .unwrap_err();
     assert!(fact_error.to_string().contains("failed to parse"));
-    assert_eq!(tokio::fs::read(&path).await.unwrap(), malformed);
+    assert_eq!(std::fs::read(&path).unwrap(), malformed);
 }

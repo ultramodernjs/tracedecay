@@ -707,19 +707,8 @@ where
                 .diagnostics
                 .diagnostic_history(context, &diagnostics_request, runtime)
                 .await;
-            if let Some((termination, states)) = self
-                .runtime_override(context, request, progress.runtime.as_ref())
-                .await
-            {
-                return Ok(FeedbackCycleStep::terminal(
-                    after_runtime_terminal_with_baselines(
-                        termination,
-                        states,
-                        Vec::new(),
-                        progress.runtime.take(),
-                        FeedbackCycleStageEmission::Suppressed,
-                    ),
-                ));
+            if let Some(step) = self.runtime_override_step(context, request, progress).await {
+                return Ok(step);
             }
             baselines
         } else {
@@ -750,19 +739,8 @@ where
             .diagnostics
             .diagnostics(context, &diagnostics_request)
             .await;
-        if let Some((termination, states)) = self
-            .runtime_override(context, request, progress.runtime.as_ref())
-            .await
-        {
-            return Ok(FeedbackCycleStep::terminal(
-                after_runtime_terminal_with_baselines(
-                    termination,
-                    states,
-                    Vec::new(),
-                    progress.runtime.take(),
-                    FeedbackCycleStageEmission::Suppressed,
-                ),
-            ));
+        if let Some(step) = self.runtime_override_step(context, request, progress).await {
+            return Ok(step);
         }
         Ok(FeedbackCycleStep::continue_with(
             FeedbackCycleStage::ClassifyDiagnostics,
@@ -806,15 +784,15 @@ where
         if let Some(termination) =
             terminal_before_impact(&provider_states, &progress.baseline_states)
         {
-            return Ok(FeedbackCycleStep::terminal(
-                after_runtime_terminal_with_baselines(
+            return Ok(FeedbackCycleStep::terminal(FeedbackCycleTerminal {
+                baseline_states: progress.baseline_states.clone(),
+                ..after_runtime_terminal(
                     termination,
                     provider_states,
-                    progress.baseline_states.clone(),
                     progress.runtime.take(),
                     FeedbackCycleStageEmission::FromProgress,
-                ),
-            ));
+                )
+            }));
         }
         progress
             .completed_stages
@@ -845,41 +823,24 @@ where
                 progress.impact_state = Some(state);
             }
             FeedbackImpactResolution::Cancelled => {
-                return Ok(FeedbackCycleStep::terminal(
-                    after_runtime_terminal_with_baselines(
-                        FeedbackCycleTerminationV1::Cancelled,
-                        vec![ProviderEvaluationStateV1::Cancelled],
-                        Vec::new(),
-                        progress.runtime.take(),
-                        FeedbackCycleStageEmission::FromProgress,
-                    ),
-                ));
+                return Ok(FeedbackCycleStep::terminal(after_runtime_terminal(
+                    FeedbackCycleTerminationV1::Cancelled,
+                    vec![ProviderEvaluationStateV1::Cancelled],
+                    progress.runtime.take(),
+                    FeedbackCycleStageEmission::FromProgress,
+                )));
             }
             FeedbackImpactResolution::TimedOut => {
-                return Ok(FeedbackCycleStep::terminal(
-                    after_runtime_terminal_with_baselines(
-                        FeedbackCycleTerminationV1::BudgetExceeded,
-                        vec![ProviderEvaluationStateV1::TimedOut],
-                        Vec::new(),
-                        progress.runtime.take(),
-                        FeedbackCycleStageEmission::FromProgress,
-                    ),
-                ));
+                return Ok(FeedbackCycleStep::terminal(after_runtime_terminal(
+                    FeedbackCycleTerminationV1::BudgetExceeded,
+                    vec![ProviderEvaluationStateV1::TimedOut],
+                    progress.runtime.take(),
+                    FeedbackCycleStageEmission::FromProgress,
+                )));
             }
         }
-        if let Some((termination, states)) = self
-            .runtime_override(context, request, progress.runtime.as_ref())
-            .await
-        {
-            return Ok(FeedbackCycleStep::terminal(
-                after_runtime_terminal_with_baselines(
-                    termination,
-                    states,
-                    Vec::new(),
-                    progress.runtime.take(),
-                    FeedbackCycleStageEmission::Suppressed,
-                ),
-            ));
+        if let Some(step) = self.runtime_override_step(context, request, progress).await {
+            return Ok(step);
         }
         progress
             .completed_stages
@@ -917,64 +878,47 @@ where
             ))?;
             let key = request.input.dedupe_key(&evidence_identity)?;
             let dedupe_state = self.dedupe.lookup_completed(context, &key).await;
-            if let Some((termination, states)) = self
-                .runtime_override(context, request, progress.runtime.as_ref())
-                .await
-            {
-                return Ok(FeedbackCycleStep::terminal(
-                    after_runtime_terminal_with_baselines(
-                        termination,
-                        states,
-                        Vec::new(),
-                        progress.runtime.take(),
-                        FeedbackCycleStageEmission::Suppressed,
-                    ),
-                ));
+            if let Some(step) = self.runtime_override_step(context, request, progress).await {
+                return Ok(step);
             }
             match dedupe_state {
                 FeedbackCycleDedupeState::Duplicate => {
-                    return Ok(FeedbackCycleStep::terminal(
-                        after_runtime_terminal_with_dedupe(
+                    return Ok(FeedbackCycleStep::terminal(FeedbackCycleTerminal {
+                        dedupe_key: Some(key),
+                        ..after_runtime_terminal(
                             FeedbackCycleTerminationV1::DuplicateNoop,
                             Vec::new(),
-                            Some(key),
                             progress.runtime.take(),
                             FeedbackCycleStageEmission::FromProgress,
-                        ),
-                    ));
+                        )
+                    }));
                 }
                 FeedbackCycleDedupeState::Unavailable => {
-                    return Ok(FeedbackCycleStep::terminal(
-                        after_runtime_terminal_with_dedupe(
+                    return Ok(FeedbackCycleStep::terminal(FeedbackCycleTerminal {
+                        dedupe_key: Some(key),
+                        ..after_runtime_terminal(
                             FeedbackCycleTerminationV1::DaemonUnavailable,
                             vec![ProviderEvaluationStateV1::Unavailable],
-                            Some(key),
                             progress.runtime.take(),
                             FeedbackCycleStageEmission::FromProgress,
-                        ),
-                    ));
+                        )
+                    }));
                 }
                 FeedbackCycleDedupeState::Cancelled => {
-                    return Ok(FeedbackCycleStep::terminal(
-                        after_runtime_terminal_with_baselines(
-                            FeedbackCycleTerminationV1::Cancelled,
-                            vec![ProviderEvaluationStateV1::Cancelled],
-                            Vec::new(),
-                            progress.runtime.take(),
-                            FeedbackCycleStageEmission::FromProgress,
-                        ),
-                    ));
+                    return Ok(FeedbackCycleStep::terminal(after_runtime_terminal(
+                        FeedbackCycleTerminationV1::Cancelled,
+                        vec![ProviderEvaluationStateV1::Cancelled],
+                        progress.runtime.take(),
+                        FeedbackCycleStageEmission::FromProgress,
+                    )));
                 }
                 FeedbackCycleDedupeState::TimedOut => {
-                    return Ok(FeedbackCycleStep::terminal(
-                        after_runtime_terminal_with_baselines(
-                            FeedbackCycleTerminationV1::BudgetExceeded,
-                            vec![ProviderEvaluationStateV1::TimedOut],
-                            Vec::new(),
-                            progress.runtime.take(),
-                            FeedbackCycleStageEmission::FromProgress,
-                        ),
-                    ));
+                    return Ok(FeedbackCycleStep::terminal(after_runtime_terminal(
+                        FeedbackCycleTerminationV1::BudgetExceeded,
+                        vec![ProviderEvaluationStateV1::TimedOut],
+                        progress.runtime.take(),
+                        FeedbackCycleStageEmission::FromProgress,
+                    )));
                 }
                 FeedbackCycleDedupeState::Unique => Some(key),
             }
@@ -1002,8 +946,7 @@ where
         let affected_tests_state = progress
             .impact
             .as_ref()
-            .map(|impact| impact.affected_tests_state)
-            .unwrap_or(impact_state);
+            .map_or(impact_state, |impact| impact.affected_tests_state);
         let termination = determine_termination(
             &progress.provider_states,
             &progress.baseline_states,
@@ -1160,6 +1103,25 @@ where
                 )
             }
         }
+    }
+
+    /// Ends the cycle with suppressed stage emission when the runtime changed
+    /// or the request was interrupted while a stage awaited its port.
+    async fn runtime_override_step(
+        &self,
+        context: &RequestContext,
+        request: &FeedbackCycleExecutionRequest,
+        progress: &mut FeedbackCycleProgress,
+    ) -> Option<FeedbackCycleStep> {
+        let (termination, states) = self
+            .runtime_override(context, request, progress.runtime.as_ref())
+            .await?;
+        Some(FeedbackCycleStep::terminal(after_runtime_terminal(
+            termination,
+            states,
+            progress.runtime.take(),
+            FeedbackCycleStageEmission::Suppressed,
+        )))
     }
 
     #[tracing::instrument(
@@ -1548,6 +1510,10 @@ fn request_interruption(
             FeedbackCycleTerminationV1::BudgetExceeded,
             vec![ProviderEvaluationStateV1::TimedOut],
         )),
+        RequestAdmission::GrantExpired => Some((
+            FeedbackCycleTerminationV1::DaemonUnavailable,
+            vec![ProviderEvaluationStateV1::Unavailable],
+        )),
     }
 }
 
@@ -1747,26 +1713,29 @@ fn collect_diagnostics(
                             &request.input,
                         ) && diagnostic.validate().is_ok() =>
                     {
-                        let classification = baselines
-                            .get(provider_index)
-                            .map(|resolved| {
+                        let classification = baselines.get(provider_index).map_or(
+                            FeedbackDiagnosticClassificationV1::Unknown,
+                            |resolved| {
                                 resolved
                                     .baseline
                                     .zip(resolved.expected.as_ref())
-                                    .map(|(baseline, expected)| {
-                                        baseline.classify(expected, &diagnostic.diagnostic_anchor)
-                                    })
-                                    .unwrap_or_else(|| {
-                                        if resolved.state
-                                            == FeedbackBaselineStateV1::NoPriorBaseline
-                                        {
-                                            FeedbackDiagnosticClassificationV1::New
-                                        } else {
-                                            FeedbackDiagnosticClassificationV1::Unknown
-                                        }
-                                    })
-                            })
-                            .unwrap_or(FeedbackDiagnosticClassificationV1::Unknown);
+                                    .map_or_else(
+                                        || {
+                                            if resolved.state
+                                                == FeedbackBaselineStateV1::NoPriorBaseline
+                                            {
+                                                FeedbackDiagnosticClassificationV1::New
+                                            } else {
+                                                FeedbackDiagnosticClassificationV1::Unknown
+                                            }
+                                        },
+                                        |(baseline, expected)| {
+                                            baseline
+                                                .classify(expected, &diagnostic.diagnostic_anchor)
+                                        },
+                                    )
+                            },
+                        );
                         provider_findings.push(FeedbackFindingV1 {
                             finding_id: derive_feedback_finding_id(
                                 &diagnostic.diagnostic_anchor,
@@ -2011,46 +1980,6 @@ fn after_runtime_terminal(
             stage_emission,
         },
     )
-}
-
-fn after_runtime_terminal_with_baselines(
-    termination: FeedbackCycleTerminationV1,
-    provider_states: Vec<ProviderEvaluationStateV1>,
-    baseline_states: Vec<FeedbackBaselineStateV1>,
-    runtime: Option<FeedbackRuntimeStateV1>,
-    stage_emission: FeedbackCycleStageEmission,
-) -> FeedbackCycleTerminal {
-    FeedbackCycleTerminal {
-        baseline_states,
-        ..early_terminal(
-            termination,
-            provider_states,
-            FeedbackCycleFinishPath::AfterRuntime {
-                runtime: runtime.map(Box::new),
-                stage_emission,
-            },
-        )
-    }
-}
-
-fn after_runtime_terminal_with_dedupe(
-    termination: FeedbackCycleTerminationV1,
-    provider_states: Vec<ProviderEvaluationStateV1>,
-    dedupe_key: Option<FeedbackDedupeKeyV1>,
-    runtime: Option<FeedbackRuntimeStateV1>,
-    stage_emission: FeedbackCycleStageEmission,
-) -> FeedbackCycleTerminal {
-    FeedbackCycleTerminal {
-        dedupe_key,
-        ..early_terminal(
-            termination,
-            provider_states,
-            FeedbackCycleFinishPath::AfterRuntime {
-                runtime: runtime.map(Box::new),
-                stage_emission,
-            },
-        )
-    }
 }
 
 #[cfg(test)]

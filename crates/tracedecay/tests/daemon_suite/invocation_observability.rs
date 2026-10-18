@@ -23,6 +23,8 @@ use tracedecay_domain::{
 };
 
 use tracedecay_domain::test_fixtures::digest;
+use tracedecay_runtime_core::native_runtime;
+use tracedecay_rusqlite_runtime::exact_sql;
 
 /// A registry mount request whose store-authority fields match `identity`,
 /// stamping that identity's configuration and policy revisions for the
@@ -136,7 +138,7 @@ async fn project_runtime_reuses_one_producer_and_shutdown_flushes_it() {
         ObservabilityEmissionOutcomeV1::Enqueued
     );
 
-    service.expire_all().await;
+    service.expire_all(None).await;
     assert_eq!(
         first
             .try_emit(envelope(&project_id, "mounted:after-shutdown"))
@@ -212,7 +214,7 @@ async fn a_same_root_remount_stamps_the_configuration_it_resolved() {
             .expect("configuration B emission"),
         ObservabilityEmissionOutcomeV1::Enqueued
     );
-    service.expire_all().await;
+    service.expire_all(None).await;
 
     let page = RegisteredObservabilityPortV1::new(&database)
         .query(ObservabilityQueryV1 {
@@ -269,7 +271,7 @@ async fn a_new_daemon_runtime_restarts_the_project_producer_after_clean_shutdown
         )
         .await
         .expect("first daemon mount");
-    first_service.expire_all().await;
+    first_service.expire_all(None).await;
 
     let restarted_service = DaemonInvocationService::default();
     let restarted = restarted_service
@@ -289,7 +291,7 @@ async fn a_new_daemon_runtime_restarts_the_project_producer_after_clean_shutdown
             .expect("restarted enqueue"),
         ObservabilityEmissionOutcomeV1::Enqueued
     );
-    restarted_service.expire_all().await;
+    restarted_service.expire_all(None).await;
 }
 
 #[tokio::test]
@@ -558,7 +560,7 @@ async fn linked_roots_alias_one_store_producer_until_the_last_alias_shuts_down()
         .expect("remounted emission");
 
     // The last alias shuts the store producer down.
-    first_service.expire_all().await;
+    first_service.expire_all(None).await;
     assert_eq!(
         linked
             .try_emit(envelope(&project_id, "alias:after-shutdown"))
@@ -595,7 +597,7 @@ async fn linked_roots_alias_one_store_producer_until_the_last_alias_shuts_down()
     restarted
         .try_emit(envelope(&project_id, "alias:restarted"))
         .expect("restarted emission");
-    restarted_service.expire_all().await;
+    restarted_service.expire_all(None).await;
 
     let page = RegisteredObservabilityPortV1::new(&database)
         .query(ObservabilityQueryV1 {
@@ -809,7 +811,7 @@ async fn exact_store_routing_collapses_linked_roots_without_crossing_stores() {
             )
             .is_none()
     );
-    service.expire_all().await;
+    service.expire_all(None).await;
 }
 
 #[tokio::test]
@@ -829,13 +831,13 @@ async fn last_alias_shutdown_keeps_the_store_retiring_until_drain_finishes() {
         )
         .await
         .expect("first producer");
+    // The held writer keeps the drain's mandatory terminal write in flight.
+    // Nothing is enqueued before shutdown, so no persistence deadline runs
+    // while quiescence retires the root and stops the ancillary owners.
     let blocker = database
         .begin_write_transaction()
         .await
         .expect("hold registered writer");
-    producer
-        .try_emit(envelope(&project_id, "retiring:blocked"))
-        .expect("enqueue blocked event");
 
     let lsp_registry = Arc::new(tokio::sync::Mutex::new(
         tracedecay_lsp::LspSessionRegistry::default(),
@@ -855,21 +857,35 @@ async fn last_alias_shutdown_keeps_the_store_retiring_until_drain_finishes() {
             )
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        let mut probe = 0_u64;
-        loop {
-            match producer.try_emit(envelope(&project_id, &format!("retiring:probe:{probe}"))) {
-                Err("observability_producer_closed") => break,
-                Err(error) => panic!("unexpected producer state: {error}"),
-                Ok(_) => {
-                    probe += 1;
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            }
+    // A foreign project's mount reads the store entry without joining it:
+    // refused as busy while the alias is live, as retiring once quiescence
+    // releases it.
+    let foreign_root = PathBuf::from("/project/observability-retiring-shutdown-foreign");
+    let foreign_project =
+        ProjectId::new("project.observability-retiring-shutdown-foreign").expect("project id");
+    loop {
+        let refusal = match service
+            .mount_observability_producer(
+                foreign_root.clone(),
+                database.clone(),
+                foreign_project.clone(),
+                digest('3'),
+                digest('4'),
+            )
+            .await
+        {
+            Ok(_) => panic!("a foreign project must not join the store owner"),
+            Err(error) => error.to_string(),
+        };
+        if refusal.contains("store_observability_retiring") {
+            break;
         }
-    })
-    .await
-    .expect("last-alias shutdown reaches the producer");
+        assert!(
+            refusal.contains("a different observability producer is already mounted"),
+            "unexpected foreign mount result: {refusal}"
+        );
+        tokio::task::yield_now().await;
+    }
 
     let retiring = match service
         .mount_observability_producer(
@@ -892,17 +908,156 @@ async fn last_alias_shutdown_keeps_the_store_retiring_until_drain_finishes() {
     );
 
     blocker.commit().await.expect("release registered writer");
-    let quiescence = tokio::time::timeout(Duration::from_secs(3), quiescence)
+    let quiescence = quiescence
         .await
-        .expect("quiescence completes")
         .expect("quiescence task")
         .expect("clean project quiescence");
     drop(quiescence);
+    assert_eq!(
+        producer
+            .try_emit(envelope(&project_id, "retiring:after-drain"))
+            .expect_err("last-alias quiescence closes the producer"),
+        "observability_producer_closed"
+    );
     service
         .mount_observability_producer(linked_root, database, project_id, digest('3'), digest('5'))
         .await
         .expect("one replacement mounts after retirement");
-    service.expire_all().await;
+    service.expire_all(None).await;
+}
+
+/// A write that missed its persistence deadline is a gap in the stream, not
+/// an owner still running: the producer worker still joins. Quiescence has
+/// already taken the root's runtime out of the registry by then, so it must
+/// report the root quiesced rather than fail the capacity retirement.
+#[tokio::test]
+async fn quiescence_survives_a_producer_write_that_missed_its_deadline() {
+    let (_project, project_id, database, _runtime) =
+        runtime("observability-quiesce-missed-write").await;
+    let root = PathBuf::from("/project/observability-quiesce-missed-write");
+    let service = DaemonInvocationService::default();
+    let producer = service
+        .mount_observability_producer(
+            root.clone(),
+            database.clone(),
+            project_id.clone(),
+            digest('3'),
+            digest('4'),
+        )
+        .await
+        .expect("producer");
+    let blocker = database
+        .begin_write_transaction()
+        .await
+        .expect("hold registered writer");
+    producer
+        .try_emit(envelope(&project_id, "quiesce:missed-write"))
+        .expect("enqueue the event whose write misses its deadline");
+
+    let lsp_registry = Arc::new(tokio::sync::Mutex::new(
+        tracedecay_lsp::LspSessionRegistry::default(),
+    ));
+    let profile_id = database.binding().shard_id.profile_id.clone();
+    let quiescing_service = service.clone();
+    let quiescing_project = project_id.clone();
+    let quiescence = tokio::spawn(async move {
+        quiescing_service
+            .quiesce_project(
+                &lsp_registry,
+                &profile_id,
+                &quiescing_project,
+                &BTreeSet::from([root]),
+            )
+            .await
+    });
+    while !producer.shutdown_joined() && !quiescence.is_finished() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    blocker.commit().await.expect("release registered writer");
+
+    let quiescence = quiescence
+        .await
+        .expect("quiescence task")
+        .expect("a missed persistence deadline must not fail quiescence");
+    assert_eq!(
+        producer
+            .try_emit(envelope(&project_id, "quiesce:after-drain"))
+            .expect_err("quiescence closes the producer"),
+        "observability_producer_closed"
+    );
+    drop(quiescence);
+    service.expire_all(None).await;
+}
+
+/// A daemon shutdown after a producer missed a write deadline joins every
+/// owner. The missed write is lost work to report, not an owner that failed
+/// to stop, so the shutdown receipt stays clean.
+#[tokio::test]
+async fn daemon_shutdown_stays_clean_after_a_producer_write_missed_its_deadline() {
+    let (_project, project_id, database, _runtime) =
+        runtime("observability-shutdown-missed-write").await;
+    let root = PathBuf::from("/project/observability-shutdown-missed-write");
+    let service = DaemonInvocationService::default();
+    let producer = service
+        .mount_observability_producer(
+            root,
+            database.clone(),
+            project_id.clone(),
+            digest('3'),
+            digest('4'),
+        )
+        .await
+        .expect("producer");
+    let blocker = database
+        .begin_write_transaction()
+        .await
+        .expect("hold registered writer");
+    producer
+        .try_emit(envelope(&project_id, "shutdown:missed-write"))
+        .expect("enqueue the event whose write misses its deadline");
+
+    let shutdown = tokio::spawn(async move {
+        tracedecay_daemon_service::shutdown::join_shutdown_owners(
+            std::time::Instant::now() + Duration::from_secs(30),
+            vec![
+                tracedecay_daemon_service::shutdown::ShutdownOwner::with_deadline_status(
+                    "invocation",
+                    || {},
+                    move |deadline| async move { service.expire_all(Some(deadline)).await },
+                ),
+            ],
+        )
+        .await
+    });
+    while !producer.shutdown_joined() && !shutdown.is_finished() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    blocker.commit().await.expect("release registered writer");
+
+    let receipt = shutdown.await.expect("shutdown task");
+    assert!(
+        producer.shutdown_joined(),
+        "the producer worker joined despite the missed write"
+    );
+    assert_eq!(
+        receipt.owners[0].status,
+        tracedecay_daemon_service::shutdown::ShutdownStatus::Clean,
+        "a missed persistence deadline must not make daemon shutdown unclean"
+    );
+    assert!(receipt.unfinished().is_empty());
+    let [lost] = receipt.lost_work.as_slice() else {
+        panic!(
+            "the missed write is reported exactly once: {:?}",
+            receipt.lost_work
+        );
+    };
+    assert_eq!(lost.owner, "invocation");
+    assert!(
+        lost.work.contains("observability-shutdown-missed-write")
+            && lost.work.contains("observability_persistence_deadline"),
+        "lost work names the project and the missed deadline: {}",
+        lost.work
+    );
 }
 
 #[tokio::test]
@@ -941,13 +1096,13 @@ async fn concurrent_two_alias_release_keeps_the_store_retiring_until_drain_finis
         producer.identity().process_boot_id
     );
 
+    // The held writer keeps the drain's mandatory terminal write in flight.
+    // Nothing is enqueued before shutdown, so no persistence deadline runs
+    // while the ancillary owners stop.
     let blocker = database
         .begin_write_transaction()
         .await
         .expect("hold registered writer");
-    producer
-        .try_emit(envelope(&project_id, "retiring:two-aliases:blocked"))
-        .expect("enqueue blocked event");
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let first_barrier = Arc::clone(&barrier);
     let first_release = tokio::spawn(async move {
@@ -960,24 +1115,22 @@ async fn concurrent_two_alias_release_keeps_the_store_retiring_until_drain_finis
         linked.shutdown().await
     });
     barrier.wait().await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        let mut probe = 0_u64;
-        loop {
-            match producer.try_emit(envelope(
-                &project_id,
-                &format!("retiring:two-aliases:probe:{probe}"),
-            )) {
-                Err("observability_producer_closed") => break,
-                Err(error) => panic!("unexpected producer state: {error}"),
-                Ok(_) => {
-                    probe += 1;
-                    tokio::task::yield_now().await;
-                }
-            }
+    // A foreign-revision mount reads the entry without joining it: Busy while
+    // an alias is live, Retiring once the last release begins the drain.
+    let foreign_mount = store_mount(&ObservabilityProducerIdentityV1 {
+        producer_revision: "producer.foreign".to_owned(),
+        ..identity.clone()
+    });
+    loop {
+        match registry.acquire_or_start(&database, &foreign_mount, || {
+            panic!("the held writer keeps the store owned")
+        }) {
+            Err(StoreObservabilityMountErrorV1::Busy) => tokio::task::yield_now().await,
+            Err(StoreObservabilityMountErrorV1::Retiring) => break,
+            Err(error) => panic!("unexpected store state: {error}"),
+            Ok(_) => panic!("a foreign revision must not join the store owner"),
         }
-    })
-    .await
-    .expect("concurrent last release reaches the producer");
+    }
 
     let retiring = registry.acquire_or_start(&database, &store_mount(&identity), || {
         panic!("retiring store must not start an overlapping producer")
@@ -987,18 +1140,20 @@ async fn concurrent_two_alias_release_keeps_the_store_retiring_until_drain_finis
         Err(StoreObservabilityMountErrorV1::Retiring)
     ));
     blocker.commit().await.expect("release registered writer");
-    tokio::time::timeout(Duration::from_secs(3), async {
-        first_release
-            .await
-            .expect("first release task")
-            .expect("first alias release");
-        linked_release
-            .await
-            .expect("linked release task")
-            .expect("linked alias release");
-    })
-    .await
-    .expect("concurrent owner retirement completes");
+    first_release
+        .await
+        .expect("first release task")
+        .expect("first alias release");
+    linked_release
+        .await
+        .expect("linked release task")
+        .expect("linked alias release");
+    assert_eq!(
+        producer
+            .try_emit(envelope(&project_id, "retiring:two-aliases:after-drain"))
+            .expect_err("the concurrent last release closes the shared producer"),
+        "observability_producer_closed"
+    );
 
     let replacement_identity = ObservabilityProducerIdentityV1 {
         process_boot_id: "daemon:retiring-two-aliases-replacement".to_owned(),
@@ -1051,23 +1206,38 @@ async fn adjacent_linked_alias_capacity_drops_retain_distinct_policy_carriers() 
     let first_producer = first.producer();
     let linked_producer = linked.producer();
 
-    let mut index = 0_u64;
-    let first_missing_sequence = loop {
+    // Each offer takes the next shared sequence, starting at 1. The native
+    // worker can free the slot between A's drop and B's offer; B then carries
+    // A's single drop and the pair is retried until both drop adjacently.
+    let mut sequence = 0_u64;
+    let mut alias_a_drops = Vec::new();
+    let alias_b_drop = loop {
+        assert!(
+            sequence < 1_024,
+            "writer pressure must fill the bounded queue"
+        );
         let outcome = first_producer
-            .try_emit(envelope(&project_id, &format!("capacity:alias-a:{index}")))
+            .try_emit(envelope(
+                &project_id,
+                &format!("capacity:alias-a:{sequence}"),
+            ))
             .expect("bounded alias A emission");
-        index = index.saturating_add(1);
-        if outcome == ObservabilityEmissionOutcomeV1::DroppedAtCapacity {
-            break index;
+        sequence += 1;
+        if outcome != ObservabilityEmissionOutcomeV1::DroppedAtCapacity {
+            continue;
         }
-        assert!(index < 1_024, "writer pressure must fill the bounded queue");
+        alias_a_drops.push(sequence);
+        let outcome = linked_producer
+            .try_emit(envelope(
+                &project_id,
+                &format!("capacity:alias-b:{sequence}"),
+            ))
+            .expect("adjacent bounded alias B emission");
+        sequence += 1;
+        if outcome == ObservabilityEmissionOutcomeV1::DroppedAtCapacity {
+            break sequence;
+        }
     };
-    assert_eq!(
-        linked_producer
-            .try_emit(envelope(&project_id, "capacity:alias-b"))
-            .expect("adjacent bounded alias B emission"),
-        ObservabilityEmissionOutcomeV1::DroppedAtCapacity
-    );
 
     blocker.commit().await.expect("release registered writer");
     first.shutdown().await.expect("release first alias");
@@ -1082,11 +1252,11 @@ async fn adjacent_linked_alias_capacity_drops_retain_distinct_policy_carriers() 
                 until_micros: i64::MAX,
             },
             after_watermark: None,
-            limit: 8,
+            limit: 64,
         })
         .await
         .expect("query linked-root capacity drops");
-    let dropped: BTreeMap<&str, (u64, u64, u64)> = page
+    let mut dropped: Vec<(&str, (u64, u64, u64))> = page
         .events
         .iter()
         .filter_map(|event| {
@@ -1103,18 +1273,15 @@ async fn adjacent_linked_alias_capacity_drops_retain_distinct_policy_carriers() 
             ))
         })
         .collect();
+    dropped.sort_unstable();
+    let mut expected: Vec<(&str, (u64, u64, u64))> = alias_a_drops
+        .iter()
+        .map(|&sequence| (policy_a.as_str(), (sequence, sequence, 1)))
+        .chain([(policy_b.as_str(), (alias_b_drop, alias_b_drop, 1))])
+        .collect();
+    expected.sort_unstable();
     assert_eq!(
-        dropped,
-        BTreeMap::from([
-            (
-                policy_a.as_str(),
-                (first_missing_sequence, first_missing_sequence, 1),
-            ),
-            (
-                policy_b.as_str(),
-                (first_missing_sequence + 1, first_missing_sequence + 1, 1),
-            ),
-        ]),
+        dropped, expected,
         "adjacent alias losses must not coalesce or inherit core A's policy"
     );
 }
@@ -1165,25 +1332,13 @@ async fn dropped_last_alias_keeps_the_store_retiring_until_owners_release() {
         ..identity.clone()
     };
     let replacement_mount = store_mount(&replacement_identity);
-    let replacement = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let attempt = registry.acquire_or_start(&database, &replacement_mount, || {
-                BoundedObservabilityProducerV1::start(
-                    database.clone(),
-                    replacement_identity.clone(),
-                    1,
-                )
+    registry.join_retirement_drains().await;
+    let replacement = registry
+        .acquire_or_start(&database, &replacement_mount, || {
+            BoundedObservabilityProducerV1::start(database.clone(), replacement_identity.clone(), 1)
                 .map_err(StoreObservabilityMountErrorV1::Unavailable)
-            });
-            match attempt {
-                Ok(replacement) => break replacement,
-                Err(StoreObservabilityMountErrorV1::Retiring) => tokio::task::yield_now().await,
-                Err(error) => panic!("unexpected replacement result: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("dropped owner retirement completes");
+        })
+        .expect("the dropped owner's joined drain vacated the store");
     replacement.shutdown().await.expect("replacement shutdown");
 }
 
@@ -1212,11 +1367,6 @@ async fn joined_retirement_drains_settle_a_dropped_last_alias() {
         })
     };
     drop(mount_as("daemon:joined-drop").expect("registered observability producer"));
-    assert!(matches!(
-        mount_as("daemon:joined-drop-overlap"),
-        Err(StoreObservabilityMountErrorV1::Retiring)
-    ));
-
     registry.join_retirement_drains().await;
 
     let replacement = mount_as("daemon:joined-drop-replacement")
@@ -1228,14 +1378,16 @@ async fn joined_retirement_drains_settle_a_dropped_last_alias() {
     replacement.shutdown().await.expect("replacement shutdown");
 }
 
+/// A last alias dropped on a thread with no Tokio runtime drains its store
+/// owners on the native runtime; nothing waits for a later mount to start it.
 #[tokio::test]
-async fn runtimeless_last_alias_drop_keeps_the_store_retiring_until_the_drain_confirms() {
-    let (_project, project_id, database, _runtime) =
-        runtime("observability-runtimeless-drop").await;
+async fn last_alias_dropped_off_tokio_drains_on_the_native_runtime() {
+    const DROP_SITE: &str = "daemon-service.observability.producer_drop";
+    let (_project, project_id, database, _runtime) = runtime("observability-off-tokio-drop").await;
     let registry = StoreObservabilityRegistryV1::default();
     let identity = ObservabilityProducerIdentityV1 {
         authorized_scope_ref: project_id.as_str().to_owned(),
-        process_boot_id: "daemon:runtimeless-drop".to_owned(),
+        process_boot_id: "daemon:off-tokio-drop".to_owned(),
         producer_revision: "producer.v1".to_owned(),
         configuration_revision: digest('6').as_str().to_owned(),
         policy_revision: digest('7').as_str().to_owned(),
@@ -1248,69 +1400,44 @@ async fn runtimeless_last_alias_drop_keeps_the_store_retiring_until_the_drain_co
     // Owners that record through the mounted producer retain frontends past
     // the alias handle's lifetime; this one keeps the shared core open.
     let retained = registered.producer();
-    std::thread::spawn(move || drop(registered))
-        .join()
-        .expect("drop the last alias handle outside any tokio runtime");
-    assert_eq!(
-        retained
-            .try_emit(envelope(&project_id, "runtimeless:retained"))
-            .expect("retained frontend still emits through the open core"),
-        ObservabilityEmissionOutcomeV1::Enqueued
-    );
-
-    // The store entry must stay retiring: the drain never ran, so vacating
-    // it would let a second producer start while the first still writes.
-    let overlap_identity = ObservabilityProducerIdentityV1 {
-        process_boot_id: "daemon:runtimeless-drop-overlap".to_owned(),
-        ..identity.clone()
-    };
-    let overlap_mount = store_mount(&overlap_identity);
-    let refused = registry.acquire_or_start(&database, &overlap_mount, || {
-        panic!("a runtimeless drop must not vacate the store entry into a duplicate producer")
-    });
-    assert!(matches!(
-        refused,
-        Err(StoreObservabilityMountErrorV1::Retiring)
-    ));
-
-    // That refused mount ran on a live runtime, so the deferred drain is now
-    // in flight; only its confirmed close releases the store entry.
-    let replacement_identity = ObservabilityProducerIdentityV1 {
-        process_boot_id: "daemon:runtimeless-drop-replacement".to_owned(),
-        ..identity.clone()
-    };
-    let replacement_mount = store_mount(&replacement_identity);
-    let replacement = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let attempt = registry.acquire_or_start(&database, &replacement_mount, || {
-                BoundedObservabilityProducerV1::start(
-                    database.clone(),
-                    replacement_identity.clone(),
-                    1,
-                )
-                .map_err(StoreObservabilityMountErrorV1::Unavailable)
-            });
-            match attempt {
-                Ok(replacement) => break replacement,
-                Err(StoreObservabilityMountErrorV1::Retiring) => tokio::task::yield_now().await,
-                Err(error) => panic!("unexpected replacement result: {error}"),
-            }
-        }
+    let missing_before = native_runtime::tokio_runtime_missing_count(DROP_SITE);
+    let writer_waits_before = exact_sql::native_thread_writer_waits();
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(registered);
     })
-    .await
-    .expect("deferred drain confirms and releases the store");
+    .join()
+    .expect("drop the last alias handle outside any tokio runtime");
+
+    registry.join_retirement_drains().await;
+    let replacement_identity = ObservabilityProducerIdentityV1 {
+        process_boot_id: "daemon:off-tokio-drop-replacement".to_owned(),
+        ..identity.clone()
+    };
+    let replacement = registry
+        .acquire_or_start(&database, &store_mount(&replacement_identity), || {
+            BoundedObservabilityProducerV1::start(database.clone(), replacement_identity.clone(), 1)
+                .map_err(StoreObservabilityMountErrorV1::Unavailable)
+        })
+        .expect("the dropped alias's drain confirms and releases the store");
     assert_eq!(
         retained
-            .try_emit(envelope(&project_id, "runtimeless:after-drain"))
+            .try_emit(envelope(&project_id, "off-tokio:after-drain"))
             .expect_err("the confirmed drain closes the retained frontend"),
         "observability_producer_closed"
     );
+    assert_eq!(
+        native_runtime::tokio_runtime_missing_count(DROP_SITE),
+        missing_before
+    );
+    assert_eq!(exact_sql::native_thread_writer_waits(), writer_waits_before);
     replacement.shutdown().await.expect("replacement shutdown");
 }
 
 #[tokio::test]
 async fn registered_persistence_failure_releases_only_after_join_and_writer_fence() {
     let (_project, project_id, database, _runtime) = runtime("observability-shutdown-fenced").await;
+    let persistence = Duration::from_millis(50);
     let identity = ObservabilityProducerIdentityV1 {
         authorized_scope_ref: project_id.as_str().to_owned(),
         process_boot_id: "daemon:shutdown-failure".to_owned(),
@@ -1322,9 +1449,11 @@ async fn registered_persistence_failure_releases_only_after_join_and_writer_fenc
         database.clone(),
         identity.clone(),
         1,
+        // The writer fence waits for the test to release the writer, so the
+        // shutdown budget must outlast any scheduling delay before it does.
         ObservabilityProducerDeadlinesV1 {
-            persistence: Duration::from_millis(50),
-            shutdown: Duration::from_millis(250),
+            persistence,
+            shutdown: Duration::from_secs(30),
         },
     )
     .expect("producer");
@@ -1340,23 +1469,19 @@ async fn registered_persistence_failure_releases_only_after_join_and_writer_fenc
         .producer()
         .try_emit(envelope(&project_id, "shutdown:blocked"))
         .expect("enqueue blocked event");
-    tokio::task::yield_now().await;
 
     let retained = registered.producer();
     assert!(!retained.shutdown_settled());
     let shutdown = tokio::spawn(registered.shutdown());
-    // Release the writer only once the worker has joined: its persistence
-    // attempt has then failed against the held writer and shutdown is parked
-    // on the fence, which the release lets observe transaction closure within
-    // shutdown's existing budget. A fixed hold could end before a starved
-    // worker even tried, and the attempt would then succeed.
-    while !retained.shutdown_joined() {
-        assert!(
-            !shutdown.is_finished(),
-            "shutdown finished before the writer was released"
-        );
+    // The terminal write misses the held writer, so the worker joins with
+    // the fence still owed. Release the writer only then.
+    while !retained.shutdown_joined() && !shutdown.is_finished() {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+    assert!(
+        retained.shutdown_joined(),
+        "the worker joins before the fence"
+    );
     assert!(!retained.shutdown_settled());
     blocker.commit().await.expect("release registered writer");
     let error = shutdown
@@ -1399,10 +1524,13 @@ async fn registered_persistence_failure_releases_only_after_join_and_writer_fenc
 
 #[tokio::test]
 async fn registered_blocked_writer_retries_settlement_only_on_mount_demand() {
+    // The shutdown budget must outlast scheduling delays before the worker's
+    // reply and the released writer's fence, so it keeps the production
+    // value. Only the persistence deadline is short, so held writes fail fast.
     assert_blocked_writer_retirement(
         ObservabilityProducerDeadlinesV1 {
             persistence: Duration::from_millis(50),
-            shutdown: Duration::from_millis(250),
+            ..ObservabilityProducerDeadlinesV1::default()
         },
         "observability_persistence_deadline",
         true,
@@ -1430,6 +1558,10 @@ async fn assert_blocked_writer_retirement(
 ) {
     let (_project, project_id, database, _runtime) =
         runtime("observability-shutdown-failure").await;
+    // The same logical project in another registered store. Built before the
+    // writer is held: the held transaction's lease must not span a fixture.
+    let (_other_project, other_id, other_database, _other_runtime) =
+        runtime("observability-shutdown-failure").await;
     let identity = ObservabilityProducerIdentityV1 {
         authorized_scope_ref: project_id.as_str().to_owned(),
         process_boot_id: "daemon:shutdown-failure".to_owned(),
@@ -1456,6 +1588,9 @@ async fn assert_blocked_writer_retirement(
         .producer()
         .try_emit(envelope(&project_id, "shutdown:blocked"))
         .expect("enqueue blocked event");
+    // The batch is still in flight when shutdown begins. A shutdown budget
+    // no longer than the persistence deadline therefore expires before the
+    // worker can reply.
     tokio::task::yield_now().await;
 
     let retained = registered.producer();
@@ -1520,8 +1655,6 @@ async fn assert_blocked_writer_retirement(
     );
 
     // The same logical project in another registered store remains independent.
-    let (_other_project, other_id, other_database, _other_runtime) =
-        runtime("observability-shutdown-failure").await;
     assert_eq!(project_id, other_id);
     let other = registry
         .acquire_or_start(&other_database, &store_mount(&identity), || {
@@ -1531,7 +1664,16 @@ async fn assert_blocked_writer_retirement(
         .expect("foreign exact store is not retiring");
 
     blocker.commit().await.expect("release registered writer");
-    tokio::task::yield_now().await;
+    // Admitted writes outlive their timed-out callers, and the writer serves
+    // them before any later transaction. Draining them here leaves the
+    // bounded retry below only the released writer to observe.
+    database
+        .begin_write_transaction()
+        .await
+        .expect("drain admitted writes")
+        .rollback()
+        .await
+        .expect("drain admitted writes");
     assert!(
         !retained.shutdown_settled(),
         "release alone must not trigger a retry loop"

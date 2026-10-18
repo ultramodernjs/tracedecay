@@ -29,8 +29,7 @@ use tracedecay_code_index_retention::code_index_generations::{
     try_acquire_code_generation_store_read_lock,
 };
 use tracedecay_domain::{
-    CodeGenerationId, ContentDigest, ManifestDigest, ProjectId, ProjectionBatchRequestV1,
-    ProjectionOperationV1, ProjectionOutcomeV1, SanitizerRevision, WorktreeId,
+    CodeGenerationId, ContentDigest, ManifestDigest, ProjectId, SanitizerRevision, WorktreeId,
     canonical_text::encode_tagged_lowercase_hex, sha256_hex_suffix,
 };
 use tracedecay_graph_db::{GraphBudgetKind, GraphDbError};
@@ -41,7 +40,7 @@ use tracedecay_runtime_core::resident_memory::{
     release_process_allocator_memory_v1,
 };
 
-use crate::code_index::{
+use tracedecay_code_index::{
     chunks::content_digest,
     production::{
         CodeGraphBuildBoundV1, CodeIndexAtomicPublicationPort, CodeIndexExecutionControlV1,
@@ -51,10 +50,6 @@ use crate::code_index::{
         SealedGenerationSegmentPublicationV1, SealedGenerationSegmentReadV1, SealedSegmentReaderV1,
         SharedDecodedContentPoolV1, SharedPhysicalCodeArtifactPoolV1,
         VerifiedSealedTextGenerationMetadataV1,
-    },
-    projection::{
-        ChunkProjectionDecisionV1, CodeChunkProjectionSink, ProjectionReceiptBuilderV1,
-        ProjectionSinkErrorV1, ProjectionSinkReceiptV1,
     },
 };
 
@@ -973,7 +968,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
                 .is_some_and(|(_, control)| control.is_cancelled())
         {
             return Err(CodeIndexProductionErrorV1::Interrupted(
-                crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+                tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
             ));
         }
         Ok(())
@@ -3049,7 +3044,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
         let manifest_bytes = match manifest_bytes {
             Ok(bytes) => bytes,
             Err(CodeIndexProductionErrorV1::Interrupted(
-                crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+                tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
             )) => {
                 evidence_pack.rollback_unattached(&self.segments_root)?;
                 return Err(CodeIndexPublicationStoreErrorV1::CompareAndSwap);
@@ -3158,8 +3153,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
         let exact_git_evidence = self.exact_git_evidence(generation.snapshot())?;
         let mut generation_index = prior_pointer
             .as_ref()
-            .map(|pointer| pointer.generation_index.clone())
-            .unwrap_or_default();
+            .map_or_default(|pointer| pointer.generation_index.clone());
         generation_index.retain(|entry| {
             entry.generation_id != generation.manifest().generation_id.as_str()
                 && exact_git_evidence
@@ -3315,55 +3309,5 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
         Ok(Arc::from(manifest_bytes))
-    }
-}
-
-#[derive(Default)]
-pub(super) struct DaemonProjectionSinkV1;
-
-impl CodeChunkProjectionSink for DaemonProjectionSinkV1 {
-    fn project_changed_chunks(
-        &mut self,
-        request: &ProjectionBatchRequestV1,
-        receipt_builder: ProjectionReceiptBuilderV1<'_>,
-    ) -> Result<ProjectionSinkReceiptV1, ProjectionSinkErrorV1> {
-        let mut decisions = request
-            .changes
-            .added_or_changed
-            .iter()
-            .map(|change| ChunkProjectionDecisionV1 {
-                chunk_id: change.chunk_id.clone(),
-                prior_chunk_digest: change.prior_digest.clone(),
-                current_chunk_digest: change.current_digest.clone(),
-                operation: if change.prior_digest.is_some() {
-                    ProjectionOperationV1::Updated
-                } else {
-                    ProjectionOperationV1::Added
-                },
-                outcome: ProjectionOutcomeV1::Applied,
-                output_digest: change.current_digest.clone(),
-            })
-            .collect::<Vec<_>>();
-        decisions.extend(
-            request
-                .changes
-                .deleted
-                .iter()
-                .map(|change| ChunkProjectionDecisionV1 {
-                    chunk_id: change.chunk_id.clone(),
-                    prior_chunk_digest: change.prior_digest.clone(),
-                    current_chunk_digest: None,
-                    operation: ProjectionOperationV1::Deleted,
-                    outcome: ProjectionOutcomeV1::Applied,
-                    output_digest: None,
-                }),
-        );
-        // Unchanged chunks are not a list. `reused_count` / `reused_digest`
-        // authenticate them, and the receipt builder records that count.
-        // Emitting per-chunk Reused decisions is now ExtraChunkReceipt.
-        decisions.sort_by(|left, right| left.chunk_id.cmp(&right.chunk_id));
-        receipt_builder
-            .build(&decisions)
-            .map_err(|error| ProjectionSinkErrorV1::Rejected(error.to_string()))
     }
 }

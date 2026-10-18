@@ -339,7 +339,7 @@ fn colliding_rewrite(
     anchored_write(observation, expected_cursor)
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn n_persist_observation_calls_open_n_writer_transactions() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -362,7 +362,7 @@ async fn n_persist_observation_calls_open_n_writer_transactions() {
     assert_eq!(after.operations - before.operations, BATCH_SIZE as i64);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn persist_observations_opens_one_writer_transaction_for_the_batch() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -408,7 +408,7 @@ async fn persist_observations_opens_one_writer_transaction_for_the_batch() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn intra_batch_exact_duplicate_is_hydrated_as_a_duplicate() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -555,7 +555,7 @@ async fn assert_batch_settles_like_sequential_writes(
     (batch, batch_effect)
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn intra_batch_identity_rewrite_settles_like_sequential_writes() {
     let session_id = SessionId::new("session.observation-batch.intra-rewrite").unwrap();
     let first = sequential_writes(&session_id, 1)
@@ -575,7 +575,7 @@ async fn intra_batch_identity_rewrite_settles_like_sequential_writes() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn intra_batch_receipt_collision_settles_like_sequential_writes() {
     let session_id = SessionId::new("session.observation-batch.intra-receipt").unwrap();
     let mut writes = sequential_writes(&session_id, 2);
@@ -606,7 +606,7 @@ async fn intra_batch_receipt_collision_settles_like_sequential_writes() {
     assert_eq!(effect.retained, vec![true, false]);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn intra_batch_alias_collision_settles_like_sequential_writes() {
     let session_id = SessionId::new("session.observation-batch.intra-alias").unwrap();
     let mut writes = sequential_writes(&session_id, 2);
@@ -628,7 +628,7 @@ async fn intra_batch_alias_collision_settles_like_sequential_writes() {
     assert_eq!(effect.retained, vec![true, false]);
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[asupersync::test]
 async fn persist_observations_dispatches_one_runtime_command_independent_of_batch_size() {
     let mut expected_snapshot_probes = None;
     for count in [1, BATCH_SIZE, ABOVE_WRITER_COALESCING_LIMIT] {
@@ -676,7 +676,7 @@ async fn persist_observations_dispatches_one_runtime_command_independent_of_batc
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[asupersync::test]
 async fn covered_duplicate_replay_reads_one_snapshot_independent_of_batch_size() {
     let mut expected_snapshot_probes = None;
     for count in [1, BATCH_SIZE, ABOVE_WRITER_COALESCING_LIMIT] {
@@ -732,7 +732,7 @@ async fn covered_duplicate_replay_reads_one_snapshot_independent_of_batch_size()
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[asupersync::test]
 async fn persist_observations_partitions_large_windows_by_exact_admission_bytes() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -767,7 +767,7 @@ async fn persist_observations_partitions_large_windows_by_exact_admission_bytes(
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn failed_batch_preflight_commits_no_valid_prefix() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -819,7 +819,7 @@ async fn failed_batch_preflight_commits_no_valid_prefix() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn persist_observations_keeps_cursor_cas_collision_and_file_identity() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -905,7 +905,7 @@ async fn persist_observations_keeps_cursor_cas_collision_and_file_identity() {
     assert_eq!(cursor.resume_fingerprint(), Some(0xcafe_babe));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn retained_duplicate_rescan_restores_frontier_before_new_batch_records() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1036,7 +1036,7 @@ async fn retained_duplicate_rescan_restores_frontier_before_new_batch_records() 
     assert_eq!(writer_txn_census(&runtime).await, before_replay);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn persist_observations_recovers_a_peer_commit_as_exact_duplicate() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -1051,7 +1051,7 @@ async fn persist_observations_recovers_a_peer_commit_as_exact_duplicate() {
     let right_store = store.clone();
     let left_writes = writes.clone();
     let right_writes = writes;
-    let (left, right) = tokio::join!(
+    let (left, right) = asupersync::join!(
         left_store.persist_observations(left_writes),
         right_store.persist_observations(right_writes),
     );

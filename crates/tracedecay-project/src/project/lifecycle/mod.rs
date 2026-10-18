@@ -12,8 +12,6 @@ use crate::config::{
     open_runtime_configuration_for_registered_database_read_only,
 };
 use crate::project_store_runtime::join_standalone_session_registry;
-#[cfg(any(test, feature = "test-helpers"))]
-use tokio::sync::Mutex as AsyncMutex;
 use tracedecay_configuration::ProjectConfigurationRuntime;
 use tracedecay_domain::errors::{ProjectOpenFailureKind, Result, TraceDecayError};
 use tracedecay_global_db::{RegisteredGlobalDbLeaseV1, registered_enrollment_roots};
@@ -21,6 +19,9 @@ use tracedecay_runtime_core::branch;
 use tracedecay_runtime_core::branch_meta::{self, BranchMeta};
 use tracedecay_runtime_core::db::{Database, DatabaseAccessMode, DatabaseAuthority};
 use tracedecay_runtime_core::storage::{self, StoreLayout};
+#[cfg(any(test, feature = "test-helpers"))]
+use tracedecay_runtime_core::weak_registry::SingleFlightWeakRegistry;
+#[cfg(not(any(test, feature = "test-transport")))]
 use tracedecay_runtime_core::weak_registry::WeakRegistry;
 #[cfg(any(test, feature = "test-helpers"))]
 use tracedecay_store::ProjectId;
@@ -47,20 +48,18 @@ static STANDALONE_MAINTENANCE_SCOPES: LazyLock<
 /// therefore cannot open the store. Standalone test opens share one retained
 /// runtime per key, mirroring the production single-registry invariant (and
 /// `STANDALONE_MAINTENANCE_SCOPES` above); the underlying daemon session
-/// registry is additionally shared per profile inside the runtime
+/// registry is also shared per profile inside the runtime
 /// constructor, the way one production daemon mounts many projects. Entries
 /// are weak: once every graph holding the runtime drops, the next open
 /// constructs a fresh runtime, so close-then-reopen journeys still observe
 /// fresh mounts.
 #[cfg(any(test, feature = "test-helpers"))]
 static STANDALONE_TEST_RUNTIMES: LazyLock<
-    AsyncMutex<
-        WeakRegistry<
-            (PathBuf, PathBuf),
-            crate::test_support::host_admission::HostAdmissionTestRuntimeV1,
-        >,
+    SingleFlightWeakRegistry<
+        (PathBuf, PathBuf),
+        crate::test_support::host_admission::HostAdmissionTestRuntimeV1,
     >,
-> = LazyLock::new(|| AsyncMutex::new(WeakRegistry::new()));
+> = LazyLock::new(SingleFlightWeakRegistry::new);
 
 impl TraceDecay {
     #[cfg(not(any(test, feature = "test-transport")))]
@@ -127,22 +126,17 @@ impl TraceDecay {
             tracedecay_runtime_core::lifecycle_lease::canonical_or_original(&profile_root),
             tracedecay_runtime_core::lifecycle_lease::canonical_or_original(project_root),
         );
-        // The async lock is held across construction so two concurrent opens
-        // of the same key cannot race into two runtimes.
-        let runtimes = STANDALONE_TEST_RUNTIMES.lock().await;
-        if let Some(runtime) = runtimes.get_live(&registry_key) {
-            return Ok(runtime);
-        }
-        let runtime = Arc::new(
-            crate::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
-                profile_root,
-                project_root,
-                project_id,
-            )
-            .await?,
-        );
-        runtimes.insert(registry_key, &runtime);
-        Ok(runtime)
+        // Single-flight per key so two concurrent opens of the same key cannot
+        // race into two runtimes.
+        STANDALONE_TEST_RUNTIMES
+            .get_or_open(registry_key, || {
+                crate::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
+                    profile_root,
+                    project_root,
+                    project_id,
+                )
+            })
+            .await
     }
 
     /// Initializes a project through the shared registered test runtime for
@@ -297,9 +291,10 @@ impl TraceDecay {
         // nothing here, its identity is deterministic from the canonical
         // path and durably owned by the profile registry. TraceDecay never
         // creates files inside a project's working tree.
-        tracedecay_runtime_core::storage::write_repository_identity_marker(
+        tracedecay_runtime_core::storage::claim_repository_identity_marker(
             project_root,
             project_id.as_str(),
+            &profile_root,
         )?;
         let configuration_database = runtime_registry
             .project_session_store(project_id, vec![project_root.to_path_buf()])
@@ -415,15 +410,7 @@ impl TraceDecay {
         // First-touch parity with the registered open path: daemon warm-up
         // refuses to advertise an identity-bearing project whose Context
         // Scout owner is absent, so init must start it too.
-        ts.hook_publications =
-            std::sync::Mutex::new(tracedecay_agent_hosts::hooks::publish_hook_bindings(
-                &crate::runtime_ports::hook_runtime(
-                    tracedecay_runtime_core::config::ProfileRoot::new(
-                        ts.open_options.resolved_profile_root()?,
-                    ),
-                )?,
-                &ts.store_layout,
-            )?);
+        ts.publish_hook_bindings(None).await?;
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
@@ -446,27 +433,19 @@ impl TraceDecay {
 
     async fn schema_version(db: &Database, operation: &str) -> Result<u32> {
         let connection = db.read_connection();
-        let mut rows = connection
-            .query("PRAGMA user_version", ())
-            .await
-            .map_err(|e| TraceDecayError::Database {
-                message: format!("{operation}: failed to read user_version: {e}"),
-                operation: operation.to_string(),
-            })?;
-        let row = rows.next().await.map_err(|e| TraceDecayError::Database {
-            message: format!("{operation}: failed to read user_version row: {e}"),
+        let version = tracedecay_runtime_core::db::schema_version::read_version(
+            &connection,
+            tracedecay_runtime_core::db::schema_version::GRAPH_COMPONENT,
+        )
+        .await
+        .map_err(|error| TraceDecayError::Database {
+            message: format!("{operation}: failed to read schema version: {error}"),
             operation: operation.to_string(),
         })?;
-        match row {
-            Some(row) => {
-                let version: i64 = row.get(0).map_err(|e| TraceDecayError::Database {
-                    message: format!("{operation}: failed to read user_version value: {e}"),
-                    operation: operation.to_string(),
-                })?;
-                Ok(version as u32)
-            }
-            None => Ok(0),
-        }
+        u32::try_from(version.unwrap_or(0)).map_err(|_| TraceDecayError::Database {
+            message: format!("{operation}: schema version does not fit the graph stamp"),
+            operation: operation.to_string(),
+        })
     }
 
     async fn ensure_database_schema_current(db: &Database) -> Result<()> {
@@ -652,17 +631,7 @@ impl TraceDecay {
             _standalone_maintenance_scope: None,
         };
 
-        ts.hook_publications = std::sync::Mutex::new(
-            tracedecay_agent_hosts::hooks::publish_hook_bindings_for_open(
-                &crate::runtime_ports::hook_runtime(
-                    tracedecay_runtime_core::config::ProfileRoot::new(
-                        ts.open_options.resolved_profile_root()?,
-                    ),
-                )?,
-                &ts.store_layout,
-                hook_recovery,
-            )?,
-        );
+        ts.publish_hook_bindings(hook_recovery).await?;
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
@@ -677,6 +646,41 @@ impl TraceDecay {
 
         ts.register_project_store_in_global_registry().await?;
         Ok(ts)
+    }
+
+    /// Publishes this project's Hook bindings on the blocking pool: under
+    /// contention the binding lock waits out the writer lease, which must not
+    /// park a native worker. The open owns the writes, so an aborted open is
+    /// not drained until they return.
+    async fn publish_hook_bindings(
+        &self,
+        recovery: Option<&[tracedecay_hooks::HookConfigurationSnapshotV1]>,
+    ) -> Result<()> {
+        let runtime =
+            crate::runtime_ports::hook_runtime(tracedecay_runtime_core::config::ProfileRoot::new(
+                self.open_options.resolved_profile_root()?,
+            ))?;
+        let layout = self.store_layout.clone();
+        let recovery = recovery.map(<[_]>::to_vec);
+        let publications =
+            tracedecay_runtime_core::native_runtime::spawn_owned_blocking(move || {
+                tracedecay_agent_hosts::hooks::publish_hook_bindings_for_open(
+                    &runtime,
+                    &layout,
+                    recovery.as_deref(),
+                )
+            })
+            .await
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("hook binding publication task failed: {error}"),
+            })??;
+        *self
+            .hook_publications
+            .lock()
+            .map_err(|_| TraceDecayError::Config {
+                message: "hook publication ownership lock is poisoned".to_owned(),
+            })? = publications;
+        Ok(())
     }
 
     /// Branch provenance for an ordinary open of the single project store.
@@ -867,6 +871,7 @@ fn configuration_runtime_unavailable() -> TraceDecayError {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use tracedecay_agent_hosts::agents::context_scout::address_registry::{
@@ -1055,7 +1060,7 @@ mod tests {
         (lifecycle, address)
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn context_scout_owner_survives_branch_reopen() {
         let root = tempfile::TempDir::new().expect("fixture root");
         let project = root.path().join("project");
@@ -1115,7 +1120,59 @@ mod tests {
         assert!(Arc::ptr_eq(&owner, &registered[0]));
     }
 
-    #[tokio::test]
+    #[asupersync::test]
+    async fn dropping_the_graph_releases_its_context_scout_owner_and_store() {
+        let root = tempfile::TempDir::new().expect("fixture root");
+        let project = root.path().join("project");
+        let profile = root.path().join("profile");
+        std::fs::create_dir_all(&project).expect("create project root");
+        let options = TraceDecayOpenOptions {
+            profile_root: Some(profile.clone()),
+            global_db_path: Some(profile.join("registry.db")),
+        };
+        let opened = TraceDecay::init_with_options(&project, options)
+            .await
+            .expect("initialize project graph");
+        let project_id =
+            tracedecay_agent_hosts::hooks::hook_project_id_for_layout(opened.hook_store_layout())
+                .expect("initialized project has hook identity");
+        let owner = Arc::downgrade(
+            &opened
+                .context_scout_owner()
+                .expect("Context Scout owner starts with the project"),
+        );
+        let graph_db = opened.db_path().to_string_lossy().into_owned();
+
+        drop(opened);
+
+        assert!(
+            tracedecay_agent_hosts::agents::context_scout::owner::lookup_registered_context_scout_owners(
+                project_id,
+            )
+            .is_empty(),
+            "a dropped graph must not leave its Context Scout owner registered"
+        );
+        assert_eq!(
+            owner.strong_count(),
+            0,
+            "the owner of a dropped graph must release its graph store"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let open_graph_files = std::fs::read_dir("/proc/self/fd")
+                .expect("open file descriptors")
+                .flatten()
+                .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+                .filter(|target| target.to_string_lossy().starts_with(&graph_db))
+                .collect::<Vec<_>>();
+            assert!(
+                open_graph_files.is_empty(),
+                "a dropped graph's store must close its files: {open_graph_files:?}"
+            );
+        }
+    }
+
+    #[asupersync::test]
     async fn read_only_open_does_not_resolve_writable_context_scout_owner() {
         let root = tempfile::TempDir::new().expect("fixture root");
         let project = root.path().join("project");
@@ -1148,7 +1205,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn project_open_accepts_a_normalized_alias_of_the_profile_authority() {
         let root = tempfile::TempDir::new().expect("fixture root");
         let project = root.path().join("project");
@@ -1172,7 +1229,7 @@ mod tests {
         opened.close();
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn nonempty_wrong_schema_read_only_open_returns_reset_required() {
         let root = tempfile::TempDir::new().expect("fixture root");
         let project = root.path().join("project");
@@ -1188,13 +1245,16 @@ mod tests {
         let db_path = initialized.store_layout().graph_db_path.clone();
         initialized.close();
         let connection = rusqlite::Connection::open(&db_path).expect("open graph fixture");
-        connection
-            .pragma_update(
-                None,
-                "user_version",
-                tracedecay_runtime_core::db::migrations::SCHEMA_VERSION - 1,
+        let downgraded = connection
+            .execute(
+                "UPDATE tracedecay_schema_version SET version = ?1 WHERE component = ?2",
+                rusqlite::params![
+                    tracedecay_runtime_core::db::migrations::SCHEMA_VERSION - 1,
+                    tracedecay_runtime_core::db::schema_version::GRAPH_COMPONENT
+                ],
             )
             .expect("stamp incompatible graph schema");
+        assert_eq!(downgraded, 1, "the graph stamp row must exist to downgrade");
         drop(connection);
 
         let error = match TraceDecay::open_read_only_with_options(&project, options).await {

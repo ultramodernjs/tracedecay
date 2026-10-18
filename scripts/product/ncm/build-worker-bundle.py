@@ -12,7 +12,8 @@ these inputs and writes:
 The checked-in ``product/ncm/reference/worker-manifest.json`` pins no worker,
 so host binaries only admit a worker when their build embeds a pinned manifest.
 Bazel passes the generated manifest to the host runtime as a declared build
-input. This script also prints the absolute release trust-root assignment.
+input. This script also prints the absolute release trust-root assignment,
+using forward slashes so POSIX shells preserve Windows paths.
 For a multi-platform release, build one bundle per target,
 merge their manifests with ``--merge a.json b.json ... -o merged.json``, build
 every host binary with the merged manifest, and ship the merged manifest as the
@@ -30,7 +31,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import sys
 import tempfile
 from typing import Any
@@ -167,6 +168,12 @@ def merge_manifests(manifests: list[dict[str, Any]], *, header: dict[str, Any]) 
     return merged
 
 
+def assignment(variable: str, path: PurePath) -> str:
+    """Render a path assignment without shell-sensitive Windows backslashes."""
+
+    return f"{variable}={path.as_posix()}"
+
+
 def encode_manifest(manifest: dict[str, Any]) -> bytes:
     return (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
 
@@ -291,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     except (BundleError, OSError, json.JSONDecodeError) as error:
         print(f"NCM worker bundle failed: {error}", file=sys.stderr)
         return 2
-    print(f"{WORKER_MANIFEST_ENV}={manifest_path}")
+    print(assignment(WORKER_MANIFEST_ENV, manifest_path))
     return 0
 
 

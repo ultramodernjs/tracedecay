@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tracedecay_domain::ManifestDigest;
 use tracedecay_project::project::TraceDecay;
+use tracedecay_runtime_core::native_runtime;
 
 use super::{
     AdvisoryMemoryContextV1, CognitiveRecallMountError, cognitive_recall, native_authority,
@@ -30,6 +31,7 @@ pub type NcmRegistrationFactoryV1 = Arc<
             PathBuf,
             u64,
             tracedecay_memory_provider_registry::EnabledProviderMode,
+            tracedecay_domain::configuration::MemoryProviderNcmNamespaceBindingV1,
             Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
         ) -> std::result::Result<
             (
@@ -142,6 +144,14 @@ impl ProjectObservationJourneyMountV1 {
     /// Shuts down the already-owned observation worker inside the caller's
     /// deadline and returns typed failures as display-safe text.
     pub async fn shutdown(&self, deadline: tokio::time::Instant) -> Vec<String> {
+        match native_runtime::on_tokio("memory_provider.shutdown", self.shutdown_in_tokio(deadline))
+        {
+            Some(work) => work.await,
+            None => vec!["memory provider Tokio runtime unavailable during shutdown".to_owned()],
+        }
+    }
+
+    async fn shutdown_in_tokio(&self, deadline: tokio::time::Instant) -> Vec<String> {
         self.inner
             .shutdown(deadline)
             .await
@@ -307,6 +317,27 @@ impl ProjectMemoryProviderFullMountV1 {
         observation_store: tracedecay_global_db::GlobalDbObservationStore,
         cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
     ) -> std::result::Result<(), String> {
+        if self
+            .deferred_observation_journeys
+            .lock()
+            .map_err(|_| "provider observation activation state was poisoned".to_owned())?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        native_runtime::on_tokio(
+            "memory_provider.activate",
+            self.activate_after_publication_in_tokio(observation_store, cancellation),
+        )
+        .ok_or_else(|| "memory provider Tokio runtime unavailable".to_owned())?
+        .await
+    }
+
+    async fn activate_after_publication_in_tokio(
+        &self,
+        observation_store: tracedecay_global_db::GlobalDbObservationStore,
+        cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
+    ) -> std::result::Result<(), String> {
         let deferred = self
             .deferred_observation_journeys
             .lock()
@@ -351,6 +382,23 @@ impl ProjectMemoryProviderFullMountV1 {
 /// project. The concrete NCM constructor remains a closure supplied by the
 /// daemon root, so service composition has no dependency cycle.
 pub async fn mount_project_memory_provider_host(
+    inputs: ProjectMemoryProviderHostInputsV1,
+) -> std::result::Result<Arc<ProjectMemoryProviderHostMountV1>, String> {
+    if inputs.activation.is_disabled() {
+        return mount_project_memory_provider_host_in_tokio(inputs).await;
+    }
+    // The daemon polls this mount on its native runtime. Provider timers and
+    // spawned work still belong to its installed Tokio runtime; entering that
+    // runtime here keeps cancellation attached to the original mount future.
+    native_runtime::on_tokio(
+        "memory_provider.host_mount",
+        mount_project_memory_provider_host_in_tokio(inputs),
+    )
+    .ok_or_else(|| "memory provider Tokio runtime unavailable".to_owned())?
+    .await
+}
+
+async fn mount_project_memory_provider_host_in_tokio(
     inputs: ProjectMemoryProviderHostInputsV1,
 ) -> std::result::Result<Arc<ProjectMemoryProviderHostMountV1>, String> {
     use tracedecay_domain::configuration::MemoryProviderParticipationV1;
@@ -435,6 +483,7 @@ pub async fn mount_project_memory_provider_host(
             let tracedecay_domain::configuration::MemoryProviderNcmObserverV1::Enabled {
                 worker_binary,
                 state_root,
+                namespace_binding,
             } = inputs.ncm_observer.clone()
             else {
                 return Err("selected NCM participation is disabled".to_owned());
@@ -447,6 +496,7 @@ pub async fn mount_project_memory_provider_host(
                     state_root,
                     1,
                     mode,
+                    namespace_binding,
                     Some(admission_authority),
                 )
             })
@@ -563,6 +613,19 @@ pub async fn mount_project_memory_provider_host(
 /// Inputs and owner assembly for the full project server. This function is
 /// called only after the project session database has been admitted.
 pub async fn mount_project_memory_provider_full(
+    host: &Arc<ProjectMemoryProviderHostMountV1>,
+    inputs: ProjectMemoryProviderFullMountInputsV1,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
+) -> std::result::Result<Arc<ProjectMemoryProviderFullMountV1>, String> {
+    native_runtime::on_tokio(
+        "memory_provider.full_mount",
+        mount_project_memory_provider_full_in_tokio(host, inputs, cancellation),
+    )
+    .ok_or_else(|| "memory provider Tokio runtime unavailable".to_owned())?
+    .await
+}
+
+async fn mount_project_memory_provider_full_in_tokio(
     host: &Arc<ProjectMemoryProviderHostMountV1>,
     inputs: ProjectMemoryProviderFullMountInputsV1,
     cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
@@ -814,7 +877,7 @@ async fn shutdown_partial_provider_journeys(journeys: &[Arc<ProjectObservationJo
 fn new_recall_locator_key()
 -> std::result::Result<cognitive_recall::control_attribution::RecallLocatorKeyV1, String> {
     let mut bytes = vec![0_u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|error| {
+    getrandom::fill(&mut bytes).map_err(|error| {
         format!("OS entropy unavailable for the project recall locator key: {error}")
     })?;
     cognitive_recall::control_attribution::RecallLocatorKeyV1::from_material(bytes)

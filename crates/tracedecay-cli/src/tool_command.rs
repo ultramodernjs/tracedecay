@@ -40,13 +40,13 @@
 //! separate exact administrative tools.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracedecay_runtime_core::config::ProfileRoot;
 
 use serde_json::{Value, json};
-use tokio::time::Instant;
 
 use tracedecay::daemon::invocation_client_for_current_client;
 use tracedecay::mcp::tools::{registered_project_not_found, registered_project_selector_id};
@@ -55,9 +55,7 @@ use tracedecay_contracts::code_index_freshness::{
     CodeIndexReadinessWaitOutcomeV1,
 };
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
-use tracedecay_contracts::retrieval::{
-    AdminCliRegistryContextV1, AdminCliResultV1, AdminCliSurfaceRequestV1,
-};
+use tracedecay_contracts::retrieval::AdminCliRegistryContextV1;
 use tracedecay_contracts::{
     CancellationSignal, Deadline, RetainedSurfaceOperation, retained_surface_operation_is_effect,
 };
@@ -76,8 +74,8 @@ use tracedecay_mcp::tool_errors::{mark_semantic_tool_error, tool_result_problem}
 use tracedecay_mcp::tools::binding::tool_dispatches_registered_project_reader;
 use tracedecay_mcp::tools::response_trailers::{account_tool_result, is_beside_result_block};
 use tracedecay_mcp::{
-    ALWAYS_LOAD_META, RESERVED_FLAGS_FOOTER, ToolDefinition, ToolResult, cli_tool_definition,
-    get_tool_definitions_ref, render_tool_cli_help, short_tool_name,
+    ALWAYS_LOAD_META, RESERVED_FLAGS_FOOTER, ToolCategory, ToolDefinition, ToolResult,
+    cli_tool_definition, get_tool_definitions_ref, render_tool_cli_help, short_tool_name,
 };
 use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
 
@@ -133,8 +131,12 @@ fn tool_deadline_range_error() -> TraceDecayError {
     }
 }
 
-pub(crate) fn tool_command_deadline() -> Result<Duration> {
-    tool_request_deadline()
+/// The wall-clock deadline of one CLI tool call, under the shared
+/// `TRACEDECAY_TOOL_DEADLINE_MS` budget.
+pub(crate) fn tool_command_deadline() -> Result<Instant> {
+    Instant::now()
+        .checked_add(tool_request_deadline()?)
+        .ok_or_else(tool_deadline_range_error)
 }
 
 fn catalog_discovery_unavailable(error: tracedecay_mcp::McpCatalogError) -> TraceDecayError {
@@ -243,9 +245,7 @@ fn run_inner(
                 return Ok(());
             }
             let explicit_project = project.or(parsed_project);
-            let deadline = Instant::now()
-                .checked_add(tool_command_deadline()?)
-                .ok_or_else(tool_deadline_range_error)?;
+            let deadline = tool_command_deadline()?;
             let tool_name = operation.mcp_tool_name();
             if RetainedSurfaceOperation::from_application(operation).is_some() {
                 let mut tool_args = tool_args;
@@ -323,21 +323,12 @@ fn run_inner(
             return Ok(());
         };
 
+        // Every application operation returned above, so what remains is a
+        // non-application tool advertised under its canonical name.
         let canonical = canonical_tool_name(&raw_name);
-        // An application operation advertises one MCP definition under its
-        // transport spelling; a canonical-identity request selects that same
-        // definition instead of a second, unadvertised one.
-        let advertised_name: &str = match requested_operation {
-            Some(operation) => operation.mcp_tool_name(),
-            None => canonical.as_str(),
-        };
-        let Some(def) = defs
-            .iter()
-            .find(|definition| definition.name == advertised_name)
-        else {
+        let Some(def) = defs.iter().find(|definition| definition.name == canonical) else {
             let suggestion = nearest_tool_name(&canonical, defs)
-                .map(|name| format!(" Did you mean '{name}'?"))
-                .unwrap_or_default();
+                .map_or_default(|name| format!(" Did you mean '{name}'?"));
             return Err(TraceDecayError::project_route(
                 "unknown_tool",
                 false,
@@ -353,7 +344,7 @@ fn run_inner(
             return Ok(());
         }
         let ParsedInvocation {
-            mut tool_args,
+            tool_args,
             project: parsed_project,
             raw_json,
             dry_run,
@@ -366,83 +357,7 @@ fn run_inner(
         }
 
         let explicit_project = project.or(parsed_project);
-        let deadline = Instant::now()
-            .checked_add(tool_command_deadline()?)
-            .ok_or_else(tool_deadline_range_error)?;
-        if let Some(operation) = ApplicationSurfaceOperation::from_tool_name(&def.name)
-            && RetainedSurfaceOperation::from_application(operation).is_some()
-        {
-            let dispatch = DaemonToolDispatch::for_retained(
-                profile,
-                explicit_project,
-                &def.name,
-                &mut tool_args,
-            )
-            .await?;
-            return dispatch_cli_retained(
-                profile, operation, tool_args, dispatch, raw_json, deadline,
-            )
-            .await;
-        }
-        if let Some(operation) = ApplicationSurfaceOperation::from_tool_name(&def.name)
-            && operation.is_profile_registry_read()
-        {
-            let dispatch =
-                DaemonToolDispatch::for_tool(profile, explicit_project, &def.name, &mut tool_args);
-            return dispatch_cli_profile_registry(
-                profile, operation, tool_args, dispatch, raw_json, deadline,
-            )
-            .await;
-        }
-        if let Some(operation) = ApplicationSurfaceOperation::from_tool_name(&def.name)
-            && operation.is_graph_tool()
-        {
-            let project_path =
-                selected_project_path(profile, explicit_project, &def.name, &tool_args).await?;
-            return dispatch_cli_graph_tool(
-                profile,
-                operation,
-                tool_args,
-                project_path,
-                raw_json,
-                deadline,
-            )
-            .await;
-        }
-        if let Some(operation) = ApplicationSurfaceOperation::from_tool_name(&def.name)
-            && tracedecay_daemon_protocol::is_source_edit_operation(operation)
-        {
-            let project_path =
-                DaemonToolDispatch::project_scoped(profile, explicit_project, &def.name)
-                    .project_path;
-            return dispatch_cli_source_edit(
-                profile,
-                operation,
-                tool_args,
-                project_path,
-                raw_json,
-                deadline,
-            )
-            .await;
-        }
-        if let Some(operation) = ApplicationSurfaceOperation::from_tool_name(&def.name)
-            && RetainedSurfaceOperation::from_application(operation).is_none()
-        {
-            let (request, requested_format, output) =
-                cli_surface_invocation(&def.name, tool_args, raw_json)
-                    .map_err(ApplicationSurfaceAdapterError::into_trace_decay_error)?;
-            return dispatch_cli_application_surface(
-                profile,
-                operation,
-                request,
-                DaemonToolDispatch::project_scoped(profile, explicit_project, &def.name)
-                    .project_path,
-                requested_format,
-                output,
-                deadline,
-            )
-            .await;
-        }
+        let deadline = tool_command_deadline()?;
         if let Some(tool) = FamilyTool::from_tool_name(&def.name) {
             let project_path =
                 DaemonToolDispatch::project_scoped(profile, explicit_project, &def.name)
@@ -478,9 +393,7 @@ pub(crate) async fn dispatch_catalogued_cli_operation(
     project: Option<PathBuf>,
     raw_json: bool,
 ) -> Result<()> {
-    let deadline = Instant::now()
-        .checked_add(tool_command_deadline()?)
-        .ok_or_else(tool_deadline_range_error)?;
+    let deadline = tool_command_deadline()?;
     let (request, requested_format, output) =
         cli_surface_invocation(operation.mcp_tool_name(), tool_args, raw_json)
             .map_err(ApplicationSurfaceAdapterError::into_trace_decay_error)?;
@@ -561,11 +474,7 @@ fn dispatch_cli_application_surface_inner(
         let profile = &profile;
 
         tracing::trace!(name: "cli.application.operation", value = ?operation.as_str());
-        let request_id = mint_global_request_id(GlobalRequestSurface::Cli).map_err(|_| {
-            TraceDecayError::Config {
-                message: "could not allocate an application surface request id".to_owned(),
-            }
-        })?;
+        let request_id = cli_request_id()?;
         let request = match parse_application_surface_request(operation, tool_args.clone()) {
             Ok(request) => request,
             Err(error) => {
@@ -585,13 +494,7 @@ fn dispatch_cli_application_surface_inner(
                 return Err(error.into_trace_decay_error());
             }
         };
-        let handshake = tracedecay::daemon::handshake_for_current_client(
-            profile,
-            project.clone(),
-            None,
-            false,
-            false,
-        )?;
+        let handshake = crate::commands::client_handshake(profile, project.as_deref())?;
         let client = invocation_client_for_current_client(profile, handshake)?;
         // A cold daemon answers the mounting refusal while the project open
         // still warms in the background. The compatibility tool path rides
@@ -605,22 +508,7 @@ fn dispatch_cli_application_surface_inner(
                 None => parse_application_surface_request(operation, tool_args.clone())
                     .map_err(ApplicationSurfaceAdapterError::into_trace_decay_error)?,
             };
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX))
-                .unwrap_or(i64::MAX);
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let request_deadline = Deadline::new(UtcMicros(
-                now.saturating_add(i64::try_from(remaining.as_micros()).unwrap_or(i64::MAX)),
-            ))
-            .map_err(|error| TraceDecayError::Config {
-                message: error.to_string(),
-            })?;
-            let cancellation =
-                CancellationSignal::active(format!("cancellation.cli.{}", request_id.as_str()))
-                    .map_err(|error| TraceDecayError::Config {
-                        message: error.to_string(),
-                    })?;
+            let (request_deadline, cancellation) = cli_request_controls(&request_id, deadline)?;
             let result = resolve_cli_application_surface(
                 operation,
                 request_id.clone(),
@@ -638,7 +526,7 @@ fn dispatch_cli_application_surface_inner(
             if deadline.saturating_duration_since(Instant::now()) <= delay {
                 break result;
             }
-            tokio::time::sleep(delay).await;
+            sleep_before_retry(delay).await?;
         };
         print_cli_application_surface(profile, project.as_deref(), result, output)
     })
@@ -652,8 +540,9 @@ fn cli_request_controls(
     let remaining = deadline.saturating_duration_since(Instant::now());
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX))
-        .unwrap_or(i64::MAX);
+        .map_or(i64::MAX, |duration| {
+            i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
+        });
     let request_deadline = Deadline::new(UtcMicros(
         now.saturating_add(i64::try_from(remaining.as_micros()).unwrap_or(i64::MAX)),
     ))
@@ -669,6 +558,53 @@ fn cli_request_controls(
     Ok((request_deadline, cancellation))
 }
 
+/// Waits `delay` before a retry. Without a timer the retry fails rather than
+/// resend at once.
+async fn sleep_before_retry(delay: Duration) -> Result<()> {
+    tracedecay_runtime_core::native_runtime::sleep_until(Instant::now() + delay)
+        .await
+        .map_err(|message| TraceDecayError::Config { message })
+}
+
+fn cli_request_id() -> Result<tracedecay_contracts::RequestId> {
+    mint_global_request_id(GlobalRequestSurface::Cli).map_err(|_| TraceDecayError::Config {
+        message: "could not allocate an application surface request id".to_owned(),
+    })
+}
+
+/// Accounts and prints one rendered tool result, then settles the process
+/// outcome it carries.
+fn print_cli_tool_result(
+    project: Option<&Path>,
+    mut result: ToolResult,
+    raw_json: bool,
+    tool_args: &Value,
+    tool_name: &str,
+) -> Result<()> {
+    account_tool_result(project, &mut result);
+    mark_semantic_tool_error(&mut result);
+    print_tool_output(&result, CliToolOutput::for_args(raw_json, tool_args))?;
+    tool_result_process_outcome(&result.value, tool_name)
+}
+
+/// Renders a settled graph-tool owner outcome as its MCP tool result.
+fn render_graph_tool_outcome(
+    profile: &ProfileRoot,
+    project: Option<&Path>,
+    tool_args: &Value,
+    outcome: tracedecay::mcp::tools::GraphToolOutcome,
+) -> Result<ToolResult> {
+    let response_handle_root = cli_response_handle_root(profile, project)?;
+    match outcome {
+        Ok(completion) => tracedecay_mcp::handlers::graph_tool::render_graph_tool(
+            response_handle_root.as_deref(),
+            tool_args,
+            completion,
+        ),
+        Err(refusal) => refusal.render(response_handle_root.as_deref(), tool_args),
+    }
+}
+
 /// Run one retained memory, session, or workflow tool through the application
 /// surface and print the same tool result its MCP call returns.
 #[tracing::instrument(name = "cli.tool.retained", level = "trace", skip_all)]
@@ -680,11 +616,7 @@ async fn dispatch_cli_retained(
     raw_json: bool,
     deadline: Instant,
 ) -> Result<()> {
-    let tool_name = operation.mcp_tool_name();
-    let request_id =
-        mint_global_request_id(GlobalRequestSurface::Cli).map_err(|_| TraceDecayError::Config {
-            message: "could not allocate an application surface request id".to_owned(),
-        })?;
+    let request_id = cli_request_id()?;
     let client = invocation_client_for_current_client(profile, dispatch.handshake(profile)?)?;
     // The mounting refusal precedes admission; re-send it until the deadline.
     let execution = loop {
@@ -710,17 +642,20 @@ async fn dispatch_cli_retained(
         if deadline.saturating_duration_since(Instant::now()) <= delay {
             break execution;
         }
-        tokio::time::sleep(delay).await;
+        sleep_before_retry(delay).await?;
     };
     let response_handle_root = cli_response_handle_root(profile, dispatch.project_path.as_deref())?;
-    let mut result = tracedecay::mcp::tools::render_retained_execution(
+    let result = tracedecay::mcp::tools::render_retained_execution(
         response_handle_root.as_deref(),
         &execution,
     )?;
-    account_tool_result(dispatch.project_path.as_deref(), &mut result);
-    tracedecay_mcp::tool_errors::mark_semantic_tool_error(&mut result);
-    print_tool_output(&result, CliToolOutput::for_args(raw_json, &tool_args))?;
-    tool_result_process_outcome(&result.value, tool_name)
+    print_cli_tool_result(
+        dispatch.project_path.as_deref(),
+        result,
+        raw_json,
+        &tool_args,
+        operation.mcp_tool_name(),
+    )
 }
 
 /// Run one source-edit tool through the application surface and print the
@@ -734,18 +669,8 @@ async fn dispatch_cli_source_edit(
     raw_json: bool,
     deadline: Instant,
 ) -> Result<()> {
-    let tool_name = operation.mcp_tool_name();
-    let request_id =
-        mint_global_request_id(GlobalRequestSurface::Cli).map_err(|_| TraceDecayError::Config {
-            message: "could not allocate an application surface request id".to_owned(),
-        })?;
-    let handshake = tracedecay::daemon::handshake_for_current_client(
-        profile,
-        project.clone(),
-        None,
-        false,
-        false,
-    )?;
+    let request_id = cli_request_id()?;
+    let handshake = crate::commands::client_handshake(profile, project.as_deref())?;
     let client = invocation_client_for_current_client(profile, handshake)?;
     // A cold daemon refuses with the mounting problem while the project open
     // warms; that refusal precedes admission, so it is re-sent until the CLI
@@ -775,19 +700,22 @@ async fn dispatch_cli_source_edit(
         if deadline.saturating_duration_since(Instant::now()) <= delay {
             break outcome;
         }
-        tokio::time::sleep(delay).await;
+        sleep_before_retry(delay).await?;
     };
     let response_handle_root = cli_response_handle_root(profile, project.as_deref())?;
-    let mut result = tracedecay_mcp::handlers::edit::render_source_edit_outcome(
+    let result = tracedecay_mcp::handlers::edit::render_source_edit_outcome(
         response_handle_root.as_deref(),
         operation,
         &tool_args,
         outcome,
     )?;
-    account_tool_result(project.as_deref(), &mut result);
-    tracedecay_mcp::tool_errors::mark_semantic_tool_error(&mut result);
-    print_tool_output(&result, CliToolOutput::for_args(raw_json, &tool_args))?;
-    tool_result_process_outcome(&result.value, tool_name)
+    print_cli_tool_result(
+        project.as_deref(),
+        result,
+        raw_json,
+        &tool_args,
+        operation.mcp_tool_name(),
+    )
 }
 
 /// Run one graph or port read through its project owner and print the same
@@ -801,29 +729,17 @@ async fn dispatch_cli_graph_tool(
     raw_json: bool,
     deadline: Instant,
 ) -> Result<()> {
-    let tool_name = operation.mcp_tool_name();
-    let handshake = tracedecay::daemon::handshake_for_current_client(
-        profile,
-        project.clone(),
-        None,
-        false,
-        false,
-    )?;
+    let handshake = crate::commands::client_handshake(profile, project.as_deref())?;
     let outcome =
         invoke_cli_graph_tool(profile, handshake, operation, &tool_args, deadline).await?;
-    let response_handle_root = cli_response_handle_root(profile, project.as_deref())?;
-    let mut result = match outcome {
-        Ok(completion) => tracedecay_mcp::handlers::graph_tool::render_graph_tool(
-            response_handle_root.as_deref(),
-            &tool_args,
-            completion,
-        )?,
-        Err(refusal) => refusal.render(response_handle_root.as_deref(), &tool_args)?,
-    };
-    account_tool_result(project.as_deref(), &mut result);
-    tracedecay_mcp::tool_errors::mark_semantic_tool_error(&mut result);
-    print_tool_output(&result, CliToolOutput::for_args(raw_json, &tool_args))?;
-    tool_result_process_outcome(&result.value, tool_name)
+    let result = render_graph_tool_outcome(profile, project.as_deref(), &tool_args, outcome)?;
+    print_cli_tool_result(
+        project.as_deref(),
+        result,
+        raw_json,
+        &tool_args,
+        operation.mcp_tool_name(),
+    )
 }
 
 /// The project a graph-tool read or a selected retained effect answers for.
@@ -860,21 +776,13 @@ async fn selected_project_path(
             "--project and project_selector both name a project; pass only one".to_owned(),
         ));
     }
-    let request = AdminCliSurfaceRequestV1::RegistryContext {
-        project_arg: Some(PathBuf::from(project_id)),
-    };
     // The registry also matches aliases and paths; only the exact project id
     // is this selector's project.
-    match crate::commands::admin_cli_result(profile, None, request).await? {
-        AdminCliResultV1::RegistryContext(AdminCliRegistryContextV1::Ok { project, .. })
-            if project.project_id == project_id =>
-        {
+    match crate::commands::registry_context(profile, PathBuf::from(project_id)).await? {
+        AdminCliRegistryContextV1::Ok { project, .. } if project.project_id == project_id => {
             Ok(Some(PathBuf::from(project.canonical_root)))
         }
-        AdminCliResultV1::RegistryContext(_) => Err(registered_project_not_found(project_id)),
-        _ => Err(crate::commands::admin_cli_result_mismatch(
-            "registry_context",
-        )),
+        _ => Err(registered_project_not_found(project_id)),
     }
 }
 
@@ -887,10 +795,7 @@ async fn invoke_cli_graph_tool(
     tool_args: &Value,
     deadline: Instant,
 ) -> Result<tracedecay::mcp::tools::GraphToolOutcome> {
-    let request_id =
-        mint_global_request_id(GlobalRequestSurface::Cli).map_err(|_| TraceDecayError::Config {
-            message: "could not allocate an application surface request id".to_owned(),
-        })?;
+    let request_id = cli_request_id()?;
     let client = invocation_client_for_current_client(profile, handshake)?;
     // A cold daemon refuses with the mounting problem while the project open
     // warms; that refusal precedes admission, so it is re-sent until the CLI
@@ -917,7 +822,7 @@ async fn invoke_cli_graph_tool(
         if deadline.saturating_duration_since(Instant::now()) <= delay {
             return Ok(outcome);
         }
-        tokio::time::sleep(delay).await;
+        sleep_before_retry(delay).await?;
     }
 }
 
@@ -948,11 +853,7 @@ async fn dispatch_cli_profile_registry(
     raw_json: bool,
     deadline: Instant,
 ) -> Result<()> {
-    let tool_name = operation.mcp_tool_name();
-    let request_id =
-        mint_global_request_id(GlobalRequestSurface::Cli).map_err(|_| TraceDecayError::Config {
-            message: "could not allocate an application surface request id".to_owned(),
-        })?;
+    let request_id = cli_request_id()?;
     let client = invocation_client_for_current_client(profile, dispatch.handshake(profile)?)?;
     let (request_deadline, cancellation) = cli_request_controls(&request_id, deadline)?;
     let outcome = tracedecay::mcp::tools::execute_graph_tool_surface(
@@ -965,19 +866,15 @@ async fn dispatch_cli_profile_registry(
         Some(cancellation),
     )
     .await?;
-    let response_handle_root = cli_response_handle_root(profile, dispatch.project_path.as_deref())?;
-    let mut result = match outcome {
-        Ok(completion) => tracedecay_mcp::handlers::graph_tool::render_graph_tool(
-            response_handle_root.as_deref(),
-            &tool_args,
-            completion,
-        )?,
-        Err(refusal) => refusal.render(response_handle_root.as_deref(), &tool_args)?,
-    };
-    account_tool_result(dispatch.project_path.as_deref(), &mut result);
-    tracedecay_mcp::tool_errors::mark_semantic_tool_error(&mut result);
-    print_tool_output(&result, CliToolOutput::for_args(raw_json, &tool_args))?;
-    tool_result_process_outcome(&result.value, tool_name)
+    let project = dispatch.project_path.as_deref();
+    let result = render_graph_tool_outcome(profile, project, &tool_args, outcome)?;
+    print_cli_tool_result(
+        project,
+        result,
+        raw_json,
+        &tool_args,
+        operation.mcp_tool_name(),
+    )
 }
 
 /// Enrolled project's handle root, or none when that path has no store.
@@ -1128,7 +1025,7 @@ impl DaemonToolDispatch {
             }
             None => std::env::current_dir()
                 .ok()
-                .and_then(|cwd| implicit_tool_project_path(profile, &cwd)),
+                .and_then(|cwd| profile.discover_project_root(&cwd)),
         };
         Self {
             project_path,
@@ -1150,7 +1047,7 @@ impl DaemonToolDispatch {
             Some(path) => Some(tracedecay_configuration::resolve_path(Some(path))),
             None => std::env::current_dir()
                 .ok()
-                .and_then(|cwd| implicit_tool_project_path(profile, &cwd)),
+                .and_then(|cwd| profile.discover_project_root(&cwd)),
         };
         let allow_init = explicitly_targeted && FIRST_TOUCH_STORE_TOOLS.contains(&tool_name);
 
@@ -1177,10 +1074,6 @@ fn targets_profile(tool_name: &str, tool_args: &Value) -> bool {
         tracedecay::mcp::tools::retained_tool_target(operation, tool_args)
             .is_ok_and(|target| target == tracedecay_contracts::InvocationTarget::Profile)
     })
-}
-
-fn implicit_tool_project_path(profile: &ProfileRoot, cwd: &Path) -> Option<PathBuf> {
-    profile.discover_project_root(cwd)
 }
 
 /// `project_context` with an explicit uninitialised `--project` and no
@@ -1240,14 +1133,13 @@ fn tool_result_process_outcome(result_value: &Value, tool_name: &str) -> Result<
         let untested = result_value
             .pointer("/structuredContent/test_gate/untested")
             .and_then(Value::as_array)
-            .map(|items| {
+            .map_or_default(|items| {
                 items
                     .iter()
                     .filter_map(Value::as_str)
                     .collect::<Vec<_>>()
                     .join(", ")
-            })
-            .unwrap_or_default();
+            });
         std::io::stdout().flush()?;
         return Err(TraceDecayError::tool_refused(
             tool_name,
@@ -1405,9 +1297,13 @@ fn content_text_blocks(result_value: &Value) -> impl Iterator<Item = &str> {
 
 /// Print a grouped list of every available tool. Tools annotated as
 /// `alwaysLoad` come first since they're the most commonly used; everything
-/// else is alphabetized.
+/// else is grouped by [`ToolCategory`] and alphabetized within its group.
 fn print_tool_list(defs: &[ToolDefinition]) {
-    let mut groups: BTreeMap<&str, Vec<&ToolDefinition>> = BTreeMap::new();
+    print!("{}", render_tool_list(defs));
+}
+
+fn render_tool_list(defs: &[ToolDefinition]) -> String {
+    let mut groups: BTreeMap<Option<ToolCategory>, Vec<&ToolDefinition>> = BTreeMap::new();
     let mut always = Vec::new();
     for def in defs {
         let is_always = def
@@ -1420,92 +1316,68 @@ fn print_tool_list(defs: &[ToolDefinition]) {
             always.push(def);
             continue;
         }
-        let group = group_for(def);
-        groups.entry(group).or_default().push(def);
+        groups
+            .entry(ToolCategory::of(&def.name))
+            .or_default()
+            .push(def);
     }
 
-    println!(
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "Available tools ({}; TraceDecay {}), run `tracedecay tool <name> --help` for parameters, then",
         defs.len(),
         crate::product_runtime::PRODUCT_BUILD_VERSION
     );
-    println!("invoke with `tracedecay tool <name> --args '<json>'` (the same JSON arguments");
-    println!("object as the MCP tool; `--args -` reads a heredoc from stdin) or, for quick");
-    println!("scalar calls, `--key value` flags.\n");
+    let _ = writeln!(
+        out,
+        "invoke with `tracedecay tool <name> --args '<json>'` (the same JSON arguments"
+    );
+    let _ = writeln!(
+        out,
+        "object as the MCP tool; `--args -` reads a heredoc from stdin) or, for quick"
+    );
+    let _ = writeln!(out, "scalar calls, `--key value` flags.\n");
 
     if !always.is_empty() {
-        println!("[always-loaded]");
+        let _ = writeln!(out, "[always-loaded]");
         for def in &always {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {:<32}  {}",
                 short_tool_name(&def.name),
                 first_line(&def.description)
             );
         }
-        println!();
+        let _ = writeln!(out);
     }
 
-    for (group, mut list) in groups {
+    for (category, mut list) in groups {
         list.sort_by_key(|d| d.name.clone());
-        println!("[{group}]");
+        let group = category.map_or("uncategorized", ToolCategory::label);
+        let _ = writeln!(out, "[{group}]");
         for def in list {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {:<32}  {}",
                 short_tool_name(&def.name),
                 first_line(&def.description)
             );
         }
-        println!();
+        let _ = writeln!(out);
     }
 
-    println!("{RESERVED_FLAGS_FOOTER}");
+    let _ = writeln!(out, "{RESERVED_FLAGS_FOOTER}");
+    out
 }
 
 /// First line of a (possibly multi-line) description, truncated for layout.
 fn first_line(s: &str) -> String {
     let line = s.lines().next().unwrap_or("");
-    if line.len() > 90 {
-        format!("{}…", &line[..89])
+    if line.chars().count() > 90 {
+        format!("{}…", line.chars().take(89).collect::<String>())
     } else {
         line.to_string()
-    }
-}
-
-/// Best-effort categorisation by tool-name prefix. Matches how the codebase
-/// already groups handlers (`graph`, `info`, `git`, `health`, `edit`,
-/// `memory`). Tools that don't match any prefix fall under `other`.
-fn group_for(def: &ToolDefinition) -> &'static str {
-    let n = def.name.as_str();
-    if ApplicationSurfaceOperation::from_tool_name(n).is_some() {
-        "application"
-    } else if n == "tracedecay_str_replace"
-        || n == "tracedecay_multi_str_replace"
-        || n == "tracedecay_insert_at"
-        || n == "tracedecay_ast_grep_rewrite"
-        || n == "tracedecay_replace_symbol"
-        || n == "tracedecay_insert_at_symbol"
-        || n == "tracedecay_move_symbol"
-        || n == "tracedecay_rename_symbol"
-    {
-        "edit"
-    } else if n.starts_with("tracedecay_fact_store_")
-        || n == "tracedecay_fact_feedback"
-        || n == "tracedecay_memory_status"
-    {
-        "memory & session"
-    } else if n == "tracedecay_runtime" {
-        "health"
-    } else if n == "tracedecay_call_chain"
-        || n == "tracedecay_impact"
-        || n == "tracedecay_file_dependents"
-        || n == "tracedecay_similar"
-        || n == "tracedecay_rename_preview"
-    {
-        "graph"
-    } else if n == "tracedecay_run_affected_tests" {
-        "workflow"
-    } else {
-        "info"
     }
 }
 

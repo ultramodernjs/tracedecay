@@ -25,28 +25,20 @@ use crate::retrieval::ports::{
 mod artifact;
 
 pub use artifact::{
-    CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1, CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
-    CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
-    CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
     CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1, CODE_LEXICAL_ARTIFACT_FORMAT_REVISION_V1,
     CODE_LEXICAL_ARTIFACT_MAXIMUM_PAGE_RETAINED_BYTES_V1,
     CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1,
     CarriedFilePagesV1, CloneArtifactCursorV1, CloneArtifactPageV1, CloneExactArtifactMemberV1,
     CloneExactFamilyArtifactCandidateV1, CloneExactFamilyArtifactPageV1,
-    CloneFingerprintArtifactReadV1, CloneFingerprintCancellationPointV1,
-    CloneFingerprintPartialReasonV1, CloneFingerprintReadAccountingV1,
-    CloneFingerprintStreamDescriptorV1, CloneNearMatchArtifactV1, CloneNearMatchExtentV1,
-    CloneSelectedBlockArtifactCandidateV1, CloneSelectedBlockArtifactReadV1,
-    CloneSelectedBlockContainmentClassV1, CloneSelectedBlockV1, CodeExactLexicalArtifactReaderV1,
-    CodeLexicalArtifactBatchLimitV1, CodeLexicalArtifactBuildProgressV1,
-    CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
+    CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactBatchLimitV1,
+    CodeLexicalArtifactBuildProgressV1, CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
     CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
     CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
     CodeLexicalArtifactRestoreWitnessV1, CodeLexicalArtifactSectionDigestV1,
     CodeLexicalCloneIndexCensusV1, MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
-    MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1, PreparedCodeLexicalArtifactBatchV1,
-    PreparedCodeLexicalArtifactPageV1, VerifiedCodeLexicalArtifactV1,
-    code_lexical_artifact_build_memory_budget_for, code_lexical_artifact_content_key,
+    PreparedCodeLexicalArtifactBatchV1, PreparedCodeLexicalArtifactPageV1,
+    VerifiedCodeLexicalArtifactV1, code_lexical_artifact_build_memory_budget_for,
+    code_lexical_artifact_content_key,
 };
 
 const BM25_K1_MILLIS: u64 = 1_200;
@@ -502,6 +494,45 @@ impl ExactOccurrenceOwnersV1 {
             }
         }
         (literals.into_iter().collect(), kinds.into_iter().collect())
+    }
+}
+
+/// How specific each request literal is: the inverse of the number of rows
+/// it matched, the chance that one of those rows is the one the literal
+/// names. `format_relative_time callers` names one function and a word that
+/// hundreds of rows contain, so a row matching only `callers` carries a
+/// small share of the query and the definition carries nearly all of it.
+struct ExactLiteralSpecificityV1 {
+    inverse_frequencies: Vec<u128>,
+    total: u128,
+}
+
+impl ExactLiteralSpecificityV1 {
+    /// `document_frequencies[literal]` counts the rows that matched it; a
+    /// literal nothing matched carries no weight.
+    fn new(document_frequencies: &[usize]) -> Self {
+        let inverse_frequencies = document_frequencies
+            .iter()
+            .map(|&frequency| match frequency {
+                0 => 0,
+                frequency => (1_u128 << 64) / frequency as u128,
+            })
+            .collect::<Vec<_>>();
+        let total = inverse_frequencies.iter().sum();
+        Self {
+            inverse_frequencies,
+            total,
+        }
+    }
+
+    /// The share of the query's literal specificity that `literals` carry,
+    /// in `[1, 1_000_000]` micros for a non-empty matched set.
+    fn share_micros(&self, literals: &[usize]) -> u64 {
+        let matched = literals
+            .iter()
+            .map(|&literal| self.inverse_frequencies[literal])
+            .sum::<u128>();
+        (matched * 1_000_000 / self.total.max(1)).clamp(1, 1_000_000) as u64
     }
 }
 

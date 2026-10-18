@@ -18,12 +18,13 @@ doctest = false
 test-helpers = []
 
 [dependencies]
+asupersync.workspace = true
 futures-util = "0.3.33"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
 tracing = "0.1"
 tracedecay-contracts = { path = "../tracedecay-contracts" }
 tracedecay-code-index = { path = "../tracedecay-code-index", default-features = false }
@@ -48,7 +49,7 @@ tracedecay-application = { path = "../tracedecay-application" }
 
 [dev-dependencies]
 hex = "0.4"
-rusqlite = { workspace = true }
+rusqlite = { version = "0.40.1", default-features = false }
 tracedecay-maintenance = { path = "../tracedecay-maintenance" }
 tracedecay-privacy = { path = "../tracedecay-privacy" }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -99,3 +100,12 @@ required-features = ["test-helpers"]
 [[test]]
 name = "session_retention_read_cost"
 required-features = ["test-helpers"]
+
+# Read-cost probes populate their stores through production ingest, so the
+# fixture sets their cost. CI runs a probe beside other actions on four vCPUs
+# at up to three times its cost pinned alone to four CPUs on tmpfs. The two
+# probes above 80 s pinned (index 97-101 s, refresh 89 s) reached 237-300 s
+# in CI. Drain (55 s), retention (60 s) and backlog (38 s) stay medium.
+[package.metadata.bazel.test_sizes]
+session_ingest_index_read_cost = "large"
+session_refresh_read_cost = "large"

@@ -60,7 +60,7 @@ and the config reference):
   currently *does* consume MCP-heavy threads (both systems learn from the same
   sessions, duplication risk, see §5).
 - Managed via `/memories` in the TUI and `codex debug clear-memories`.
-- `[features.memories] custom_tools = true` (nested form) additionally exposes
+- `[features.memories] custom_tools = true` (nested form) also exposes
   memories read/retrieval **tools** to the model, i.e. Codex is moving toward
   model-invocable memory reads, which is exactly the slot a
   `tracedecay_fact_store_search` MCP tool already occupies.
@@ -365,7 +365,7 @@ construction:
   automation is disabled ("N sessions ingested, 0 reflected").
 
 Pointers: `crates/tracedecay-automation-runtime/src/automation/config.rs` (defaults/validation),
-`crates/tracedecay-automation-runtime/src/automation/runner/session_reflector.rs::run_session_reflector_with_backend`,
+`crates/tracedecay-automation-runtime/src/automation/runner/session_reflector.rs::run_session_reflector_with_backend_and_retrieval_for_retained_settlement`,
 dashboard curation UI (concurrent work in `dashboard/`, coordinate, don't
 touch).
 

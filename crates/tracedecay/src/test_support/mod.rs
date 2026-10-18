@@ -13,6 +13,15 @@ pub mod git;
 #[cfg(any(test, feature = "test-transport"))]
 pub mod host_admission;
 
+/// Tokio-dependent paths this process skipped, plus synchronous writer waits
+/// that parked a native worker. An off-Tokio test asserts this does not move.
+#[cfg(test)]
+pub(crate) fn native_runtime_hazards() -> u64 {
+    tracedecay_runtime_core::native_runtime::tokio_runtime_missing_count(
+        "daemon-service.shutdown.runner",
+    ) + tracedecay_rusqlite_runtime::exact_sql::native_thread_writer_waits()
+}
+
 /// Park after core publication when `TRACEDECAY_TEST_HOLD_AFTER_CORE_PUBLISH`
 /// names a file. The core graph-tool owner is already registered and the
 /// route is ready, so a session action can land before the full server
@@ -29,6 +38,53 @@ pub async fn hold_after_core_publish_for_test() -> Result<()> {
 /// for a store mount that cannot observe cancellation from inside.
 pub async fn hold_after_project_sessions_for_test() -> Result<()> {
     hold_for_test("TRACEDECAY_TEST_HOLD_AFTER_PROJECT_SESSIONS", b"sessions").await
+}
+
+/// Park a project open after its independent production owners registered,
+/// the Hook V2 replay consumer among them, when
+/// `TRACEDECAY_TEST_HOLD_AFTER_INDEPENDENT_OWNERS` names a file.
+pub async fn hold_after_independent_owners_for_test() -> Result<()> {
+    hold_for_test("TRACEDECAY_TEST_HOLD_AFTER_INDEPENDENT_OWNERS", b"owners").await
+}
+
+/// Park a project open after capacity admission and before it binds its route
+/// into the bounded project-server cache, when
+/// `TRACEDECAY_TEST_HOLD_BEFORE_ROUTE_BIND` names a file.
+pub async fn hold_before_route_bind_for_test() -> Result<()> {
+    hold_for_test("TRACEDECAY_TEST_HOLD_BEFORE_ROUTE_BIND", b"bind").await
+}
+
+/// Park a route-bind eviction's detached retirement before it waits out the
+/// in-flight opens and retires the evicted graph's process owners, when
+/// `TRACEDECAY_TEST_HOLD_BEFORE_EVICTED_OWNER_RETIRE` names a file.
+pub async fn hold_before_evicted_owner_retire_for_test() -> Result<()> {
+    hold_for_test(
+        "TRACEDECAY_TEST_HOLD_BEFORE_EVICTED_OWNER_RETIRE",
+        b"evicted-owner-retire",
+    )
+    .await
+}
+
+/// Park unserved-owner retirement after its served check found no published
+/// server and before it removes the process owners, when
+/// `TRACEDECAY_TEST_HOLD_AFTER_UNSERVED_OWNER_CHECK` names a file.
+pub async fn hold_after_unserved_owner_check_for_test() -> Result<()> {
+    hold_for_test(
+        "TRACEDECAY_TEST_HOLD_AFTER_UNSERVED_OWNER_CHECK",
+        b"unserved-owner-check",
+    )
+    .await
+}
+
+/// Park a retention maintenance tick after it listed the mounted stores and
+/// before it runs any store unit, when
+/// `TRACEDECAY_TEST_HOLD_AFTER_MAINTENANCE_LISTING` names a file.
+pub async fn hold_after_maintenance_listing_for_test() -> Result<()> {
+    hold_for_test(
+        "TRACEDECAY_TEST_HOLD_AFTER_MAINTENANCE_LISTING",
+        b"maintenance-listing",
+    )
+    .await
 }
 
 /// Releases `store`'s interactive catalog once nothing holds it. `Busy` means
@@ -62,8 +118,14 @@ async fn hold_for_test(variable: &str, stage: &[u8]) -> Result<()> {
             entered.display()
         ),
     })?;
+    // Holds park daemon tasks on the native runtime too, where a Tokio timer
+    // panics for want of a reactor.
     while hold.exists() {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tracedecay_runtime_core::native_runtime::sleep_until(
+            std::time::Instant::now() + Duration::from_millis(20),
+        )
+        .await
+        .map_err(|message| TraceDecayError::Config { message })?;
     }
     Ok(())
 }

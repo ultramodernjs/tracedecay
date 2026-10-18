@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use tracedecay_contracts::session_sync::{
@@ -12,6 +14,7 @@ use tracedecay_domain::{BrainId, ProjectId, UserProfileId, UtcMicros};
 use tracedecay_store::{StoreShardScopeV1, VerifiedStoreLocatorV1};
 
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_runtime_core::native_runtime::{self, NativeTask};
 use tracedecay_sessions::admission::SESSION_INGEST_DISABLED_REASON_V1;
 
 use super::{
@@ -40,7 +43,7 @@ pub struct SessionSyncTaskV1 {
     pub scope: SessionSyncScopeV1,
     pub key: String,
     pub cancellation: CancellationSignal,
-    pub task: tokio::task::JoinHandle<()>,
+    pub task: NativeTask<()>,
 }
 
 impl SessionSyncProjectContext {
@@ -458,11 +461,6 @@ impl DaemonSessionSyncService {
             .cloned()
     }
 
-    #[tracing::instrument(
-        name = "daemon.session_sync.lifecycle.execute_request",
-        level = "trace",
-        skip_all
-    )]
     pub(super) async fn execute_request(
         &self,
         request: SessionSyncRequestV1,
@@ -477,8 +475,10 @@ impl DaemonSessionSyncService {
                 reason_code: "session_sync_project_retired",
             };
         };
-        self.execute_request_admitted(request, Arc::clone(&context), project_sessions)
-            .await
+        let admitted: Pin<Box<dyn Future<Output = SessionSyncOutcomeV1> + Send + '_>> = Box::pin(
+            self.execute_request_admitted(request, Arc::clone(&context), project_sessions),
+        );
+        admitted.await
     }
 
     pub async fn retire_project(
@@ -533,9 +533,7 @@ impl DaemonSessionSyncService {
             return Err(format!(
                 "session sync project '{}' could not recover after rebind: {error}{}",
                 project_id.as_str(),
-                drain
-                    .map(|drain| format!("; rollback failed: {drain}"))
-                    .unwrap_or_default(),
+                drain.map_or_default(|drain| format!("; rollback failed: {drain}")),
             ));
         }
         Ok(true)
@@ -560,21 +558,23 @@ impl DaemonSessionSyncService {
         for task in &project_tasks {
             task.cancellation.cancel(cancelled_at);
         }
-        let joined = tokio::time::timeout(SESSION_SYNC_SHUTDOWN_DEADLINE, async {
-            futures_util::future::join_all(project_tasks.iter_mut().map(|task| &mut task.task))
-                .await
+        let joined = native_runtime::timeout(SESSION_SYNC_SHUTDOWN_DEADLINE, async {
+            futures_util::future::join_all(project_tasks.iter().map(|task| task.task.wait())).await
         })
         .await;
-        let Ok(results) = joined else {
-            project_tasks.retain(|task| !task.task.is_finished());
-            self.tasks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .extend(project_tasks);
-            return Err(format!(
-                "session sync tasks for project '{}' did not retire before the deadline",
-                scope.project_id().as_str()
-            ));
+        let results = match joined {
+            Ok(results) => results,
+            Err(error) => {
+                project_tasks.retain(|task| !task.task.is_finished());
+                self.tasks
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(project_tasks);
+                return Err(format!(
+                    "session sync tasks for project '{}' did not retire: {error}",
+                    scope.project_id().as_str()
+                ));
+            }
         };
         for result in results {
             work::log_session_sync_join(result);

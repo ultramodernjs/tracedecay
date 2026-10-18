@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(row.get::<i64>(1).unwrap(), 8 * 4096);
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn legacy_none_auto_vacuum_reports_no_progress_and_preserves_file_pages() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("store.db");
@@ -304,7 +304,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn incremental_auto_vacuum_reports_bounded_observed_page_reduction() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("store.db");
@@ -336,7 +336,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn read_only_compaction_reports_writer_failure_without_modifying_pages() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("store.db");

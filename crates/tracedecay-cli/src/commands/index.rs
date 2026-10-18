@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use tokio::time::Instant;
+use std::time::{Duration, Instant};
 use tracedecay_runtime_core::config::ProfileRoot;
 
 use tracedecay_project::project::TraceDecay;
@@ -350,7 +349,7 @@ fn require_first_generation_ready(
 async fn admin_sync(
     profile: &ProfileRoot,
     handshake: tracedecay_daemon_protocol::DaemonHandshake,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
 ) -> tracedecay_domain::errors::Result<AdminSyncResultV1> {
     match crate::tool_command::owner_operation_result(
         profile,
@@ -706,7 +705,7 @@ pub(crate) async fn handle_sync(
     )
     .await?;
     let handshake = super::daemon::client_handshake(profile, Some(&resolved.project_path))?;
-    let deadline = tokio::time::Instant::now() + crate::tool_command::tool_command_deadline()?;
+    let deadline = crate::tool_command::tool_command_deadline()?;
     let result = admin_sync(profile, handshake, deadline).await?;
     if verbose {
         eprintln!("{}", serde_json::to_string_pretty(&result)?);

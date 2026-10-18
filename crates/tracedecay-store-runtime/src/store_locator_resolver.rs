@@ -21,6 +21,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
 use tracedecay_domain::canonical_text::sha256_hex;
+use tracedecay_runtime_core::config::GLOBAL_DB_FILENAME;
 use tracedecay_runtime_core::db::DatabaseAuthority;
 use tracedecay_runtime_core::path_safety::canonicalize_path_or_existing_parent;
 use tracedecay_runtime_core::shard_runtime::registry::{
@@ -37,8 +38,6 @@ use tracedecay_store::{
 
 mod graph;
 
-const PROFILE_DATABASE_FILENAME: &str = "global.db";
-const REMOTE_NODE_DATABASE_FILENAME: &str = "remote.db";
 /// Explicit local authority for one typed profile.
 ///
 /// `profile_root` is a locator supplied by the daemon's profile authority. It
@@ -106,63 +105,14 @@ impl LocalProjectEnrollmentAuthorityV1 {
     }
 }
 
-/// Exact daemon authority for one already-created code-shard database.
-///
-/// The typed shard selects this record. `database_path` is locator evidence
-/// only and can never select or manufacture a project, repository, worktree,
-/// or snapshot identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalCodeStoreAuthorityV1 {
-    shard_id: StoreShardIdV1,
-    database_path: PathBuf,
-}
-
-impl LocalCodeStoreAuthorityV1 {
-    pub fn new(
-        shard_id: StoreShardIdV1,
-        database_path: PathBuf,
-    ) -> Result<Self, LocalStoreRuntimeResolverConfigurationErrorV1> {
-        if !matches!(&shard_id.scope, StoreShardScopeV1::Code { .. }) {
-            return Err(
-                LocalStoreRuntimeResolverConfigurationErrorV1::CodeAuthorityIsNotCodeShard {
-                    shard_id: Box::new(shard_id),
-                },
-            );
-        }
-        Ok(Self {
-            shard_id,
-            database_path,
-        })
-    }
-}
-
 /// In-memory configuration failures for a local resolver.
 ///
 /// This is deliberately separate from resolution unavailability: a duplicate
 /// typed authority is a daemon wiring bug, not a reason to choose an arbitrary
 /// path at runtime.
-///
-/// Shard identities are boxed so `Result<_, Self>` stays under Clippy's
-/// `result_large_err` threshold; the boxed value remains the exact typed
-/// authority identity used for fail-closed equality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalStoreRuntimeResolverConfigurationErrorV1 {
     DuplicateProjectAuthority { project_id: ProjectId },
-    DuplicateCodeAuthority { shard_id: Box<StoreShardIdV1> },
-    CodeAuthorityIsNotCodeShard { shard_id: Box<StoreShardIdV1> },
-    CodeAuthorityRetirementMismatch { shard_id: Box<StoreShardIdV1> },
-}
-
-/// Whether an exact code-store authority was added by this registration.
-///
-/// Callers use this to roll back only their own newly added authority when a
-/// subsequent runtime open fails. An identical authority may already be owned
-/// by a retained or concurrently opening runtime and must not be retired by an
-/// idempotent registrant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalCodeStoreAuthorityRegistrationOutcomeV1 {
-    Registered,
-    AlreadyRegistered,
 }
 
 /// Infrastructure-only resolver for the local profile-sharded layout.
@@ -179,13 +129,10 @@ pub struct LocalStoreRuntimeResolverV1 {
     /// read here that waits is a registrant holding the map against the
     /// resolve path.
     project_authorities: Arc<RwLock<BTreeMap<ProjectId, LocalProjectEnrollmentAuthorityV1>>>,
-    /// Read on every code-shard resolution; also written by retirement, which
-    /// is the writer that can starve concurrent resolves.
-    code_authorities: Arc<RwLock<BTreeMap<StoreShardIdV1, LocalCodeStoreAuthorityV1>>>,
 }
 
-/// Hand-written so the authority maps are omitted rather than printed:
-/// formatting them would take the very locks this type exists to hand out.
+/// Hand-written so the authority map is omitted rather than printed:
+/// formatting it would take the very lock this type exists to hand out.
 impl fmt::Debug for LocalStoreRuntimeResolverV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalStoreRuntimeResolverV1")
@@ -199,15 +146,16 @@ impl LocalStoreRuntimeResolverV1 {
         Self {
             profile_authority,
             project_authorities: Arc::new(RwLock::new(BTreeMap::new())),
-            code_authorities: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
     /// Adds exactly one typed project authority.
     ///
     /// A project can carry many aliases in its one
-    /// [`LocalProjectEnrollmentAuthorityV1`], but two separately configured
-    /// authorities for the same typed project are refused rather than merged.
+    /// [`LocalProjectEnrollmentAuthorityV1`]. A later registration adds its
+    /// roots only when each new root's repository marker names the project
+    /// (another clone of the repository); any other second authority for the
+    /// same typed project is refused rather than merged.
     #[cfg(test)]
     pub(crate) fn with_project_authority(
         self,
@@ -217,83 +165,59 @@ impl LocalStoreRuntimeResolverV1 {
         Ok(self)
     }
 
+    /// Returns the roots this registration added, for
+    /// [`Self::withdraw_project_authority`].
     pub fn register_project_authority(
         &self,
         authority: LocalProjectEnrollmentAuthorityV1,
-    ) -> Result<(), LocalStoreRuntimeResolverConfigurationErrorV1> {
+    ) -> Result<LocalProjectEnrollmentAuthorityV1, LocalStoreRuntimeResolverConfigurationErrorV1>
+    {
         let project_id = authority.project_id.clone();
         let mut project_authorities = self.project_authorities_write();
-        if project_authorities
-            .get(&project_id)
-            .is_some_and(|existing| existing == &authority)
-        {
-            return Ok(());
-        }
-        if project_authorities.contains_key(&project_id) {
+        let Some(existing) = project_authorities.get_mut(&project_id) else {
+            project_authorities.insert(project_id, authority.clone());
+            return Ok(authority);
+        };
+        let added = authority
+            .enrollment_roots
+            .into_iter()
+            .filter(|root| !existing.enrollment_roots.contains(root))
+            .collect::<Vec<_>>();
+        // Another clone of the repository joins the authority by naming the
+        // project in its own marker; any other root is a second authority.
+        let joins = |root: &PathBuf| {
+            matches!(
+                storage::read_repository_identity_marker(root),
+                Ok(Some(marker)) if marker.project_id == project_id.as_str()
+            )
+        };
+        if !added.iter().all(joins) {
             return Err(
                 LocalStoreRuntimeResolverConfigurationErrorV1::DuplicateProjectAuthority {
                     project_id,
                 },
             );
         }
-        project_authorities.insert(project_id, authority);
-        Ok(())
+        existing.enrollment_roots.extend(added.iter().cloned());
+        existing.enrollment_roots.sort();
+        Ok(LocalProjectEnrollmentAuthorityV1 {
+            project_id,
+            enrollment_roots: added,
+        })
     }
 
-    /// Withdraws `authority` while it is still the one registered for its
-    /// project; a different registration is left in place.
-    pub(crate) fn withdraw_project_authority(&self, authority: &LocalProjectEnrollmentAuthorityV1) {
+    /// Withdraws the roots a [`Self::register_project_authority`] call added,
+    /// leaving every root another registration added in place.
+    pub(crate) fn withdraw_project_authority(&self, added: &LocalProjectEnrollmentAuthorityV1) {
         let mut project_authorities = self.project_authorities_write();
-        if project_authorities.get(&authority.project_id) == Some(authority) {
-            project_authorities.remove(&authority.project_id);
-        }
-    }
-
-    pub fn register_code_authority(
-        &self,
-        authority: LocalCodeStoreAuthorityV1,
-    ) -> Result<
-        LocalCodeStoreAuthorityRegistrationOutcomeV1,
-        LocalStoreRuntimeResolverConfigurationErrorV1,
-    > {
-        let shard_id = authority.shard_id.clone();
-        let mut code_authorities = self.code_authorities_write();
-        if code_authorities
-            .get(&shard_id)
-            .is_some_and(|existing| existing == &authority)
-        {
-            return Ok(LocalCodeStoreAuthorityRegistrationOutcomeV1::AlreadyRegistered);
-        }
-        if code_authorities.contains_key(&shard_id) {
-            return Err(
-                LocalStoreRuntimeResolverConfigurationErrorV1::DuplicateCodeAuthority {
-                    shard_id: Box::new(shard_id),
-                },
-            );
-        }
-        code_authorities.insert(shard_id, authority);
-        Ok(LocalCodeStoreAuthorityRegistrationOutcomeV1::Registered)
-    }
-
-    pub fn retire_code_authority(
-        &self,
-        shard_id: &StoreShardIdV1,
-        database_path: &Path,
-    ) -> Result<(), LocalStoreRuntimeResolverConfigurationErrorV1> {
-        let expected =
-            LocalCodeStoreAuthorityV1::new(shard_id.clone(), database_path.to_path_buf())?;
-        let mut code_authorities = self.code_authorities_write();
-        match code_authorities.get(shard_id) {
-            None => Ok(()),
-            Some(existing) if existing == &expected => {
-                code_authorities.remove(shard_id);
-                Ok(())
-            }
-            Some(_) => Err(
-                LocalStoreRuntimeResolverConfigurationErrorV1::CodeAuthorityRetirementMismatch {
-                    shard_id: Box::new(shard_id.clone()),
-                },
-            ),
+        let Some(existing) = project_authorities.get_mut(&added.project_id) else {
+            return;
+        };
+        existing
+            .enrollment_roots
+            .retain(|root| !added.enrollment_roots.contains(root));
+        if existing.enrollment_roots.is_empty() {
+            project_authorities.remove(&added.project_id);
         }
     }
 
@@ -309,22 +233,6 @@ impl LocalStoreRuntimeResolverV1 {
         &self,
     ) -> RwLockWriteGuard<'_, BTreeMap<ProjectId, LocalProjectEnrollmentAuthorityV1>> {
         self.project_authorities
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn code_authorities_read(
-        &self,
-    ) -> RwLockReadGuard<'_, BTreeMap<StoreShardIdV1, LocalCodeStoreAuthorityV1>> {
-        self.code_authorities
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn code_authorities_write(
-        &self,
-    ) -> RwLockWriteGuard<'_, BTreeMap<StoreShardIdV1, LocalCodeStoreAuthorityV1>> {
-        self.code_authorities
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -385,7 +293,7 @@ impl LocalStoreRuntimeResolverV1 {
         match &shard_id.scope {
             StoreShardScopeV1::Profile => {
                 let locator_path = canonical_or_prospective_regular_file(
-                    &canonical_profile_root.join(PROFILE_DATABASE_FILENAME),
+                    &canonical_profile_root.join(GLOBAL_DB_FILENAME),
                     &canonical_profile_root,
                 )?;
                 verified_locator(
@@ -445,48 +353,12 @@ impl LocalStoreRuntimeResolverV1 {
                 &canonical_profile_root,
                 filesystem_safety,
             ),
+            // Code scopes are namespaces inside their project graph runtime,
+            // never physical stores of their own.
             StoreShardScopeV1::Code { .. } => {
-                self.resolve_code_locator(key, &canonical_profile_root, filesystem_safety)
+                Err(LocalStoreLocatorUnavailableReasonV1::MissingCodeStoreAuthority)
             }
         }
-    }
-
-    fn resolve_code_locator(
-        &self,
-        key: &StoreRuntimeKey,
-        canonical_profile_root: &Path,
-        filesystem_safety: &dyn Fn(&Path) -> FilesystemSafety,
-    ) -> LocalStoreLocatorResult<VerifiedLocalStoreLocatorV1> {
-        let authority = self
-            .code_authorities_read()
-            .get(key.shard_id())
-            .cloned()
-            .ok_or(LocalStoreLocatorUnavailableReasonV1::MissingCodeStoreAuthority)?;
-        // A never-indexed worktree has no graph database until its first index
-        // creates one under the daemon's authority. Resolve a prospective
-        // locator exactly like the project and session locators do, so the
-        // `Initialize` open mode can create the file. `canonical_or_prospective_*`
-        // still reject symlinked or non-regular existing paths and confine the
-        // locator to the profile root; the mode-aware `resolve()` remains the
-        // authoritative existence gate, failing closed for a non-`Initialize`
-        // open of a missing store. Requiring pre-existence here instead blocked
-        // that legitimate first-touch initialization.
-        let canonical_path = canonical_or_prospective_regular_file(
-            &authority.database_path,
-            canonical_profile_root,
-        )?;
-        let canonical_store_root = canonical_path
-            .parent()
-            .ok_or(LocalStoreLocatorUnavailableReasonV1::UnsafeLocatorPath)?
-            .to_path_buf();
-        verified_locator(
-            key,
-            LocalStoreLocatorKindV1::Code,
-            canonical_profile_root.to_path_buf(),
-            canonical_store_root,
-            canonical_path,
-            filesystem_safety,
-        )
     }
 
     fn resolve_remote_node_locator(
@@ -505,7 +377,7 @@ impl LocalStoreRuntimeResolverV1 {
             canonical_profile_root,
         )?;
         let locator_path = canonical_or_prospective_regular_file(
-            &canonical_store_root.join(REMOTE_NODE_DATABASE_FILENAME),
+            &canonical_store_root.join(storage::REMOTE_DB_FILENAME),
             &canonical_store_root,
         )?;
         verified_locator(
@@ -607,8 +479,7 @@ impl LocalStoreRuntimeResolverV1 {
             LocalStoreLocatorKindV1::ProfileAuthority
             | LocalStoreLocatorKindV1::ProfileMemory
             | LocalStoreLocatorKindV1::ProfileSessions
-            | LocalStoreLocatorKindV1::RemoteNode
-            | LocalStoreLocatorKindV1::Code => {
+            | LocalStoreLocatorKindV1::RemoteNode => {
                 return Err(LocalStoreLocatorUnavailableReasonV1::UnsupportedShardScope);
             }
         };
@@ -727,7 +598,6 @@ pub enum LocalStoreLocatorKindV1 {
     RemoteNode,
     Project,
     ProjectSessions,
-    Code,
 }
 
 /// Locality facts captured while resolving a physical locator.
@@ -1665,7 +1535,7 @@ mod tests {
         let profile = resolved(resolve_as_local(&resolver, &profile_key));
         assert_eq!(
             profile.locator().path(),
-            fixture.profile_root.join(PROFILE_DATABASE_FILENAME)
+            fixture.profile_root.join(GLOBAL_DB_FILENAME)
         );
         assert_eq!(
             profile.metadata().kind,
@@ -1723,7 +1593,7 @@ mod tests {
                 .join("remote")
                 .join("nodes")
                 .join(hex::encode(Sha256::digest(node_id.as_str().as_bytes())))
-                .join(REMOTE_NODE_DATABASE_FILENAME)
+                .join(storage::REMOTE_DB_FILENAME)
         );
         assert_eq!(
             remote_node.metadata().kind,
@@ -1895,226 +1765,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn exact_code_authority_resolves_only_its_typed_code_shard() {
-        let fixture = Fixture::new();
-        let resolver = LocalStoreRuntimeResolverV1::new(fixture.profile_authority());
-        let graph_root = fixture.profile_root.join("code-fixture");
-        fs::create_dir_all(&graph_root).expect("graph root");
-        let graph_path = graph_root.join("graph.db");
-        fs::write(&graph_path, b"fixture").expect("graph fixture");
-        let code_shard = StoreShardIdV1::code(
-            id::<BrainId>("brain.local-resolver"),
-            id::<UserProfileId>("profile.local-resolver"),
-            fixture.project_id.clone(),
-            id("repository.local-resolver"),
-            tracedecay_store::CodeShardScopeV1::Worktree {
-                worktree_id: id("worktree.local-resolver"),
-            },
-        );
-        resolver
-            .register_code_authority(
-                LocalCodeStoreAuthorityV1::new(code_shard.clone(), graph_path.clone())
-                    .expect("typed code authority"),
-            )
-            .expect("register exact code authority");
-
-        let locator = resolved(resolve_as_local(
-            &resolver,
-            &StoreRuntimeKey::new(code_shard.clone(), incarnation()),
-        ));
-        assert_eq!(locator.locator().verified().shard_id, code_shard);
-        assert_eq!(
-            locator.locator().path(),
-            graph_path.canonicalize().expect("canonical graph path")
-        );
-        assert_eq!(locator.metadata().kind, LocalStoreLocatorKindV1::Code);
-
-        let other_worktree = StoreShardIdV1::code(
-            id::<BrainId>("brain.local-resolver"),
-            id::<UserProfileId>("profile.local-resolver"),
-            fixture.project_id.clone(),
-            id("repository.local-resolver"),
-            tracedecay_store::CodeShardScopeV1::Worktree {
-                worktree_id: id("worktree.other"),
-            },
-        );
-        assert!(matches!(
-            resolve_as_local(
-                &resolver,
-                &StoreRuntimeKey::new(other_worktree, incarnation())
-            ),
-            LocalStoreLocatorResolutionV1::Unavailable(LocalStoreLocatorUnavailableV1 {
-                reason: LocalStoreLocatorUnavailableReasonV1::MissingCodeStoreAuthority,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn branch_code_authority_keeps_its_typed_ref_path_distinct_from_worktree() {
-        let fixture = Fixture::new();
-        let resolver = LocalStoreRuntimeResolverV1::new(fixture.profile_authority());
-        let worktree_id = id::<tracedecay_domain::WorktreeId>("worktree-component");
-        let project_id = fixture.project_id.clone();
-        let branch_shard = StoreShardIdV1::code(
-            id::<BrainId>("brain.local-resolver"),
-            id::<UserProfileId>("profile.local-resolver"),
-            project_id.clone(),
-            id("repository.local-resolver"),
-            tracedecay_store::CodeShardScopeV1::Branch {
-                worktree_id: worktree_id.clone(),
-                ref_id: id("ref-component"),
-            },
-        );
-        let worktree_shard = StoreShardIdV1::code(
-            id::<BrainId>("brain.local-resolver"),
-            id::<UserProfileId>("profile.local-resolver"),
-            project_id,
-            id("repository.local-resolver"),
-            tracedecay_store::CodeShardScopeV1::Worktree { worktree_id },
-        );
-        let worktree_root = fixture
-            .profile_root
-            .join("code-fixture")
-            .join("worktrees")
-            .join("worktree-component");
-        let worktree_path = worktree_root.join("graph.db");
-        let branch_path = worktree_root
-            .join("refs")
-            .join("ref-component")
-            .join("graph.db");
-        fs::create_dir_all(worktree_path.parent().expect("worktree graph parent"))
-            .expect("worktree graph root");
-        fs::create_dir_all(branch_path.parent().expect("branch graph parent"))
-            .expect("branch graph root");
-        fs::write(&worktree_path, b"worktree fixture").expect("worktree graph fixture");
-        fs::write(&branch_path, b"branch fixture").expect("branch graph fixture");
-
-        for (shard, path) in [
-            (worktree_shard.clone(), worktree_path.clone()),
-            (branch_shard.clone(), branch_path.clone()),
-        ] {
-            resolver
-                .register_code_authority(
-                    LocalCodeStoreAuthorityV1::new(shard, path).expect("typed code authority"),
-                )
-                .expect("register exact code authority");
-        }
-
-        let branch = resolved(resolve_as_local(
-            &resolver,
-            &StoreRuntimeKey::new(branch_shard.clone(), incarnation()),
-        ));
-        let worktree = resolved(resolve_as_local(
-            &resolver,
-            &StoreRuntimeKey::new(worktree_shard.clone(), incarnation()),
-        ));
-
-        assert_eq!(branch.locator().verified().shard_id, branch_shard);
-        assert_eq!(worktree.locator().verified().shard_id, worktree_shard);
-        assert_eq!(
-            branch.locator().path(),
-            branch_path.canonicalize().expect("canonical branch path")
-        );
-        assert_eq!(
-            worktree.locator().path(),
-            worktree_path
-                .canonicalize()
-                .expect("canonical worktree path")
-        );
-        assert_ne!(branch.locator().path(), worktree.locator().path());
-    }
-
-    #[test]
-    fn code_authority_rejects_scope_conflicts_and_paths_outside_profile() {
-        let fixture = Fixture::new();
-        assert!(matches!(
-            LocalCodeStoreAuthorityV1::new(fixture.shard(), fixture.profile_root.join("graph.db")),
-            Err(LocalStoreRuntimeResolverConfigurationErrorV1::CodeAuthorityIsNotCodeShard { .. })
-        ));
-
-        let code_shard = StoreShardIdV1::code(
-            id::<BrainId>("brain.local-resolver"),
-            id::<UserProfileId>("profile.local-resolver"),
-            fixture.project_id.clone(),
-            id("repository.local-resolver"),
-            tracedecay_store::CodeShardScopeV1::Worktree {
-                worktree_id: id("worktree.local-resolver"),
-            },
-        );
-        let outside_path = fixture.root.join("outside.db");
-        fs::write(&outside_path, b"fixture").expect("outside graph fixture");
-        let resolver = LocalStoreRuntimeResolverV1::new(fixture.profile_authority());
-        resolver
-            .register_code_authority(
-                LocalCodeStoreAuthorityV1::new(code_shard.clone(), outside_path)
-                    .expect("typed code authority"),
-            )
-            .expect("register code authority");
-        assert!(matches!(
-            resolve_as_local(&resolver, &StoreRuntimeKey::new(code_shard, incarnation())),
-            LocalStoreLocatorResolutionV1::Unavailable(LocalStoreLocatorUnavailableV1 {
-                reason: LocalStoreLocatorUnavailableReasonV1::UnsafeLocatorPath,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn code_authority_registration_is_idempotent_but_rejects_rebinding() {
-        let fixture = Fixture::new();
-        let code_shard = StoreShardIdV1::code(
-            id::<BrainId>("brain.local-resolver"),
-            id::<UserProfileId>("profile.local-resolver"),
-            fixture.project_id.clone(),
-            id("repository.local-resolver"),
-            tracedecay_store::CodeShardScopeV1::Worktree {
-                worktree_id: id("worktree.local-resolver"),
-            },
-        );
-        let first_path = fixture.profile_root.join("first.db");
-        let second_path = fixture.profile_root.join("second.db");
-        let resolver = LocalStoreRuntimeResolverV1::new(fixture.profile_authority());
-        let first = LocalCodeStoreAuthorityV1::new(code_shard.clone(), first_path.clone())
-            .expect("first authority");
-
-        assert_eq!(
-            resolver
-                .register_code_authority(first.clone())
-                .expect("first registration"),
-            LocalCodeStoreAuthorityRegistrationOutcomeV1::Registered
-        );
-        assert_eq!(
-            resolver
-                .register_code_authority(first)
-                .expect("identical registration is idempotent"),
-            LocalCodeStoreAuthorityRegistrationOutcomeV1::AlreadyRegistered
-        );
-        assert!(matches!(
-            resolver.register_code_authority(
-                LocalCodeStoreAuthorityV1::new(code_shard.clone(), second_path.clone())
-                    .expect("conflicting authority")
-            ),
-            Err(LocalStoreRuntimeResolverConfigurationErrorV1::DuplicateCodeAuthority { .. })
-        ));
-        assert!(matches!(
-            resolver.retire_code_authority(&code_shard, &second_path),
-            Err(
-                LocalStoreRuntimeResolverConfigurationErrorV1::CodeAuthorityRetirementMismatch { .. }
-            )
-        ));
-        resolver
-            .retire_code_authority(&code_shard, &first_path)
-            .expect("retire exact authority");
-        resolver
-            .register_code_authority(
-                LocalCodeStoreAuthorityV1::new(code_shard, second_path)
-                    .expect("replacement authority"),
-            )
-            .expect("retired shard may bind its next physical generation");
     }
 
     #[cfg(target_os = "linux")]
@@ -2450,5 +2100,114 @@ mod tests {
         .with_project_authority(via_real)
         .expect("alias spelling must not be DuplicateProjectAuthority");
         let _ = resolver;
+    }
+
+    #[test]
+    fn a_clone_whose_marker_names_the_project_joins_its_authority() {
+        let temp = tempfile::TempDir::new().expect("temporary root");
+        let project_id = id::<ProjectId>("project.second-clone");
+        let [first, clone, unmarked] = ["first", "clone", "unmarked"].map(|name| {
+            let root = temp.path().join(name);
+            fs::create_dir_all(&root).expect("enrollment root");
+            root
+        });
+        for root in [&first, &clone] {
+            storage::pin_fixture_repository_identity(root, project_id.as_str())
+                .expect("repository marker");
+        }
+        let resolver = LocalStoreRuntimeResolverV1::new(LocalProfileStoreAuthorityV1::new(
+            id::<BrainId>("brain.second-clone"),
+            id::<UserProfileId>("profile.second-clone"),
+            temp.path().join("profile"),
+        ))
+        .with_project_authority(LocalProjectEnrollmentAuthorityV1::new(
+            project_id.clone(),
+            [first.clone()],
+        ))
+        .expect("first checkout")
+        .with_project_authority(LocalProjectEnrollmentAuthorityV1::new(
+            project_id.clone(),
+            [clone.clone()],
+        ))
+        .expect("a marked clone joins the project's authority");
+
+        assert_eq!(
+            resolver
+                .project_authorities_read()
+                .get(&project_id)
+                .map(|authority| authority.enrollment_roots().to_vec()),
+            Some(vec![
+                clone.canonicalize().unwrap(),
+                first.canonicalize().unwrap()
+            ])
+        );
+        assert_eq!(
+            resolver.register_project_authority(LocalProjectEnrollmentAuthorityV1::new(
+                project_id.clone(),
+                [unmarked],
+            )),
+            Err(
+                LocalStoreRuntimeResolverConfigurationErrorV1::DuplicateProjectAuthority {
+                    project_id
+                }
+            ),
+            "a root without the project's marker is a second authority"
+        );
+    }
+
+    #[test]
+    fn withdrawing_a_joined_root_keeps_every_root_another_registration_added() {
+        let temp = tempfile::TempDir::new().expect("temporary root");
+        let project_id = id::<ProjectId>("project.withdraw-joined");
+        let [first, clone] = ["first", "clone"].map(|name| {
+            let root = temp.path().join(name);
+            fs::create_dir_all(&root).expect("enrollment root");
+            storage::pin_fixture_repository_identity(&root, project_id.as_str())
+                .expect("repository marker");
+            root.canonicalize().unwrap()
+        });
+        let resolver = LocalStoreRuntimeResolverV1::new(LocalProfileStoreAuthorityV1::new(
+            id::<BrainId>("brain.withdraw-joined"),
+            id::<UserProfileId>("profile.withdraw-joined"),
+            temp.path().join("profile"),
+        ));
+        let roots = || {
+            resolver
+                .project_authorities_read()
+                .get(&project_id)
+                .map(|authority| authority.enrollment_roots().to_vec())
+        };
+        resolver
+            .register_project_authority(LocalProjectEnrollmentAuthorityV1::new(
+                project_id.clone(),
+                [first.clone()],
+            ))
+            .expect("first checkout");
+
+        let joined = resolver
+            .register_project_authority(LocalProjectEnrollmentAuthorityV1::new(
+                project_id.clone(),
+                [clone],
+            ))
+            .expect("a marked clone joins");
+        resolver.withdraw_project_authority(&joined);
+        assert_eq!(
+            roots(),
+            Some(vec![first.clone()]),
+            "only the joined root leaves"
+        );
+
+        let repeated = resolver
+            .register_project_authority(LocalProjectEnrollmentAuthorityV1::new(
+                project_id.clone(),
+                [first.clone()],
+            ))
+            .expect("a repeated registration is the same authority");
+        resolver.withdraw_project_authority(&repeated);
+        assert_eq!(
+            roots(),
+            Some(vec![first]),
+            "a registration that added nothing withdraws nothing"
+        );
     }
 }

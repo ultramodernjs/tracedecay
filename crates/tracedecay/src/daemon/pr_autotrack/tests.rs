@@ -2,17 +2,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
+use crate::test_support::git::git;
+use tracedecay_runtime_core::native_runtime;
 
-#[tokio::test]
-async fn spawned_loop_is_cancellable_and_joinable() {
-    let schedulers = CodeIndexSchedulerRegistryV1::new(1);
-    let task = spawn_with_administration(StoreAdministration::default(), schedulers);
+#[test]
+fn spawned_loop_is_cancellable_and_joinable_without_a_tokio_runtime() {
+    let hazards = crate::test_support::native_runtime_hazards();
+    native_runtime::block_on(async {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let schedulers = CodeIndexSchedulerRegistryV1::new(1);
+        let task = spawn_with_administration(StoreAdministration::default(), schedulers)
+            .expect("the native runtime admits the loop");
 
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), task.shutdown())
-            .await
-            .is_ok()
-    );
+        assert!(
+            native_runtime::timeout(Duration::from_secs(1), task.shutdown())
+                .await
+                .is_ok()
+        );
+    })
+    .expect("native runtime");
+    assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
+}
+
+/// The tick's reconcile mounts the PR head through the code-index scheduler
+/// with no Tokio runtime entered.
+#[test]
+fn reconcile_activates_a_pr_head_without_a_tokio_runtime() {
+    let repo = tempfile::tempdir().unwrap();
+    let origin = tempfile::tempdir().unwrap();
+    init_repo_with_pr_11_head(repo.path(), origin.path());
+    let hazards = crate::test_support::native_runtime_hazards();
+    native_runtime::block_on(async {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        assert_pr_11_head_reconciles(repo.path()).await;
+    })
+    .expect("native runtime");
+    assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
 }
 
 // ---- Reconcile: removal + idempotency (no index required) -------------------
@@ -104,7 +129,7 @@ async fn cancelled_pr_teardown_preserves_artifacts_and_retries_exactly() {
     let pr = 5;
     let label = pr_label(pr);
     let tracking_ref = pr_tracking_ref(pr);
-    let head_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
+    let head_sha = git(repo.path(), &["rev-parse", "HEAD"]);
     let worktree = data_root.path().join("pr-worktrees/pr-5");
     std::fs::create_dir_all(worktree.parent().expect("worktree parent"))
         .expect("create worktree parent");
@@ -333,48 +358,52 @@ async fn reconcile_does_not_prepare_new_pr_without_scheduler_activation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconcile_activates_discovered_pr_head_when_scheduler_is_injected() {
-    use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
-
     let repo = tempfile::tempdir().unwrap();
     let origin = tempfile::tempdir().unwrap();
-    git(repo.path(), &["init", "-q", "-b", "main"]);
-    git(repo.path(), &["config", "user.name", "TraceDecay Test"]);
+    init_repo_with_pr_11_head(repo.path(), origin.path());
+    assert_pr_11_head_reconciles(repo.path()).await;
+}
+
+/// A repository whose origin holds `refs/pull/11/head`, with the PR branch
+/// deleted locally.
+fn init_repo_with_pr_11_head(repo: &Path, origin: &Path) {
+    git(repo, &["init", "-q", "-b", "main"]);
+    git(repo, &["config", "user.name", "TraceDecay Test"]);
     git(
-        repo.path(),
+        repo,
         &["config", "user.email", "tracedecay@example.invalid"],
     );
-    std::fs::create_dir_all(repo.path().join("src")).unwrap();
-    std::fs::write(repo.path().join("src/lib.rs"), "pub fn on_main() {}\n").unwrap();
-    git(repo.path(), &["add", "."]);
-    git(repo.path(), &["commit", "-qm", "initial"]);
-    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn on_main() {}\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "initial"]);
+    git(origin, &["init", "-q", "--bare", "-b", "main"]);
+    git(repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(repo, &["push", "-q", "origin", "main"]);
+    git(repo, &["checkout", "-q", "-b", "feature-11", "main"]);
+    std::fs::write(repo.join("src/pr_11.rs"), "pub fn pr_eleven() {}\n").unwrap();
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-qm", "PR 11 content"]);
+    git(repo, &["push", "-q", "origin", "feature-11"]);
     git(
-        repo.path(),
-        &["remote", "add", "origin", origin.path().to_str().unwrap()],
-    );
-    git(repo.path(), &["push", "-q", "origin", "main"]);
-    git(repo.path(), &["checkout", "-q", "-b", "feature-11", "main"]);
-    std::fs::write(repo.path().join("src/pr_11.rs"), "pub fn pr_eleven() {}\n").unwrap();
-    git(repo.path(), &["add", "."]);
-    git(repo.path(), &["commit", "-qm", "PR 11 content"]);
-    git(repo.path(), &["push", "-q", "origin", "feature-11"]);
-    git(
-        origin.path(),
+        origin,
         &["update-ref", "refs/pull/11/head", "refs/heads/feature-11"],
     );
-    git(repo.path(), &["checkout", "-q", "main"]);
-    git(repo.path(), &["branch", "-q", "-D", "feature-11"]);
+    git(repo, &["checkout", "-q", "main"]);
+    git(repo, &["branch", "-q", "-D", "feature-11"]);
+}
 
+async fn assert_pr_11_head_reconciles(repo: &Path) {
     let graph = Arc::new(
         tracedecay_project::project::TraceDecay::open_with_options_for_test(
-            repo.path(),
+            repo,
             tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("open project graph"),
     );
     let data_root = graph.store_layout().data_root.clone();
-    let discovery = discover_open_prs_with_control(repo.path(), default_pr_command_control())
+    let discovery = discover_open_prs_with_control(repo, default_pr_command_control())
         .expect("discover PR head");
     assert_eq!(discovery.open.len(), 1);
     assert_eq!(discovery.open[0].number, 11);
@@ -382,7 +411,7 @@ async fn reconcile_activates_discovered_pr_head_when_scheduler_is_injected() {
     let schedulers = CodeIndexSchedulerRegistryV1::new(2);
     let command_control = PrCommandControl::default();
     let report = reconcile_project_with_administration(
-        repo.path(),
+        repo,
         &data_root,
         &discovery,
         10,
@@ -408,15 +437,6 @@ async fn reconcile_activates_discovered_pr_head_when_scheduler_is_injected() {
     schedulers.shutdown().await;
 }
 
-fn git(repo: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .status()
-        .expect("spawn git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
 /// Runs one Git command and reports only whether it succeeded. Used for
 /// options whose availability depends on the installed Git version.
 fn git_succeeds(repo: &Path, args: &[&str]) -> bool {
@@ -425,20 +445,6 @@ fn git_succeeds(repo: &Path, args: &[&str]) -> bool {
         .current_dir(repo)
         .output()
         .is_ok_and(|output| output.status.success())
-}
-
-/// Runs one Git command and returns its trimmed stdout.
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("spawn git");
-    assert!(output.status.success(), "git {args:?} failed");
-    String::from_utf8(output.stdout)
-        .expect("git output")
-        .trim()
-        .to_owned()
 }
 
 #[tokio::test]
@@ -892,11 +898,7 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
     .unwrap();
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-qm", "advance branch head"]);
-    let advanced_head = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo.path())
-        .output()
-        .unwrap();
+    let advanced_head = git(repo.path(), &["rev-parse", "HEAD"]);
     git(repo.path(), &["checkout", "-q", "main"]);
 
     let staged_graph = Arc::clone(&graph);
@@ -932,7 +934,7 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
     assert_ne!(initial.worktree, replay.worktree);
     assert!(schedulers.is_worktree_mounted(&initial.worktree).await);
     assert_eq!(
-        git_output(&initial.worktree, &["rev-parse", "HEAD"]).trim(),
+        git(&initial.worktree, &["rev-parse", "HEAD"]),
         initial.head_sha
     );
     assert_eq!(
@@ -1002,11 +1004,7 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
             .source_oid,
         replay.head_sha
     );
-    let mounted_head = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&replay.worktree)
-        .output()
-        .unwrap();
+    let mounted_head = git(&replay.worktree, &["rev-parse", "HEAD"]);
 
     assert_eq!(
         replay.outcome,
@@ -1014,8 +1012,7 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
     );
     assert_ne!(initial.head_sha, replay.head_sha);
     assert_eq!(
-        String::from_utf8_lossy(&advanced_head.stdout).trim(),
-        String::from_utf8_lossy(&mounted_head.stdout).trim(),
+        advanced_head, mounted_head,
         "the new candidate must carry the newly resolved branch head"
     );
     schedulers.shutdown().await;
@@ -1041,7 +1038,7 @@ async fn manual_branch_activation_queues_behind_the_exact_lifecycle_before_mutat
             .expect("first lifecycle owner");
     let schedulers = CodeIndexSchedulerRegistryV1::new(2);
     let tracking_refs = || {
-        git_output(
+        git(
             repo.path(),
             &[
                 "for-each-ref",
@@ -1162,7 +1159,7 @@ async fn manual_branch_fails_closed_without_scheduler_before_git_or_state_mutati
     assert_eq!(error.reason_code(), "code_index_scheduler_unavailable");
     assert!(!data_root.join("branch-worktrees").exists());
     assert_eq!(
-        git_output(
+        git(
             repo.path(),
             &[
                 "for-each-ref",
@@ -1213,7 +1210,7 @@ async fn manual_branch_missing_ref_is_typed_failure() {
     );
     assert!(!data_root.join("branch-worktrees").exists());
     assert_eq!(
-        git_output(
+        git(
             repo.path(),
             &[
                 "for-each-ref",
@@ -1225,6 +1222,93 @@ async fn manual_branch_missing_ref_is_typed_failure() {
         .len(),
         0
     );
+    schedulers.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manual_branch_head_git_failure_is_retryable_not_missing_ref() {
+    use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
+
+    let repo = tempfile::tempdir().unwrap();
+    let branch = "feature-present";
+    init_manual_branch_repo(repo.path(), branch);
+    let graph = Arc::new(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
+            repo.path(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
+        )
+        .await
+        .expect("open project graph"),
+    );
+    let data_root = graph.store_layout().data_root.clone();
+    let schedulers = CodeIndexSchedulerRegistryV1::new(2);
+    let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
+    cancellation.cancel();
+    let failing_controls = [
+        ("deadline", PrCommandControl::with_timeout(Duration::ZERO)),
+        (
+            "cancelled",
+            PrCommandControl::with_cancellation(cancellation),
+        ),
+    ];
+
+    for (label, control) in failing_controls {
+        let lifecycle = acquire_manual_branch_lifecycle(&data_root, branch)
+            .await
+            .expect("lifecycle owner");
+        let error = activate_manual_branch_head_with_lifecycle(
+            repo.path(),
+            &graph,
+            Some(&schedulers),
+            branch,
+            &lifecycle,
+            &control,
+        )
+        .await
+        .expect_err("failed Git head resolution must not activate the branch");
+
+        assert!(
+            matches!(
+                &error,
+                ManualBranchActivationError::GitAuthorityUnavailable { .. }
+            ),
+            "{label}: {error}"
+        );
+        assert_eq!(error.reason_code(), "git_authority_unavailable", "{label}");
+        assert!(
+            error.retryable(),
+            "{label}: a transient Git failure must stay retryable"
+        );
+        assert!(
+            !data_root.join("branch-worktrees").exists(),
+            "{label}: no artifacts are staged without a resolved head"
+        );
+        drop(lifecycle);
+    }
+
+    let lifecycle = acquire_manual_branch_lifecycle(&data_root, branch)
+        .await
+        .expect("lifecycle owner");
+    let activation = activate_manual_branch_head_with_lifecycle(
+        repo.path(),
+        &graph,
+        Some(&schedulers),
+        branch,
+        &lifecycle,
+        default_pr_command_control(),
+    )
+    .await
+    .expect("the same branch activates once Git is available");
+    cleanup_manual_branch_activation(
+        repo.path(),
+        &data_root,
+        &schedulers,
+        &activation,
+        &lifecycle,
+    )
+    .await
+    .expect("retire activated branch");
+    drop(lifecycle);
     schedulers.shutdown().await;
 }
 
@@ -1255,7 +1339,7 @@ async fn cancelled_activation_keeps_its_lifecycle_owner_bounded_during_stalled_e
     // first, and it takes precedence over any packed entry, so the FIFO stalls
     // that read whether or not the ref was packed away.
     let ref_path = {
-        let reported = std::path::PathBuf::from(git_output(
+        let reported = std::path::PathBuf::from(git(
             repo.path(),
             &["rev-parse", "--git-path", &artifacts.tracking_ref],
         ));
@@ -1282,19 +1366,17 @@ async fn cancelled_activation_keeps_its_lifecycle_owner_bounded_during_stalled_e
         "the exact Git ref reader must block on the real FIFO"
     );
 
-    let (writer_ready_tx, writer_ready_rx) = std::sync::mpsc::sync_channel(1);
     let writer_path = ref_path.clone();
     let fifo_writer_task = tokio::task::spawn_blocking(move || {
-        let writer = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .open(writer_path)
-            .expect("open FIFO writer once Git begins its exact ref read");
-        writer_ready_tx
-            .send(writer)
-            .expect("deliver open FIFO writer");
+            .expect("open FIFO writer once Git begins its exact ref read")
     });
 
-    let (owner_done_tx, owner_done_rx) = tokio::sync::oneshot::channel();
+    let (owner_done_tx, mut owner_done_rx) = tokio::sync::oneshot::channel();
+    let owner_cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
+    let owner_control = PrCommandControl::with_cancellation(owner_cancellation.clone());
     let owner_repo = repo.path().to_path_buf();
     let owner_data_root = data_root.clone();
     let owner_graph = Arc::clone(&graph);
@@ -1305,12 +1387,15 @@ async fn cancelled_activation_keeps_its_lifecycle_owner_bounded_during_stalled_e
             let lifecycle = acquire_manual_branch_lifecycle(&owner_data_root, &owner_branch)
                 .await
                 .expect("activation owner acquires the exact lifecycle");
-            let control = PrCommandControl::with_timeout(Duration::from_millis(300));
             let outcome = activate_manual_branch_with_administration(
                 &owner_repo,
                 &owner_data_root,
                 &owner_branch,
-                PrStoreAdministration::with_control(&owner_schedulers, &owner_graph, &control),
+                PrStoreAdministration::with_control(
+                    &owner_schedulers,
+                    &owner_graph,
+                    &owner_control,
+                ),
                 &lifecycle,
             )
             .await;
@@ -1319,38 +1404,41 @@ async fn cancelled_activation_keeps_its_lifecycle_owner_bounded_during_stalled_e
         let _ = owner.await;
     });
 
-    let fifo_writer = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::task::spawn_blocking(move || {
-            writer_ready_rx
-                .recv()
-                .expect("Git exact-ref read opens the FIFO")
-        }),
-    )
-    .await
-    .expect("activation reaches the stalled exact-ref read")
-    .expect("FIFO-writer task joins");
-    fifo_writer_task.await.expect("FIFO writer task joins");
-    let (heartbeat_tx, heartbeat_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        tokio::task::yield_now().await;
-        let _ = heartbeat_tx.send(());
-    });
-    tokio::time::timeout(Duration::from_millis(100), heartbeat_rx)
-        .await
-        .expect("the current-thread runtime keeps scheduling while Git exact-read stalls")
-        .expect("heartbeat task runs");
+    // Git opening the FIFO is the stall itself; the test task observing it
+    // also proves the current-thread runtime keeps scheduling during the read.
+    let fifo_writer = tokio::select! {
+        biased;
+        writer = fifo_writer_task => writer.expect("FIFO writer task joins"),
+        outcome = &mut owner_done_rx => {
+            // The read end releases the blocked writer so the runtime can shut down.
+            drop(std::fs::File::open(&ref_path));
+            panic!("activation finished before Git reached the stalled exact-ref read: {outcome:?}");
+        }
+    };
 
     requester.abort();
     assert!(
         requester.await.is_err(),
         "the requester is cancelled while its lifecycle owner continues"
     );
-    let error = tokio::time::timeout(Duration::from_secs(2), owner_done_rx)
+    assert!(
+        matches!(
+            owner_done_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the lifecycle owner stays in its stalled exact read after the requester is cancelled"
+    );
+    owner_cancellation.cancel();
+    let error = owner_done_rx
         .await
-        .expect("lifecycle owner remains bounded by its Git deadline")
         .expect("lifecycle owner reports its terminal activation outcome")
-        .expect_err("a timed-out exact read cannot be treated as a missing ref");
+        .expect_err("a cancelled exact read cannot be treated as a missing ref");
+    assert!(
+        error
+            .detail()
+            .contains(&tracedecay_runtime_core::git::GitCommandError::Cancelled.to_string()),
+        "the owner's cancellation, not its Git deadline, ends the stalled read: {error}"
+    );
     assert!(matches!(
         &error,
         ManualBranchActivationError::GitAuthorityUnavailable { .. }

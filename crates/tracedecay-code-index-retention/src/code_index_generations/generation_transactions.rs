@@ -491,13 +491,10 @@ pub(super) fn path_still_names_open_file(
         return Ok(false);
     }
     let opened_metadata = opened.metadata().map_err(storage)?;
-    if !metadata_identity_matches(admitted, &opened_metadata)
-        || !metadata_identity_matches(&current, &opened_metadata)
-    {
-        return Ok(false);
-    }
+    let identity_matches = metadata_identity_matches(admitted, &opened_metadata)
+        && metadata_identity_matches(&current, &opened_metadata);
     #[cfg(windows)]
-    {
+    if identity_matches {
         let named = match File::open(path) {
             Ok(file) => file,
             Err(error)
@@ -521,7 +518,7 @@ pub(super) fn path_still_names_open_file(
             return Ok(false);
         }
     }
-    Ok(true)
+    Ok(identity_matches)
 }
 
 /// Whether two metadata snapshots name the same stable file identity. On
@@ -864,10 +861,26 @@ pub(super) fn ensure_transaction_liveness(
 }
 
 pub(super) fn regular_file_exists(path: &Path) -> Result<bool, CodeGenerationRetentionErrorV1> {
+    entry_exists(
+        path,
+        std::fs::FileType::is_file,
+        "retention path",
+        "regular file",
+    )
+}
+
+/// Whether `path` names an entry `is_kind` accepts. An entry of any other
+/// kind is unsafe state, never an absent path.
+pub(super) fn entry_exists(
+    path: &Path,
+    is_kind: fn(&std::fs::FileType) -> bool,
+    subject: &str,
+    kind: &str,
+) -> Result<bool, CodeGenerationRetentionErrorV1> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(metadata) if is_kind(&metadata.file_type()) => Ok(true),
         Ok(_) => Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-            "retention path '{}' is not a regular file",
+            "{subject} '{}' is not a {kind}",
             path.display()
         ))),
         Err(error)

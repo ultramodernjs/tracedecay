@@ -1,7 +1,9 @@
 //! Extended primitive port: module API, qualified names, diagnostics, and storage status history.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use sha2::{Digest, Sha256};
@@ -24,6 +26,7 @@ use tracedecay_graph_query::{
     request_graph_cancellation,
 };
 use tracedecay_runtime_core::db::Database;
+use tracedecay_runtime_core::native_runtime;
 
 use super::super::runtime::{
     CallChainPrimitiveRequest, CallChainPrimitiveResult, DiagnosticPrimitiveRecord,
@@ -39,11 +42,12 @@ use super::{
     AuthenticatedDiagnosticCursorAuthorityV1, DIAGNOSTIC_CURSOR_LANE_WORKSPACE,
     all_code_graph_symbols, completed, completed_unsupported, diagnostics_result,
     diagnostics_unavailable, evidence_unavailable, failed, graph_query_outcome, graph_read_outcome,
-    now_observed, omitted_evidence, open_code_graph, refused, unpublished_file_outcome,
+    health_delta_outcome, now_observed, omitted_evidence, open_code_graph, refused,
+    unpublished_file_outcome,
 };
 use crate::diagnostics_publication::CodeIndexPublicationIdentityPortV1;
 use crate::diagnostics_query::{DiagnosticPageRequest, DiagnosticQueryCoverage, DiagnosticsQuery};
-use crate::graph_health_delta::compute_verified_health_delta;
+use crate::graph_health_delta::{HealthDeltaError, compute_verified_health_delta};
 use crate::lsp_runtime::LspCodeIndexProjectionIdentityPort;
 
 pub(super) fn public_module_symbols(
@@ -293,7 +297,7 @@ pub(crate) async fn canonical_storage_status(
             // on the blocking pool so a stalled filesystem cannot capture an
             // async executor thread for the daemon.
             tracing::Instrument::instrument(
-                tokio::task::spawn_blocking(move || {
+                native_runtime::spawn_blocking(move || {
                     update_storage_status_history(
                         &history_path,
                         history_project_id,
@@ -805,22 +809,23 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
                     }
                 };
                 let query = GraphQueryManager::new(&reader, cancellation);
-                match compute_verified_health_delta(
+                let verified_delta: Pin<
+                    Box<
+                        dyn Future<
+                                Output = std::result::Result<HealthDeltaResult, HealthDeltaError>,
+                            > + Send
+                            + '_,
+                    >,
+                > = Box::pin(compute_verified_health_delta(
                     Some(context.request.scope().project_id.as_str().to_owned()),
                     &query,
                     self.observation_database.as_ref(),
                     request.before_cursor.as_deref(),
                     request.path_prefix.as_deref(),
-                )
-                .await
-                {
+                ));
+                match verified_delta.await {
                     Ok(result) => completed(result, EvidenceDomain::Operational, now_observed()),
-                    Err(_) => evidence_unavailable(
-                        EvidenceDomain::Operational,
-                        observed_at,
-                        OmissionReason::Unavailable,
-                        0,
-                    ),
+                    Err(error) => health_delta_outcome(&error, observed_at),
                 }
             },
             tracing::trace_span!("usecases.primitives.health_delta"),
@@ -1052,44 +1057,4 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
             tracing::trace_span!("usecases.primitives.diagnostics"),
         ))
     }
-}
-
-/// How many tables the storage detail lines name before summarising the rest.
-#[cfg(test)]
-pub(super) const STORAGE_TABLE_DETAIL_LIMIT: usize = 10;
-
-/// Renders per-table byte attribution for the graph store.
-///
-/// Without this, a store total is one opaque number and no claim about which
-/// table holds the bytes can be reproduced through the product. A read the
-/// runtime cannot serve reports that it could not be sampled, never an absent
-/// or zero line that would read as "no table holds any bytes".
-#[cfg(test)]
-pub(super) fn largest_table_details(
-    tables: tracedecay_domain::errors::Result<Vec<(String, u64)>>,
-) -> Vec<String> {
-    let mut tables = match tables {
-        Ok(tables) => tables,
-        Err(error) => return vec![format!("table sizes could not be sampled: {error}")],
-    };
-    if tables.is_empty() {
-        return vec!["table sizes reported no tables".to_owned()];
-    }
-    tables.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let total: u64 = tables.iter().map(|(_, bytes)| bytes).sum();
-    let remainder = tables.len().saturating_sub(STORAGE_TABLE_DETAIL_LIMIT);
-    let mut details = vec![format!(
-        "table bytes total {total} across {} tables",
-        tables.len()
-    )];
-    details.extend(
-        tables
-            .iter()
-            .take(STORAGE_TABLE_DETAIL_LIMIT)
-            .map(|(table, bytes)| format!("table {table} holds {bytes} bytes")),
-    );
-    if remainder > 0 {
-        details.push(format!("{remainder} smaller tables not listed"));
-    }
-    details
 }

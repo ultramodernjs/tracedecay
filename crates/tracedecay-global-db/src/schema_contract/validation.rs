@@ -1,7 +1,18 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::LazyLock;
 
 use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
+use tracedecay_runtime_core::db::{
+    DatabaseEngineReadConnection, DatabaseEngineReadSnapshot, DatabaseWriteTransaction,
+};
+use tracedecay_runtime_core::ports::registered_schema::{
+    RegisteredSchemaInstallationTransactionV1, RegisteredSchemaInstallationV1,
+};
+use tracedecay_rusqlite_runtime::repository::{
+    GraphPublicationSchemaObjectV1, canonical_graph_publication_schema_inventory,
+};
 
 use super::super::{global_db_operation_error, global_db_operation_message};
 use super::definitions::{
@@ -22,75 +33,12 @@ pub(crate) enum RootOccurrenceIndexOrder {
     Ascending,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GraphPublicationSchemaObject {
-    object_type: String,
-    table: String,
-    sql: String,
-}
-
-type GraphPublicationSchemaInventory = BTreeMap<String, GraphPublicationSchemaObject>;
+type GraphPublicationSchemaInventory = BTreeMap<String, GraphPublicationSchemaObjectV1>;
 type GraphPublicationSchemaBuildResult =
     std::result::Result<GraphPublicationSchemaInventory, String>;
 
 static EXPECTED_GRAPH_PUBLICATION_SCHEMA: LazyLock<GraphPublicationSchemaBuildResult> =
-    LazyLock::new(build_expected_graph_publication_schema);
-
-fn build_expected_graph_publication_schema() -> GraphPublicationSchemaBuildResult {
-    let connection = rusqlite::Connection::open_in_memory()
-        .map_err(|error| format!("failed to open canonical graph publication schema: {error}"))?;
-    connection
-        .execute_batch(tracedecay_rusqlite_runtime::repository::GRAPH_PUBLICATION_SCHEMA_V1)
-        .map_err(|error| {
-            format!("failed to install canonical graph publication schema: {error}")
-        })?;
-    read_rusqlite_graph_publication_inventory(&connection)
-}
-
-fn read_rusqlite_graph_publication_inventory(
-    connection: &rusqlite::Connection,
-) -> std::result::Result<GraphPublicationSchemaInventory, String> {
-    let mut statement = connection
-        .prepare(
-            "SELECT type, name, tbl_name, COALESCE(sql, '')
-             FROM sqlite_master
-             WHERE type IN ('table', 'index', 'trigger', 'view')
-               AND name NOT LIKE 'sqlite_%'
-             ORDER BY name",
-        )
-        .map_err(|error| format!("failed to prepare canonical graph schema inventory: {error}"))?;
-    let rows = statement
-        .query_map((), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(|error| format!("failed to query canonical graph schema inventory: {error}"))?;
-    let mut inventory = GraphPublicationSchemaInventory::new();
-    for row in rows {
-        let (object_type, name, table, sql) =
-            row.map_err(|error| format!("failed to read canonical graph schema object: {error}"))?;
-        if inventory
-            .insert(
-                name.clone(),
-                GraphPublicationSchemaObject {
-                    object_type,
-                    table,
-                    sql,
-                },
-            )
-            .is_some()
-        {
-            return Err(format!(
-                "canonical graph publication schema repeats object '{name}'"
-            ));
-        }
-    }
-    Ok(inventory)
-}
+    LazyLock::new(canonical_graph_publication_schema_inventory);
 
 fn outer_parentheses_enclose_value(value: &str) -> bool {
     let bytes = value.as_bytes();
@@ -407,8 +355,9 @@ async fn validate_observation_autoincrement(
     let mut rows = conn
         .query(
             "SELECT EXISTS(
-                SELECT 1 FROM global_schema_migrations
-                WHERE migration = 'observations-v2-canonical-autoincrement'
+                SELECT 1 FROM tracedecay_schema_version
+                WHERE component = 'observations-v2-canonical-autoincrement'
+                  AND version = 1
              ),
              COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'observations'), 0),
              COALESCE((SELECT MAX(sequence) FROM observations), 0)",
@@ -622,7 +571,7 @@ async fn read_graph_publication_inventory(
         if inventory
             .insert(
                 name.clone(),
-                GraphPublicationSchemaObject {
+                GraphPublicationSchemaObjectV1 {
                     object_type,
                     table,
                     sql,
@@ -662,17 +611,70 @@ pub async fn validate_remote_deletion_schema_contract(
 ///
 /// Transcript, LCM, git-correlation, and workflow-index tables are independently owned by their
 /// schema modules; this validator intentionally neither claims nor validates those domains.
-pub async fn validate_authority_schema_contract(
-    conn: &impl QueryExecutor,
-) -> tracedecay_domain::errors::Result<()> {
-    validate_tables_and_indexes(conn, TABLES).await?;
-    for invariant in super::invariants::INVARIANTS {
-        for trigger in invariant.triggers {
-            validate_trigger(conn, trigger).await?;
+///
+/// Each concrete connection implements this instead of one generic async function: nesting
+/// `validate_tables_and_indexes` under the trigger walk overflows the next solver's `Send`
+/// proof (rust-lang/rust#159228). The returned future only awaits already-erased children.
+pub(crate) trait AuthoritySchemaContract: Sync {
+    fn validate_authority_schema<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send + 'a>>;
+}
+
+macro_rules! impl_authority_schema_contract {
+    ($ty:ty) => {
+        impl AuthoritySchemaContract for $ty {
+            fn validate_authority_schema<'a>(
+                &'a self,
+            ) -> Pin<Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    let tables: Pin<
+                        Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send + '_>,
+                    > = Box::pin(validate_tables_and_indexes(self, TABLES));
+                    tables.await?;
+                    for invariant in super::invariants::INVARIANTS {
+                        for trigger in invariant.triggers {
+                            let checked: Pin<
+                                Box<
+                                    dyn Future<Output = tracedecay_domain::errors::Result<()>>
+                                        + Send
+                                        + '_,
+                                >,
+                            > = Box::pin(validate_trigger(self, trigger));
+                            checked.await?;
+                        }
+                    }
+                    let autoincrement: Pin<
+                        Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send + '_>,
+                    > = Box::pin(validate_observation_autoincrement(self));
+                    autoincrement.await
+                })
+            }
         }
-    }
-    validate_observation_autoincrement(conn).await?;
-    Ok(())
+    };
+}
+
+impl_authority_schema_contract!(DatabaseEngineReadConnection);
+impl_authority_schema_contract!(DatabaseEngineReadSnapshot);
+impl_authority_schema_contract!(RegisteredSchemaInstallationV1);
+// The admitted ascending-index repair must validate before commit. Keep the
+// same concrete, erased boundary for its cancellable transaction executors.
+impl_authority_schema_contract!(DatabaseWriteTransaction<'_>);
+impl_authority_schema_contract!(
+    crate::schema_stages::CancellableSchemaTransaction<
+        '_,
+        RegisteredSchemaInstallationTransactionV1<'_>,
+    >
+);
+impl_authority_schema_contract!(
+    crate::schema_stages::CancellableSchemaTransaction<'_, DatabaseWriteTransaction<'_>>
+);
+
+pub(crate) fn validate_authority_schema_contract<'a>(
+    conn: &'a impl AuthoritySchemaContract,
+) -> Pin<Box<dyn Future<Output = tracedecay_domain::errors::Result<()>> + Send + 'a>> {
+    conn.validate_authority_schema()
 }
 
 #[cfg(test)]
@@ -730,7 +732,7 @@ mod tests {
         assert_eq!(normalize_default(Some("(')')")).as_deref(), Some("')'"));
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn table_contract_metadata_is_read_in_a_constant_query_count() {
         let directory = tempfile::tempdir().unwrap();
         let (database, _owner) = open_registered_test_database_fixture(

@@ -23,22 +23,27 @@ use thiserror::Error;
 use tracedecay_contracts::remote::auth::OpaqueRemoteCredential;
 use tracedecay_contracts::remote::capture_protocol::RemoteCaptureRequestV1;
 use tracedecay_contracts::remote::credential_admission::{
-    RemoteAuthenticatedSessionV1, RemoteCredentialAdmissionPortV1, RemoteSessionBoundProtocolBodyV1,
+    RemoteAuthenticatedSessionV1, RemoteCredentialAdmissionErrorV1,
+    RemoteCredentialAdmissionPortV1, RemoteSessionBoundProtocolBodyV1,
 };
 use tracedecay_contracts::remote::protocol::{
-    EnrollmentRequestV1, RemoteEnrollmentProtocolPortV1, RemoteProtocolExecutionControlV1,
-    RemoteProtocolFailureV1, RemoteProtocolPortV1, RemoteProtocolRequestV1,
-    RemoteProtocolResponseV1, RemoteProtocolServiceV1, remote_protocol_problem,
+    CurrentAuthorityRequestV1, EnrollmentRequestV1, RemoteEnrollmentProtocolPortV1,
+    RemoteProtocolExecutionControlV1, RemoteProtocolFailureV1, RemoteProtocolPortV1,
+    RemoteProtocolRequestV1, RemoteProtocolResponseV1, RemoteProtocolServiceV1,
+    remote_protocol_problem,
 };
 use tracedecay_contracts::remote::protocol_owner::RemoteOperationProtocolPortsV1;
 use tracedecay_contracts::remote::query::RemoteQueryRequestV1;
 use tracedecay_contracts::remote::recovery::PromotionConfirmationV1;
-use tracedecay_contracts::remote::replay::RemoteReplayRequestV1;
+use tracedecay_contracts::remote::replay::{RemoteReplayPendingRequestV1, RemoteReplayRequestV1};
 use tracedecay_contracts::remote::transfer::RemoteFrameTransferRequestV1;
 use tracedecay_contracts::{
-    ApplicationContractError, CancellationSignal, RequestId, ResultContractRef,
+    ApplicationContractError, CancellationSignal, REMOTE_ENROLLMENT_CREDENTIAL_HEADER, RequestId,
+    ResultContractRef,
 };
-use tracedecay_domain::UtcMicros;
+use tracedecay_domain::{
+    CurrentRemoteAuthorityStateV1, RemoteAuthorityUnavailableReasonV1, UtcMicros,
+};
 use tracedecay_tool_catalog::SchemaId;
 
 const BEARER_PREFIX: &[u8] = b"Bearer ";
@@ -46,7 +51,6 @@ const BEARER_PREFIX: &[u8] = b"Bearer ";
 // versioned wire and can occupy nearly four times their binary size. The
 // application contract still enforces the exact one-mebibyte binary bound.
 const MAX_REMOTE_HTTP_BODY_BYTES: usize = 5 * 1024 * 1024;
-pub const REMOTE_ENROLLMENT_CREDENTIAL_HEADER: &str = "x-tracedecay-enrollment-credential";
 
 /// Parsed HTTP credential header. It cannot be cloned, serialized, or logged.
 pub struct RemoteAuthorizationHeader {
@@ -150,9 +154,19 @@ impl<Port: ?Sized> Clone for RemoteProtocolRouterStateV1<Port> {
 ///
 /// It intentionally implements neither `Clone`, `Debug`, nor serialization.
 struct RemotePreBodyAdmissionV1<Request> {
-    session: RemoteAuthenticatedSessionV1,
-    credential: OpaqueRemoteCredential,
+    outcome: RemotePreBodyOutcomeV1,
     request: PhantomData<fn() -> Request>,
+}
+
+enum RemotePreBodyOutcomeV1 {
+    Admitted {
+        session: RemoteAuthenticatedSessionV1,
+        credential: OpaqueRemoteCredential,
+    },
+    /// The presented secret matched a revoked enrollment, so only its holder
+    /// reaches this. The body is read only to address the refusal; no
+    /// operation port runs.
+    Revoked,
 }
 
 impl<Port: ?Sized, Request> FromRequestParts<RemoteProtocolRouterStateV1<Port>>
@@ -163,27 +177,30 @@ where
 {
     type Rejection = RemoteHttpRejection;
 
+    #[tracing::instrument(name = "api.http.admission", level = "trace", skip_all)]
     async fn from_request_parts(
         parts: &mut Parts,
         state: &RemoteProtocolRouterStateV1<Port>,
     ) -> Result<Self, Self::Rejection> {
-        {
-            let _span = tracing::trace_span!("api.http.admission").entered();
-            {
-                let authorization = authorization_header(&parts.headers)
-                    .map_err(|_| concealed_authentication_rejection())?;
-                let credential = authorization.into_credential();
-                let session = state
-                    .credential_admission
-                    .admit_before_body(&credential, Request::CREDENTIAL_USE, (state.clock)())
-                    .map_err(|_| concealed_authentication_rejection())?;
-                Ok(Self {
-                    session,
-                    credential,
-                    request: PhantomData,
-                })
-            }
-        }
+        let authorization = authorization_header(&parts.headers)
+            .map_err(|_| concealed_authentication_rejection())?;
+        let credential = authorization.into_credential();
+        let outcome = match state.credential_admission.admit_before_body(
+            &credential,
+            Request::CREDENTIAL_USE,
+            (state.clock)(),
+        ) {
+            Ok(session) => RemotePreBodyOutcomeV1::Admitted {
+                session,
+                credential,
+            },
+            Err(RemoteCredentialAdmissionErrorV1::Revoked) => RemotePreBodyOutcomeV1::Revoked,
+            Err(_) => return Err(concealed_authentication_rejection()),
+        };
+        Ok(Self {
+            outcome,
+            request: PhantomData,
+        })
     }
 }
 
@@ -220,33 +237,29 @@ where
 {
     type Rejection = RemoteHttpRejection;
 
+    #[tracing::instrument(name = "api.http.admission", level = "trace", skip_all)]
     async fn from_request_parts(
         parts: &mut Parts,
         state: &RemoteProtocolRouterStateV1<Port>,
     ) -> Result<Self, Self::Rejection> {
-        {
-            let _span = tracing::trace_span!("api.http.admission").entered();
-            {
-                let authorization = authorization_header(&parts.headers)
-                    .map_err(|_| concealed_authentication_rejection())?;
-                let grant_credential = authorization.into_credential();
-                let session = state
-                    .credential_admission
-                    .admit_before_body(
-                        &grant_credential,
-                        <EnrollmentRequestV1 as RemoteSessionBoundProtocolBodyV1>::CREDENTIAL_USE,
-                        (state.clock)(),
-                    )
-                    .map_err(|_| concealed_authentication_rejection())?;
-                let enrollment_credential = enrollment_credential(&parts.headers)
-                    .map_err(|_| concealed_authentication_rejection())?;
-                Ok(Self {
-                    session,
-                    grant_credential,
-                    enrollment_credential,
-                })
-            }
-        }
+        let authorization = authorization_header(&parts.headers)
+            .map_err(|_| concealed_authentication_rejection())?;
+        let grant_credential = authorization.into_credential();
+        let session = state
+            .credential_admission
+            .admit_before_body(
+                &grant_credential,
+                <EnrollmentRequestV1 as RemoteSessionBoundProtocolBodyV1>::CREDENTIAL_USE,
+                (state.clock)(),
+            )
+            .map_err(|_| concealed_authentication_rejection())?;
+        let enrollment_credential = enrollment_credential(&parts.headers)
+            .map_err(|_| concealed_authentication_rejection())?;
+        Ok(Self {
+            session,
+            grant_credential,
+            enrollment_credential,
+        })
     }
 }
 
@@ -290,9 +303,11 @@ pub fn remote_protocol_router(
     mount_operations! {
         "/capture" => RemoteCaptureRequestV1, operations.capture;
         "/replay" => RemoteReplayRequestV1, operations.replay;
+        "/replay/pending" => RemoteReplayPendingRequestV1, operations.replay_pending;
         "/frames/transfer" => RemoteFrameTransferRequestV1, operations.frame_transfer;
         "/query" => RemoteQueryRequestV1, operations.query;
         "/failover" => PromotionConfirmationV1, operations.promotion;
+        "/authority" => CurrentAuthorityRequestV1, operations.authority;
     }
     .layer(DefaultBodyLimit::max(MAX_REMOTE_HTTP_BODY_BYTES))
 }
@@ -317,11 +332,18 @@ where
                         .map_err(RemoteHttpRejection::Contract);
                 }
             };
-            let RemotePreBodyAdmissionV1 {
-                mut session,
-                credential,
-                ..
-            } = admission;
+            let (mut session, credential) = match admission.outcome {
+                RemotePreBodyOutcomeV1::Admitted {
+                    session,
+                    credential,
+                } => (session, credential),
+                RemotePreBodyOutcomeV1::Revoked => {
+                    return enrollment_revoked_response::<Request>(
+                        request.request.request_id,
+                        (state.clock)(),
+                    );
+                }
+            };
             if Request::bind_authenticated_session(&session, &request.request).is_err() {
                 return Err(concealed_authentication_rejection());
             }
@@ -331,6 +353,12 @@ where
                     .reauthorize_publication(&session, (state.clock)())
                 {
                     Ok(session) => session,
+                    Err(RemoteCredentialAdmissionErrorV1::Revoked) => {
+                        return enrollment_revoked_response::<Request>(
+                            request.request.request_id,
+                            (state.clock)(),
+                        );
+                    }
                     Err(_) => return Err(concealed_authentication_rejection()),
                 };
                 if Request::bind_authenticated_session(&session, &request.request).is_err() {
@@ -376,12 +404,13 @@ where
         }
     };
     let execution = tracing::Instrument::instrument(
-        async move {
-            tokio::task::spawn_blocking(move || {
-                service.execute_controlled(request.request, credential, control)
-            })
-            .await
-        },
+        // The ports' persistence is synchronous exact SQL, so the operation
+        // runs on the blocking pool; its project-store effects await there.
+        tracedecay_rusqlite_runtime::native_runtime::on_blocking_pool(async move {
+            service
+                .execute_controlled(request.request, credential, control)
+                .await
+        }),
         tracing::trace_span!("api.http.handler"),
     )
     .await;
@@ -422,19 +451,24 @@ where
             request
         }
     };
-    let match_result = {
-        let _span = tracing::trace_span!("api.http.handler").entered();
-        {
-            state.service.execute_enrollment(
+    // The enrollment commit waits on the store writer; a native worker must
+    // not park on it, so it runs on the blocking pool as `protocol_route` does.
+    let service = Arc::clone(&state.service);
+    let execution = tracing::Instrument::instrument(
+        tracedecay_rusqlite_runtime::native_runtime::spawn_blocking(move || {
+            service.execute_enrollment(
                 request.request,
                 admission.grant_credential,
                 admission.enrollment_credential,
             )
-        }
-    };
-    match match_result {
-        Ok(response) => Ok(remote_protocol_response(response.into())),
-        Err(error) => Err(RemoteHttpRejection::Contract(error)),
+        }),
+        tracing::trace_span!("api.http.handler"),
+    )
+    .await;
+    match execution {
+        Ok(Ok(response)) => Ok(remote_protocol_response(response.into())),
+        Ok(Err(error)) => Err(RemoteHttpRejection::Contract(error)),
+        Err(_) => invalid_remote_request_response().map_err(RemoteHttpRejection::Contract),
     }
 }
 
@@ -483,6 +517,29 @@ fn concealed_authentication_rejection() -> RemoteHttpRejection {
         Ok(response) => RemoteHttpRejection::Response(Box::new(response)),
         Err(error) => RemoteHttpRejection::Contract(error),
     }
+}
+
+/// Typed refusal for the holder of a revoked enrollment credential, addressed
+/// to its own request so the client can decode it.
+fn enrollment_revoked_response<Request: RemoteSessionBoundProtocolBodyV1>(
+    request_id: RequestId,
+    observed_at: UtcMicros,
+) -> Result<Response, RemoteHttpRejection> {
+    let failure = RemoteProtocolFailureV1::EnrollmentRevoked;
+    let response = Request::result_contract()
+        .and_then(|contract| remote_protocol_problem(contract, request_id.clone(), failure))
+        .and_then(|problem| {
+            RemoteProtocolResponseV1::<()>::new(
+                request_id,
+                CurrentRemoteAuthorityStateV1::Unavailable {
+                    reason: RemoteAuthorityUnavailableReasonV1::EnrollmentRevoked,
+                    observed_at,
+                },
+                Err(problem),
+            )
+        })
+        .map_err(RemoteHttpRejection::Contract)?;
+    Ok(remote_protocol_response(response.into()))
 }
 
 fn concealed_request_id() -> RequestId {

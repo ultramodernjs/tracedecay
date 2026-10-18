@@ -14,6 +14,7 @@ use tracedecay_automation_runtime::automation::backend::{
 };
 use tracedecay_automation_runtime::automation::config::{AutomationBackend, AutomationConfig};
 use tracedecay_domain::configuration::LcmSummarizerExecutableV1;
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_session_memory::provider_pricing::{cost_of_usage, load_table};
 
 /// The automation settings and the configured `codex` executable one project
@@ -24,11 +25,14 @@ pub struct ContextScoutModelConfig<'a> {
     pub codex: &'a LcmSummarizerExecutableV1,
 }
 
-const CONTEXT_SCOUT_PROMPT_V1: &str = "\
-Select one supplied candidate and return only the JSON object required by the response schema. \
-You may refine suggestion_text, but selected_dedupe_key and cited_anchor_ids must come from that \
-same candidate. Do not call tools, inspect files, run commands, access credentials, mutate state, \
-or add facts not present in the supplied candidates.";
+const CONTEXT_SCOUT_PROMPT: &str = "\
+The request holds one candidate. Return only the JSON object required by the response schema. \
+You may rewrite its suggestion_text for clarity and actionability. Copy its dedupe_key into \
+selected_dedupe_key and its citation_anchor_ids into cited_anchor_ids unchanged. Keep every \
+identifier, path, number, error code, and time qualifier it states. Do not add facts, \
+identifiers, paths, or numbers absent from that candidate, and do not infer what it does not \
+state, such as which value was expected or what caused a failure. Do not call tools, inspect \
+files, run commands, access credentials, mutate state.";
 
 pub fn context_scout_backend_from_automation_config(
     config: &AutomationConfig,
@@ -125,28 +129,29 @@ impl ContextScoutModelAssistantV1 for ProductionContextScoutModelAssistantV1 {
             let measured_input_tokens = u64::try_from(execution.validate_input(&request)?).ok();
             let backend_request = backend_request(request, execution.max_output_tokens)?;
             let cancellation = execution.cancellation.clone();
-            let deadline = tokio::time::Instant::from_std(execution.deadline.instant());
-            let mut task = tokio::task::spawn_blocking(move || backend.run_task(&backend_request));
+            let deadline = native_runtime::sleep_until(execution.deadline.instant());
+            let task = native_runtime::spawn_blocking(move || backend.run_task(&backend_request));
             // Fixed order, not a coin flip: cancellation stays authoritative,
             // then a settled backend result, then the deadline. Preparation
             // runs inside this budget, so on a slow host the deadline can be
             // elapsed the moment the race starts; an unbiased select would
             // then report a timeout roughly half the time over a denial or a
-            // disconnect the backend had already produced.
+            // disconnect the backend had already produced. Losing branches
+            // abandon only the wait: a running backend call is not
+            // interruptible.
             let response = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
-                    task.abort();
                     return Err(ContextScoutModelErrorV1::Cancelled);
                 }
                 // A join failure means the backend worker terminated without
                 // producing a result: the run was lost mid-flight, which is a
                 // disconnect, not an unreachable backend.
-                result = &mut task => result
+                result = task => result
                     .map_err(|_| ContextScoutModelErrorV1::Disconnected)?
                     .map_err(scout_model_error_from_agent_task)?,
-                () = tokio::time::sleep_until(deadline) => {
-                    task.abort();
+                // An unavailable timer fails closed like an elapsed one.
+                _ = deadline => {
                     return Err(ContextScoutModelErrorV1::DeadlineExceeded);
                 }
             };
@@ -178,7 +183,8 @@ impl ContextScoutModelAssistantV1 for UnavailableContextScoutModelAssistantV1 {
         let error = match self.route {
             ContextScoutModelBackendV1::Disabled => ContextScoutModelErrorV1::Disabled,
             ContextScoutModelBackendV1::CodexAppServer
-            | ContextScoutModelBackendV1::Unsupported => ContextScoutModelErrorV1::Unavailable,
+            | ContextScoutModelBackendV1::Unsupported
+            | ContextScoutModelBackendV1::DecisionEngine => ContextScoutModelErrorV1::Unavailable,
         };
         Box::pin(async move { Err(error) })
     }
@@ -216,12 +222,12 @@ fn backend_request(
         serde_json::to_value(request).map_err(|_| ContextScoutModelErrorV1::InvalidOutput)?;
     let contract = AgentTaskContract {
         task_key: "context_scout_v1".to_string(),
-        prompt_version: "context-scout-model-v1".to_string(),
+        prompt_version: "context-scout-model-v3".to_string(),
         response_schema: response_schema(),
         strict_json: true,
     };
     let prompt = format!(
-        "{CONTEXT_SCOUT_PROMPT_V1} The maximum serialized output budget is \
+        "{CONTEXT_SCOUT_PROMPT} The maximum serialized output budget is \
          {max_output_tokens} tokens."
     );
     Ok(AgentTaskRequest::new(
@@ -546,6 +552,50 @@ mod tests {
             .await,
             Err(ContextScoutModelErrorV1::Unavailable)
         );
+    }
+
+    #[cfg(feature = "token-counting")]
+    struct HeldBackend {
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(feature = "token-counting")]
+    impl AgentTaskBackend for HeldBackend {
+        fn run_task(
+            &self,
+            _request: &AgentTaskRequest,
+        ) -> Result<AgentTaskResponse, AgentTaskError> {
+            let _ = self.release.lock().unwrap().recv();
+            Err(AgentTaskError::Disconnected {
+                reason: "released after the deadline".to_string(),
+            })
+        }
+
+        fn executable(&self) -> Option<&std::path::Path> {
+            None
+        }
+    }
+
+    #[cfg(feature = "token-counting")]
+    #[test]
+    fn held_backend_elapses_the_deadline_without_a_tokio_runtime() {
+        let (release, held) = std::sync::mpsc::channel();
+        let assistant = ProductionContextScoutModelAssistantV1::new(
+            Arc::new(HeldBackend {
+                release: Mutex::new(held),
+            }),
+            ContextScoutModelBackendV1::CodexAppServer,
+        );
+        let mut execution = execution_with_ready_tokenizer();
+        execution.deadline = MonotonicDeadline::at(Instant::now() + Duration::from_millis(100));
+
+        let outcome = tracedecay_runtime_core::native_runtime::block_on(
+            assistant.propose(request(), execution),
+        )
+        .expect("process runtime");
+        drop(release);
+
+        assert_eq!(outcome, Err(ContextScoutModelErrorV1::DeadlineExceeded));
     }
 
     #[tokio::test]

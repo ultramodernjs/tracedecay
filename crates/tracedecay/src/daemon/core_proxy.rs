@@ -5,11 +5,12 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
+use asupersync::io::AsyncWriteExt;
+use asupersync::time::wall_now;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
-use tokio::time::{Duration, Instant};
 
 use super::binary_version;
 #[cfg(unix)]
@@ -23,6 +24,7 @@ use super::{
     REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE, connect_to_current_daemon_within,
     json_rpc_error_is_project_open_retryable, next_daemon_response_line, write_daemon_preamble,
 };
+use tracedecay_contracts::catalog_composition::CatalogProfileName;
 use tracedecay_daemon_protocol::{DAEMON_TOOL_RESPONSE_GRACE, version_skew_action};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_mcp::JsonRpcRequest;
@@ -76,23 +78,26 @@ pub async fn should_proxy_serve_to_daemon(
 }
 
 /// `full_tool_list` serves the daemon's catalog unchanged; otherwise tools the
-/// catalog does not mark always-loaded are listed as stubs.
+/// catalog does not mark always-loaded are listed as stubs. `catalog_profile`
+/// omits the tools that profile excludes; `None` lists the default profile.
 #[tracing::instrument(name = "daemon.engine.proxy.stdio", level = "trace", skip_all)]
 pub async fn proxy_stdio_to_daemon(
     socket_path: &Path,
     handshake: &DaemonHandshake,
     replay_line: Option<String>,
     full_tool_list: bool,
+    catalog_profile: Option<&CatalogProfileName>,
     repeated_query_hints: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut transport = StdioTransport::new();
+    let surface = ToolSurface::new(full_tool_list, catalog_profile)?;
+    let mut transport = StdioTransport::new()?;
     proxy_transport_to_daemon_with_drain_bound(
         socket_path,
         handshake,
         replay_line,
         &mut transport,
         None,
-        ToolSurface::new(full_tool_list),
+        surface,
         repeated_query_hints,
     )
     .await
@@ -145,7 +150,7 @@ pub async fn proxy_transport_to_daemon(
         replay_line,
         transport,
         None,
-        ToolSurface::new(true),
+        ToolSurface::new(true, None)?,
         tokio::sync::watch::channel(false).1,
     )
     .await
@@ -300,7 +305,7 @@ async fn drain_daemon_request_after_disconnect(
     daemon_request: impl Future<Output = Result<Vec<String>>>,
     drain_bound: Duration,
 ) -> Result<Vec<String>> {
-    tokio::time::timeout(drain_bound, daemon_request)
+    asupersync::time::timeout(wall_now(), drain_bound, daemon_request)
         .await
         .unwrap_or_else(|_| {
             Err(TraceDecayError::Config {
@@ -736,15 +741,12 @@ pub(crate) async fn send_daemon_request_line(
     handshake: &DaemonHandshake,
     line: &str,
 ) -> Result<Vec<String>> {
-    let request = DaemonProxyRequest::new(line);
-    let (_cancellation_tx, mut cancellation_rx) = tokio::sync::watch::channel(None);
-    send_daemon_request_with_liveness_poll(
+    send_daemon_request_line_with_liveness_poll(
         socket_path,
         handshake,
-        &request,
+        line,
         DAEMON_TOOL_LIVENESS_POLL_INTERVAL,
         None,
-        &mut cancellation_rx,
     )
     .await
 }
@@ -798,7 +800,7 @@ async fn send_daemon_request_with_project_open_retry(
         else {
             break;
         };
-        tokio::time::sleep(remaining.min(PROJECT_OPEN_RETRY_INTERVAL)).await;
+        asupersync::time::sleep(wall_now(), remaining.min(PROJECT_OPEN_RETRY_INTERVAL)).await;
         if cancellation.borrow().is_some() {
             break;
         }
@@ -864,18 +866,16 @@ async fn send_daemon_request_with_liveness_poll(
         .map_or("daemon request", |request| request.method.as_str())
         .to_string();
     let profile_root = &handshake.client_identity.profile_root;
-    let (connection, stream) = match client_deadline {
-        Some(deadline) => {
-            deadline
-                .run("connect", &request_label, async {
-                    connect_to_current_daemon_within(profile_root, socket_path, Some(deadline))
-                        .await
-                })
-                .await?
-        }
-        None => connect_to_current_daemon_within(profile_root, socket_path, None).await?,
-    };
-    let (reader, mut writer) = stream.into_owned_split();
+    let (connection, stream) = DaemonClientDeadline::run_optional(
+        client_deadline,
+        "connect",
+        &request_label,
+        connect_to_current_daemon_within(profile_root, socket_path, client_deadline),
+    )
+    .await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader =
+        tracedecay_framing::BoundedLineReader::new(asupersync::io::BufReader::new(reader));
 
     let write = async {
         write_daemon_preamble(&mut writer, &connection, handshake).await?;
@@ -886,12 +886,11 @@ async fn send_daemon_request_with_liveness_poll(
         writer.flush().await?;
         Ok(())
     };
-    match client_deadline {
-        Some(deadline) => deadline.run("write", &request_label, write).await?,
-        None => write.await?,
-    }
+    let written =
+        DaemonClientDeadline::run_optional(client_deadline, "write", &request_label, write);
+    tracedecay_daemon_protocol::refusal_behind_failed_write(written.await, &mut reader, handshake)
+        .await?;
 
-    let mut reader = tokio::io::BufReader::new(reader);
     let mut responses = Vec::new();
     let mut matched_response = request_id.is_none();
     let mut cancellation_open = true;
@@ -902,12 +901,8 @@ async fn send_daemon_request_with_liveness_poll(
             &request_label,
             liveness_poll_interval,
         );
-        let read = async {
-            match client_deadline {
-                Some(deadline) => deadline.run("read", &request_label, read).await,
-                None => read.await,
-            }
-        };
+        let read =
+            DaemonClientDeadline::run_optional(client_deadline, "read", &request_label, read);
         let response_line =
             read_forwarding_cancellation(read, cancellation, &mut cancellation_open, &mut writer)
                 .await?;
@@ -917,28 +912,24 @@ async fn send_daemon_request_with_liveness_poll(
         if response_line.trim().is_empty() {
             continue;
         }
-        let is_matching_response = match client_deadline {
-            Some(deadline) => {
-                deadline
-                    .run("decode", &request_label, async {
-                        Ok(request_id.as_ref().is_some_and(|id| {
-                            serde_json::from_str::<serde_json::Value>(&response_line)
-                                .ok()
-                                .and_then(|value| value.get("id").cloned())
-                                .as_ref()
-                                == Some(id)
-                        }))
-                    })
-                    .await?
-            }
-            None => request_id.as_ref().is_some_and(|id| {
-                serde_json::from_str::<serde_json::Value>(&response_line)
-                    .ok()
-                    .and_then(|value| value.get("id").cloned())
-                    .as_ref()
-                    == Some(id)
-            }),
-        };
+        if let Some(refusal) =
+            tracedecay_daemon_protocol::DaemonHandshakeRefusal::from_line(&response_line)
+        {
+            return Err(tracedecay_daemon_protocol::handshake_refusal_error(
+                &refusal, handshake,
+            ));
+        }
+        let is_matching_response =
+            DaemonClientDeadline::run_optional(client_deadline, "decode", &request_label, async {
+                Ok(request_id.as_ref().is_some_and(|id| {
+                    serde_json::from_str::<serde_json::Value>(&response_line)
+                        .ok()
+                        .and_then(|value| value.get("id").cloned())
+                        .as_ref()
+                        == Some(id)
+                }))
+            })
+            .await?;
         responses.push(format!("{response_line}\n"));
         if is_matching_response {
             matched_response = true;
@@ -963,7 +954,7 @@ async fn read_forwarding_cancellation<W>(
     writer: &mut W,
 ) -> Result<Option<String>>
 where
-    W: tokio::io::AsyncWrite + Unpin,
+    W: asupersync::io::AsyncWrite + Unpin,
 {
     tokio::pin!(read);
     loop {

@@ -347,7 +347,6 @@ pub(crate) struct StoredLspTestRunExpansionV1 {
 /// recorded in.
 #[allow(clippy::too_many_arguments)]
 pub fn lsp_session_factory<F>(
-    runtime: tokio::runtime::Handle,
     feedback_runtime: Arc<FeedbackRuntime>,
     test_run_store: RegisteredGlobalDbLeaseV1,
     code_index: Arc<dyn LspCodeIndexProjectionIdentityPort>,
@@ -369,7 +368,7 @@ where
         code_index,
         workspace_index,
     )?);
-    let test_runs = lsp_test_result_port(project.clone(), test_run_store, runtime.clone());
+    let test_runs = lsp_test_result_port(project.clone(), test_run_store);
     let diagnostic_projection = Arc::new(DiagnosticsStoreLspFeedbackProjection::new(
         diagnostic_records,
         project.clone(),
@@ -388,7 +387,6 @@ where
         diagnostics_quiet_window,
     ));
     Ok(DaemonLspSessionFactory::new(
-        runtime,
         feedback.clone(),
         semantics,
         diagnostics,

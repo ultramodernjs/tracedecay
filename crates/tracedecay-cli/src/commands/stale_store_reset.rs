@@ -8,13 +8,12 @@ use tracedecay_hooks::{
 };
 use tracedecay_runtime_core::config::{GLOBAL_DB_FILENAME, ProfileRoot};
 use tracedecay_runtime_core::storage::{
-    SESSIONS_DB_FILENAME, STORE_MANIFEST_FILENAME, profile_sharded_data_root, read_store_manifest,
-    validate_project_id,
+    SESSIONS_DB_FILENAME, STORE_MANIFEST_FILENAME, USER_SESSIONS_DB_FILENAME,
+    profile_sharded_data_root, read_store_manifest, validate_project_id,
 };
-use tracedecay_sessions::runtime::USER_SESSIONS_DB_FILENAME;
 
 use super::storage::{
-    ProfileOfflineAuthority, join_outcome_and_restore, remove_fixed_profile_path,
+    ProfileOfflineAuthority, RestoreWording, join_outcome_and_restore, remove_fixed_profile_path,
     take_profile_offline,
 };
 
@@ -58,7 +57,7 @@ pub(crate) async fn handle_wipe_stale(profile: &ProfileRoot, assume_yes: bool) -
     let profile_offline = take_stale_reset_offline(profile, &profile_root)?;
     let outcome = reset_stores(&profile_root, &targets);
     let restore = profile_offline.finish();
-    join_outcome_and_restore(OPERATION, outcome, restore)
+    join_outcome_and_restore(RestoreWording::ManagedService, OPERATION, outcome, restore)
 }
 
 /// The managed daemon is quiesced and restored afterwards. An unmanaged daemon

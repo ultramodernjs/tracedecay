@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tokio::task::JoinHandle;
 use tracedecay_contracts::feedback::observations::{
     FeedbackAnchorOperationV1, FeedbackCoverageV1, FeedbackObservationDeliveryV1,
     FeedbackObservationEnvelopeV1, FeedbackOutcomeV1, FeedbackSourceEventV1,
@@ -61,9 +60,11 @@ use super::owner::{
     FeedbackReadRequestResolutionV1, FeedbackReadRequestV1,
 };
 use crate::diagnostics_store::DiagnosticsStore;
+use crate::project_open_authorization::mounted_grant_expires_at;
 use crate::source_authorization::ProjectSourceAccessSnapshot;
 use tracedecay_runtime_core::db::engine::params;
 use tracedecay_runtime_core::db::{Database, DatabaseWriteTransaction};
+use tracedecay_runtime_core::native_runtime::{NativeTask, NativeTaskOutcome};
 use tracedecay_session_memory::response_handles::{
     RESPONSE_HANDLE_TTL_SECS, ResponseHandleLookup, is_valid_response_handle, micros_to_seconds,
     retrieve_response_handle, store_response_handle,
@@ -121,7 +122,6 @@ pub struct ProjectFeedbackRequestAuthority {
     response_handle_root: PathBuf,
     scope: ResolvedScope,
     requester: ActorId,
-    maximum_expiry: UtcMicros,
 }
 
 #[derive(Clone)]
@@ -190,14 +190,13 @@ struct ProjectFeedbackObservationSinkV1 {
     admission: Mutex<()>,
     closed: AtomicBool,
     shutdown_failure: AtomicU8,
-    worker: AsyncMutex<Option<JoinHandle<Result<(), FeedbackRuntimeError>>>>,
+    /// Fails with `Err(())` only when the terminal observation was not stored.
+    worker: AsyncMutex<Option<NativeTask<Result<(), ()>>>>,
 }
 
 impl ProjectFeedbackObservationSinkV1 {
     async fn start(database: Database) -> Result<Self, FeedbackRuntimeError> {
         static BOOT_NONCE: AtomicU64 = AtomicU64::new(0);
-        let runtime =
-            tokio::runtime::Handle::try_current().map_err(|_| FeedbackRuntimeError::Store)?;
         let boot_id = canonical_sha256(&(
             "tracedecay.feedback.producer-boot.v1",
             std::process::id(),
@@ -212,7 +211,7 @@ impl ProjectFeedbackObservationSinkV1 {
             mpsc::channel::<FeedbackObservationEnvelopeV1>(1);
         let dropped_count = Arc::new(AtomicU64::new(0));
         let worker_dropped_count = Arc::clone(&dropped_count);
-        let worker = runtime.spawn(async move {
+        let worker = NativeTask::spawn(async move {
             let mut data_open = true;
             let mut control_open = true;
             while data_open || control_open {
@@ -246,7 +245,7 @@ impl ProjectFeedbackObservationSinkV1 {
                 {
                     saturating_add(&worker_dropped_count, reported_drops.saturating_add(1));
                     if terminal {
-                        return Err(FeedbackRuntimeError::Store);
+                        return Err(());
                     }
                 }
                 if terminal {
@@ -254,7 +253,8 @@ impl ProjectFeedbackObservationSinkV1 {
                 }
             }
             Ok(())
-        });
+        })
+        .map_err(|_| FeedbackRuntimeError::ObservationWorker)?;
         Ok(Self {
             sender,
             control_sender,
@@ -292,10 +292,13 @@ impl ProjectFeedbackObservationSinkV1 {
         };
 
         let mut worker = self.worker.lock().await;
-        let outcome = match worker.as_mut() {
-            Some(task) => match task.await {
-                Ok(outcome) => outcome,
-                Err(_) => Err(FeedbackRuntimeError::ObservationWorker),
+        let outcome = match worker.as_ref() {
+            Some(task) => match task.wait().await {
+                NativeTaskOutcome::Completed(Ok(())) => Ok(()),
+                NativeTaskOutcome::Completed(Err(())) => Err(FeedbackRuntimeError::Store),
+                NativeTaskOutcome::Cancelled | NativeTaskOutcome::Panicked(_) => {
+                    Err(FeedbackRuntimeError::ObservationWorker)
+                }
             },
             None => Ok(()),
         };
@@ -485,13 +488,11 @@ impl FeedbackRuntime {
         let project_root = project_root.into();
         let response_handle_root = response_handle_root.into();
         let requester = access.requester.clone();
-        let maximum_expiry = access.grant_expires_at;
         let requests = ProjectFeedbackRequestAuthority {
             project_root,
             response_handle_root: response_handle_root.clone(),
             scope,
             requester,
-            maximum_expiry,
         };
         let mut publications = ProjectFeedbackStore {
             database,
@@ -645,7 +646,7 @@ impl ProjectFeedbackRequestAuthority {
             observed_at
                 .0
                 .saturating_add(REQUEST_HANDLE_TTL_MICROS)
-                .min(self.maximum_expiry.0),
+                .min(mounted_grant_expires_at(observed_at).0),
         );
         (expires_at > observed_at)
             .then_some(expires_at)
@@ -701,7 +702,7 @@ impl ProjectFeedbackRequestAuthority {
             Some("invalid_record_expiry")
         } else if observed_at >= record.expires_at {
             Some("expired")
-        } else if record.expires_at > self.maximum_expiry {
+        } else if record.expires_at > mounted_grant_expires_at(observed_at) {
             Some("expiry_exceeds_authority")
         } else if operation != FeedbackReadOperationV1::List && record.after_finding_id.is_some() {
             Some("unexpected_list_cursor")
@@ -798,6 +799,9 @@ impl FeedbackRouteAuthorizationPort for ProjectFeedbackRouteAuthorization {
             RequestAdmission::TimedOut => {
                 return Err(ApplicationProblem::timed_out_before_admission());
             }
+            RequestAdmission::GrantExpired => {
+                return Err(ApplicationProblem::grant_expired_before_admission());
+            }
             RequestAdmission::Admitted => {}
         }
         if !self.allows(context, operation, observed_at) {
@@ -890,6 +894,9 @@ impl FeedbackCycleDedupePort for ProjectFeedbackStore {
             }
             RequestAdmission::TimedOut => {
                 return Box::pin(async { FeedbackPublicationRecordState::TimedOut });
+            }
+            RequestAdmission::GrantExpired => {
+                return Box::pin(async { FeedbackPublicationRecordState::Unavailable });
             }
         }
         Box::pin(async move {
@@ -1715,6 +1722,7 @@ fn interruption_outcome(context: &RequestContext, observed_at: UtcMicros) -> Fee
     match context.admission_at(observed_at) {
         RequestAdmission::Cancelled => FeedbackOutcomeV1::Cancelled,
         RequestAdmission::TimedOut => FeedbackOutcomeV1::TimedOut,
+        RequestAdmission::GrantExpired => FeedbackOutcomeV1::Denied,
         RequestAdmission::Admitted => FeedbackOutcomeV1::Unavailable,
     }
 }
@@ -2135,7 +2143,6 @@ mod tests {
                 response_handle_root: store.path().join("response-handles"),
                 scope: scope(),
                 requester: id("actor.feedback-reader.requester"),
-                maximum_expiry: UtcMicros(i64::MAX),
             });
         let barrier = std::sync::Barrier::new(authorities.len());
         let handles = std::thread::scope(|threads| {
@@ -2354,6 +2361,22 @@ mod tests {
         assert!(!authorization.allows(&admitted, &operation, UtcMicros(100)));
     }
 
+    /// The feedback owner keeps the project-open access snapshot, which
+    /// nothing renews; a request under a live grant must still be admitted
+    /// after that snapshot's own expiry has passed.
+    #[test]
+    fn feedback_route_authorization_outlives_the_project_open_access() {
+        let operation = feedback_surface_operation("feedback_list")
+            .unwrap()
+            .unwrap();
+        let admitted = context(&operation, "actor.feedback-reader.requester");
+        let mut access = source_access(&operation, &admitted);
+        access.grant_expires_at = UtcMicros(50);
+        let authorization = ProjectFeedbackRouteAuthorization { access };
+
+        assert!(authorization.allows(&admitted, &operation, UtcMicros(60)));
+    }
+
     fn source_envelope(boot_id: &ManifestDigest, sequence: u64) -> FeedbackObservationEnvelopeV1 {
         super::super::observations::feedback_source_event_envelope_for_subject(
             boot_id.clone(),
@@ -2484,13 +2507,14 @@ mod tests {
     async fn failed_terminal_persistence_remains_sticky_across_close_retries() {
         let (sender, _receiver) = mpsc::channel(1);
         let (control_sender, mut control_receiver) = mpsc::channel(1);
-        let worker = tokio::spawn(async move {
+        let worker = NativeTask::spawn(async move {
             control_receiver
                 .recv()
                 .await
                 .expect("terminal observation command");
-            Err(FeedbackRuntimeError::Store)
-        });
+            Err(())
+        })
+        .unwrap();
         let sink = ProjectFeedbackObservationSinkV1 {
             sender,
             control_sender,

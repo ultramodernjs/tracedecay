@@ -95,6 +95,8 @@ impl DashboardGraphTestRuntimeV1 {
             .await?;
             let graph_proxy =
                 tracedecay_project::test_support::host_admission::await_bound_graph_runtime(
+                    &self.registry,
+                    &project_id,
                     &project_database,
                     "bind dashboard project graph",
                 )
@@ -117,6 +119,12 @@ impl DashboardGraphTestRuntimeV1 {
             project_root,
             project_id.as_str(),
         )?;
+        // A marker names a project only through a shard this profile holds, so
+        // the fixture holds the shard the marker names, as an enrolled
+        // project's store does.
+        let held =
+            tracedecay_runtime_core::storage::resolve_layout(project_root, &self.profile_root)?;
+        std::fs::create_dir_all(&held.data_root)?;
         let options = tracedecay_project::project::TraceDecayOpenOptions {
             profile_root: Some(self.profile_root.clone()),
             global_db_path: Some(self.profile_database.db_path().to_path_buf()),

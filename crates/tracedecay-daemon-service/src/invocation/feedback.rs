@@ -52,23 +52,6 @@ fn decode_feedback_proximity_payload(
     serde_json::from_value(payload.clone()).map_err(DaemonFeedbackProximityPayloadError::Invalid)
 }
 
-#[cfg(test)]
-mod payload_decode_tests {
-    use super::{DaemonFeedbackProximityPayloadError, decode_feedback_proximity_payload};
-
-    #[test]
-    fn missing_or_invalid_proximity_payload_is_a_typed_failure() {
-        assert!(matches!(
-            decode_feedback_proximity_payload(None),
-            Err(DaemonFeedbackProximityPayloadError::Missing)
-        ));
-        assert!(matches!(
-            decode_feedback_proximity_payload(Some(&serde_json::json!({"unexpected": true}))),
-            Err(DaemonFeedbackProximityPayloadError::Invalid(_))
-        ));
-    }
-}
-
 pub(crate) type DaemonFeedbackInvocationFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<DaemonFeedbackInvocationResult, ApplicationProblem>> + Send + 'a,
@@ -481,19 +464,17 @@ pub fn advisory_cycle_invocation_result(
                 | OperationTermination::Failed
                 | OperationTermination::EffectUnknown => None,
             };
-            let omissions = omission_reason
-                .map(|reason| {
-                    vec![Omission {
-                        domain: EvidenceDomain::Diagnostic,
-                        count: cycle
-                            .execution
-                            .cycle
-                            .omitted_findings
-                            .max(u64::from(returned == total)),
-                        reason,
-                    }]
-                })
-                .unwrap_or_default();
+            let omissions = omission_reason.map_or_default(|reason| {
+                vec![Omission {
+                    domain: EvidenceDomain::Diagnostic,
+                    count: cycle
+                        .execution
+                        .cycle
+                        .omitted_findings
+                        .max(u64::from(returned == total)),
+                    reason,
+                }]
+            });
             let finding_handles = cycle
                 .finding_handles
                 .iter()
@@ -573,6 +554,10 @@ pub fn advisory_cycle_invocation_result(
             RequestAdmission::TimedOut => {
                 Some((OperationTermination::TimedOut, OmissionReason::TimedOut))
             }
+            RequestAdmission::GrantExpired => Some((
+                OperationTermination::Unavailable,
+                OmissionReason::Unavailable,
+            )),
             RequestAdmission::Admitted => None,
         }
     };
@@ -733,15 +718,13 @@ pub fn feedback_proximity_invocation_result(
     execution
         .validate()
         .map_err(|_| feedback_proximity_contract_problem())?;
-    let omissions = omission_reason
-        .map(|reason| {
-            vec![Omission {
-                domain: EvidenceDomain::Graph,
-                count: 1,
-                reason,
-            }]
-        })
-        .unwrap_or_default();
+    let omissions = omission_reason.map_or_default(|reason| {
+        vec![Omission {
+            domain: EvidenceDomain::Graph,
+            count: 1,
+            reason,
+        }]
+    });
     let payload =
         serde_json::to_value(result).map_err(|_| feedback_proximity_contract_problem())?;
     Ok(DaemonFeedbackInvocationResult {
@@ -998,7 +981,7 @@ impl DaemonInvocationService {
                 return owner;
             }
             let remaining = Duration::from_micros(remaining_micros.unsigned_abs());
-            let woke = tokio::time::timeout(remaining, async {
+            let woke = tracedecay_runtime_core::native_runtime::timeout(remaining, async {
                 tokio::select! {
                     published = changed.changed() => published.is_ok(),
                     () = mount_changed => true,
@@ -1019,5 +1002,22 @@ impl DaemonInvocationService {
             .get::<Arc<SwitchableFeedbackCycleRuntimeV1>>(project_root?)
             .await
             .map(|input| -> Arc<dyn FeedbackCycleRuntimePort> { input })
+    }
+}
+
+#[cfg(test)]
+mod payload_decode_tests {
+    use super::{DaemonFeedbackProximityPayloadError, decode_feedback_proximity_payload};
+
+    #[test]
+    fn missing_or_invalid_proximity_payload_is_a_typed_failure() {
+        assert!(matches!(
+            decode_feedback_proximity_payload(None),
+            Err(DaemonFeedbackProximityPayloadError::Missing)
+        ));
+        assert!(matches!(
+            decode_feedback_proximity_payload(Some(&serde_json::json!({"unexpected": true}))),
+            Err(DaemonFeedbackProximityPayloadError::Invalid(_))
+        ));
     }
 }

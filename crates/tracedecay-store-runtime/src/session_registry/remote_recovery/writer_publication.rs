@@ -11,8 +11,9 @@ use std::sync::atomic::AtomicU8;
 
 use tracedecay_contracts::RequestId;
 use tracedecay_contracts::remote::capture::RemoteWriterAuthorityV1;
+use tracedecay_contracts::remote::query::RemoteQueryPolicyRecordV1;
 use tracedecay_contracts::remote::replay::RemoteReplayPolicyEvidenceV1;
-use tracedecay_domain::{BrainNodeId, ManifestDigest, UtcMicros, canonical_sha256};
+use tracedecay_domain::{BrainNodeId, ManifestDigest, ProjectId, RemoteWriterFenceV1, UtcMicros};
 use tracedecay_rusqlite_runtime::remote::{
     RemoteRecoveryPhysicalEffectErrorV1, RemoteSqliteStorageV1, RemoteWriterPublicationErrorV1,
 };
@@ -26,12 +27,14 @@ use crate::remote_replay_transaction::DaemonRemoteReplayTransactionAuthorityV1;
 impl DaemonSessionRuntimeRegistryV1 {
     /// Publishes `writer` as the first writer authority `node_id` serves for
     /// its Brain lineage, together with the replay policy admitting its
-    /// frames. Publishing the identical writer again is an exact replay.
+    /// frames and the query policy admitting reads of them. Publishing the
+    /// identical writer again is an exact replay.
     pub async fn publish_remote_writer_authority(
         &self,
         node_id: &BrainNodeId,
         writer: RemoteWriterAuthorityV1,
         policy: RemoteReplayPolicyEvidenceV1,
+        query_policy: RemoteQueryPolicyRecordV1,
     ) -> Result<(), RemoteWriterPublicationErrorV1> {
         let storage = self
             .remote_credential_authority
@@ -55,33 +58,50 @@ impl DaemonSessionRuntimeRegistryV1 {
                 RemoteWriterPublicationErrorV1::ProjectUnavailable
             })?;
         let replay = Arc::clone(&self.remote_replay_transaction);
-        tokio::task::spawn_blocking(move || {
+        // The RemoteNode sinks are synchronous exact SQL, so the publication
+        // stays off async workers; only the fence effects await the store.
+        tracedecay_runtime_core::native_runtime::on_blocking_pool(async move {
             publish_first_writer(
                 &storage,
                 &replay,
                 &writer,
                 &policy,
+                &query_policy,
                 tracedecay_contracts::clock::now_micros(),
             )
+            .await
         })
         .await
         .map_err(|_| RemoteWriterPublicationErrorV1::Unavailable)?
     }
 }
 
-fn publish_first_writer(
+async fn publish_first_writer(
     storage: &RemoteSqliteStorageV1,
     replay: &DaemonRemoteReplayTransactionAuthorityV1,
     writer: &RemoteWriterAuthorityV1,
     policy: &RemoteReplayPolicyEvidenceV1,
+    query_policy: &RemoteQueryPolicyRecordV1,
     published_at: UtcMicros,
 ) -> Result<(), RemoteWriterPublicationErrorV1> {
-    storage.writer_publication_state(writer, policy, published_at)?;
-    seed_project_writer_fence(replay, writer, published_at)?;
-    storage.publish_authority(writer, policy, published_at)
+    storage.writer_publication_state(writer, policy, query_policy, published_at)?;
+    seed_project_writer_fence(replay, writer, published_at).await?;
+    storage.publish_authority(writer, policy, query_policy, published_at)
 }
 
-fn seed_project_writer_fence(
+async fn stored_fence(
+    replay: &DaemonRemoteReplayTransactionAuthorityV1,
+    project_id: &ProjectId,
+    authority_key: &ManifestDigest,
+) -> Result<Option<RemoteWriterFenceV1>, RemoteWriterPublicationErrorV1> {
+    replay
+        .current_writer_fence(project_id.clone(), authority_key.clone())
+        .await
+        .map(|stored| stored.map(|(stored, _)| stored))
+        .map_err(map_fence_error)
+}
+
+async fn seed_project_writer_fence(
     replay: &DaemonRemoteReplayTransactionAuthorityV1,
     writer: &RemoteWriterAuthorityV1,
     installed_at: UtcMicros,
@@ -94,20 +114,10 @@ fn seed_project_writer_fence(
     let (target_binding, _) = replay
         .target_descriptor(&project_id)
         .map_err(|_| RemoteWriterPublicationErrorV1::ProjectUnavailable)?;
-    let authority_key = canonical_sha256(&(
-        "tracedecay.remote-recovery-authority.v1",
-        &fence.brain_id,
-        &fence.shard_id,
-        &fence.generation_id,
-    ))
-    .map_err(|_| RemoteWriterPublicationErrorV1::InvalidWriter)?;
-    let stored_fence = |replay: &DaemonRemoteReplayTransactionAuthorityV1| {
-        replay
-            .current_writer_fence(project_id.clone(), authority_key.clone())
-            .map(|stored| stored.map(|(stored, _)| stored))
-            .map_err(map_fence_error)
-    };
-    match stored_fence(replay)? {
+    let authority_key = fence
+        .recovery_authority_key()
+        .map_err(|_| RemoteWriterPublicationErrorV1::InvalidWriter)?;
+    match stored_fence(replay, &project_id, &authority_key).await? {
         Some(stored) if stored == *fence => return Ok(()),
         Some(_) => return Err(RemoteWriterPublicationErrorV1::Conflict),
         None => {}
@@ -127,9 +137,12 @@ fn seed_project_writer_fence(
         replacement: fence.clone(),
         installed_at,
     };
-    match replay.install_writer_fence(project_id.clone(), install, probe) {
+    match replay
+        .install_writer_fence(project_id.clone(), install, probe)
+        .await
+    {
         Ok(_) => Ok(()),
-        Err(error) => match stored_fence(replay)? {
+        Err(error) => match stored_fence(replay, &project_id, &authority_key).await? {
             Some(stored) if stored != *fence => Err(RemoteWriterPublicationErrorV1::Conflict),
             _ => Err(map_fence_error(error)),
         },

@@ -551,6 +551,7 @@ async fn primitive_read_with_a_saturated_configuration_store_is_unavailable_not_
         matches!(served.outcome, DaemonInvocationOutcome::Primitive { .. }),
         "the same read is served once readers free up: {served:?}"
     );
+    drop((configuration_store, server));
     engine.shutdown_all().await;
 }
 
@@ -842,6 +843,7 @@ async fn required_ncm_failure_preserves_core_configuration_repair() {
     let observer = MemoryProviderNcmObserverV1::Enabled {
         worker_binary: worker_binary.clone(),
         state_root,
+        namespace_binding: Default::default(),
     };
     let strict_routing = MemoryProviderRecallRoutingV1 {
         active_provider: Some("ncm".to_owned()),

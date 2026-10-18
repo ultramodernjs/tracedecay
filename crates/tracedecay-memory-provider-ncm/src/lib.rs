@@ -15,7 +15,7 @@
 //! topology, open NCM state, or modify licensed behavior. It translates the
 //! provider-neutral runtime contract into an opaque NCM surface contract. Raw
 //! coding and caller identities never cross that surface: TraceDecay derives
-//! one stable namespace digest from the exact admitted scope, projects payloads
+//! one stable namespace digest under the selected scope policy, projects payloads
 //! conservatively, and retains responsibility for reattaching public identity
 //! and inert extensions to validated responses.
 
@@ -50,16 +50,13 @@ mod common;
 /// Stable logical provider identity reserved for NCM.
 pub const NCM_PROVIDER_ID: &str = "ncm";
 
-/// Recall candidate scope bindings the host authorizes NCM to attest, in the
-/// wire vocabulary of `tracedecay.memory.provider.recall.v1`
-/// `candidate_scope_binding.bindings`. NCM memories are bound to the exact
-/// coding scope namespace the adapter derives from the admitted call, so
-/// every candidate the adapter re-asserts must carry
-/// `scope_binding: "exact_coding_scope"`; the registry records this
-/// declaration at registration and passes it to admission with the admitted
-/// call, never from a reply.
+/// Recall candidate scope bindings the host authorizes NCM to attest.
+/// Ordinary canonical observations belong to a checkout across agent sessions;
+/// original-history candidates retain the exact scope and host history grants.
+/// The registry records these declarations at registration, never from a reply.
 pub const NCM_RECALL_SCOPE_BINDINGS: &[&str] = &["exact_coding_scope"];
 const NAMESPACE_DOMAIN: &[u8] = b"tracedecay.ncm.scope.v1\0";
+const CHECKOUT_NAMESPACE_DOMAIN: &[u8] = b"tracedecay.ncm.checkout.v1\0";
 const CHALLENGE_DOMAIN: &[u8] = b"tracedecay.ncm.handshake-proof.v1\0";
 const CHALLENGE_DOMAIN_V2: &[u8] = b"tracedecay.ncm.handshake-proof.v2\0";
 const OPAQUE_ID_DOMAIN: &[u8] = b"tracedecay.ncm.opaque-id.v1\0";
@@ -98,31 +95,63 @@ impl fmt::Display for NcmAdapterError {
 
 impl Error for NcmAdapterError {}
 
-/// Opaque provider-local namespace derived from a complete TraceDecay coding
-/// scope.
+/// Explicit provider-state partition selected by the host configuration.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum NcmNamespaceBinding {
+    /// Preserve the original seven-field session namespace and persisted IDs.
+    #[default]
+    ExactSessionV1,
+    /// Share ordinary canonical observations across sessions of one checkout.
+    CheckoutObservationsV1,
+}
+
+impl NcmNamespaceBinding {
+    /// Scope claims authorized for this partition. Original-history candidates
+    /// continue to require exact scope and separately granted canonical proof.
+    #[must_use]
+    pub const fn recall_scope_bindings(self) -> &'static [&'static str] {
+        match self {
+            Self::ExactSessionV1 => NCM_RECALL_SCOPE_BINDINGS,
+            Self::CheckoutObservationsV1 => &["exact_coding_scope", "checkout_observations"],
+        }
+    }
+}
+
+/// Opaque provider-local namespace; its selected binding never changes an
+/// existing namespace's bytes or rebinds retained state.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct NcmNamespace(String);
+pub struct NcmNamespace(String, NcmNamespaceBinding);
 
 impl NcmNamespace {
-    /// Derives a stable namespace without exposing raw profile, project,
-    /// repository, worktree, branch, or agent-session identifiers to NCM.
+    /// Derives the original seven-field namespace, including session and
+    /// resolved scope digest, preserving existing persisted state identities.
     #[must_use]
     pub fn from_exact_scope(scope: &OwnedExactScope) -> Self {
+        Self::from_scope(scope, NcmNamespaceBinding::ExactSessionV1)
+    }
+
+    /// Derives the namespace for an explicit host-selected state partition.
+    #[must_use]
+    pub fn from_scope(scope: &OwnedExactScope, binding: NcmNamespaceBinding) -> Self {
         let mut digest = Sha256::new();
-        digest.update(NAMESPACE_DOMAIN);
+        digest.update(match binding {
+            NcmNamespaceBinding::ExactSessionV1 => NAMESPACE_DOMAIN,
+            NcmNamespaceBinding::CheckoutObservationsV1 => CHECKOUT_NAMESPACE_DOMAIN,
+        });
         for value in [
             scope.profile_id.as_bytes(),
             scope.project_id.as_bytes(),
             scope.repository_identity.as_bytes(),
             scope.worktree_identity.as_bytes(),
             scope.branch_identity.as_bytes(),
-            scope.agent_session_id.as_bytes(),
-            scope.resolved_scope_digest.as_bytes(),
         ] {
-            digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-            digest.update(value);
+            digest_field(&mut digest, value);
         }
-        Self(hex_digest(&digest.finalize()))
+        if binding == NcmNamespaceBinding::ExactSessionV1 {
+            digest_field(&mut digest, scope.agent_session_id.as_bytes());
+            digest_field(&mut digest, scope.resolved_scope_digest.as_bytes());
+        }
+        Self(hex_digest(&digest.finalize()), binding)
     }
 
     /// Returns the lowercase SHA-256 namespace digest.
@@ -141,12 +170,21 @@ struct OpaqueCallerIds {
 impl OpaqueCallerIds {
     fn from_call(namespace: &NcmNamespace, call: &ProviderCall) -> Self {
         Self {
-            request_id: opaque_surface_id(namespace, b"request-id", &call.request_id),
-            operation_id: opaque_surface_id(namespace, b"operation-id", &call.operation_id),
-            idempotency_key: call
-                .idempotency_key
-                .as_deref()
-                .map(|value| opaque_surface_id(namespace, b"idempotency-key", value)),
+            request_id: opaque_caller_id(
+                namespace,
+                &call.exact_scope,
+                b"request-id",
+                &call.request_id,
+            ),
+            operation_id: opaque_caller_id(
+                namespace,
+                &call.exact_scope,
+                b"operation-id",
+                &call.operation_id,
+            ),
+            idempotency_key: call.idempotency_key.as_deref().map(|value| {
+                opaque_caller_id(namespace, &call.exact_scope, b"idempotency-key", value)
+            }),
         }
     }
 }
@@ -275,8 +313,8 @@ impl NcmSurfaceCall {
         payload: CanonicalPayload,
         control: OperationControl,
         surface_ready_receipt_sha256: &str,
+        namespace: NcmNamespace,
     ) -> Self {
-        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let opaque_ids = OpaqueCallerIds::from_call(&namespace, call);
         Self {
             operation: call.operation,
@@ -420,6 +458,7 @@ pub trait NcmCognitiveSurface: Send + Sync + 'static {
 }
 
 struct AcceptedReadiness {
+    namespace: NcmNamespace,
     registration_revision: u64,
     exact_scope: OwnedExactScope,
     public_ready_receipt_sha256: String,
@@ -476,6 +515,7 @@ impl Drop for OperationAdmission<'_> {
 
 /// Provider-neutral adapter over one audited licensed NCM surface.
 pub struct NcmProviderAdapter {
+    namespace_binding: NcmNamespaceBinding,
     surface: Arc<dyn NcmCognitiveSurface>,
     readiness: RwLock<ReadinessState>,
     admission_authority: Option<Arc<dyn AdvisoryAdmissionAuthority>>,
@@ -495,12 +535,24 @@ impl NcmProviderAdapter {
             });
         }
         Ok(Self {
+            namespace_binding: NcmNamespaceBinding::default(),
             surface,
             readiness: RwLock::new(ReadinessState::default()),
             admission_authority: None,
             recall_diagnostic_sink: None,
             recall_diagnostic_key: None,
         })
+    }
+
+    /// Selects a state partition before registration. Existing callers retain
+    /// the exact-session namespace unless checkout sharing is explicit.
+    #[must_use]
+    pub fn with_namespace_binding(mut self, binding: NcmNamespaceBinding) -> Self {
+        if self.namespace_binding != binding {
+            self.namespace_binding = binding;
+            self.readiness = RwLock::new(ReadinessState::default());
+        }
+        self
     }
 
     /// Installs the trusted host authority used freshly for each invocation.
@@ -598,6 +650,7 @@ impl NcmProviderAdapter {
 
     fn surface_payload(
         call: &ProviderCall,
+        namespace: &NcmNamespace,
         admission: Option<&CurrentAdvisoryAdmission>,
         descriptor: &ProviderDescriptor,
         limits: ProviderLimits,
@@ -609,7 +662,6 @@ impl NcmProviderAdapter {
         if !value.is_object() {
             return None;
         }
-        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let opaque_ids = OpaqueCallerIds::from_call(&namespace, call);
         if let Some(projected) =
             common::project_portability(call, &value, &namespace, admission, descriptor, limits)?
@@ -1235,11 +1287,16 @@ impl MemoryProvider for NcmProviderAdapter {
                 return Self::handshake_failure(request, code, "ncm.request_control_terminal");
             }
         };
-        let namespace = NcmNamespace::from_exact_scope(&request.exact_scope);
+        let namespace = NcmNamespace::from_scope(&request.exact_scope, self.namespace_binding);
         let surface_request = NcmSurfaceHandshakeRequest {
             registration_revision: request.registration_revision,
             namespace: namespace.clone(),
-            request_id: opaque_surface_id(&namespace, b"handshake-request-id", &request.request_id),
+            request_id: opaque_caller_id(
+                &namespace,
+                &request.exact_scope,
+                b"handshake-request-id",
+                &request.request_id,
+            ),
             required_capabilities: request.required_capabilities.clone(),
             host_limits: request.host_limits,
             control: surface_control,
@@ -1442,6 +1499,7 @@ impl MemoryProvider for NcmProviderAdapter {
             );
         }
         let accepted_readiness = AcceptedReadiness {
+            namespace: namespace.clone(),
             registration_revision: request.registration_revision,
             exact_scope: request.exact_scope.clone(),
             public_ready_receipt_sha256: public_ready_receipt_sha256.clone(),
@@ -1611,6 +1669,7 @@ impl MemoryProvider for NcmProviderAdapter {
         }
         let Some(surface_payload) = Self::surface_payload(
             call,
+            &readiness.namespace,
             current_admission.as_ref(),
             &readiness.descriptor,
             readiness.effective_limits,
@@ -1633,6 +1692,7 @@ impl MemoryProvider for NcmProviderAdapter {
             surface_payload,
             surface_control,
             &readiness.surface_ready_receipt_sha256,
+            readiness.namespace.clone(),
         );
         let projected_control = match surface_call.control.snapshot() {
             Ok(control) => control,
@@ -1657,6 +1717,7 @@ impl MemoryProvider for NcmProviderAdapter {
             if call.operation == ProviderOperation::Recall {
                 common::emit_recall_post_dispatch_control_diagnostic(
                     call,
+                    &readiness.namespace,
                     &readiness.provider_instance_id,
                     &reply,
                     code,
@@ -1695,6 +1756,7 @@ impl MemoryProvider for NcmProviderAdapter {
                 && reply.payload.is_some()
                 && common::reconstruct_portability(
                     call,
+                    &readiness.namespace,
                     &mut reply,
                     &readiness.descriptor,
                     readiness.effective_limits,
@@ -1728,7 +1790,7 @@ impl MemoryProvider for NcmProviderAdapter {
                             .is_some()
                 })
                 && reply.terminal.terminal_code() == TerminalCode::Success
-                && common::reconstruct_observation(call, &mut reply).is_none()
+                && common::reconstruct_observation(call, &readiness.namespace, &mut reply).is_none()
             {
                 return Self::surface_contract_failure(call, &surface_call, &reply);
             }
@@ -1741,6 +1803,7 @@ impl MemoryProvider for NcmProviderAdapter {
                 )
                 && common::reconstruct_recall_with_diagnostics(
                     call,
+                    &readiness.namespace,
                     &readiness.provider_instance_id,
                     &mut reply,
                     current_admission.as_ref(),
@@ -2083,6 +2146,92 @@ fn framed_str_bytes(value: &str) -> u64 {
 
 fn framed_slice_bytes(value: &[u8]) -> u64 {
     8_u64.saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+}
+
+// State is shared by checkout, but caller keys still identify one exact caller.
+// Keep legacy projections byte-for-byte compatible with existing durable receipts.
+fn opaque_caller_id(
+    namespace: &NcmNamespace,
+    exact_scope: &OwnedExactScope,
+    kind: &[u8],
+    public_value: &str,
+) -> String {
+    if namespace.1 == NcmNamespaceBinding::ExactSessionV1 {
+        return opaque_surface_id(namespace, kind, public_value);
+    }
+    let mut digest = Sha256::new();
+    digest.update(OPAQUE_ID_DOMAIN);
+    digest_field(&mut digest, namespace.as_str().as_bytes());
+    digest_field(&mut digest, kind);
+    digest_field(
+        &mut digest,
+        NcmNamespace::from_exact_scope(exact_scope)
+            .as_str()
+            .as_bytes(),
+    );
+    digest_field(&mut digest, public_value.as_bytes());
+    hex_digest(&digest.finalize())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod caller_id_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_caller_ids_keep_durable_bytes_and_checkout_ids_partition_all_exact_callers() {
+        let exact = OwnedExactScope::new(
+            "profile",
+            "project",
+            "repository",
+            "worktree",
+            "master",
+            "session",
+            format!("sha256:{}", "ab".repeat(32)),
+        )
+        .unwrap();
+        let legacy = NcmNamespace::from_exact_scope(&exact);
+        let checkout =
+            NcmNamespace::from_scope(&exact, NcmNamespaceBinding::CheckoutObservationsV1);
+        for (kind, expected) in [
+            (
+                b"request-id".as_slice(),
+                "cb8986c562e87ab5aa2ea07efe83ee6b6569062405600f48e9fd301a9aeb45f5",
+            ),
+            (
+                b"operation-id".as_slice(),
+                "ecb4fd23c1ed795b650ad376099cd49748f9c1a54571138327b4d67c7d2fc155",
+            ),
+            (
+                b"idempotency-key".as_slice(),
+                "1075834b4748d947af67b885f7152f6e9126caddfbe5be70b03d338eb373bd25",
+            ),
+        ] {
+            assert_eq!(
+                opaque_caller_id(&legacy, &exact, kind, "caller-key"),
+                expected
+            );
+            let first = opaque_caller_id(&checkout, &exact, kind, "caller-key");
+            assert_eq!(
+                first,
+                opaque_caller_id(&checkout, &exact, kind, "caller-key")
+            );
+            let mut session_changed = exact.clone();
+            session_changed.agent_session_id = "another-session".to_owned();
+            let mut digest_changed = exact.clone();
+            digest_changed.resolved_scope_digest = format!("sha256:{}", "cd".repeat(32));
+            for other in [session_changed, digest_changed] {
+                assert_eq!(
+                    checkout,
+                    NcmNamespace::from_scope(&other, NcmNamespaceBinding::CheckoutObservationsV1)
+                );
+                assert_ne!(
+                    first,
+                    opaque_caller_id(&checkout, &other, kind, "caller-key")
+                );
+            }
+        }
+    }
 }
 
 fn opaque_surface_id(namespace: &NcmNamespace, kind: &[u8], public_value: &str) -> String {

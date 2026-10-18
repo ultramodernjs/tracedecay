@@ -48,6 +48,7 @@ impl CodeGraphProjectionReadPort for FixtureCodeGraphProjection {
                 RequestAdmission::Admitted => {}
                 RequestAdmission::Cancelled => return Err(CodeGraphReadError::Cancelled),
                 RequestAdmission::TimedOut => return Err(CodeGraphReadError::TimedOut),
+                RequestAdmission::GrantExpired => return Err(CodeGraphReadError::Denied),
             }
             VerifiedCodeGraphRead::new(
                 self.scope.clone(),
@@ -59,7 +60,7 @@ impl CodeGraphProjectionReadPort for FixtureCodeGraphProjection {
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn source_reads_reuse_the_cross_session_cache() {
     crate::runtime_ports::register_runtime_ports(
         crate::runtime_ports::fixture_daemon_client_ports(),

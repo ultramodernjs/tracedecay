@@ -69,14 +69,15 @@ pub fn sync_parent_directory(path: &Path, policy: DirectorySyncPolicy) -> io::Re
 /// into place.
 ///
 /// On Linux each member's writeback starts as soon as it is written, and
-/// [`Self::sync`] then fsyncs the members: their block allocations share a
-/// journal commit, so the first fsync pays it and the rest only confirm
-/// already-submitted writes. The cost stays proportional to the batch's own
-/// bytes. `syncfs(2)` also paid one commit, but waited for every dirty inode on
-/// the filesystem, so a one-file seal stalled for seconds behind unrelated
-/// writers. On macOS full file syncs are also deferred to [`Self::sync`],
-/// so the whole staged batch can be written before issuing those barriers.
-/// Other platforms fsync each file as it is written.
+/// [`Self::sync`] then fsyncs the members concurrently. Concurrent fsyncs
+/// share a commit on a journaling filesystem and on ZFS's intent log alike,
+/// but on ZFS one fsync after another pays one intent-log commit each, so a
+/// seal of a hundred segments waited out a hundred commits. The cost stays
+/// proportional to the batch's own bytes. `syncfs(2)` also paid one
+/// commit, but waited for every dirty inode on the filesystem, so a one-file
+/// seal stalled for seconds behind unrelated writers. Other platforms fsync
+/// each file as it is written. On macOS full file syncs are deferred to
+/// [`Self::sync`] so the staged batch is written before issuing barriers.
 #[derive(Default)]
 pub struct DurableFileBatch {
     /// Paths rather than open handles, so a large seal holds no descriptors.
@@ -116,6 +117,31 @@ impl DurableFileBatch {
 
     /// Make every member file's contents durable.
     pub fn sync(&self) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let syncer = || -> io::Result<()> {
+                while let Some(member) = self.members.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    sync_file_at(member)?;
+                }
+                Ok(())
+            };
+            let syncers = self.members.len().min(DURABLE_BATCH_CONCURRENT_SYNCS);
+            std::thread::scope(|scope| {
+                let helpers = (1..syncers)
+                    .map(|_| scope.spawn(syncer))
+                    .collect::<Vec<_>>();
+                let mut outcome = syncer();
+                for helper in helpers {
+                    let helped = helper
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    outcome = outcome.and(helped);
+                }
+                outcome
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
         self.sync_with_checkpoint(|| Ok(()), |error| error)
     }
 
@@ -144,6 +170,12 @@ impl DurableFileBatch {
         checkpoint()
     }
 }
+
+/// Barriers one batch keeps in flight together: enough for the filesystem to
+/// fold them into a shared log commit, bounded so a large seal does not
+/// spawn a thread per segment.
+#[cfg(target_os = "linux")]
+const DURABLE_BATCH_CONCURRENT_SYNCS: usize = 32;
 
 /// Flush an already-written file's contents so its bytes are durable.
 ///

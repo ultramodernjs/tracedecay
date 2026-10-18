@@ -93,8 +93,26 @@ fn validate(
         (Some(request_capsule), Some(response_capsule)) => {
             let requested = super::lifecycle::decode_receipt_capsule(request_capsule)?;
             let retained = super::lifecycle::decode_receipt_capsule(response_capsule)?;
-            fields(&requested, &["operation_id", "idempotency_key"])?;
-            fields(&retained, &["operation_id", "idempotency_key"])?;
+            for delivery in [&requested, &retained] {
+                if let Some(binding) = delivery.get("caller_binding") {
+                    fields(
+                        delivery,
+                        &["operation_id", "idempotency_key", "caller_binding"],
+                    )?;
+                    fields(binding, &["version", "exact_scope"])?;
+                    if binding["version"] != 1 {
+                        return None;
+                    }
+                    scope(&binding["exact_scope"])?;
+                } else {
+                    fields(delivery, &["operation_id", "idempotency_key"])?;
+                }
+            }
+            // A retry may carry a new public operation identity, but its
+            // retained page receipt must still belong to the same exact caller.
+            if requested.get("caller_binding") != retained.get("caller_binding") {
+                return None;
+            }
             string(&requested["operation_id"])?;
             string(&retained["operation_id"])?;
             let requested_key = string(&requested["idempotency_key"])?;
@@ -300,6 +318,108 @@ mod tests {
         response["items"][1]["record_id"] = json!(2);
         response["items"][1]["state_generation"] = json!(2);
         (request, response)
+    }
+
+    #[test]
+    fn checkout_page_receipts_require_the_same_exact_caller_on_success_and_retry() {
+        let (mut request, mut response) = completed_page();
+        let binding = json!({"version":1,"exact_scope":{
+            "profile_id":"profile", "project_id":"project", "repository_identity":"repository",
+            "worktree_identity":"worktree", "branch_identity":"master", "agent_session_id":"session",
+            "resolved_scope_digest":format!("sha256:{}", "ab".repeat(32))}});
+        let mut delivery = json!({"operation_id":"first-page-operation", "idempotency_key":"page-key", "caller_binding":binding});
+        request["page_delivery_capsule"] = receipt_capsule(delivery.clone());
+        response["page_delivery_capsule"] = request["page_delivery_capsule"].clone();
+        assert!(
+            validate(
+                &request,
+                &response,
+                0,
+                3,
+                TerminalCode::Success,
+                crate::CommittedEffectState::Committed
+            )
+            .is_some()
+        );
+        response["replayed"] = json!(true);
+        delivery["operation_id"] = json!("retry-page-operation");
+        request["page_delivery_capsule"] = receipt_capsule(delivery.clone());
+        assert!(
+            validate(
+                &request,
+                &response,
+                3,
+                3,
+                TerminalCode::Success,
+                crate::CommittedEffectState::Duplicate
+            )
+            .is_some()
+        );
+        for field in [
+            "profile_id",
+            "project_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch_identity",
+            "agent_session_id",
+            "resolved_scope_digest",
+        ] {
+            let mut forged = delivery.clone();
+            forged["caller_binding"]["exact_scope"][field] = if field == "resolved_scope_digest" {
+                json!(format!("sha256:{}", "cd".repeat(32)))
+            } else {
+                json!("other")
+            };
+            let mut rejected = response.clone();
+            rejected["page_delivery_capsule"] = receipt_capsule(forged);
+            assert!(
+                validate(
+                    &request,
+                    &rejected,
+                    3,
+                    3,
+                    TerminalCode::Success,
+                    crate::CommittedEffectState::Duplicate
+                )
+                .is_none(),
+                "{field}"
+            );
+        }
+        for malformed in [
+            "unknown_field",
+            "missing_scope",
+            "unsupported_version",
+            "missing_binding",
+        ] {
+            let mut forged = delivery.clone();
+            match malformed {
+                "unknown_field" => forged["caller_binding"]["extra"] = json!(true),
+                "missing_scope" => {
+                    forged["caller_binding"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("exact_scope");
+                }
+                "unsupported_version" => forged["caller_binding"]["version"] = json!(2),
+                _ => {
+                    forged.as_object_mut().unwrap().remove("caller_binding");
+                }
+            }
+            let mut rejected = response.clone();
+            rejected["page_delivery_capsule"] = receipt_capsule(forged);
+            assert!(
+                validate(
+                    &request,
+                    &rejected,
+                    3,
+                    3,
+                    TerminalCode::Success,
+                    crate::CommittedEffectState::Duplicate
+                )
+                .is_none(),
+                "{malformed}"
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use asupersync::runtime::RuntimeHandle;
+
+use tracedecay_rusqlite_runtime::reader::ReaderAcquireError;
 use tracedecay_rusqlite_runtime::repository::{
     RepositoryDispatchError, RepositoryPhysicalAttachmentFactory,
     RepositoryRuntimePhysicalAttachment, RepositoryRuntimePhysicalSnapshot,
@@ -127,16 +130,24 @@ impl ShardRuntimePublisher for LifecycleShardRuntimePublisher {
     ) -> StoreRuntimeRegistryFuture<'_, Result<PublishedShardRuntime, StoreRuntimeRegistryFailure>>
     {
         Box::pin(async move {
-            let admission = AdmissionConfigV1::default();
             let pinned_profile =
                 matches!(request.binding.shard_id.scope, StoreShardScopeV1::Profile);
             let runtime = ShardRuntime::new(request.binding.clone(), pinned_profile);
             runtime
                 .transition(RuntimeMaintenanceStateV1::Opening)
                 .map_err(runtime_lifecycle_failure)?;
+            // A `RuntimeHandle` held across the await overflows the `Send`
+            // proof (rust-lang/rust#159228), so it drops before publication.
             let attachment =
                 LifecycleShardRuntimeAttachment::new(RepositoryPhysicalAttachmentFactory);
-            let physical = attachment.attach(&request, admission)?;
+            let physical = {
+                let executor = crate::native_runtime::handle().ok_or(
+                    StoreRuntimeRegistryFailure::RuntimeUnavailable {
+                        operation: "publish physical registered runtime",
+                    },
+                )?;
+                attachment.attach(&executor, &request, AdmissionConfigV1::default())?
+            };
             publish_lifecycle_runtime(request, runtime, physical).await
         })
     }
@@ -234,6 +245,7 @@ impl LifecycleShardRuntimeAttachment {
 
     fn attach(
         &self,
+        runtime: &RuntimeHandle,
         request: &ShardRuntimeBuildRequest,
         admission: AdmissionConfigV1,
     ) -> Result<LifecyclePhysicalAttachment, StoreRuntimeRegistryFailure> {
@@ -245,6 +257,7 @@ impl LifecycleShardRuntimeAttachment {
         }
         let attachment = if request.locator.is_prospective() {
             self.repository.initialize(
+                runtime,
                 request.binding.clone(),
                 request.locator.verified().clone(),
                 request.locator.path().to_path_buf(),
@@ -259,6 +272,7 @@ impl LifecycleShardRuntimeAttachment {
             )
         } else {
             self.repository.attach(
+                runtime,
                 request.binding.clone(),
                 request.locator.verified().clone(),
                 request.locator.path().to_path_buf(),
@@ -491,6 +505,14 @@ impl PhysicalRuntimeAttachment for RepositoryRuntimePhysicalAttachment {
         ))
     }
 
+    fn file_lost(&self) -> bool {
+        RepositoryRuntimePhysicalAttachment::file_lost(self)
+    }
+
+    fn lost_file_closed(&self) -> bool {
+        RepositoryRuntimePhysicalAttachment::lost_file_closed(self)
+    }
+
     fn drain(&self) -> Result<(), String> {
         RepositoryRuntimePhysicalAttachment::drain(self)
     }
@@ -514,14 +536,15 @@ impl PhysicalRuntimeAttachment for RepositoryRuntimePhysicalAttachment {
         )
     }
 
-    fn run_bounded_incremental_compaction(
-        &self,
+    fn run_bounded_incremental_compaction<'a>(
+        &'a self,
+        cx: &'a asupersync::Cx,
         max_pages: u32,
         authority: Arc<dyn tracedecay_rusqlite_runtime::RuntimeWriteAuthority>,
-    ) -> StoreRuntimeRegistryFuture<'_, Result<(), StoreRuntimeRegistryFailure>> {
+    ) -> StoreRuntimeRegistryFuture<'a, Result<(), StoreRuntimeRegistryFailure>> {
         Box::pin(async move {
             RepositoryRuntimePhysicalAttachment::run_bounded_incremental_compaction(
-                self, max_pages, authority,
+                self, cx, max_pages, authority,
             )
             .await
             .map_err(|error| StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
@@ -531,16 +554,17 @@ impl PhysicalRuntimeAttachment for RepositoryRuntimePhysicalAttachment {
         })
     }
 
-    fn run_checkpoint(
-        &self,
+    fn run_checkpoint<'a>(
+        &'a self,
+        cx: &'a asupersync::Cx,
         request: tracedecay_rusqlite_runtime::CheckpointRequest,
         authority: Arc<dyn tracedecay_rusqlite_runtime::RuntimeWriteAuthority>,
     ) -> StoreRuntimeRegistryFuture<
-        '_,
+        'a,
         Result<tracedecay_rusqlite_runtime::CheckpointOutcome, StoreRuntimeRegistryFailure>,
     > {
         Box::pin(async move {
-            RepositoryRuntimePhysicalAttachment::run_checkpoint(self, request, authority)
+            RepositoryRuntimePhysicalAttachment::run_checkpoint(self, cx, request, authority)
                 .await
                 .map_err(|error| StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
                     operation: "run repository checkpoint",
@@ -549,38 +573,49 @@ impl PhysicalRuntimeAttachment for RepositoryRuntimePhysicalAttachment {
         })
     }
 
-    fn dispatch_submit(
-        &self,
+    fn dispatch_submit<'a>(
+        &'a self,
+        cx: &'a asupersync::Cx,
         request: RuntimeSubmitRequestV1,
         probe: Arc<dyn RuntimeRequestProbeV1>,
         authority: Arc<dyn tracedecay_rusqlite_runtime::RuntimeWriteAuthority>,
-    ) -> StoreRuntimeRegistryFuture<'_, Result<RuntimeSubmitOutcomeV1, StoreRuntimeRegistryFailure>>
+    ) -> StoreRuntimeRegistryFuture<'a, Result<RuntimeSubmitOutcomeV1, StoreRuntimeRegistryFailure>>
     {
         Box::pin(async move {
-            RepositoryRuntimePhysicalAttachment::dispatch_submit(self, request, probe, authority)
-                .await
-                .map_err(|error| match error {
-                    RepositoryDispatchError::WriterRuntime(error) => {
-                        StoreRuntimeRegistryFailure::StorageRuntime(Box::new(error))
-                    }
-                    error => StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-                        operation: "dispatch repository submit",
-                        message: error.to_string(),
-                    },
-                })
+            RepositoryRuntimePhysicalAttachment::dispatch_submit(
+                self, cx, request, probe, authority,
+            )
+            .await
+            .map_err(|error| match error {
+                RepositoryDispatchError::WriterRuntime(error) => {
+                    StoreRuntimeRegistryFailure::StorageRuntime(Box::new(error))
+                }
+                error => StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
+                    operation: "dispatch repository submit",
+                    message: error.to_string(),
+                },
+            })
         })
     }
 
     fn dispatch_read(
         &self,
         request: RuntimeReadRequestV1,
-        probe: &dyn RuntimeRequestProbeV1,
-    ) -> Result<RuntimeReadOutcomeV1, StoreRuntimeRegistryFailure> {
-        RepositoryRuntimePhysicalAttachment::dispatch_read(self, request, probe).map_err(|error| {
-            StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
-                operation: "dispatch repository read",
-                message: error.to_string(),
-            }
+        probe: Arc<dyn RuntimeRequestProbeV1>,
+    ) -> StoreRuntimeRegistryFuture<'_, Result<RuntimeReadOutcomeV1, StoreRuntimeRegistryFailure>>
+    {
+        Box::pin(async move {
+            RepositoryRuntimePhysicalAttachment::dispatch_read(self, request, probe)
+                .await
+                .map_err(|error| match error {
+                    RepositoryDispatchError::Reader(ReaderAcquireError::Saturated { .. }) => {
+                        StoreRuntimeRegistryFailure::ReaderSaturated
+                    }
+                    error => StoreRuntimeRegistryFailure::PhysicalRuntimeFailed {
+                        operation: "dispatch repository read",
+                        message: error.to_string(),
+                    },
+                })
         })
     }
 }

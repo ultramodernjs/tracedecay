@@ -3,7 +3,7 @@ use std::{
     time::Instant,
 };
 
-use tokio::sync::oneshot;
+use asupersync::channel::oneshot;
 use tracedecay_store::{
     OperationPriorityV1, RuntimeRequestProbeV1, RuntimeSubmitOutcomeV1, RuntimeSubmitRequestV1,
     StorageRuntimeErrorV1, StoreClientIdV1, StoreOperationIdV1,
@@ -12,11 +12,7 @@ use tracedecay_store::{
 use crate::{
     RuntimeWriteAuthority, RuntimeWriteAuthorityStage, WriterActorError,
     admission::{Permit, QueueItem},
-    checkpoint::{
-        CheckpointBlockers, CheckpointError, CheckpointResult, MaintenanceCheckpointMode,
-        RusqliteCheckpointError,
-    },
-    maintenance::ExclusiveMaintenancePermit,
+    checkpoint::{CheckpointBlockers, CheckpointError, CheckpointResult, RusqliteCheckpointError},
 };
 
 pub(super) type RequestResult = Result<RuntimeSubmitOutcomeV1, StorageRuntimeErrorV1>;
@@ -61,7 +57,7 @@ impl SharedReply {
         if let Some(settled) = &state.settled {
             let result = settled.result.clone();
             drop(state);
-            let _ = follower.send(result);
+            let _ = follower.send_blocking(result);
             return;
         }
         state.followers.push(follower);
@@ -104,10 +100,10 @@ impl SharedReply {
         let followers = std::mem::take(&mut state.followers);
         drop(state);
         for follower in followers {
-            let _ = follower.send(result.clone());
+            let _ = follower.send_blocking(result.clone());
         }
         if let Some(leader) = leader {
-            let _ = leader.send(result);
+            let _ = leader.send_blocking(result);
         }
     }
 }
@@ -192,19 +188,9 @@ pub(super) type CheckpointRequestResult =
 
 pub(super) struct CheckpointCommand {
     pub(super) snapshot_blockers: CheckpointBlockers,
-    pub(super) kind: CheckpointCommandKind,
+    probe: Arc<dyn RuntimeRequestProbeV1>,
     authority: Arc<dyn RuntimeWriteAuthority>,
     reply: oneshot::Sender<CheckpointRequestResult>,
-}
-
-pub(super) enum CheckpointCommandKind {
-    Passive {
-        probe: Arc<dyn RuntimeRequestProbeV1>,
-    },
-    Maintenance {
-        mode: MaintenanceCheckpointMode,
-        permit: Box<ExclusiveMaintenancePermit>,
-    },
 }
 
 impl CheckpointCommand {
@@ -216,25 +202,7 @@ impl CheckpointCommand {
     ) -> Self {
         Self {
             snapshot_blockers,
-            kind: CheckpointCommandKind::Passive { probe },
-            authority,
-            reply,
-        }
-    }
-
-    pub(super) fn new_maintenance(
-        snapshot_blockers: CheckpointBlockers,
-        mode: MaintenanceCheckpointMode,
-        permit: ExclusiveMaintenancePermit,
-        authority: Arc<dyn RuntimeWriteAuthority>,
-        reply: oneshot::Sender<CheckpointRequestResult>,
-    ) -> Self {
-        Self {
-            snapshot_blockers,
-            kind: CheckpointCommandKind::Maintenance {
-                mode,
-                permit: Box::new(permit),
-            },
+            probe,
             authority,
             reply,
         }
@@ -250,20 +218,20 @@ impl CheckpointCommand {
     }
 
     pub(super) fn settle(self, result: CheckpointRequestResult) {
-        let _ = self.reply.send(result);
+        let _ = self.reply.send_blocking(result);
     }
 
     pub(super) fn into_parts(
         self,
     ) -> (
         CheckpointBlockers,
-        CheckpointCommandKind,
+        Arc<dyn RuntimeRequestProbeV1>,
         Arc<dyn RuntimeWriteAuthority>,
         CheckpointReply,
     ) {
         (
             self.snapshot_blockers,
-            self.kind,
+            self.probe,
             self.authority,
             CheckpointReply(self.reply),
         )
@@ -274,7 +242,7 @@ pub(super) struct CheckpointReply(oneshot::Sender<CheckpointRequestResult>);
 
 impl CheckpointReply {
     pub(super) fn settle(self, result: CheckpointRequestResult) {
-        let _ = self.0.send(result);
+        let _ = self.0.send_blocking(result);
     }
 }
 
@@ -298,6 +266,6 @@ impl IncrementalVacuumCommand {
     }
 
     pub(super) fn settle(self, result: Result<(), WriterActorError>) {
-        let _ = self.reply.send(result);
+        let _ = self.reply.send_blocking(result);
     }
 }

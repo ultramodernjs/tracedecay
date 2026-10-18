@@ -17,14 +17,16 @@
 //! dispositions and derivatives. The profile/configuration family
 //! ([`RepositoryWritePayloadV1::Configuration`] and every
 //! [`RepositoryReadOperationV1::Profile`] operation) is wired and tested here,
-//! but its live writer is still
+//! and writes the same receipt and desired-state SQL as
 //! `crates/tracedecay-global-db/src/configuration/store.rs`.
 //!
-//! `Code` operations cross the graph-db boundary, while `Effects` operations
-//! are owned by the writer ledger; both dispatch arms here reject them.
+//! Git-index operations need a domain this attachment does not own, so that
+//! arm rejects them.
 
 mod attachment;
 mod configuration;
+mod configuration_projection;
+mod configuration_receipt;
 mod diagnostics;
 mod external_source;
 mod fact;
@@ -49,10 +51,23 @@ pub use attachment::{
     RepositoryWriterRuntimeSnapshot,
 };
 pub use configuration::ConfigurationExecutor;
+pub use configuration_projection::configuration_projection_statements;
+pub use configuration_receipt::{
+    ADVANCE_COMPONENT_DESIRED_STATE_SQL, CONFIGURATION_ACTIVATION_DESIRED_RECORDED,
+    CONFIGURATION_PLAN_PAYLOAD_SCHEMA_VERSION, INSERT_CONFIGURATION_MUTATION_RECEIPT_SQL,
+    LATEST_COMPONENT_ACTIVATION_STATES_SQL, STORED_CHANGE_PLAN_SQL, StoredChangePlanColumns,
+    StoredComponentActivationState, StoredConfigurationPlanPayload,
+    StoredConfigurationProtectedOperationV1, advance_component_desired_state,
+    configuration_entry_layer, decode_stored_change_plan_row, decode_stored_change_plan_rows,
+    insert_mutation_receipt, validate_activation_error_code, validate_component_name,
+};
 pub use diagnostics::DiagnosticExecutor;
 pub use external_source::{EXTERNAL_SOURCE_SCHEMA_V1, ExternalSourceExecutor};
 pub use fact::FactExecutor;
-pub use graph_publication::{GRAPH_PUBLICATION_SCHEMA_V1, GraphPublicationExactSqlStorage};
+pub use graph_publication::{
+    GRAPH_PUBLICATION_SCHEMA_V1, GraphPublicationExactSqlStorage, GraphPublicationSchemaObjectV1,
+    canonical_graph_publication_schema_inventory,
+};
 pub use observation::cursor_authority as observation_cursor_authority;
 pub use observation::{
     ObservationExecutor, REPOSITORY_PROVENANCE_CAPTURE_JOIN, REPOSITORY_PROVENANCE_HYDRATED_COLUMNS,
@@ -67,10 +82,10 @@ pub use scope_set::{
 
 pub use tracedecay_store::{
     CodeReadOperationV1, CodeReadResultV1, DiagnosticReadOperationV1, DiagnosticReadResultV1,
-    EffectsReadOperationV1, EffectsReadResultV1, ExternalSourceReadOperationV1,
-    ExternalSourceReadResultV1, FactReadOperationV1, FactReadResultV1, ObservationReadOperationV1,
-    ObservationReadResultV1, ProfileReadOperationV1, ProfileReadResultV1, ProjectReadOperationV1,
-    ProjectReadResultV1, RepositoryReadOperationV1, RepositoryReadResultV1, StoredObservationRowV1,
+    ExternalSourceReadOperationV1, ExternalSourceReadResultV1, FactReadOperationV1,
+    FactReadResultV1, ObservationReadOperationV1, ObservationReadResultV1, ProfileReadOperationV1,
+    ProfileReadResultV1, ProjectReadOperationV1, ProjectReadResultV1, RepositoryReadOperationV1,
+    RepositoryReadResultV1, StoredObservationRowV1,
 };
 
 #[derive(Default)]
@@ -150,10 +165,7 @@ impl StorageOperationExecutor for ConcreteRepositoryWriteExecutor {
                 self.project
                     .execute_retrieval_anchor_derivative_write(savepoint, derivative)?;
             }
-            RepositoryWritePayloadV1::GitIndexTransaction(_)
-            | RepositoryWritePayloadV1::EnqueueOutbox(_)
-            | RepositoryWritePayloadV1::ApplyInbox(_)
-            | RepositoryWritePayloadV1::AcknowledgeOutbox(_) => {
+            RepositoryWritePayloadV1::GitIndexTransaction(_) => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "repository attachment does not own {}",
                     payload.name()
@@ -193,9 +205,6 @@ impl ConcreteRepositoryReadExecutor {
                 .map(RepositoryReadResultV1::ExternalSource),
             RepositoryReadOperationV1::Code(_) => Err(rusqlite::Error::InvalidParameterName(
                 "repository attachment does not own code reads".to_owned(),
-            )),
-            RepositoryReadOperationV1::Effects(_) => Err(rusqlite::Error::InvalidParameterName(
-                "repository attachment does not own effects reads".to_owned(),
             )),
         }
     }

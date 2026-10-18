@@ -19,10 +19,7 @@ use tracedecay_sessions::runtime::hosts::claude::{ClaudeSource, identify_claude_
 use tracedecay_sessions::runtime::hosts::claude_observation::{
     ClaudeObservationIngestError, ingest_source_with_observations_with_admission,
 };
-use tracedecay_sessions::runtime::hosts::cursor::{
-    ingest_cursor_transcript_event as ingest_cursor_transcript_event_registered,
-    try_ingest_cursor_transcript_event as try_ingest_cursor_transcript_event_registered,
-};
+use tracedecay_sessions::runtime::hosts::cursor::try_ingest_cursor_transcript_event_capped_with_admission;
 use tracedecay_sessions::runtime::ingest::test_support::{
     IngestPassOutcome, default_ingest_pass_bounds,
     ingest_user_global_sources_for_provider_with_roots_bounded,
@@ -224,9 +221,8 @@ pub(super) async fn ingest_user_provider(
     let database = runtime
         .registered_database(HostAdmissionScope::Profile)
         .expect("fixture mounts its profile session store");
-    let authority = GlobalDbSessionIngestAuthority::new(database)
-        .with_background_cpu(runtime.background_cpu())
-        .with_session_review(tracedecay::session_review_port());
+    let authority =
+        GlobalDbSessionIngestAuthority::new(database).with_background_cpu(runtime.background_cpu());
     let shard = &database.binding().shard_id;
     let outcome = with_transcript_source_profile(
         ProfileRoot::new(runtime.profile_root_for_test()).with_home(home),
@@ -274,7 +270,11 @@ pub(super) async fn claude_observation_cursor(
     runtime: &ProjectSessionTestRuntime,
     transcript: &Path,
 ) -> Option<u64> {
-    let identity = identify_claude_source(transcript).unwrap();
+    let projects_dir = transcript
+        .ancestors()
+        .find(|ancestor| ancestor.ends_with(".claude/projects"))
+        .expect("transcript under .claude/projects");
+    let identity = identify_claude_source(projects_dir, transcript).unwrap();
     let source = ObservationSourceIdentityV1::for_source(
         SessionId::new(identity.session_id).unwrap(),
         SessionId::new(identity.source_id).unwrap(),
@@ -294,8 +294,9 @@ async fn ingest_cursor_transcript_event(
     runtime: &ProjectSessionTestRuntime,
     project_id: ProjectId,
 ) -> tracedecay_sessions::runtime::hosts::cursor::CursorTranscriptIngestStats {
-    ingest_cursor_transcript_event_registered(event_json, &runtime.runtime.facade(), project_id)
+    try_ingest_cursor_transcript_event(event_json, runtime, project_id)
         .await
+        .expect("cursor transcript ingest")
 }
 
 async fn try_ingest_cursor_transcript_event(
@@ -305,8 +306,13 @@ async fn try_ingest_cursor_transcript_event(
 ) -> tracedecay_sessions::runtime::source::TranscriptIngestResult<
     tracedecay_sessions::runtime::hosts::cursor::CursorTranscriptIngestStats,
 > {
-    try_ingest_cursor_transcript_event_registered(event_json, &runtime.runtime.facade(), project_id)
-        .await
+    try_ingest_cursor_transcript_event_capped_with_admission(
+        event_json,
+        project_id,
+        &runtime.runtime.facade(),
+        None,
+    )
+    .await
 }
 
 /// Runs the production provider sweep with `home` as the transcript source
@@ -488,10 +494,9 @@ fn assert_no_transcript_adjacent_fallback_writer(
     assert!(
         !transcript
             .parent()
-            .map(|parent| parent.join("sessions.db").exists()
+            .is_some_and(|parent| parent.join("sessions.db").exists()
                 || parent.join("tracedecay.db").exists()
-                || parent.join(".tracedecay").exists())
-            .unwrap_or(false),
+                || parent.join(".tracedecay").exists()),
         "provider ingest must not create a transcript-adjacent fallback writer"
     );
     assert_ne!(

@@ -131,6 +131,7 @@ import type {
   CodeIndexOmittedSourcesV1,
   CodeIndexOmittedSourceV1,
   CodeIndexRestoreProgressV1,
+  CodeIndexRouteRefusalV1,
   CodeIndexSourceOmissionReasonV1,
   CodeIndexStalenessStateV1,
   CodeIndexWorkerLimitingReasonV1,
@@ -145,6 +146,8 @@ import type {
   ConfigurationRevisionId,
   ConfigurationSnapshotId,
   ContentDigest,
+  ContextScoutIntentKindV1,
+  ContextScoutIntentSettingsV1,
   CostsReadModelV1,
   CoverageCompleteness,
   CoverageDomainState,
@@ -171,6 +174,7 @@ import type {
   DashboardWatermarkV1,
   DecideWorkProposalRequestV1,
   DecideWorkRelationReplanRequestV1,
+  DecisionEngineSettingsV1,
   DeliveryAgentUsageRowV1,
   DeliveryAgentUsageV1,
   DeliveryAttentionEvidenceV1,
@@ -371,6 +375,8 @@ import type {
   HandoffOpenTargetV1,
   HistoryRewritePolicyV1,
   IncomingCallEdgeV1,
+  IntentQuestionSettingsV1,
+  IntentWindowSettingsV1,
   JobDelivery,
   LatencyDistributionReadModelV1,
   LcmCompressionSummaryV1,
@@ -2258,23 +2264,11 @@ export const CapabilityIdSchema: z.ZodType<string, unknown> = z.string();
 /** Strongly typed canonical identity: `CatalogGenerationId`. */
 export const CatalogGenerationIdSchema: z.ZodType<string, unknown> = z.string();
 
-/** Fixed per-request clone candidate and verification budgets. */
+/** Fixed automatic clone-discovery limits. */
 export const CodeCloneIndexBudgetsV1Schema: z.ZodObject<{
-  candidate_bodies: z.ZodType<number, unknown>;
-  hot_posting_rows: z.ZodType<number, unknown>;
   minimum_body_tokens: z.ZodType<number, unknown>;
-  minimum_directional_coverage_millionths: z.ZodType<number, unknown>;
-  posting_rows: z.ZodType<number, unknown>;
-  verification_bodies: z.ZodType<number, unknown>;
-  verification_token_work: z.ZodType<number, unknown>;
 }> = z.object({
-  candidate_bodies: z.number().int().min(0),
-  hot_posting_rows: z.number().int().min(0),
   minimum_body_tokens: z.number().int().min(0),
-  minimum_directional_coverage_millionths: z.number().int().min(0),
-  posting_rows: z.number().int().min(0),
-  verification_bodies: z.number().int().min(0),
-  verification_token_work: z.number().int().min(0),
 });
 
 /** Coverage retained by one clone-index artifact or in-progress successor.
@@ -2289,10 +2283,6 @@ export const CodeCloneIndexCoverageV1Schema: z.ZodObject<{
   excluded_incomplete_tokenization_bodies: z.ZodType<number | null, unknown>;
   excluded_too_large_bodies: z.ZodType<number | null, unknown>;
   excluded_too_small_bodies: z.ZodType<number | null, unknown>;
-  hot_posting_rows_skipped: z.ZodType<number | null, unknown>;
-  hot_postings_skipped: z.ZodType<number | null, unknown>;
-  near_fingerprint_bodies: z.ZodType<number | null, unknown>;
-  near_fingerprint_postings: z.ZodType<number | null, unknown>;
   payloads_reused: z.ZodType<number | null, unknown>;
   rename_normalized_bodies: z.ZodType<number | null, unknown>;
   rename_partial_bodies: z.ZodType<number | null, unknown>;
@@ -2306,10 +2296,6 @@ export const CodeCloneIndexCoverageV1Schema: z.ZodObject<{
   excluded_incomplete_tokenization_bodies: z.number().int().min(0).nullable(),
   excluded_too_large_bodies: z.number().int().min(0).nullable(),
   excluded_too_small_bodies: z.number().int().min(0).nullable(),
-  hot_posting_rows_skipped: z.number().int().min(0).nullable(),
-  hot_postings_skipped: z.number().int().min(0).nullable(),
-  near_fingerprint_bodies: z.number().int().min(0).nullable(),
-  near_fingerprint_postings: z.number().int().min(0).nullable(),
   payloads_reused: z.number().int().min(0).nullable(),
   rename_normalized_bodies: z.number().int().min(0).nullable(),
   rename_partial_bodies: z.number().int().min(0).nullable(),
@@ -2488,10 +2474,12 @@ export const CodeIndexFreshnessCoverageV1Schema: z.ZodType<"complete" | "partial
 export const CodeIndexFreshnessPayloadV1Schema: z.ZodObject<{
   mount_failure: z.ZodOptional<z.ZodType<CodeIndexMountFailureV1 | null, unknown>>;
   note: z.ZodType<string, unknown>;
+  refusal: z.ZodOptional<z.ZodType<CodeIndexRouteRefusalV1 | null, unknown>>;
   worktrees: z.ZodType<Array<CodeIndexWorktreeFreshnessV1>, unknown>;
 }> = z.object({
   mount_failure: z.union([z.lazy(() => CodeIndexMountFailureV1Schema), z.null()]).optional(),
   note: z.string(),
+  refusal: z.union([z.lazy(() => CodeIndexRouteRefusalV1Schema), z.null()]).optional(),
   worktrees: z.array(z.lazy(() => CodeIndexWorktreeFreshnessV1Schema)),
 });
 
@@ -2557,6 +2545,16 @@ export const CodeIndexRestoreProgressV1Schema: z.ZodObject<{
   authenticated_remaining: z.number().int().min(0),
   authenticated_total: z.number().int().min(0),
   generation_id: z.string(),
+});
+
+/** A policy that keeps the route from being indexed, with the operator step
+that lifts it. */
+export const CodeIndexRouteRefusalV1Schema: z.ZodObject<{
+  reason: z.ZodType<string, unknown>;
+  remediation: z.ZodType<string, unknown>;
+}> = z.object({
+  reason: z.string(),
+  remediation: z.string(),
 });
 
 export const CodeIndexSourceOmissionReasonV1Schema: z.ZodType<CodeIndexSourceOmissionReasonV1, unknown> = z.discriminatedUnion("kind", [z.object({
@@ -2687,6 +2685,32 @@ export const ConfigurationSnapshotIdSchema: z.ZodType<string, unknown> = z.strin
 
 /** Strongly typed algorithm-tagged integrity digest: `ContentDigest`. */
 export const ContentDigestSchema: z.ZodType<string, unknown> = z.string();
+
+/** One user intent the Scout can recognize. The serialized keys are the
+historical hook hint category keys, so persisted hint analytics, hint
+settlement, and evals keep one vocabulary. */
+export const ContextScoutIntentKindV1Schema: z.ZodEnum<{ "atomic_edit": "atomic_edit"; "broad_read": "broad_read"; "build_diagnostics": "build_diagnostics"; "call_graph": "call_graph"; "edit_redundancy": "edit_redundancy"; "explore_subagent": "explore_subagent"; "file_lookup": "file_lookup"; "file_read": "file_read"; "impact": "impact"; "memory_store": "memory_store"; "project_context": "project_context"; "review_changes": "review_changes"; "search": "search"; "semantic_search": "semantic_search"; "session_recall": "session_recall"; "subagent_start_context": "subagent_start_context"; "symbol_lookup": "symbol_lookup"; "tool_descriptor_read": "tool_descriptor_read"; "type_orientation": "type_orientation"; "unexpected_changes": "unexpected_changes" }> = z.enum(["atomic_edit", "broad_read", "build_diagnostics", "call_graph", "edit_redundancy", "explore_subagent", "file_lookup", "file_read", "impact", "memory_store", "project_context", "review_changes", "search", "semantic_search", "session_recall", "subagent_start_context", "symbol_lookup", "tool_descriptor_read", "type_orientation", "unexpected_changes"]);
+
+/** Operator configuration for the Context Scout intent pass. */
+export const ContextScoutIntentSettingsV1Schema: z.ZodObject<{
+  action_fact_score_permille: z.ZodType<number, unknown>;
+  enabled: z.ZodType<boolean, unknown>;
+  engine: z.ZodType<DecisionEngineSettingsV1, unknown>;
+  min_delivery_gap_secs: z.ZodType<number, unknown>;
+  prompt_lookup_deadline_ms: z.ZodType<number, unknown>;
+  questions: z.ZodType<Array<IntentQuestionSettingsV1>, unknown>;
+  ttl_secs: z.ZodType<number, unknown>;
+  window: z.ZodType<IntentWindowSettingsV1, unknown>;
+}, z.core.$strict> = z.object({
+  action_fact_score_permille: z.number().refine(Number.isInteger).min(0).max(65535),
+  enabled: z.boolean(),
+  engine: z.lazy(() => DecisionEngineSettingsV1Schema),
+  min_delivery_gap_secs: z.number().refine(Number.isInteger).min(0),
+  prompt_lookup_deadline_ms: z.number().refine(Number.isInteger).min(0),
+  questions: z.array(z.lazy(() => IntentQuestionSettingsV1Schema)),
+  ttl_secs: z.number().refine(Number.isInteger).min(0),
+  window: z.lazy(() => IntentWindowSettingsV1Schema),
+}).strict();
 
 export const CostsReadModelV1Schema: z.ZodObject<{
   authorized_scope_ref: z.ZodType<string, unknown>;
@@ -2966,6 +2990,22 @@ export const DecideWorkRelationReplanRequestV1Schema: z.ZodObject<{
   mutation: z.lazy(() => WorkProductMutationIdentityV1Schema),
   proposal: z.lazy(() => WorkRelationReplanProposalV1Schema),
   selection: z.lazy(() => WorkProductSelectionScopeV1Schema),
+}).strict();
+
+/** The decision engine the intent pass asks. There is no default endpoint or
+model; both come only from explicit operator configuration. */
+export const DecisionEngineSettingsV1Schema: z.ZodObject<{
+  base_url: z.ZodType<string, unknown>;
+  max_concurrent: z.ZodType<number, unknown>;
+  max_state_bytes: z.ZodType<number, unknown>;
+  model: z.ZodType<string | null, unknown>;
+  timeout_ms: z.ZodType<number, unknown>;
+}, z.core.$strict> = z.object({
+  base_url: z.string(),
+  max_concurrent: z.number().refine(Number.isInteger).min(0).max(255),
+  max_state_bytes: z.number().refine(Number.isInteger).min(0),
+  model: z.string().nullable(),
+  timeout_ms: z.number().refine(Number.isInteger).min(0),
 }).strict();
 
 export const DeliveryAgentUsageRowV1Schema: z.ZodObject<{
@@ -4065,7 +4105,7 @@ The storage family never reports a silent overage: each subclass names one
 observable retention/size condition Doctor surfaces over canonical size
 observability read models. The set is closed and grows only through a future
 versioned enum, never by widening an existing subclass. */
-export const DoctorStorageFindingKindV1Schema: z.ZodUnion<[z.ZodLiteral<"over_budget_store">, z.ZodLiteral<"orphan_store">, z.ZodLiteral<"incident_debris_present">, z.ZodLiteral<"retention_backlog">, z.ZodLiteral<"table_growth">, z.ZodLiteral<"pending_schema_migration">]> = z.union([z.literal("over_budget_store"), z.literal("orphan_store"), z.literal("incident_debris_present"), z.literal("retention_backlog"), z.literal("table_growth"), z.literal("pending_schema_migration")]);
+export const DoctorStorageFindingKindV1Schema: z.ZodUnion<[z.ZodLiteral<"over_budget_store">, z.ZodLiteral<"orphan_store">, z.ZodLiteral<"incident_debris_present">, z.ZodLiteral<"retention_backlog">, z.ZodLiteral<"table_growth">, z.ZodLiteral<"pending_schema_migration">, z.ZodLiteral<"wal_checkpoint_pinned">]> = z.union([z.literal("over_budget_store"), z.literal("orphan_store"), z.literal("incident_debris_present"), z.literal("retention_backlog"), z.literal("table_growth"), z.literal("pending_schema_migration"), z.literal("wal_checkpoint_pinned")]);
 
 export const DuplicateEffectOutcomeV1Schema: z.ZodEnum<{ "committed": "committed"; "not_applicable": "not_applicable"; "prevented": "prevented"; "unknown": "unknown" }> = z.enum(["committed", "not_applicable", "prevented", "unknown"]);
 
@@ -5311,6 +5351,37 @@ export const IncomingCallEdgeV1Schema: z.ZodObject<{
   source: z.string(),
   target: z.string(),
 });
+
+/** One yes/no question asked of the decision engine for one intent. The
+intent is a candidate when the engine's probability reaches
+`threshold_permille` and, when set, exceeds the runner-up by
+`margin_permille`. */
+export const IntentQuestionSettingsV1Schema: z.ZodObject<{
+  instructions: z.ZodType<string, unknown>;
+  intent: z.ZodType<ContextScoutIntentKindV1, unknown>;
+  margin_permille: z.ZodType<number | null, unknown>;
+  threshold_permille: z.ZodType<number, unknown>;
+}, z.core.$strict> = z.object({
+  instructions: z.string(),
+  intent: z.lazy(() => ContextScoutIntentKindV1Schema),
+  margin_permille: z.number().refine(Number.isInteger).min(0).max(65535).nullable(),
+  threshold_permille: z.number().refine(Number.isInteger).min(0).max(65535),
+}).strict();
+
+/** Bounds on the recent-session window one intent pass reads. */
+export const IntentWindowSettingsV1Schema: z.ZodObject<{
+  freshen_budget_ms: z.ZodType<number, unknown>;
+  max_age_secs: z.ZodType<number, unknown>;
+  max_bytes: z.ZodType<number, unknown>;
+  max_messages: z.ZodType<number, unknown>;
+  max_user_turns: z.ZodType<number, unknown>;
+}, z.core.$strict> = z.object({
+  freshen_budget_ms: z.number().refine(Number.isInteger).min(0),
+  max_age_secs: z.number().refine(Number.isInteger).min(0),
+  max_bytes: z.number().refine(Number.isInteger).min(0),
+  max_messages: z.number().refine(Number.isInteger).min(0).max(255),
+  max_user_turns: z.number().refine(Number.isInteger).min(0).max(255),
+}).strict();
 
 export const JobDeliverySchema: z.ZodType<JobDelivery, unknown> = z.discriminatedUnion("mode", [z.object({
   mode: z.literal("file"),
@@ -7496,6 +7567,7 @@ export const ProjectRepoGroupSchema: z.ZodObject<{
 /** Project-scoped settings patch accepted by `PATCH /api/settings/project`. */
 export const ProjectSettingsPatchSchema: z.ZodObject<{
   context_scout: z.ZodOptional<z.ZodType<boolean | null, unknown>>;
+  context_scout_intent: z.ZodOptional<z.ZodType<ContextScoutIntentSettingsV1 | null, unknown>>;
   exclude: z.ZodOptional<z.ZodType<Array<string> | null, unknown>>;
   expected_revision_id: z.ZodType<string, unknown>;
   extract_docstrings: z.ZodOptional<z.ZodType<boolean | null, unknown>>;
@@ -7507,6 +7579,7 @@ export const ProjectSettingsPatchSchema: z.ZodObject<{
   track_call_sites: z.ZodOptional<z.ZodType<boolean | null, unknown>>;
 }, z.core.$strict> = z.object({
   context_scout: z.boolean().nullable().optional(),
+  context_scout_intent: z.union([z.lazy(() => ContextScoutIntentSettingsV1Schema), z.null()]).optional(),
   exclude: z.array(z.string()).nullable().optional(),
   expected_revision_id: z.string(),
   extract_docstrings: z.boolean().nullable().optional(),
@@ -8810,7 +8883,12 @@ export const SkillOutcomeRecordSchema: z.ZodObject<{
   views_since_activation: z.number().int().min(0),
 });
 
-export const SkillOutcomeVerdictSchema: z.ZodEnum<{ "adopted": "adopted"; "ignored": "ignored"; "too_early": "too_early" }> = z.enum(["adopted", "ignored", "too_early"]);
+/** `adopted` means a use was recorded after activation. It is an adoption
+proxy, not evidence that the skill improved any task. `unknown` means no use was
+recorded and neither task opportunity nor reliable host use telemetry
+exists, so it is never a failure. Snapshots written before that
+distinction stored `unknown` as `ignored`. */
+export const SkillOutcomeVerdictSchema: z.ZodEnum<{ "adopted": "adopted"; "too_early": "too_early"; "unknown": "unknown" }> = z.enum(["adopted", "too_early", "unknown"]);
 
 /** Byte range inside one sanitized source file. Mutable line numbers are
 never part of identity. */

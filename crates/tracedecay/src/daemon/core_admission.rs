@@ -5,21 +5,22 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracedecay_runtime_core::path_safety::{canonical_existing_identity, same_canonical_path};
 
 use serde::{Deserialize, Serialize};
-use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use super::{
     AuthenticatedFirstRequest, BrokerStream, BrokerStreamTransport, DaemonAuthPreface,
     DaemonHandshake, JsonRpcResponse, McpMethod, Result, StoreAdministration, TraceDecayError,
     binary_version, classify_mcp_method, parse_daemon_invocation_request,
-    read_line_handling_wire_oversized, write_json_rpc_response,
+    read_line_handling_wire_oversized, write_daemon_response,
 };
 use tracedecay_contracts::ApplicationProblem;
 use tracedecay_daemon_protocol::DAEMON_SHUTDOWN_METHOD;
 use tracedecay_mcp::ErrorCode;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_runtime_core::weak_registry::WeakRegistry;
 
 pub(crate) const MAX_CONCURRENT_DAEMON_CLIENTS: usize = 64;
@@ -67,13 +68,30 @@ impl DaemonClientDeadline {
     where
         F: std::future::Future<Output = Result<T>>,
     {
-        match timeout_at(self.deadline, fut).await {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        match asupersync::time::timeout(asupersync::time::wall_now(), remaining, fut).await {
             Ok(result) => result,
             Err(_) => Err(tracedecay_daemon_protocol::daemon_response_stalled_during(
                 stage,
                 request_label,
                 self.started.elapsed(),
             )),
+        }
+    }
+
+    /// Run one client stage under `deadline` when the caller carries one.
+    pub(crate) async fn run_optional<F, T>(
+        deadline: Option<Self>,
+        stage: &'static str,
+        request_label: &str,
+        fut: F,
+    ) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        match deadline {
+            Some(deadline) => deadline.run(stage, request_label, fut).await,
+            None => fut.await,
         }
     }
 }
@@ -197,32 +215,6 @@ where
     F: std::future::Future,
 {
     tracedecay_code_index_runtime::park_admission(future).await
-}
-
-/// Capture the calling connection's admission lease, if it has one.
-///
-/// Needed because `rmcp` serves each connection from a task it spawns itself.
-/// A task-local does not cross that spawn, so the adapter captures the lease
-/// while it is still constructed on the connection task and re-enters the scope
-/// per request with [`in_connection_admission`]. Without that, every MCP
-/// `tools/call`, the daemon's main serving path, would park on a generation
-/// decode while still holding its admission slot.
-pub(crate) fn current_connection_admission() -> Option<Arc<ParkableConnectionAdmission>> {
-    CONNECTION_ADMISSION.try_with(Arc::clone).ok()
-}
-
-/// Re-enter a captured connection's admission scope on another task.
-pub(crate) async fn in_connection_admission<F>(
-    lease: Option<Arc<ParkableConnectionAdmission>>,
-    future: F,
-) -> F::Output
-where
-    F: std::future::Future,
-{
-    match lease {
-        Some(lease) => with_dual_connection_admission_scope(lease, future).await,
-        None => future.await,
-    }
 }
 
 /// Serve one accepted connection under its admission permit.
@@ -583,7 +575,7 @@ pub(crate) async fn reject_admitted_request(
                 .and_then(|request| request.id.clone())
                 .unwrap_or(serde_json::Value::Null);
             let response = saturation.into_json_rpc_with_id(request_id);
-            write_json_rpc_response(transport, &response).await?;
+            write_daemon_response(transport, &response).await?;
         }
     }
     log_daemon_event("daemon_client", &[("outcome", outcome.to_string())]);
@@ -647,11 +639,10 @@ pub(crate) async fn reject_saturated_daemon_client(
                 .ok()
                 .and_then(|request| request.get("id").cloned())
                 .unwrap_or(serde_json::Value::Null);
-            write_json_rpc_response(&mut transport, &response.into_json_rpc_with_id(request_id))
-                .await
+            write_daemon_response(&mut transport, &response.into_json_rpc_with_id(request_id)).await
         }
     };
-    match timeout(DAEMON_SATURATION_RESPONSE_DEADLINE, response).await {
+    match native_runtime::timeout(DAEMON_SATURATION_RESPONSE_DEADLINE, response).await {
         Ok(Ok(())) => log_daemon_event(
             "daemon_client",
             &[("outcome", "client_capacity_reached".to_string())],
@@ -663,9 +654,12 @@ pub(crate) async fn reject_saturated_daemon_client(
                 ("error", error.to_string()),
             ],
         ),
-        Err(_) => log_daemon_event(
+        Err(error) => log_daemon_event(
             "daemon_client",
-            &[("outcome", "saturation_response_timeout".to_string())],
+            &[
+                ("outcome", "saturation_response_timeout".to_string()),
+                ("error", error.to_string()),
+            ],
         ),
     }
 }

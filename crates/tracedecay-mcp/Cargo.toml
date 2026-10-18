@@ -19,20 +19,20 @@ test-transport = []
 test-helpers = ["tracedecay-project/test-helpers"]
 
 [dependencies]
+asupersync.workspace = true
 futures-util = "0.3.33"
 shell-words = "1.1"
 gix.workspace = true
 glob = "0.3"
 hex = "0.4"
 libc = "0.2"
-rmcp = { version = "3.0.1", default-features = false, features = ["server"] }
+rmcp = { version = "3.5.1", default-features = false, features = ["server"] }
 # The multi-root execute tool derives its input schema from the contracts DTO.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "io-util", "io-std", "signal", "sync", "time"] }
-tokio-util = { version = "0.7.19", default-features = false }
+tokio = { version = "1", features = ["macros", "sync"] }
 toml = "1"
 tracedecay-agent-hosts = { path = "../tracedecay-agent-hosts" }
 tracedecay-api = { path = "../tracedecay-api" }
@@ -69,11 +69,11 @@ tracedecay-store-runtime = { path = "../tracedecay-store-runtime" }
 tracedecay-temporal-query = { path = "../tracedecay-temporal-query" }
 tracedecay-tool-catalog = { path = "../tracedecay-tool-catalog" }
 tracing = "0.1"
-tree-sitter = "0.26"
+tree-sitter = "0.27"
 url = "2"
 
 [dev-dependencies]
-rmcp = { version = "3.0.1", default-features = false, features = ["client", "server", "transport-async-rw"] }
+rmcp = { version = "3.5.1", default-features = false, features = ["client", "server", "transport-async-rw"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracedecay-code-index-runtime = { path = "../tracedecay-code-index-runtime", features = ["test-helpers"] }
@@ -82,7 +82,6 @@ tracedecay-daemon-protocol = { path = "../tracedecay-daemon-protocol", features 
 # The dashboard LCM adapter's unit tests build request controls through the
 # dashboard-api test-transport constructor.
 tracedecay-dashboard-api = { path = "../tracedecay-dashboard-api", features = ["test-transport"] }
-tracedecay-framing = { path = "../tracedecay-framing", features = ["test-helpers"] }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", features = ["test-helpers"] }
 tracedecay-global-db = { path = "../tracedecay-global-db", features = ["test-helpers"] }
 tracedecay-graph-db = { path = "../tracedecay-graph-db" }

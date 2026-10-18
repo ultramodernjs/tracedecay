@@ -119,28 +119,10 @@ impl HostAdmissionTestRuntimeV1 {
 
     /// Bind the registered workflow/handoff authority for the mounted project.
     #[doc(hidden)]
-    pub fn project_workflow_storage_for_test(
+    pub async fn project_workflow_storage_for_test(
         &self,
     ) -> Result<tracedecay_rusqlite_runtime::workflow::WorkflowSqliteAuthority> {
-        self.project_database_for_test()?.workflow_storage()
-    }
-
-    #[doc(hidden)]
-    pub async fn project_git_sessions_for_test(
-        &self,
-        query: &tracedecay_sessions::runtime::git_correlation::SessionsForQuery,
-    ) -> Result<Vec<tracedecay_sessions::runtime::git_correlation::SessionGitCorrelationHit>> {
-        tracedecay_global_db::GlobalDbGitCorrelationStore::new(self.project_database_for_test()?)
-            .sessions_for_with_relation_and_presence(
-                query,
-                tracedecay_sessions::runtime::git_correlation::CommitRelationFilter::Produced,
-            )
-            .await
-            .map(|(hits, _)| hits)
-            .map_err(|error| TraceDecayError::Database {
-                operation: "query registered project git sessions".to_owned(),
-                message: error.to_string(),
-            })
+        self.project_database_for_test()?.workflow_storage().await
     }
 
     #[doc(hidden)]
@@ -166,7 +148,7 @@ impl HostAdmissionTestRuntimeV1 {
     #[doc(hidden)]
     pub async fn converge_git_evidence_for_test(
         &self,
-        git: &dyn tracedecay_sessions::runtime::git_correlation::GitReflogSource,
+        git: std::sync::Arc<dyn tracedecay_sessions::runtime::git_correlation::GitReflogSource>,
         project_root: Option<&Path>,
     ) -> std::result::Result<
         tracedecay_sessions::runtime::git_correlation::GitEvidencePassOutcome,
@@ -297,7 +279,7 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
-    pub fn external_source_receipt_for_test(
+    pub async fn external_source_receipt_for_test(
         &self,
         scope: HostAdmissionScope,
         observation: &tracedecay_store::ObservationCommitReceipt,
@@ -325,9 +307,12 @@ impl HostAdmissionTestRuntimeV1 {
                 idempotency_key,
             },
         )?;
-        let probe = ExternalSourceRuntimeReadProbe::from_control(request.control());
+        let probe = std::sync::Arc::new(ExternalSourceRuntimeReadProbe::from_control(
+            request.control(),
+        ));
         let outcome = runtime
-            .dispatch_read(request, &probe)
+            .dispatch_read(request, probe)
+            .await
             .map_err(|_| external_source_read_failed("runtime read dispatch failed"))?;
         if !matches!(
             outcome.coverage(),

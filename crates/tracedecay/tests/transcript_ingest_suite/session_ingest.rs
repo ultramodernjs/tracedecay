@@ -10,14 +10,11 @@ use tracedecay_sessions::observation::ObservationCancellation;
 use tracedecay_sessions::runtime::ingest::test_support::{
     IngestPassBounds, PROJECT_INGEST_PROVIDER_FRONTIER_KEY, USER_INGEST_PROVIDER_FRONTIER_KEY,
     ingest_project_sources_for_provider_bounded,
-    ingest_project_sources_for_provider_without_registered_authority,
     ingest_user_global_sources_for_provider_with_roots_bounded,
-    ingest_user_global_sources_for_provider_with_roots_without_registered_authority,
-    ingest_user_global_sources_for_startup_with_db_without_registered_authority,
 };
 use tracedecay_sessions::runtime::ingest::{
     IngestPassCoverage, ingest_project_sources_for_provider,
-    ingest_user_global_sources_for_startup_with_db, registered_project_roots_from,
+    ingest_user_global_sources_for_startup_with_db_and_codex_state, registered_project_roots_from,
 };
 use tracedecay_sessions::runtime::{TranscriptIngestOutcome, with_transcript_source_profile};
 use tracedecay_sessions::{SessionProvider, TranscriptIngestStats};
@@ -52,17 +49,9 @@ struct IngestTestRuntime {
 
 impl IngestTestRuntime {
     /// Observation capture refuses to run without the process background-CPU
-    /// authority that daemon startup installs, and a user-global pass refuses
-    /// to run without the session review port; the fixture injects the same
-    /// ones the production daemon composes.
+    /// authority that daemon startup installs; the fixture injects the same
+    /// one the production daemon composes.
     fn authority(&self) -> GlobalDbSessionIngestAuthority<RegisteredGlobalDbLeaseV1> {
-        self.authority_without_session_review()
-            .with_session_review(tracedecay::session_review_port())
-    }
-
-    fn authority_without_session_review(
-        &self,
-    ) -> GlobalDbSessionIngestAuthority<RegisteredGlobalDbLeaseV1> {
         let background_cpu =
             tracedecay_project::test_support::host_admission::ensure_process_background_cpu_authority()
                 .expect("install fixture worker plan authority");
@@ -104,6 +93,21 @@ async fn open_registry_at(
         .await
         .unwrap();
     (identity, scope, registry)
+}
+
+/// Closes a registry the way daemon shutdown does. A bare drop leaves the
+/// session relation-graph open task holding the store registry, and that task
+/// closes the store writer on a native worker after the drop returns. A reopen
+/// then races the old writer's shutdown checkpoint for the write lock.
+async fn close_registry(registry: DaemonSessionRuntimeRegistryV1) {
+    let cx = tracedecay_runtime_core::native_runtime::cx().unwrap();
+    registry.shutdown_terminal_tasks(&cx).await.unwrap();
+    registry
+        .close_retained_graph_runtimes_for_shutdown(
+            std::time::Instant::now() + std::time::Duration::from_mins(1),
+        )
+        .await
+        .unwrap();
 }
 
 async fn profile_test_runtime() -> IngestTestRuntime {
@@ -156,7 +160,11 @@ async fn missing_project_identity_fails_before_ingest_writes() {
     let runtime = profile_test_runtime().await;
     let authority = runtime.authority();
 
-    let outcome = ingest_project_sources_for_provider_without_registered_authority(
+    let shard = &runtime.database.binding().shard_id;
+
+    let outcome = ingest_project_sources_for_provider(
+        &shard.brain_id,
+        &shard.profile_id,
         &authority,
         temp.path(),
         None,
@@ -167,30 +175,6 @@ async fn missing_project_identity_fails_before_ingest_writes() {
 
     assert_eq!(outcome.failures.len(), 1);
     assert_eq!(outcome.failures[0].reason_code, "project_identity_missing");
-    assert_eq!(outcome.stats, TranscriptIngestStats::default());
-}
-
-#[tokio::test]
-async fn unregistered_project_authority_fails_before_ingest_writes() {
-    let temp = tempfile::tempdir().unwrap();
-    let project_id = scheduler_test_project_id();
-    let runtime = project_test_runtime(temp.path(), project_id.clone()).await;
-    let authority = runtime.authority();
-
-    let outcome = ingest_project_sources_for_provider_without_registered_authority(
-        &authority,
-        temp.path(),
-        Some(project_id),
-        Some(SessionProvider::Vibe),
-        true,
-    )
-    .await;
-
-    assert_eq!(outcome.failures.len(), 1);
-    assert_eq!(
-        outcome.failures[0].reason_code,
-        "registered_authority_unavailable"
-    );
     assert_eq!(outcome.stats, TranscriptIngestStats::default());
 }
 
@@ -227,36 +211,6 @@ async fn mismatched_project_id_fails_before_provider_catch_up() {
         tracedecay_store::StoreShardScopeV1::ProjectSessions {
             project_id: mounted_project_id
         }
-    );
-}
-
-#[tokio::test]
-async fn unregistered_profile_authority_fails_before_ingest_writes() {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = profile_test_runtime().await;
-    let authority = runtime.authority();
-
-    let outcome = ingest_user_global_sources_for_provider_with_roots_without_registered_authority(
-        &authority,
-        temp.path(),
-        Some(SessionProvider::Codex),
-        Vec::new(),
-    )
-    .await;
-
-    assert_eq!(outcome.failures.len(), 1);
-    assert_eq!(
-        outcome.failures[0].reason_code,
-        "registered_authority_unavailable"
-    );
-    assert_eq!(outcome.stats, TranscriptIngestStats::default());
-    assert!(
-        runtime
-            .database
-            .get_parse_offset(USER_INGEST_PROVIDER_FRONTIER_KEY)
-            .await
-            .unwrap()
-            .is_none()
     );
 }
 
@@ -372,7 +326,7 @@ async fn one_profile_root_reopens_with_its_persisted_session_identity() {
     let first_database = first_registry.profile_sessions().await.unwrap();
     let first_shard = first_database.binding().shard_id.clone();
     drop(first_database);
-    drop(first_registry);
+    close_registry(first_registry).await;
     drop(first_scope);
 
     let (second_identity, second_scope, second_registry) =
@@ -382,42 +336,6 @@ async fn one_profile_root_reopens_with_its_persisted_session_identity() {
     assert_eq!(first_identity, second_identity);
     assert_eq!(first_shard, second_database.binding().shard_id);
     drop((second_database, second_registry, second_scope));
-}
-
-/// An authority with no session review port is a composition defect: the
-/// user pass refuses before admitting any unit or touching the frontier, and
-/// the refusal is a non-retryable typed failure rather than a silent skip.
-#[tokio::test]
-async fn unwired_session_review_port_refuses_the_user_pass() {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = profile_test_runtime().await;
-    let authority = runtime.authority_without_session_review();
-    let shard = &runtime.database.binding().shard_id;
-
-    let outcome = ingest_user_global_sources_for_provider_with_roots_bounded(
-        (&shard.brain_id, &shard.profile_id, &authority),
-        temp.path(),
-        None,
-        Vec::new(),
-        TEST_INGEST_BOUNDS,
-        &ObservationCancellation::default(),
-    )
-    .await;
-
-    assert_eq!(outcome.failures.len(), 1);
-    assert_eq!(outcome.failures[0].reason_code, "session_review_unwired");
-    assert!(!outcome.failures[0].retryable);
-    assert_eq!(outcome.units_admitted, 0);
-    assert!(!outcome.scheduling_state_written);
-    assert!(
-        runtime
-            .database
-            .get_parse_offset(USER_INGEST_PROVIDER_FRONTIER_KEY)
-            .await
-            .unwrap()
-            .is_none(),
-        "an unwired pass must not advance the user-ingest frontier"
-    );
 }
 
 #[tokio::test]
@@ -461,13 +379,15 @@ async fn cancelled_startup_user_ingest_stops_before_registry_reads() {
     let cancellation = ObservationCancellation::default();
     cancellation.cancel();
 
-    let outcome = ingest_user_global_sources_for_startup_with_db(
+    let codex_discovery = tracedecay_sessions::runtime::hosts::codex::CodexDiscoveryHub::default();
+    let outcome = ingest_user_global_sources_for_startup_with_db_and_codex_state(
         &shard.brain_id,
         &shard.profile_id,
         &authority,
         &authority,
         temp.path(),
         &cancellation,
+        (&codex_discovery, "session-ingest-test"),
     )
     .await;
 
@@ -478,27 +398,6 @@ async fn cancelled_startup_user_ingest_stops_before_registry_reads() {
             .iter()
             .any(|failure| failure.reason_code == "ingest_pass_cancelled")
     );
-}
-
-#[tokio::test]
-async fn unregistered_startup_authority_fails_before_registry_reads() {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = profile_test_runtime().await;
-    let authority = runtime.authority();
-
-    let outcome = ingest_user_global_sources_for_startup_with_db_without_registered_authority(
-        &authority,
-        &authority,
-        temp.path(),
-    )
-    .await;
-
-    assert_eq!(outcome.failures.len(), 1);
-    assert_eq!(
-        outcome.failures[0].reason_code,
-        "registered_authority_unavailable"
-    );
-    assert_eq!(outcome.stats, TranscriptIngestStats::default());
 }
 
 #[tokio::test]

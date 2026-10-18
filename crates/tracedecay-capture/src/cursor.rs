@@ -1,5 +1,6 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracedecay_domain::canonical_text::encode_lowercase_hex;
 use tracedecay_domain::{
     CanonicalGitEvidenceKindV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
     CanonicalObservationFactV1, CanonicalObservationRelationsV1, CanonicalReasoningVisibilityV1,
@@ -12,8 +13,8 @@ use tracedecay_store::cursor_dispatch::{cursor_model_string, is_subagent_dispatc
 
 use crate::git_facts::append_diff_and_pull_request_facts;
 use crate::{
-    ObservationRecordParseErrorV1, parse::canonical_u64_i64 as canonical_u64, parse::sha256_hex,
-    parse_cursor_human_timestamp,
+    ObservationRecordParseErrorV1, parse::canonical_u64_i64 as canonical_u64,
+    parse_cursor_human_timestamp, parse_rfc3339_timestamp,
 };
 
 pub fn normalize_cursor_observation(
@@ -499,7 +500,7 @@ pub fn observation_native_record_id(
         hasher.update(native_id.as_bytes());
         return ObservationId::new(format!(
             "cursor.native.sha256:{}",
-            sha256_hex(&hasher.finalize())
+            encode_lowercase_hex(&hasher.finalize())
         ))
         .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed);
     }
@@ -514,7 +515,7 @@ pub fn observation_native_record_id(
     );
     ObservationId::new(format!(
         "cursor.native.sha256:{}",
-        sha256_hex(&hasher.finalize())
+        encode_lowercase_hex(&hasher.finalize())
     ))
     .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed)
 }
@@ -560,14 +561,16 @@ fn cursor_record_message_model(record: &Value, message: &Value) -> Option<String
 }
 
 fn record_timestamp(value: &Value) -> Option<i64> {
-    value
-        .get("timestamp")
-        .or_else(|| value.get("created_at"))
-        .and_then(|timestamp| {
-            timestamp
-                .as_i64()
-                .or_else(|| timestamp.as_str().and_then(|value| value.parse().ok()))
-        })
+    let timestamp = value.get("timestamp").or_else(|| value.get("created_at"))?;
+    if let Some(numeric) = timestamp.as_i64() {
+        return Some(numeric);
+    }
+    let text = timestamp.as_str()?;
+    // Numeric strings stay unscaled integers. RFC3339 is a separate spelling
+    // of the same field, not a fallback clock.
+    text.parse::<i64>()
+        .ok()
+        .or_else(|| parse_rfc3339_timestamp(text))
 }
 
 /// Extracts and parses the first `<timestamp>…</timestamp>` tag carried by a

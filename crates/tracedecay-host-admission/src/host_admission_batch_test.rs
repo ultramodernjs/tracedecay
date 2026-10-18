@@ -22,6 +22,7 @@ use tracedecay_sessions::admission::{HostAdmission, HostAdmissionScope};
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationPersistOutcome, ObservationWrite,
     build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
+    runtime::DEFAULT_MAX_READERS_PER_HOT_SHARD,
 };
 
 use super::*;
@@ -167,7 +168,7 @@ fn generation_capture_requests(
     requests
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn empty_capture_batch_opens_no_writer_transaction() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -182,7 +183,7 @@ async fn empty_capture_batch_opens_no_writer_transaction() {
     assert_eq!(committed_transactions(database), before);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn provider_capture_reads_a_cursor_direct_host_admission_refuses() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -214,7 +215,7 @@ async fn provider_capture_reads_a_cursor_direct_host_admission_refuses() {
     assert_eq!(unknown.reason_code, Some("unknown_provider"));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn mounted_capture_batch_reduces_writer_transactions() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -246,6 +247,72 @@ async fn mounted_capture_batch_reduces_writer_transactions() {
     );
 }
 
+/// Every general reader held is a capacity answer about this pool, not a
+/// failed authority write: a retry backoff keyed on the reason must see
+/// backpressure, and the same capture must commit once readers return.
+#[asupersync::test]
+async fn saturated_reader_pool_reports_backpressure_not_authority_write_failure() {
+    let tmp = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+        .await
+        .unwrap();
+    let (facade, database) = profile_facade(&runtime);
+    let mut held = Vec::new();
+    for _ in 0..DEFAULT_MAX_READERS_PER_HOT_SHARD {
+        held.push(
+            database
+                .read_snapshot()
+                .await
+                .expect("hold a general reader"),
+        );
+    }
+    let occupancy = database
+        .read_connection()
+        .reader_pool_occupancy()
+        .expect("registered reader pool");
+    assert_eq!(occupancy.available_general, 0, "{occupancy:?}");
+    assert_eq!(
+        occupancy.leased_general, DEFAULT_MAX_READERS_PER_HOT_SHARD,
+        "{occupancy:?}"
+    );
+
+    let backpressured = |outcome: &HostAdmissionOutcome| {
+        assert_eq!(
+            (outcome.status, outcome.retryable, outcome.reason_code),
+            (
+                HostAdmissionStatus::Backpressured,
+                true,
+                Some("reader_pool_saturated")
+            ),
+            "cause: {:?}",
+            outcome.cause
+        );
+    };
+    let session_id = SessionId::new("session.host-admission-capture.saturated").unwrap();
+    let source = ObservationSourceIdentityV1::for_provider(
+        ProviderId::new(BATCH_PROVIDER).unwrap(),
+        session_id.clone(),
+    )
+    .unwrap();
+    backpressured(
+        &facade
+            .get_source_cursor(&source, &ObservationScopeV1::Profile)
+            .await
+            .expect_err("a cursor read needs a reader"),
+    );
+    backpressured(
+        &facade
+            .capture(sequential_capture_requests(&session_id, 1).remove(0))
+            .await,
+    );
+
+    drop(held);
+    let recovered = facade
+        .capture(sequential_capture_requests(&session_id, 1).remove(0))
+        .await;
+    assert_eq!(recovered.status, HostAdmissionStatus::AcceptedForReplay);
+}
+
 fn run_git(project: &std::path::Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -261,7 +328,7 @@ fn run_git(project: &std::path::Path, args: &[&str]) {
 
 /// Canonical Git evidence is recorded as rows in the project sessions store
 /// itself, in the capture's own transaction: no graph runtime is involved.
-#[tokio::test]
+#[asupersync::test]
 async fn canonical_capture_records_git_evidence_rows_without_a_graph_runtime() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("source-graph-unavailable");
@@ -318,7 +385,7 @@ async fn canonical_capture_records_git_evidence_rows_without_a_graph_runtime() {
 /// A session whose observations name no folder records the project id as its
 /// path. Live hook drains carry no repository provenance, so the admitted
 /// project root alone must place the session in the project's worktree.
-#[tokio::test]
+#[asupersync::test]
 async fn hook_drain_without_provenance_places_project_id_sessions_in_the_project_root() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("hook-project");
@@ -494,7 +561,7 @@ async fn capture_session_on_branch(
     hits.into_iter().map(|hit| hit.session_id).collect()
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn production_facade_preparation_waits_for_shared_background_cpu() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -507,12 +574,16 @@ async fn production_facade_preparation_waits_for_shared_background_cpu() {
         .collect::<Vec<_>>();
     let session_id = SessionId::new("session.host-admission-capture.shared-cpu").unwrap();
     let capture = facade.capture_observations(sequential_capture_requests(&session_id, 2));
-    tokio::pin!(capture);
+    let mut capture = std::pin::pin!(capture);
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(30), capture.as_mut())
-            .await
-            .is_err(),
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_millis(30),
+            capture.as_mut()
+        )
+        .await
+        .is_err(),
         "the production facade must mount preparation beneath the canonical CPU authority"
     );
     drop(permits);
@@ -695,7 +766,7 @@ fn colliding_rewrite(
     anchored_write(observation, expected_cursor)
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn empty_persist_batch_opens_no_writer_transaction() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -711,7 +782,7 @@ async fn empty_persist_batch_opens_no_writer_transaction() {
     assert_eq!(committed_transactions(database), before);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn n_persist_observation_calls_open_n_writer_transactions() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -737,7 +808,7 @@ async fn n_persist_observation_calls_open_n_writer_transactions() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn persist_observations_opens_one_writer_transaction_for_the_batch() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -764,7 +835,7 @@ async fn persist_observations_opens_one_writer_transaction_for_the_batch() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn persist_observations_keeps_cursor_cas_collision_and_file_identity() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -867,7 +938,7 @@ async fn persist_observations_keeps_cursor_cas_collision_and_file_identity() {
     assert_eq!(cursor.resume_fingerprint(), Some(0xcafe_babe));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn n_capture_observation_calls_open_at_least_n_writer_transactions() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -893,7 +964,7 @@ async fn n_capture_observation_calls_open_at_least_n_writer_transactions() {
 /// generation. Each resolves to its retained row as a covered duplicate, and
 /// that row's projection already landed, so re-offering it must not collide
 /// with its own external-source receipt.
-#[tokio::test]
+#[asupersync::test]
 async fn records_reoffered_under_a_new_generation_settle_as_covered_duplicates() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())

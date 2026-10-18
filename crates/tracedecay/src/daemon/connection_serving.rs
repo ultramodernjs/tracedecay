@@ -12,6 +12,7 @@ use tracedecay_daemon_service::{DaemonInvocationService, DaemonLspSessionAccess,
 use tracedecay_mcp::BrokerSelectedResponseLease;
 use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::native_runtime::{self, TimeoutError};
 
 /// Hermetic production-route benchmark support for the typed RMCP transport.
 ///
@@ -141,8 +142,8 @@ fn serve_routed_rmcp_connection_inner(
     lifecycle: &DaemonLifecycle,
     activity: Option<DaemonActivity>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-    // Erase the deeply nested rmcp service future before it reaches the
-    // measured wrapper so every profiling feature can compute its layout.
+    // Erase the deeply nested session future before it reaches the measured
+    // wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
         let RoutedRmcpReplay {
             first_request_line,
@@ -170,38 +171,9 @@ fn serve_routed_rmcp_connection_inner(
         let transport = transport
             .with_rmcp_selected_project_responses(adapter.selected_project_responses())
             .with_rmcp_work_delivery_settlement(adapter.work_delivery_settlement());
-        let running = match transport.serve(adapter).await {
-            Ok(running) => running,
-            // The client left before a request settled the handshake; every
-            // frame it sent was already answered or refused on the wire.
-            Err(error)
-                if matches!(
-                    *error,
-                    rmcp::service::ServerInitializeError::ConnectionClosed(_)
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => {
-                return Err(TraceDecayError::Config {
-                    message: format!("rmcp server initialization failed: {error}"),
-                });
-            }
-        };
-        let cancellation = running.cancellation_token();
-        let waiting = running.waiting();
-        tokio::pin!(waiting);
-        let result = tokio::select! {
-            result = &mut waiting => result,
-            () = lifecycle.wait_for_draining() => {
-                { let _span = tracing::trace_span!("daemon.engine.transport.cancel").entered(); cancellation.cancel() };
-                waiting.await
-            }
-        };
-        result.map_err(|error| TraceDecayError::Config {
-            message: format!("rmcp server task failed: {error}"),
-        })?;
-        Ok(())
+        adapter
+            .serve(transport, lifecycle.wait_for_draining())
+            .await
     })
 }
 
@@ -230,7 +202,7 @@ async fn refuse_sessionless_request(
          (protocolVersion and clientCapabilities)"
             .to_owned(),
     );
-    write_json_rpc_response(transport, &response).await
+    write_daemon_response(transport, &response).await
 }
 
 /// Answer an unparseable handshake with one typed refusal frame and drain
@@ -298,30 +270,40 @@ fn profile_identity_warming_error() -> TraceDecayError {
 /// dropping the initializer future would abandon the partially finished open
 /// and make the next client start over. Detaching it instead lets this client's
 /// retry, or the next one, find the registry already warm.
-async fn bind_authenticated_profile_identity_within_deadline(
+pub(super) async fn bind_authenticated_profile_identity_within_deadline(
     handshake: &mut DaemonHandshake,
     store_administration: &StoreAdministration,
 ) -> Result<StoreAdministration> {
     let mut binding_handshake = handshake.clone();
     let binding_administration = store_administration.clone();
-    let binding = tokio::spawn(async move {
-        Box::pin(bind_authenticated_profile_identity(
-            &mut binding_handshake,
-            &binding_administration,
-        ))
-        .await
-        .map(|administration| (binding_handshake, administration))
-    });
-    match tokio::time::timeout(PROFILE_IDENTITY_BIND_DEADLINE, binding).await {
+    // A `NativeTask` output must be `Clone`; the binding's error is not.
+    let (bound, binding) = tokio::sync::oneshot::channel();
+    native_runtime::NativeTask::spawn(async move {
+        let _ = bound.send(
+            Box::pin(bind_authenticated_profile_identity(
+                &mut binding_handshake,
+                &binding_administration,
+            ))
+            .await
+            .map(|administration| (binding_handshake, administration)),
+        );
+    })
+    .map_err(|error| TraceDecayError::Config {
+        message: format!("daemon profile identity binding could not start: {error}"),
+    })?;
+    match native_runtime::timeout(PROFILE_IDENTITY_BIND_DEADLINE, binding).await {
         Ok(Ok(Ok((bound_handshake, administration)))) => {
             *handshake = bound_handshake;
             Ok(administration)
         }
         Ok(Ok(Err(error))) => Err(error),
-        Ok(Err(join)) => Err(TraceDecayError::Config {
-            message: format!("daemon profile identity binding failed to join: {join}"),
+        Ok(Err(_)) => Err(TraceDecayError::Config {
+            message: "daemon profile identity binding ended without a result".to_owned(),
         }),
-        Err(_) => Err(profile_identity_warming_error()),
+        Err(TimeoutError::Elapsed) => Err(profile_identity_warming_error()),
+        Err(error @ TimeoutError::TimerUnavailable(_)) => Err(TraceDecayError::Config {
+            message: error.to_string(),
+        }),
     }
 }
 
@@ -344,7 +326,7 @@ async fn refuse_warming_profile_identity(
         .and_then(|request| request.id.clone())
         .unwrap_or(serde_json::Value::Null);
     let response = project_open_error_response(request_id, error);
-    write_json_rpc_response(transport, &response).await
+    write_daemon_response(transport, &response).await
 }
 
 async fn write_refusal_and_drain(
@@ -365,7 +347,7 @@ async fn write_refusal_and_drain(
         let _ = transport.flush().await;
     }
     for _ in 0..4 {
-        match tokio::time::timeout(
+        match native_runtime::timeout(
             Duration::from_millis(100),
             read_line_handling_wire_oversized(transport),
         )
@@ -687,20 +669,6 @@ fn settle_daemon_work_delivery(
     result
 }
 
-async fn write_daemon_delivery_ack_response(
-    transport: &mut impl McpTransport,
-    response: &tracedecay_daemon_protocol::DaemonInvocationDeliveryAckResponse,
-) -> Result<()> {
-    let payload = {
-        let _span = tracing::trace_span!("daemon.engine.transport.serialize").entered();
-        serde_json::to_string(response)
-    }?;
-    transport.write_line(&payload).await?;
-    transport.write_line("\n").await?;
-    transport.flush().await?;
-    Ok(())
-}
-
 enum DaemonDeliveryAckWait {
     Line(Option<String>),
     Deadline,
@@ -743,7 +711,9 @@ where
         result = read_line_handling_wire_oversized(transport) =>
             result.map(DaemonDeliveryAckWait::Line),
         () = &mut draining => Ok(DaemonDeliveryAckWait::Draining),
-        () = tokio::time::sleep(timeout) => Ok(DaemonDeliveryAckWait::Deadline),
+        // A timer that cannot start fails closed, as an elapsed deadline.
+        _ = native_runtime::sleep_until(std::time::Instant::now() + timeout) =>
+            Ok(DaemonDeliveryAckWait::Deadline),
         () = &mut cancellation_wait => Ok(DaemonDeliveryAckWait::Cancelled),
     }
 }
@@ -797,7 +767,11 @@ where
                             result = &mut open =>
                                 result.map(|owner| Some((owner, pending_lines))),
                             () = &mut peer_full_close => Ok(None),
-                            () = tokio::time::sleep(PROJECT_OWNER_HALF_CLOSE_GRACE) =>
+                            // A timer that cannot start fails closed, as an
+                            // elapsed grace.
+                            _ = native_runtime::sleep_until(
+                                std::time::Instant::now() + PROJECT_OWNER_HALF_CLOSE_GRACE,
+                            ) =>
                                 Err(TraceDecayError::project_route(
                                     PROJECT_WARMING_REASON_CODE,
                                     true,
@@ -932,7 +906,7 @@ async fn drive_retained_invocation_responses<'a>(
         } else {
             None
         };
-        let write_result = write_daemon_invocation_response(transport, &response).await;
+        let write_result = write_daemon_response(transport, &response).await;
         if let Err(error) = write_result {
             let recorder = service
                 .delivery_settlement_recorder(handshake.project_path.as_deref())
@@ -1027,7 +1001,7 @@ async fn drive_retained_invocation_responses<'a>(
                                 )
                             }
                         };
-                        write_daemon_delivery_ack_response(transport, &ack_response).await?;
+                        write_daemon_response(transport, &ack_response).await?;
                         if let Err(reason) = settlement_result {
                             return Err(TraceDecayError::Config {
                                 message: format!(
@@ -1394,7 +1368,7 @@ fn serve_broker_socket_client_inner(
                             Err(error) => project_open_error_response(request.id.clone(), &error),
                         };
                         drop(setup_activity);
-                        write_json_rpc_response(&mut transport, &response).await?;
+                        write_daemon_response(&mut transport, &response).await?;
                         Ok(())
                     })
                     .await;
@@ -1520,7 +1494,7 @@ fn serve_broker_socket_client_inner(
                                 return Err(error);
                             }
                             if let Some(response) = response {
-                                write_json_rpc_response(&mut transport, &response).await?;
+                                write_daemon_response(&mut transport, &response).await?;
                             }
                             return Ok::<_, TraceDecayError>(true);
                         }
@@ -1735,7 +1709,7 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
     let first_request = AuthenticatedFirstRequest::new(first_request_line);
     if let Some(response) = daemon_shutdown_response(&first_request) {
         lifecycle.begin_draining();
-        write_json_rpc_response(&mut transport, &response).await?;
+        write_daemon_response(&mut transport, &response).await?;
         drop(setup_activity);
         return Ok(());
     }
@@ -1925,7 +1899,7 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
             Err(error) => project_open_error_response(request.id.clone(), &error),
         };
         drop(setup_activity);
-        write_json_rpc_response(&mut transport, &response).await?;
+        write_daemon_response(&mut transport, &response).await?;
         return Ok(());
     }
     if let Some(invocation_request) = parse_daemon_invocation_request(first_request.raw()) {
@@ -2054,7 +2028,7 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
             }
             drop(setup_activity);
             if let Some(response) = response {
-                write_json_rpc_response(&mut transport, &response).await?;
+                write_daemon_response(&mut transport, &response).await?;
             }
             return Ok(());
         }
@@ -2138,6 +2112,150 @@ pub(super) async fn serve_windows_broker_client_with_class_and_invocation(
     Ok(())
 }
 
+/// A request parked on a barrier gives its connection's admission slot back
+/// through `park_admission`, which reads the connection's task-local lease.
+/// Dispatch must run inside the connection task's scope for that read to
+/// succeed; polled on another thread, the park keeps the slot.
+#[cfg(all(test, unix))]
+mod broker_dispatch_admission_tests {
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use tracedecay_daemon_protocol::{
+        BrokerStream, DaemonClientIdentity, DaemonHandshake, DaemonInvocationProblem,
+        DaemonInvocationRequest, DaemonInvocationResponse, MovedStoreAdoption,
+    };
+    use tracedecay_daemon_service::shutdown::DaemonLifecycle;
+    use tracedecay_mcp::BrokerStreamTransport;
+    use tracedecay_runtime_core::native_runtime::{self, NativeTask, NativeTaskOutcome};
+
+    use super::{DaemonInvocationState, drive_retained_invocation_responses};
+    use crate::daemon::{
+        DaemonClientAdmission, DaemonClientAdmissionOutcome, park_admission,
+        with_connection_admission,
+    };
+
+    const REQUEST_ID: &str = "request.parked-dispatch";
+
+    fn handshake() -> DaemonHandshake {
+        let profile_root = PathBuf::from("/profiles/parked-dispatch");
+        DaemonHandshake {
+            project_path: None,
+            scope_prefix: None,
+            timings: false,
+            allow_init: false,
+            allow_initialize_root_routing: false,
+            client_identity: DaemonClientIdentity {
+                global_db_path: profile_root.join("global.db"),
+                profile_root,
+            },
+            client_version: String::new(),
+            client_instance_id: "client.parked-dispatch".to_owned(),
+            tool_list_changed_capable: false,
+            catalog_version: String::new(),
+            moved_store_adoption: MovedStoreAdoption::Never,
+        }
+    }
+
+    fn request() -> DaemonInvocationRequest {
+        let now = tracedecay_contracts::now_micros();
+        DaemonInvocationRequest::profile_graph_tool(
+            REQUEST_ID,
+            tracedecay_tool_catalog::ApplicationSurfaceOperation::AffectedTests,
+            serde_json::Map::new(),
+            now,
+            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 + 30_000_000))
+                .expect("deadline"),
+            tracedecay_contracts::CancellationContext::active("cancel.parked-dispatch")
+                .expect("cancellation"),
+        )
+    }
+
+    #[test]
+    fn a_dispatch_parked_on_a_barrier_releases_its_admission_slot() {
+        let admission = DaemonClientAdmission::with_reserved_capacity(2, 1);
+        let DaemonClientAdmissionOutcome::Admitted(permit) = admission.try_admit() else {
+            panic!("the first client is admitted");
+        };
+        assert_eq!(admission.available_general_permits(), 0);
+
+        let (daemon_end, client) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        daemon_end
+            .set_nonblocking(true)
+            .expect("nonblocking daemon end");
+        let daemon_end = BrokerStream::Unix(
+            asupersync::net::unix::UnixStream::from_std(daemon_end).expect("daemon end"),
+        );
+        let (barrier, lifted) = tokio::sync::watch::channel(false);
+        let invocation = DaemonInvocationState::default();
+        let connection = NativeTask::spawn(with_connection_admission(permit, async move {
+            let mut transport = BrokerStreamTransport::new(daemon_end);
+            drive_retained_invocation_responses(
+                Ok(request()),
+                &mut transport,
+                &invocation.service,
+                &handshake(),
+                &DaemonLifecycle::default(),
+                &mut HashMap::new(),
+                |request| {
+                    let mut lifted = lifted.clone();
+                    Box::pin(async move {
+                        park_admission(async {
+                            while !*lifted.borrow_and_update() {
+                                lifted.changed().await.expect("barrier sender retained");
+                            }
+                        })
+                        .await;
+                        DaemonInvocationResponse::problem(
+                            request.request_id,
+                            DaemonInvocationProblem::Unavailable,
+                        )
+                    })
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }))
+        .expect("native connection task");
+
+        let parked_by = Instant::now() + Duration::from_secs(10);
+        while admission.available_general_permits() == 0 && Instant::now() < parked_by {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let released = admission.available_general_permits();
+        barrier.send(true).expect("lift the barrier");
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("client read timeout");
+        let mut line = String::new();
+        BufReader::new(&client)
+            .read_line(&mut line)
+            .expect("read the response");
+        let response: DaemonInvocationResponse =
+            serde_json::from_str(&line).expect("the connection answers the parked request");
+        assert_eq!(response.request_id, REQUEST_ID);
+        client
+            .shutdown(std::net::Shutdown::Both)
+            .expect("close the client");
+        assert_eq!(
+            native_runtime::block_on(connection.wait()).expect("process runtime"),
+            NativeTaskOutcome::Completed(Ok(()))
+        );
+        assert_eq!(
+            released, 1,
+            "the parked dispatch kept its connection's admission slot"
+        );
+        assert_eq!(
+            admission.available_general_permits(),
+            1,
+            "the connection returns its slot when it ends"
+        );
+    }
+}
+
 #[cfg(test)]
 mod delivery_ack_tests {
     use super::{
@@ -2145,21 +2263,27 @@ mod delivery_ack_tests {
     };
     use std::time::Duration;
     use tracedecay_mcp::transport::ChannelTransport;
+    use tracedecay_runtime_core::native_runtime;
 
-    #[tokio::test(start_paused = true)]
-    async fn delivery_ack_wait_uses_the_exact_deadline_budget() {
+    /// Runs outside any Tokio runtime: the deadline must be a native timer.
+    #[test]
+    fn delivery_ack_wait_uses_the_exact_deadline_budget() {
+        const BUDGET: Duration = Duration::from_millis(100);
         let (mut transport, _input, _output) = ChannelTransport::new();
-        let wait = await_daemon_delivery_ack(
-            &mut transport,
-            Duration::from_secs(3),
-            None,
-            std::future::pending::<()>(),
-        );
-        tokio::pin!(wait);
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(3)).await;
+        let started = std::time::Instant::now();
+        let wait = native_runtime::block_on(native_runtime::timeout(
+            Duration::from_secs(10),
+            await_daemon_delivery_ack(&mut transport, BUDGET, None, std::future::pending::<()>()),
+        ))
+        .expect("native runtime runs the ack wait")
+        .expect("the ack wait ends at its deadline");
+        let waited = started.elapsed();
 
-        assert!(matches!(wait.await, Ok(DaemonDeliveryAckWait::Deadline)));
+        assert!(matches!(wait, Ok(DaemonDeliveryAckWait::Deadline)));
+        assert!(
+            waited >= BUDGET,
+            "the ack wait must spend its whole budget, waited {waited:?}"
+        );
     }
 
     #[test]

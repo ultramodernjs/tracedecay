@@ -990,9 +990,11 @@ async fn daemon_http_saturated_cold_resolution_preserves_curate_request_identity
     service.shutdown().await.expect("shutdown HTTP service");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn daemon_http_timed_out_cold_resolution_preserves_curate_request_identity() {
-    let registry = DaemonHttpApplicationRegistry::default();
+    const COLD_RESOLUTION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
+    let registry = DaemonHttpApplicationRegistry::default()
+        .with_cold_resolution_deadline(COLD_RESOLUTION_DEADLINE);
     let resolver_calls = Arc::new(AtomicUsize::new(0));
     let observed_resolver_calls = Arc::clone(&resolver_calls);
     registry
@@ -1011,7 +1013,9 @@ async fn daemon_http_timed_out_cold_resolution_preserves_curate_request_identity
     let authorization = format!("Bearer {AUTH_TOKEN}");
     let origin = service.origin().to_owned();
     let supplied = "request.sdk.curate.cold-timed-out";
-    let request = tokio::spawn(async move {
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
         request_path_with_headers_at(
             endpoint,
             "POST",
@@ -1021,15 +1025,17 @@ async fn daemon_http_timed_out_cold_resolution_preserves_curate_request_identity
             Some("application/json"),
             &[(APPLICATION_REQUEST_ID_HEADER, supplied)],
             b"{}",
-        )
-        .await
-    });
-    while resolver_calls.load(Ordering::Relaxed) < 1 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(std::time::Duration::from_secs(6)).await;
-    let response = request.await.expect("timed-out cold-resolution request");
+        ),
+    )
+    .await
+    .expect("timed-out cold-resolution request");
+    let waited = started.elapsed();
 
+    assert_eq!(resolver_calls.load(Ordering::Relaxed), 1);
+    assert!(
+        waited >= COLD_RESOLUTION_DEADLINE,
+        "the cold resolution must spend its deadline, waited {waited:?}"
+    );
     assert_eq!(status(&response), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(json_body(&response)["value"]["request_id"], supplied);
     assert_eq!(
@@ -1037,6 +1043,47 @@ async fn daemon_http_timed_out_cold_resolution_preserves_curate_request_identity
         "timed_out"
     );
     service.shutdown().await.expect("shutdown HTTP service");
+}
+
+/// A Tokio runtime with neither the IO nor the time driver panics on any
+/// Tokio socket or timer, so this proves the loopback path uses neither.
+#[test]
+fn daemon_http_serves_loopback_without_tokio_io_or_time_drivers() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .expect("Tokio runtime without drivers");
+    runtime.block_on(async {
+        let (service, calls) = service_with_probe().await;
+        let endpoint = service.endpoint();
+        let origin = service.origin().to_owned();
+        let response = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut stream =
+                std::net::TcpStream::connect(endpoint).expect("connect daemon HTTP loopback");
+            write!(
+                stream,
+                "POST /projects/{PROJECT_ID}/application/tests/results HTTP/1.1\r\n\
+                 Host: {endpoint}\r\n\
+                 Authorization: Bearer {AUTH_TOKEN}\r\n\
+                 Origin: {origin}\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .expect("write HTTP request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("read HTTP response");
+            response
+        })
+        .await
+        .expect("blocking HTTP client");
+
+        assert_eq!(status(&response), StatusCode::NO_CONTENT);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        service.shutdown().await.expect("shutdown HTTP service");
+    });
 }
 
 #[tokio::test]
@@ -1226,6 +1273,34 @@ async fn authenticated_remote_node_provisioning_creates_and_registers_first_stor
         status(&unauthenticated_publication),
         StatusCode::UNAUTHORIZED
     );
+    let revocation = serde_json::json!({ "node_id": node_id }).to_string();
+    let unauthenticated_revocation = request_path_body(
+        &service,
+        "POST",
+        "/remote-nodes/revoke",
+        None,
+        Some(&origin),
+        &revocation,
+    )
+    .await;
+    assert_eq!(
+        status(&unauthenticated_revocation),
+        StatusCode::UNAUTHORIZED
+    );
+    let unregistered_revocation = request_path_body(
+        &service,
+        "POST",
+        "/remote-nodes/revoke",
+        Some(&format!("Bearer {AUTH_TOKEN}")),
+        Some(&origin),
+        &revocation,
+    )
+    .await;
+    assert_eq!(status(&unregistered_revocation), StatusCode::NOT_FOUND);
+    assert_eq!(
+        json_body(&unregistered_revocation),
+        serde_json::json!({ "code": "node_not_registered" })
+    );
 
     let authenticated = request_path_body(
         &service,
@@ -1238,6 +1313,20 @@ async fn authenticated_remote_node_provisioning_creates_and_registers_first_stor
     .await;
     assert_eq!(status(&authenticated), StatusCode::NO_CONTENT);
     assert!(runtime.remote_recovery_authority(&node_id).await.is_some());
+    let unenrolled_revocation = request_path_body(
+        &service,
+        "POST",
+        "/remote-nodes/revoke",
+        Some(&format!("Bearer {AUTH_TOKEN}")),
+        Some(&origin),
+        &revocation,
+    )
+    .await;
+    assert_eq!(status(&unenrolled_revocation), StatusCode::OK);
+    assert_eq!(
+        json_body(&unenrolled_revocation),
+        serde_json::json!({ "revocations": [], "revoked_grants": [grant.grant_id] })
+    );
 
     service.shutdown().await.expect("shutdown HTTP service");
 }
@@ -1251,12 +1340,8 @@ async fn remote_protocol_mount_authenticates_before_json_and_outside_local_admis
             UserProfileId::new("profile.remote-http").expect("remote profile identity"),
         ),
     );
-    let transaction = Arc::new(
-        tracedecay_store_runtime::DaemonRemoteReplayTransactionAuthorityV1::new(
-            tokio::runtime::Handle::current(),
-        )
-        .expect("remote replay transaction authority"),
-    );
+    let transaction =
+        Arc::new(tracedecay_store_runtime::DaemonRemoteReplayTransactionAuthorityV1::new());
     let router = tracedecay_daemon_service::build_daemon_remote_protocol_router(
         Arc::clone(&credentials),
         transaction,

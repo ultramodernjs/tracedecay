@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tracedecay_contracts::memory::{CognitiveRecallTemporalMode, CognitiveRecallTemporalQuery};
 use tracedecay_contracts::retained_surfaces::{
-    FactCategoryV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
+    FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
 };
 use tracedecay_contracts::retrieval::{
     ContextMemoryTemporalCoverageV1, ContextStageV1, ContextSurfaceRequestV1,
@@ -137,7 +137,7 @@ pub(super) fn context_memory_section(
                 section,
                 "- fact_id={} category={} trust={:.2} score={:.3}: {}",
                 hit.fact.fact_id,
-                context_fact_category(hit.fact.category),
+                hit.fact.category.as_str(),
                 f64::from(hit.fact.trust_score_millionths) / 1_000_000.0,
                 f64::from(hit.scores.score_millionths) / 1_000_000.0,
                 collapse_whitespace(&hit.fact.content)
@@ -163,17 +163,6 @@ pub(super) fn context_memory_section(
         return Some(section);
     }
     None
-}
-
-const fn context_fact_category(category: FactCategoryV1) -> &'static str {
-    match category {
-        FactCategoryV1::General => "general",
-        FactCategoryV1::UserPref => "user_pref",
-        FactCategoryV1::Project => "project",
-        FactCategoryV1::Tool => "tool",
-        FactCategoryV1::Decision => "decision",
-        FactCategoryV1::CodeArea => "code_area",
-    }
 }
 
 pub(super) struct ContextMemoryOptions {

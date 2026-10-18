@@ -281,16 +281,52 @@ fn run_with_pinned_summarizer_binding<T>(future: impl std::future::Future<Output
         .block_on(future)
 }
 
+#[asupersync::test]
+async fn pending_effect_wait_uses_a_native_deadline_without_tokio_context() {
+    let control = LcmEffectControl {
+        cancellation: None,
+        expires_at: std::time::Instant::now() + Duration::from_millis(10),
+    };
+    assert!(tokio::runtime::Handle::try_current().is_err());
+
+    let result = control.interruptible(std::future::pending::<()>()).await;
+
+    assert_eq!(result, Err(LcmError::DeadlineExceeded));
+}
+
+#[asupersync::test]
+async fn cancellation_precedes_an_expired_deadline_and_a_ready_effect() {
+    let cancellation = CancellationSignal::active("cancellation.lcm-deadline-order").unwrap();
+    assert!(cancellation.cancel(UtcMicros(2)));
+    let control = LcmEffectControl {
+        cancellation: Some(cancellation),
+        expires_at: std::time::Instant::now(),
+    };
+    let polled = std::sync::atomic::AtomicBool::new(false);
+
+    let result = control
+        .interruptible(async {
+            polled.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
+        .await;
+
+    assert_eq!(result, Err(LcmError::Cancelled));
+    assert!(!polled.load(std::sync::atomic::Ordering::Relaxed));
+}
+
 #[tokio::test]
 async fn cancellation_observed_after_a_committed_effect_does_not_replace_its_result() {
     let cancellation = CancellationSignal::active("cancellation.lcm-settlement").unwrap();
     let control = LcmEffectControl::new(None, Some(&cancellation));
     let execution = control.execution_control();
     let result = control
-        .execute(&execution, async {
-            assert!(cancellation.cancel(tracedecay_domain::UtcMicros(2)));
-            Ok::<_, LcmError>("committed")
-        })
+        .execute(
+            &execution,
+            Box::pin(async {
+                assert!(cancellation.cancel(tracedecay_domain::UtcMicros(2)));
+                Ok::<_, LcmError>("committed")
+            }),
+        )
         .await;
 
     assert_eq!(result.unwrap(), "committed");
@@ -1750,11 +1786,7 @@ fn refresh_begins_at_the_committed_frontier_after_background_summaries_publish()
                 > 0
         })
         .await;
-        assert!(
-            registry
-                .wait_profile_idle(db.db_path(), Duration::from_secs(10))
-                .await
-        );
+        registry.wait_profile_idle(db.db_path()).await;
 
         let store = tracedecay_session_temporal_store::SessionTemporalStore::new(db.as_ref());
         let session = SessionId::new(session_id).unwrap();
@@ -1874,11 +1906,8 @@ async fn mounted_schedulers_share_historical_work_admission() {
         assert!(
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
-                    if registry.profile_pass_count(db.db_path()).await >= 1
-                        && registry
-                            .wait_profile_idle(db.db_path(), Duration::from_millis(25))
-                            .await
-                    {
+                    registry.wait_profile_idle(db.db_path()).await;
+                    if registry.profile_pass_count(db.db_path()).await >= 1 {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;

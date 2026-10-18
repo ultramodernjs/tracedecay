@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tracedecay_domain::canonical_text::encode_lowercase_hex;
 use tracedecay_domain::{
     CanonicalBoundaryKindV1, CanonicalGitEvidenceKindV1, CanonicalMessageRoleV1,
     CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1, CanonicalObservationFactV1,
@@ -14,7 +15,7 @@ use tracedecay_domain::{
 };
 
 use crate::{
-    ObservationRecordParseErrorV1, parse::canonical_u64_i64 as canonical_u64, parse::sha256_hex,
+    ObservationRecordParseErrorV1, parse::canonical_u64_i64 as canonical_u64,
     parse_rfc3339_timestamp,
 };
 
@@ -905,33 +906,37 @@ fn append_codex_response_item_facts(
     };
     match item_kind {
         "message" => {
-            if payload.get("content").is_some() {
-                let role = payload.get("role").and_then(Value::as_str);
-                if role != Some("user") {
+            let role = match payload.get("role").and_then(Value::as_str) {
+                Some("user") => CanonicalMessageRoleV1::User,
+                Some("assistant") => CanonicalMessageRoleV1::Assistant,
+                other => {
                     facts.push(CanonicalObservationFactV1::Unknown {
-                        native_kind: format!("response_item.message.{}", role.unwrap_or("unknown")),
+                        native_kind: format!(
+                            "response_item.message.{}",
+                            other.unwrap_or("unknown")
+                        ),
                         state: CanonicalUnknownStateV1::Unsupported,
                     });
                     return;
                 }
-                let Some(goal_context) = codex_response_goal_context(payload) else {
-                    facts.push(CanonicalObservationFactV1::Unknown {
-                        native_kind: "response_item.message.user".to_string(),
-                        state: CanonicalUnknownStateV1::Unsupported,
-                    });
-                    return;
-                };
-                facts.push(CanonicalObservationFactV1::Message {
-                    role: CanonicalMessageRoleV1::User,
-                    content: goal_context.content.clone(),
-                    model: payload
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| context_model.map(str::to_string)),
-                    timestamp,
+            };
+            let Some(content) = payload.get("content").cloned() else {
+                facts.push(CanonicalObservationFactV1::Unknown {
+                    native_kind: "response_item.message".to_string(),
+                    state: CanonicalUnknownStateV1::Absent,
                 });
-            }
+                return;
+            };
+            facts.push(CanonicalObservationFactV1::Message {
+                role,
+                content,
+                model: payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| context_model.map(str::to_string)),
+                timestamp,
+            });
         }
         "function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call" => {
             let invocation_id = canonical_native_observation_id(
@@ -1035,7 +1040,7 @@ pub fn codex_native_record_id(
     );
     ObservationId::new(format!(
         "codex.native.sha256:{}",
-        sha256_hex(&hasher.finalize())
+        encode_lowercase_hex(&hasher.finalize())
     ))
     .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed)
 }
@@ -1062,7 +1067,7 @@ fn response_item_tool_arguments(payload: &Value, item_kind: &str) -> Value {
     }
 }
 
-fn string_field(payload: &Value, key: &str) -> Option<String> {
+pub fn string_field(payload: &Value, key: &str) -> Option<String> {
     payload
         .get(key)
         .and_then(Value::as_str)
@@ -1070,7 +1075,7 @@ fn string_field(payload: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn nested_string_field(payload: &Value, pointer: &str) -> Option<String> {
+pub fn nested_string_field(payload: &Value, pointer: &str) -> Option<String> {
     payload
         .pointer(pointer)
         .and_then(Value::as_str)

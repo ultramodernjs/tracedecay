@@ -6,7 +6,10 @@
 
 use super::*;
 #[cfg(any(test, feature = "test-helpers"))]
-use crate::test_support::hold_after_core_publish_for_test;
+use crate::test_support::{
+    hold_after_core_publish_for_test, hold_after_independent_owners_for_test,
+    hold_before_route_bind_for_test,
+};
 use tracedecay_agent_hosts::agents::context_scout::owner::unregister_registered_context_scout_owner;
 use tracedecay_agent_hosts::hooks::hook_project_id_for_layout;
 use tracedecay_code_index_runtime::code_index_scheduler;
@@ -141,10 +144,13 @@ async fn release_one_idle_project_server_before_open(
             tracedecay_runtime_core::path_safety::canonical_root_identity(&key.project_root)
         })
         .collect::<std::collections::BTreeSet<_>>();
-    let mut hook_data_roots = std::collections::BTreeSet::new();
+    let mut hook_replay_owners = Vec::with_capacity(retired_servers.len());
     for (_, server) in &retired_servers {
         let graph = server.cg().await;
-        hook_data_roots.insert(graph.hook_store_layout().data_root.clone());
+        hook_replay_owners.push((
+            graph.hook_store_layout().data_root.clone(),
+            Arc::downgrade(&graph),
+        ));
     }
     let retired_servers = retired_servers
         .into_iter()
@@ -158,10 +164,12 @@ async fn release_one_idle_project_server_before_open(
         project_roots,
         profile_identity,
     };
+    let gate_for_release = Arc::clone(&capacity_gate);
     let completion =
         retirement_admission.spawn_and_track_fallible(retired_owner.clone(), async move {
-            // Teardown joins every owner-scoped store client, so the release
-            // below finds the owner's stores unleased on its only attempt.
+            // Teardown joins every owner-scoped store client and the release
+            // joins the maintenance tick's, so the release finds the owner's
+            // stores unleased on its only attempt.
             stores
                 .administration
                 .session_temporal_refresh_schedulers()
@@ -174,15 +182,18 @@ async fn release_one_idle_project_server_before_open(
             )
             .await;
             super::project_server_lifecycle::retire_project_servers(retired_servers, None).await;
-            for data_root in hook_data_roots {
-                super::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer(&data_root).await;
+            for (data_root, owner) in hook_replay_owners {
+                super::hook_v2_replay_consumer::retire_hook_v2_replay_consumer(&data_root, &owner)
+                    .await;
             }
+            // A prior same-owner retirement can be a bind eviction cleanup,
+            // which waits on this capacity gate before its owner check.
+            // Holding the admission across the wait would deadlock both.
+            drop(capacity_admission);
             for prior in prior_owner_retirements {
                 prior.wait().await?;
             }
-            let released = release_capacity_retired_stores(stores).await;
-            drop(capacity_admission);
-            released
+            Box::pin(release_capacity_unless_re_served(stores, gate_for_release)).await
         });
     drop(retirement_admission);
     completion
@@ -210,6 +221,30 @@ struct CapacityRetirementStores {
     profile_identity: profile_identity::LocalProfileIdentityAuthorityV1,
 }
 
+/// The released gate may have let an open remount the retired owner while
+/// the retirement waited on prior same-owner retirements. Fence the
+/// project-wide release behind the gate again and skip a re-served owner:
+/// its fresh owners are not this retirement's to remove.
+async fn release_capacity_unless_re_served(
+    stores: CapacityRetirementStores,
+    capacity_gate: Arc<ProjectOpenGate>,
+) -> Result<()> {
+    let capacity_admission = capacity_gate.lock_owned().await;
+    let re_served = stores
+        .administration
+        .project_servers()
+        .lock()
+        .await
+        .servers
+        .keys()
+        .any(|key| key.owner.project_id == stores.owner.project_id);
+    if !re_served {
+        Box::pin(release_capacity_retired_stores(stores)).await?;
+    }
+    drop(capacity_admission);
+    Ok(())
+}
+
 #[tracing::instrument(
     name = "daemon.project.compose.release_retired_stores",
     level = "trace",
@@ -224,6 +259,11 @@ async fn release_capacity_retired_stores(stores: CapacityRetirementStores) -> Re
         project_roots,
         profile_identity,
     } = stores;
+    // Wait out the maintenance tick's telemetry pass or store unit in flight
+    // and keep new ones off until the release ends.
+    // ponytail: daemon-wide, so this also waits out a unit or telemetry pass
+    // on another project; key it by store if that delays capacity reuse.
+    let _maintenance_clients = administration.maintenance_store_clients().lock().await;
     let project_id = owner
         .project_id
         .clone()
@@ -302,6 +342,43 @@ pub(crate) fn daemon_transcript_source_profile(
     match owner.home() {
         Some(home) => profile.with_home(home),
         None => profile,
+    }
+}
+
+/// Server shutdown does not reach the process-global owners a project open
+/// started for `cg`'s graph: the Context Scout owner, which holds the graph's
+/// `Database`, and the Hook V2 replay consumer, which holds a project-session
+/// lease and the graph while it sweeps. Either keeps its store runtime from
+/// closing, so the WAL is never truncated. A failed open and a route-bind
+/// eviction both drop the graph's last server without retiring them. Owners
+/// another published server over the same database still serves stay
+/// registered.
+async fn retire_unserved_process_owners(
+    store_administration: &StoreAdministration,
+    cg: &Arc<tracedecay_project::project::TraceDecay>,
+) {
+    let graph_db_path = cg.db().canonical_database_path();
+    let served = store_administration
+        .project_servers()
+        .lock()
+        .await
+        .servers
+        .keys()
+        .any(|key| same_canonical_path(&key.owner.graph_db_path, graph_db_path));
+    if served {
+        return;
+    }
+    #[cfg(any(test, feature = "test-helpers"))]
+    {
+        let _ = crate::test_support::hold_after_unserved_owner_check_for_test().await;
+    }
+    super::hook_v2_replay_consumer::retire_hook_v2_replay_consumer(
+        &cg.hook_store_layout().data_root,
+        &Arc::downgrade(cg),
+    )
+    .await;
+    if let Some(project_id) = hook_project_id_for_layout(cg.hook_store_layout()) {
+        unregister_registered_context_scout_owner(project_id, graph_db_path);
     }
 }
 
@@ -451,7 +528,7 @@ async fn production_project_server_inner(
     let (resolved, inserted) = match composed {
         Ok(composed) => composed,
         Err(error) => {
-            inputs.retire_failed_open_scout_owner(&opened.cg).await;
+            retire_unserved_process_owners(inputs.store_administration, &opened.cg).await;
             return Err(error);
         }
     };
@@ -756,26 +833,6 @@ impl ProjectOpenInputs<'_> {
         log_project_open_phase(self.canonical_project_path, phase, detail, since);
     }
 
-    /// Opening the graph started the process-global Context Scout owner, which
-    /// holds that graph's `Database`. A failed open leaves no server to retire
-    /// it, and while registered its lease keeps the store runtime from ever
-    /// closing, so its WAL is never truncated. An owner that another published
-    /// server over the same database still serves stays registered.
-    async fn retire_failed_open_scout_owner(&self, cg: &tracedecay_project::project::TraceDecay) {
-        let graph_db_path = cg.db().canonical_database_path();
-        let served = self
-            .store_administration
-            .project_servers()
-            .lock()
-            .await
-            .servers
-            .keys()
-            .any(|key| same_canonical_path(&key.owner.graph_db_path, graph_db_path));
-        if !served && let Some(project_id) = hook_project_id_for_layout(cg.hook_store_layout()) {
-            unregister_registered_context_scout_owner(project_id, graph_db_path);
-        }
-    }
-
     /// Route admission: registry enrollment, the published-server cache, the
     /// route's single-flight gate, the foreground-open marker, and one graph
     /// admission slot (releasing an idle server when the daemon is at capacity).
@@ -871,7 +928,7 @@ impl ProjectOpenInputs<'_> {
         );
         let opened = self.admit_opened_graph(route, Arc::clone(&cg)).await;
         if opened.is_err() {
-            self.retire_failed_open_scout_owner(&cg).await;
+            retire_unserved_process_owners(self.store_administration, &cg).await;
         }
         opened
     }
@@ -1080,7 +1137,7 @@ impl ProjectOpenInputs<'_> {
         #[cfg(feature = "memory-provider-host")]
         let ncm_registration_factory: tracedecay_daemon_service::retained_owner::NcmRegistrationFactoryV1 = {
             let owners = Arc::clone(&self.invocation.ncm_worker_owner);
-            Arc::new(move |profile_id, worker_binary, state_root, registration_revision, mode, authority| {
+            Arc::new(move |profile_id, worker_binary, state_root, registration_revision, mode, namespace_binding, authority| {
                 ncm_observer::construct_ncm_registration_with_authority(
                     &owners,
                     &profile_id,
@@ -1088,6 +1145,7 @@ impl ProjectOpenInputs<'_> {
                     state_root,
                     registration_revision,
                     mode,
+                    namespace_binding,
                     authority,
                 )
                 .map_err(|error| error.to_string())
@@ -1196,6 +1254,10 @@ impl ProjectOpenInputs<'_> {
         core_candidate: Arc<crate::mcp::McpServer>,
         route_registered: &AtomicBool,
     ) -> Result<CoreRouteBinding> {
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            Box::pin(hold_before_route_bind_for_test()).await?;
+        }
         if self.cancellation.is_cancelled() {
             core_candidate.shutdown().await;
             return Err(project_open_cancellation_error());
@@ -1223,16 +1285,33 @@ impl ProjectOpenInputs<'_> {
             route_registered.store(false, Ordering::Release);
             return Err(project_server_capacity_error());
         };
+        let capacity_gate =
+            super::project_routing::project_open_capacity_gate(self.project_open_gates).await;
         for (retired_key, retired_server) in retired {
             let owner = retired_key.owner;
             self.store_administration
                 .session_temporal_refresh_schedulers()
                 .retire_project(&owner)
                 .await;
-            retirement_admission.spawn_and_track(
-                owner,
-                super::project_server_lifecycle::retire_project_servers(vec![retired_server], None),
-            );
+            let store_administration = self.store_administration.clone();
+            let capacity_gate = Arc::clone(&capacity_gate);
+            retirement_admission.spawn_and_track(owner, async move {
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    let _ = crate::test_support::hold_before_evicted_owner_retire_for_test().await;
+                }
+                // A reopen of this project adopts the evicted graph's owners
+                // before its route publishes. Waiting out every in-flight open
+                // lets the served check see that route instead of retiring
+                // owners the reopen now relies on.
+                let open_admission = capacity_gate.lock_owned().await;
+                let graph = retired_server.cg().await;
+                retire_unserved_process_owners(&store_administration, &graph).await;
+                drop(open_admission);
+                drop(graph);
+                super::project_server_lifecycle::retire_project_servers(vec![retired_server], None)
+                    .await;
+            });
         }
         // The owner registry guard was dropped before the synchronous
         // retirement handoff. Release admission before the remaining
@@ -1515,7 +1594,6 @@ impl ProjectOpenInputs<'_> {
                     core.transcript_source_profile.clone(),
                     refresh_schedulers.codex_discovery(),
                     Arc::clone(&background_cpu),
-                    crate::session_review_port(),
                 )),
             )
             .await;
@@ -1768,10 +1846,7 @@ impl ProjectOpenInputs<'_> {
             })?;
         self.log_phase("source_edit_preview_ready", None, full_setup_started);
         project_open_cancellation_checkpoint(self.cancellation)?;
-        let http_registry = self.http_application_registry.clone();
-        let http_owner = self.store_administration.owner_profile()?.clone();
-        let http_project_id = core.project_id.clone();
-        let http_project_path = self.canonical_project_path.to_path_buf();
+        let http_owner = self.store_administration.owner_profile()?;
         join_independent_full_owner_mounts(
             async {
                 let state = project_open_owners::register_project_open_production_owners(
@@ -1785,6 +1860,10 @@ impl ProjectOpenInputs<'_> {
                 )
                 .await?;
                 self.log_phase("independent_owners_registered", None, full_setup_started);
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    Box::pin(hold_after_independent_owners_for_test()).await?;
+                }
                 project_open_cancellation_checkpoint(self.cancellation)?;
                 project_open_owners::register_project_open_dependent_owners(
                     self.invocation,
@@ -1796,20 +1875,15 @@ impl ProjectOpenInputs<'_> {
                 self.log_phase("production_owners_registered", None, full_setup_started);
                 Ok(())
             },
-            async move {
+            async {
                 mount_http_application_router(
-                    &http_registry,
-                    &http_owner,
-                    &http_project_id,
-                    &http_project_path,
+                    self.http_application_registry,
+                    http_owner,
+                    &core.project_id,
+                    self.canonical_project_path,
                 )
                 .await?;
-                log_project_open_phase(
-                    &http_project_path,
-                    "http_application_mounted",
-                    None,
-                    full_setup_started,
-                );
+                self.log_phase("http_application_mounted", None, full_setup_started);
                 Ok(())
             },
         )
@@ -1951,10 +2025,14 @@ impl ProjectOpenInputs<'_> {
             Arc::new(move || {
                 let unconverged = registry.unconverged_registered_schemas();
                 tracedecay_daemon_service::doctor_kernel::SchemaConvergenceDoctorReadV1 {
-                    storage:
+                    storage: tracedecay_contracts::doctor::merge_storage_reads(
                         tracedecay_daemon_service::doctor_kernel::pending_schema_migration_read(
                             &unconverged,
                         ),
+                        tracedecay_daemon_service::doctor_kernel::wal_checkpoint_pinned_read(
+                            &registry.runtime_telemetry(),
+                        ),
+                    ),
                     findings: registry.registered_schema_convergence_observations(),
                 }
             })
@@ -2352,10 +2430,14 @@ fn project_dashboard_freshness_reader(
             let schedulers = schedulers.clone();
             let activation = Arc::clone(&activation);
             Box::pin(async move {
+                let unindexed_by_policy = policy_keeps_route_unindexed(&activation);
                 match schedulers.dashboard_freshness_read(&project_root).await? {
                     Some(worktree) => Ok(Some(worktree)),
                     None if activation.mount_failed() => Err(
                         tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1::MountFailed,
+                    ),
+                    None if unindexed_by_policy => Err(
+                        tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1::LinkedWorktreeDisabled,
                     ),
                     None => Ok(None),
                 }
@@ -2363,6 +2445,16 @@ fn project_dashboard_freshness_reader(
         },
     );
     reader
+}
+
+/// Whether the watch policy keeps this linked worktree out of automatic
+/// indexing and no operator mount is in flight, so an unmounted route will
+/// stay unmounted until an operator syncs it. Sample it before the scheduler
+/// read: a mount that settles after the sample shows up in that read.
+fn policy_keeps_route_unindexed(activation: &code_index_scheduler::CodeIndexActivationV1) -> bool {
+    activation.automatic_admission()
+        == code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled
+        && !activation.mount_in_progress()
 }
 
 /// `tracedecay_status` `wait_for` over this route's code-index schedulers.
@@ -2384,6 +2476,18 @@ fn project_readiness_waiter(
                 return Ok(
                     tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaitReadV1::Unreachable {
                         reason: tracedecay_contracts::code_index_freshness::CODE_INDEX_MOUNT_FAILED.to_owned(),
+                    },
+                );
+            }
+            if policy_keeps_route_unindexed(&activation)
+                && schedulers
+                    .dashboard_freshness_read(&project_root)
+                    .await?
+                    .is_none()
+            {
+                return Ok(
+                    tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaitReadV1::Unreachable {
+                        reason: tracedecay_contracts::code_index_freshness::CODE_INDEX_LINKED_WORKTREE_DISABLED.to_owned(),
                     },
                 );
             }

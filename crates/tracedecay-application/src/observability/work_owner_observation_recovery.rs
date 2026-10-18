@@ -3,14 +3,15 @@
 use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracedecay_contracts::{
     ApplicationContractError, PendingWorkOwnerObservationV1, WorkOwnerObservationReceiptV1,
     WorkOwnerObservationScanCursorV1, WorkOwnerObservationStoragePortV1,
+};
+use tracedecay_runtime_core::native_runtime::{
+    self, NativeTask, NativeTaskOutcome, sleep_until, timeout_at,
 };
 use tracedecay_rusqlite_runtime::work::WorkSqliteStorage;
 
@@ -45,7 +46,10 @@ pub struct WorkOwnerObservationRecoveryV1 {
     control: mpsc::Sender<RecoveryControl>,
     state: Arc<AtomicU8>,
     admission: Mutex<()>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    /// Abort drops the worker at its next poll. A scan or marker write parked
+    /// in native `spawn_blocking` abandons only its wait: the storage call
+    /// still finishes on the blocking pool.
+    worker: Mutex<Option<NativeTask<()>>>,
 }
 
 impl WorkOwnerObservationRecoveryV1 {
@@ -53,12 +57,11 @@ impl WorkOwnerObservationRecoveryV1 {
         storage: WorkSqliteStorage,
         producer: Arc<BoundedObservabilityProducerV1>,
     ) -> Result<Self, &'static str> {
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| "work_owner_observation_recovery_runtime_unavailable")?;
         let (control, control_rx) = mpsc::channel(1);
         let state = Arc::new(AtomicU8::new(RECOVERY_RUNNING));
         let worker_state = Arc::clone(&state);
-        let worker = runtime.spawn(run_recovery(storage, producer, control_rx, worker_state));
+        let worker = NativeTask::spawn(run_recovery(storage, producer, control_rx, worker_state))
+            .map_err(|_| "work_owner_observation_recovery_worker_unavailable")?;
         Ok(Self {
             control,
             state,
@@ -69,6 +72,17 @@ impl WorkOwnerObservationRecoveryV1 {
 
     pub async fn shutdown(
         &self,
+    ) -> Result<WorkOwnerObservationRecoverySummaryV1, ApplicationContractError> {
+        self.shutdown_until(Instant::now() + RECOVERY_SHUTDOWN_DEADLINE)
+            .await
+    }
+
+    /// Shutdown bounded by the caller's deadline instead of the recovery's
+    /// own budget. The final pass bounds each owner fact by the producer's
+    /// persistence deadline, so a held writer can outlast that budget.
+    pub async fn shutdown_until(
+        &self,
+        deadline: Instant,
     ) -> Result<WorkOwnerObservationRecoverySummaryV1, ApplicationContractError> {
         {
             let _admission = self.admission.lock().map_err(|_| {
@@ -106,7 +120,7 @@ impl WorkOwnerObservationRecoveryV1 {
                 )
             })?
             .take();
-        let summary = match timeout(RECOVERY_SHUTDOWN_DEADLINE, result).await {
+        let summary = match timeout_at(deadline, result).await {
             Ok(Ok(summary)) => summary,
             Ok(Err(_)) => {
                 return Err(ApplicationContractError::Domain(
@@ -116,7 +130,7 @@ impl WorkOwnerObservationRecoveryV1 {
             Err(_) => {
                 if let Some(worker) = worker {
                     worker.abort();
-                    let _ = worker.await;
+                    worker.wait().await;
                 }
                 self.state.store(RECOVERY_STOPPED, Ordering::Release);
                 return Err(ApplicationContractError::Domain(
@@ -125,11 +139,19 @@ impl WorkOwnerObservationRecoveryV1 {
             }
         };
         if let Some(worker) = worker {
-            worker.await.map_err(|error| {
-                ApplicationContractError::Domain(format!(
-                    "work owner-observation recovery join failed: {error}"
-                ))
-            })?;
+            match worker.wait().await {
+                NativeTaskOutcome::Completed(()) => {}
+                NativeTaskOutcome::Cancelled => {
+                    return Err(ApplicationContractError::Domain(
+                        "work owner-observation recovery join failed: cancelled".to_owned(),
+                    ));
+                }
+                NativeTaskOutcome::Panicked(payload) => {
+                    return Err(ApplicationContractError::Domain(format!(
+                        "work owner-observation recovery join failed: {payload}"
+                    )));
+                }
+            }
         }
         Ok(summary)
     }
@@ -143,13 +165,17 @@ async fn run_recovery<S>(
 ) where
     S: WorkOwnerObservationStoragePortV1 + Clone + Send + Sync + 'static,
 {
-    let mut schedule = interval(RECOVERY_INTERVAL);
-    schedule.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // A pass that falls behind skips its missed ticks: the next one is a full
+    // interval after the previous pass ends.
+    let mut due = Instant::now();
     let mut summary = WorkOwnerObservationRecoverySummaryV1::default();
     let mut cursor = None;
     loop {
         tokio::select! {
-            _ = schedule.tick() => recover_batch(&storage, producer.as_ref(), RECOVERY_BATCH, &mut cursor, &mut summary).await,
+            Ok(()) = sleep_until(due) => {
+                recover_batch(&storage, producer.as_ref(), RECOVERY_BATCH, &mut cursor, &mut summary).await;
+                due = Instant::now() + RECOVERY_INTERVAL;
+            }
             Some(RecoveryControl::Shutdown { reply }) = control.recv() => {
                 recover_batch(&storage, producer.as_ref(), RECOVERY_BATCH, &mut cursor, &mut summary).await;
                 state.store(RECOVERY_STOPPED, Ordering::Release);
@@ -175,7 +201,7 @@ async fn recover_batch<S>(
 {
     let scan_storage = S::clone(storage);
     let after = cursor.clone();
-    let pending = match tokio::task::spawn_blocking(move || {
+    let pending = match native_runtime::spawn_blocking(move || {
         scan_storage.pending_owner_observations(after.as_ref(), limit)
     })
     .await
@@ -240,7 +266,7 @@ async fn recover_one<S>(
     }
     let marker_storage = S::clone(storage);
     let marker = pending.marker;
-    match tokio::task::spawn_blocking(move || {
+    match native_runtime::spawn_blocking(move || {
         marker_storage.mark_owner_observation_durable(&marker)
     })
     .await
@@ -449,6 +475,39 @@ mod tests {
                 .len(),
             1,
             "shutdown must stop future recovery scans"
+        );
+        producer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_a_held_writer_joins_by_the_callers_deadline() {
+        let harness = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+            "owner-observation-shutdown-deadline",
+        )
+        .await;
+        for ordinal in 1..=3 {
+            insert_pending_duplicate(&harness.registered, ordinal).await;
+        }
+        let storage = harness.registered.work_storage().unwrap();
+        let producer = producer(harness.registered.clone());
+        let blocker = harness.registered.begin_write_transaction().await.unwrap();
+        let recovery =
+            WorkOwnerObservationRecoveryV1::start(storage.clone(), Arc::clone(&producer)).unwrap();
+
+        let summary = recovery
+            .shutdown_until(Instant::now() + Duration::from_secs(60))
+            .await
+            .expect("each owner fact misses its persistence deadline, past the 5 s budget");
+        assert_eq!(summary.marked_durable, 0);
+        assert!(summary.failed >= 3, "{summary:?}");
+        blocker.rollback().await.unwrap();
+        assert_eq!(
+            storage
+                .pending_owner_observations(None, NonZeroU16::new(8).unwrap())
+                .unwrap()
+                .len(),
+            3,
+            "unrecovered receipts stay pending for the next start"
         );
         producer.shutdown().await.unwrap();
     }

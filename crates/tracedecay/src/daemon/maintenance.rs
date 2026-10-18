@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tracedecay_code_index::parallelism::{
     collect_idle_installed_worker_heaps, collect_installed_worker_heaps_when_idle,
 };
 use tracedecay_code_index_retention::code_index_generations::code_index_store_root;
+use tracedecay_maintenance::clock::now_secs_i64;
 use tracedecay_maintenance::compaction_receipt::record_live_compaction_outcome;
 use tracedecay_maintenance::generation::{
     run_project_generation_maintenance, run_registered_project_generation_maintenance,
@@ -17,17 +17,20 @@ use tracedecay_maintenance::lease::ProjectStoreMaintenanceLeaseV1;
 use tracedecay_maintenance::loop_run::{MaintenanceWake, run_maintenance_loop};
 use tracedecay_maintenance::retention::registered_store::RegisteredStoreRetentionReportV1;
 use tracedecay_maintenance::store_maintenance::RegisteredProjectStoreV1;
-use tracedecay_maintenance::telemetry::StoreTelemetrySamplingOutcome;
+use tracedecay_maintenance::telemetry::{
+    StoreFileIdentityStateV1, StoreTelemetrySamplingOutcome, StoreTelemetrySamplingRegistry,
+};
 use tracedecay_maintenance::tick::{
     MaintenanceContinuation, MaintenanceTickOutcome, cursor_after_attempted_units,
     select_store_window,
 };
-use tracedecay_runtime_core::storage::profile_sharded_data_root;
+use tracedecay_runtime_core::storage::{RESPONSE_HANDLES_DIRECTORY, profile_sharded_data_root};
 
 use super::branch_admin::StoreAdministration;
 use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 use tracedecay_domain::process_heap::request_idle_thread_collection_v1;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::native_runtime::{self, NativeTask, TimeoutError};
 const MAINTENANCE_STORE_PAGE_LIMIT: usize = 8;
 const REGISTERED_PROJECT_PAGE_LIMIT: usize = 64;
 
@@ -68,20 +71,25 @@ async fn registered_project_stores(
     }
 }
 
-async fn join_abandoned_maintenance_task(task: Option<JoinHandle<()>>, owner: &'static str) {
-    let Some(task) = task else {
-        return;
-    };
-    task.abort();
-    match tokio::time::timeout(DAEMON_TASK_ABORT_DEADLINE, task).await {
-        Ok(Ok(()) | Err(_)) => {}
-        Err(_) => {
+/// Holds every mounted store whose path no longer names the file this daemon
+/// opened in the reset-required state. The writer's file probe closes such a
+/// store's connections, but its mounted owners keep the closed runtime, so
+/// status and doctor name the restart that remounts them.
+fn record_lost_store_files(
+    sampling: &StoreTelemetrySamplingRegistry,
+    registry: &tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1,
+) {
+    for (path, state) in sampling.check_store_identities() {
+        if matches!(
+            state,
+            StoreFileIdentityStateV1::Missing | StoreFileIdentityStateV1::Replaced
+        ) && registry.record_store_identity_lost(&path)
+        {
             log_daemon_event(
-                "daemon_shutdown",
+                "store_file_identity_lost",
                 &[
-                    ("outcome", "maintenance_task_abandoned".to_string()),
-                    ("owner", owner.to_string()),
-                    ("reason", "join_exceeded_abort_deadline".to_string()),
+                    ("path", path.display().to_string()),
+                    ("state", format!("{state:?}")),
                 ],
             );
         }
@@ -98,6 +106,110 @@ struct ComponentRetentionProgress {
 struct SessionRetentionProgress {
     canonical: ComponentRetentionProgress,
     observations: ComponentRetentionProgress,
+}
+
+/// Expired response handles are removed from the profile root and every
+/// registered project store, so a daemon that outlives the handle TTL still
+/// reclaims them. The sweep stops between roots once cancellation is
+/// requested.
+async fn sweep_response_handles(
+    handle_roots: Vec<PathBuf>,
+    cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
+) {
+    let swept = native_runtime::spawn_blocking(move || {
+        let now = tracedecay_runtime_core::tracedecay::current_timestamp();
+        let (mut removed, mut failed) = (0usize, 0usize);
+        for root in &handle_roots {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match tracedecay_mcp::response_handles::cleanup_expired_response_handles(root, now) {
+                Ok(count) => removed = removed.saturating_add(count),
+                Err(_) => failed = failed.saturating_add(1),
+            }
+        }
+        (handle_roots.len(), removed, failed)
+    })
+    .await;
+    match swept {
+        Ok((roots, removed, failed)) if removed > 0 || failed > 0 => log_daemon_event(
+            "response_handle_cleanup",
+            &[
+                ("roots", roots.to_string()),
+                ("removed_expired", removed.to_string()),
+                ("failed_roots", failed.to_string()),
+            ],
+        ),
+        Ok(_) => {}
+        Err(error) => log_daemon_event(
+            "retention_degraded",
+            &[
+                ("pass", "response_handles".to_owned()),
+                ("failure", "blocking_pool_unavailable".to_owned()),
+                ("error", error),
+            ],
+        ),
+    }
+}
+
+/// Starts one maintenance owner on the native runtime. A refusal is logged
+/// with the owner it leaves unstarted.
+#[track_caller]
+fn spawn_maintenance_task(
+    owner: &'static str,
+    work: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Option<NativeTask<()>> {
+    NativeTask::spawn(work)
+        .inspect_err(|error| {
+            log_daemon_event(
+                "maintenance_task_unavailable",
+                &[("owner", owner.to_string()), ("reason", error.clone())],
+            );
+        })
+        .ok()
+}
+
+/// Joins a cancelled maintenance task. A tick notices cancellation only
+/// between store units, and the unit it is in may be awaiting blocking store
+/// work that holds a database client. Aborting drops only the awaiting future:
+/// the blocking closure keeps that client past the terminal store close, which
+/// then leaves the store's WAL untruncated. The task therefore gets the abort
+/// deadline to finish cooperatively and is aborted only past it.
+async fn join_cancelled_maintenance_task(
+    task: Option<NativeTask<()>>,
+    owner: &'static str,
+    abort_deadline: Duration,
+) {
+    let Some(task) = task else {
+        return;
+    };
+    let reason = match native_runtime::timeout(abort_deadline, task.wait()).await {
+        Ok(_) => return,
+        Err(TimeoutError::Elapsed) => "cooperative_join_exceeded_abort_deadline".to_string(),
+        Err(error @ TimeoutError::TimerUnavailable(_)) => error.to_string(),
+    };
+    log_daemon_event(
+        "daemon_shutdown",
+        &[
+            ("outcome", "maintenance_task_aborted".to_string()),
+            ("owner", owner.to_string()),
+            ("reason", reason),
+        ],
+    );
+    task.abort();
+    let reason = match native_runtime::timeout(abort_deadline, task.wait()).await {
+        Ok(_) => return,
+        Err(TimeoutError::Elapsed) => "join_exceeded_abort_deadline".to_string(),
+        Err(error @ TimeoutError::TimerUnavailable(_)) => error.to_string(),
+    };
+    log_daemon_event(
+        "daemon_shutdown",
+        &[
+            ("outcome", "maintenance_task_abandoned".to_string()),
+            ("owner", owner.to_string()),
+            ("reason", reason),
+        ],
+    );
 }
 
 #[tracing::instrument(
@@ -214,15 +326,8 @@ fn log_registered_store_retention_outcome(report: &RegisteredStoreRetentionRepor
         None => {}
     }
     match &report.observability {
-        Ok(receipt) if receipt.expired_detail > 0 || receipt.expired_rollup > 0 => {
-            log_daemon_event(
-                "retention_observability_analytics",
-                &[
-                    ("store", "mounted_sessions".to_owned()),
-                    ("expired_detail", receipt.expired_detail.to_string()),
-                    ("expired_rollup", receipt.expired_rollup.to_string()),
-                ],
-            );
+        Ok(receipt) if observability_retention_expired_rows(receipt) => {
+            log_observability_retention("mounted_sessions", receipt);
         }
         Err(error) => log_daemon_event(
             "retention_degraded",
@@ -475,15 +580,8 @@ async fn run_profile_observability_retention(
     };
     match database.prune_observability_events(now).await {
         Ok(receipt) => {
-            if receipt.expired_detail > 0 || receipt.expired_rollup > 0 {
-                log_daemon_event(
-                    "retention_observability_analytics",
-                    &[
-                        ("store", "global.db".to_owned()),
-                        ("expired_detail", receipt.expired_detail.to_string()),
-                        ("expired_rollup", receipt.expired_rollup.to_string()),
-                    ],
-                );
+            if observability_retention_expired_rows(&receipt) {
+                log_observability_retention("global.db", &receipt);
             }
             true
         }
@@ -498,6 +596,37 @@ async fn run_profile_observability_retention(
             false
         }
     }
+}
+
+fn observability_retention_expired_rows(
+    receipt: &tracedecay_global_db::ObservabilityRetentionReceiptV1,
+) -> bool {
+    receipt.expired_detail > 0
+        || receipt.expired_rollup > 0
+        || receipt.expired_rollups.expired_generations > 0
+        || receipt.expired_rollups.advanced_frontiers > 0
+}
+
+fn log_observability_retention(
+    store: &str,
+    receipt: &tracedecay_global_db::ObservabilityRetentionReceiptV1,
+) {
+    log_daemon_event(
+        "retention_observability_analytics",
+        &[
+            ("store", store.to_owned()),
+            ("expired_detail", receipt.expired_detail.to_string()),
+            ("expired_rollup", receipt.expired_rollup.to_string()),
+            (
+                "expired_rollup_generations",
+                receipt.expired_rollups.expired_generations.to_string(),
+            ),
+            (
+                "advanced_rollup_frontiers",
+                receipt.expired_rollups.advanced_frontiers.to_string(),
+            ),
+        ],
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,7 +680,7 @@ pub(super) struct MaintenanceCoordinator {
     cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
     background_cpu: Option<Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>>,
     wake: Arc<MaintenanceWake>,
-    task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    task: Arc<Mutex<Option<NativeTask<()>>>>,
     metrics: Arc<Mutex<MaintenanceMetricsV1>>,
     /// Round-robin fairness cursor over mounted stores: the sort key of the
     /// last store processed. The next tick resumes immediately after it so no
@@ -566,7 +695,7 @@ pub(super) struct MaintenanceCoordinator {
     /// mounted project. `None` keeps the daily cadence retry-eligible.
     last_branch_gc: Arc<Mutex<Option<Instant>>>,
     /// The resident-memory sampler task; see [`Self::spawn`].
-    resident_memory_sampler: Arc<Mutex<Option<JoinHandle<()>>>>,
+    resident_memory_sampler: Arc<Mutex<Option<NativeTask<()>>>>,
     /// Last resident-memory verdict logged, shared by the sampler and the
     /// retention tick so a sustained over-budget state logs once per
     /// transition rather than once per sample.
@@ -594,12 +723,16 @@ impl Default for MaintenanceCoordinator {
     }
 }
 
-/// One unit of bounded per-tick maintenance work: either a mounted session
-/// database or a mounted project graph. Arcs are cloned into the item so the
-/// store stays alive for the duration of the writer-held critical section.
+/// One unit of bounded per-tick maintenance work: a mounted session database
+/// or a mounted project graph, named by its database path. A tick holds no
+/// mounted store between units. Each unit resolves its store when its
+/// writer-held section starts and drops it when that section ends. Capacity
+/// retirement of an idle project refuses while anything leases its stores, so
+/// a tick that kept every listed store for its whole run refused those
+/// retirements. A store unmounted since the listing is skipped.
 enum MaintenanceStoreWork {
-    Session(tracedecay_global_db::RegisteredGlobalDbLeaseV1),
-    Graph(Arc<tracedecay_project::project::TraceDecay>),
+    Session(PathBuf),
+    Graph(PathBuf),
     /// The code-index scopes of a registered project that no mounted graph
     /// owns; its database is never opened by this unit.
     Registered(RegisteredProjectStoreV1),
@@ -608,11 +741,28 @@ enum MaintenanceStoreWork {
 impl MaintenanceStoreWork {
     fn database_path(&self) -> Option<&Path> {
         match self {
-            Self::Session(database) => Some(database.db_path()),
-            Self::Graph(graph) => Some(graph.db().database_path()),
+            Self::Session(database_path) | Self::Graph(database_path) => Some(database_path),
             Self::Registered(_) => None,
         }
     }
+}
+
+/// What a tick reads from one mounted project graph, copied out at listing.
+struct MountedGraphListing {
+    key: String,
+    database_path: PathBuf,
+    project_root: PathBuf,
+    data_root: PathBuf,
+    code_index_store_root: PathBuf,
+}
+
+/// The work-list key of a mounted project graph: its root and serving branch.
+fn graph_work_key(graph: &tracedecay_project::project::TraceDecay) -> String {
+    format!(
+        "g:{}\u{1f}{}",
+        graph.project_root().display(),
+        graph.serving_branch().unwrap_or_default()
+    )
 }
 
 pub(crate) fn project_store_maintenance_lease(
@@ -664,13 +814,15 @@ impl MaintenanceCoordinator {
             );
         }
         let sampler_owner = coordinator.clone();
-        let sampler = tokio::spawn(tracing::Instrument::instrument(
-            async move {
-                sampler_owner.run_resident_memory_sampler().await;
-            },
-            tracing::trace_span!("daemon.maintenance.resident_memory_sampler"),
-        ));
-        *coordinator.resident_memory_sampler.lock().await = Some(sampler);
+        *coordinator.resident_memory_sampler.lock().await = spawn_maintenance_task(
+            "resident_memory_sampler",
+            tracing::Instrument::instrument(
+                async move {
+                    sampler_owner.run_resident_memory_sampler().await;
+                },
+                tracing::trace_span!("daemon.maintenance.resident_memory_sampler"),
+            ),
+        );
         if !retention_maintenance_enabled(&retention) {
             return coordinator;
         }
@@ -680,41 +832,48 @@ impl MaintenanceCoordinator {
         // letting a day of publications pile up behind the daily cadence.
         let publication_owner = coordinator.clone();
         let mut publications = code_index_schedulers.subscribe_generation_publications();
-        tokio::spawn(tracing::Instrument::instrument(
-            async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = publication_owner.cancellation.cancelled() => break,
-                        received = publications.recv() => match received {
-                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                publication_owner.request_due();
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        },
+        // Detached: it ends with the coordinator's cancellation or the
+        // publication channel.
+        drop(spawn_maintenance_task(
+            "publication_due_requests",
+            tracing::Instrument::instrument(
+                async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = publication_owner.cancellation.cancelled() => break,
+                            received = publications.recv() => match received {
+                                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                    publication_owner.request_due();
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            },
+                        }
                     }
-                }
-            },
-            tracing::trace_span!("daemon.maintenance.publication_due_requests"),
+                },
+                tracing::trace_span!("daemon.maintenance.publication_due_requests"),
+            ),
         ));
         let task_owner = coordinator.clone();
         let interval = Duration::from_secs(retention.interval_hours.max(1).saturating_mul(3_600));
-        let handle = tokio::spawn(tracing::Instrument::instrument(
-            async move {
-                task_owner
-                    .run(
-                        profile_root,
-                        administration,
-                        code_index_schedulers,
-                        retention,
-                        branch_gc,
-                        interval,
-                    )
-                    .await;
-            },
-            tracing::trace_span!("daemon.maintenance.retention_loop"),
-        ));
-        *coordinator.task.lock().await = Some(handle);
+        *coordinator.task.lock().await = spawn_maintenance_task(
+            "retention_tick",
+            tracing::Instrument::instrument(
+                async move {
+                    task_owner
+                        .run(
+                            profile_root,
+                            administration,
+                            code_index_schedulers,
+                            retention,
+                            branch_gc,
+                            interval,
+                        )
+                        .await;
+                },
+                tracing::trace_span!("daemon.maintenance.retention_loop"),
+            ),
+        );
         coordinator
     }
 
@@ -740,20 +899,23 @@ impl MaintenanceCoordinator {
     /// join below stays correct whether or not it already ran.
     pub(super) fn cancel(&self) {
         self.cancellation.cancel();
-        self.wake.notify_waiters();
     }
 
     pub(super) async fn shutdown(&self) {
         self.cancel();
-        // Cancel stops the next pass; an in-flight tick only notices between
-        // stores. Abort the tasks so shutdown does not wait for retention or
-        // RSS sampling to finish, those are abandonable maintenance, not
-        // durability. The abort deadline is the join backstop if a tick is
-        // stuck in blocking work.
-        join_abandoned_maintenance_task(self.task.lock().await.take(), "retention_tick").await;
-        join_abandoned_maintenance_task(
+        // Cancel stops the next pass and the sampler at once; an in-flight
+        // tick notices between stores. Retention and RSS sampling are
+        // abandonable, so the abort deadline bounds each join.
+        join_cancelled_maintenance_task(
+            self.task.lock().await.take(),
+            "retention_tick",
+            DAEMON_TASK_ABORT_DEADLINE,
+        )
+        .await;
+        join_cancelled_maintenance_task(
             self.resident_memory_sampler.lock().await.take(),
             "resident_memory_sampler",
+            DAEMON_TASK_ABORT_DEADLINE,
         )
         .await;
     }
@@ -874,15 +1036,18 @@ impl MaintenanceCoordinator {
             );
             return MaintenanceTickOutcome::Retry;
         };
-        let Some(_background_cpu) = background_cpu.try_acquire() else {
-            return MaintenanceTickOutcome::Retry;
-        };
         administration
             .store_telemetry_sampling()
             .begin_retention_tick_log_window();
         let (mut session_databases, session_stores_available) =
             match administration.mounted_registered_session_databases().await {
-                Ok(databases) => (databases, true),
+                Ok(databases) => (
+                    databases
+                        .iter()
+                        .map(|database| database.db_path().to_path_buf())
+                        .collect::<Vec<_>>(),
+                    true,
+                ),
                 Err(error) => {
                     log_daemon_event(
                         "retention_degraded",
@@ -901,10 +1066,7 @@ impl MaintenanceCoordinator {
         let canonical_pending_before = self.canonical_gc_pending.lock().await.clone();
         let observation_pending_before = self.observation_retention_pending.lock().await.clone();
         {
-            let mounted_paths = session_databases
-                .iter()
-                .map(|database| database.db_path().to_path_buf())
-                .collect::<BTreeSet<_>>();
+            let mounted_paths = session_databases.iter().cloned().collect::<BTreeSet<_>>();
             let mut pending = self.canonical_gc_pending.lock().await;
             let mut observation_pending = self.observation_retention_pending.lock().await;
             if session_stores_available {
@@ -918,12 +1080,34 @@ impl MaintenanceCoordinator {
                 pending.extend(mounted_paths);
             } else {
                 session_databases.retain(|database| {
-                    pending.contains(database.db_path())
-                        || observation_pending.contains(database.db_path())
+                    pending.contains(database) || observation_pending.contains(database)
                 });
             }
         }
-        let project_graphs = administration.mounted_project_graphs().await;
+        let project_graphs = administration
+            .mounted_project_graphs()
+            .await
+            .iter()
+            .map(|graph| MountedGraphListing {
+                key: graph_work_key(graph),
+                database_path: graph.db().database_path().to_path_buf(),
+                project_root: graph.project_root().to_path_buf(),
+                data_root: graph.store_layout().data_root.clone(),
+                code_index_store_root: code_index_store_root(
+                    &graph.store_layout().data_root,
+                    &graph.store_layout().project_root,
+                ),
+            })
+            .collect::<Vec<_>>();
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let _ = crate::test_support::hold_after_maintenance_listing_for_test().await;
+        }
+        // The listing copies in-memory mounts and is not CPU work, so a tick
+        // parked at the listing holds no background CPU unit.
+        let Some(_background_cpu) = background_cpu.try_acquire() else {
+            return MaintenanceTickOutcome::Retry;
+        };
         let (registered_projects, registry_listed) =
             match registered_project_stores(profile_root, profile_database).await {
                 Ok(stores) => (stores, true),
@@ -939,23 +1123,27 @@ impl MaintenanceCoordinator {
                     (Vec::new(), false)
                 }
             };
+        if continuation.is_none() && !self.cancellation.is_cancelled() {
+            let handle_roots = std::iter::once(profile_root)
+                .chain(
+                    registered_projects
+                        .iter()
+                        .map(|(_, store)| store.data_root.as_path()),
+                )
+                .map(|root| root.join(RESPONSE_HANDLES_DIRECTORY))
+                .collect();
+            sweep_response_handles(handle_roots, self.cancellation.clone()).await;
+        }
         let mounted_store_roots = project_graphs
             .iter()
-            .map(|graph| {
-                let layout = graph.store_layout();
-                code_index_store_root(&layout.data_root, &layout.project_root)
-            })
+            .map(|graph| graph.code_index_store_root.clone())
             .collect::<BTreeSet<_>>();
         let mut active_telemetry_paths = BTreeSet::from([profile_database.db_path().to_path_buf()]);
-        active_telemetry_paths.extend(
-            session_databases
-                .iter()
-                .map(|database| database.db_path().to_path_buf()),
-        );
+        active_telemetry_paths.extend(session_databases.iter().cloned());
         active_telemetry_paths.extend(
             project_graphs
                 .iter()
-                .map(|graph| graph.db().database_path().to_path_buf()),
+                .map(|graph| graph.database_path.clone()),
         );
         // Build one stably-sorted work list across both store kinds so the
         // per-tick budget and round-robin cursor bound the total work, not each
@@ -965,20 +1153,16 @@ impl MaintenanceCoordinator {
         let mut work: Vec<(String, MaintenanceStoreWork)> = Vec::with_capacity(
             session_databases.len() + project_graphs.len() + registered_projects.len(),
         );
-        for database in &session_databases {
+        for database_path in &session_databases {
             work.push((
-                format!("s:{}", database.db_path().display()),
-                MaintenanceStoreWork::Session(database.clone()),
+                format!("s:{}", database_path.display()),
+                MaintenanceStoreWork::Session(database_path.clone()),
             ));
         }
         for graph in &project_graphs {
             work.push((
-                format!(
-                    "g:{}\u{1f}{}",
-                    graph.project_root().display(),
-                    graph.serving_branch().unwrap_or_default()
-                ),
-                MaintenanceStoreWork::Graph(Arc::clone(graph)),
+                graph.key.clone(),
+                MaintenanceStoreWork::Graph(graph.database_path.clone()),
             ));
         }
         for (project_id, store) in registered_projects {
@@ -1007,16 +1191,29 @@ impl MaintenanceCoordinator {
         let maintenance_observations = administration.store_telemetry_sampling();
         let active_maintenance_projects = project_graphs
             .iter()
-            .map(|graph| graph.project_root().to_path_buf())
+            .map(|graph| graph.project_root.clone())
             .collect::<BTreeSet<_>>();
         maintenance_observations.retain_project_maintenance_state(&active_maintenance_projects);
-        let telemetry_sampling = if continuation.is_none() {
+        // A capacity retirement releasing stores skips this pass: sampling
+        // leases every sampled store until it ends.
+        let telemetry_sampling = if continuation.is_none()
+            && let Ok(_clients) = administration.maintenance_store_clients().try_lock()
+        {
             maintenance_observations
-                .advance_registered(&active_telemetry_paths, &sampled_telemetry_paths)
+                .advance_registered(
+                    &active_telemetry_paths,
+                    &sampled_telemetry_paths,
+                    &self.cancellation,
+                )
                 .await
         } else {
             StoreTelemetrySamplingOutcome::default()
         };
+        if continuation.is_none()
+            && let Some(registry) = administration.mounted_session_runtime_registry().await
+        {
+            record_lost_store_files(&maintenance_observations, &registry);
+        }
 
         // Bounded, round-robin slice of mounted stores. Writer admission is
         // per unit so one busy store defers only itself, and the cursor
@@ -1032,13 +1229,42 @@ impl MaintenanceCoordinator {
                 break;
             }
             let mut session_progress = SessionRetentionProgress::default();
+            if let MaintenanceStoreWork::Session(path) = &work[index].1 {
+                session_progress.canonical.pending = canonical_pending_before.contains(path);
+                session_progress.observations.pending = observation_pending_before.contains(path);
+            }
             let admitted = administration
                 .try_with_writer(|| async {
-                    match &work[index].1 {
-                        MaintenanceStoreWork::Session(database) => {
+                    let Ok(_clients) = administration.maintenance_store_clients().try_lock() else {
+                        return MaintenanceTickOutcome::Retry;
+                    };
+                    let (key, unit) = &work[index];
+                    match unit {
+                        MaintenanceStoreWork::Session(database_path) => {
+                            let databases =
+                                match administration.mounted_registered_session_databases().await {
+                                    Ok(databases) => databases,
+                                    Err(error) => {
+                                        log_daemon_event(
+                                            "retention_degraded",
+                                            &[
+                                                ("pass", "canonical_content".to_owned()),
+                                                ("error", error.to_string()),
+                                            ],
+                                        );
+                                        return MaintenanceTickOutcome::Retry;
+                                    }
+                                };
+                            let Some(database) = databases
+                                .into_iter()
+                                .find(|database| database.db_path() == database_path)
+                            else {
+                                session_progress = SessionRetentionProgress::default();
+                                return MaintenanceTickOutcome::Complete;
+                            };
                             let mut outcome = if continuation.is_none() {
                                 run_registered_store_retention(
-                                    database,
+                                    &database,
                                     retention,
                                     &mut session_progress,
                                 )
@@ -1057,7 +1283,7 @@ impl MaintenanceCoordinator {
                             {
                                 let content = if session_progress.observations.pending {
                                     run_session_content_slice(
-                                        database,
+                                        &database,
                                         Some(retention),
                                         &self.cancellation,
                                         &mut session_progress,
@@ -1067,7 +1293,7 @@ impl MaintenanceCoordinator {
                                     && !session_progress.canonical.failed
                                 {
                                     let canonical =
-                                        run_canonical_content_slice(database, &self.cancellation)
+                                        run_canonical_content_slice(&database, &self.cancellation)
                                             .await;
                                     session_progress.canonical.pending =
                                         canonical != MaintenanceTickOutcome::Complete;
@@ -1079,9 +1305,17 @@ impl MaintenanceCoordinator {
                             }
                             outcome
                         }
-                        MaintenanceStoreWork::Graph(graph) => {
+                        MaintenanceStoreWork::Graph(_) => {
+                            let Some(graph) = administration
+                                .mounted_project_graphs()
+                                .await
+                                .into_iter()
+                                .find(|graph| graph_work_key(graph) == *key)
+                            else {
+                                return MaintenanceTickOutcome::Complete;
+                            };
                             run_project_generation_maintenance(
-                                &project_store_maintenance_lease(graph),
+                                &project_store_maintenance_lease(&graph),
                                 code_index_schedulers,
                                 &maintenance_observations,
                                 &self.cancellation,
@@ -1111,14 +1345,14 @@ impl MaintenanceCoordinator {
                 let mut observation_pending = self.observation_retention_pending.lock().await;
                 if admitted.is_some() {
                     if session_progress.canonical.pending {
-                        pending.insert(database.db_path().to_path_buf());
+                        pending.insert(database.clone());
                     } else {
-                        pending.remove(database.db_path());
+                        pending.remove(database);
                     }
                     if session_progress.observations.pending {
-                        observation_pending.insert(database.db_path().to_path_buf());
+                        observation_pending.insert(database.clone());
                     } else {
-                        observation_pending.remove(database.db_path());
+                        observation_pending.remove(database);
                     }
                 }
             }
@@ -1198,7 +1432,7 @@ impl MaintenanceCoordinator {
             owner_roots.extend(
                 project_graphs
                     .iter()
-                    .map(|graph| graph.project_root().to_path_buf()),
+                    .map(|graph| graph.project_root.clone()),
             );
             match administration
                 .try_with_writer(|| {
@@ -1254,7 +1488,8 @@ impl MaintenanceCoordinator {
                         administration,
                         code_index_schedulers,
                         branch_gc.branch_gc_days,
-                        graph,
+                        &graph.project_root,
+                        &graph.data_root,
                     )
                     .await;
                 }
@@ -1399,7 +1634,13 @@ async fn run_resident_memory_sampler_loop(
     loop {
         tokio::select! {
             () = cancellation.cancelled() => return,
-            () = tokio::time::sleep(interval) => {}
+            slept = native_runtime::sleep_until(Instant::now() + interval) => {
+                if let Err(error) = slept {
+                    // Without a timer every park would return at once and spin.
+                    tracing::error!(event = "resident_memory_sampler_timer_unavailable", %error);
+                    return;
+                }
+            }
         }
         if cancellation.is_cancelled() {
             return;
@@ -1409,10 +1650,10 @@ async fn run_resident_memory_sampler_loop(
         // multi-gigabyte heap takes real time; keep it off the runtime. A
         // shutdown stops awaiting that blocking pass but cannot unsafely
         // interrupt allocator maintenance already running on its worker.
-        let mut sampled = tokio::task::spawn_blocking(move || sample());
+        let sampled = native_runtime::spawn_blocking(move || sample());
         tokio::select! {
             () = cancellation.cancelled() => return,
-            result = &mut sampled => {
+            result = sampled => {
                 if result.is_err() {
                     return;
                 }
@@ -1463,10 +1704,6 @@ pub(super) fn retention_maintenance_enabled(
         || retention.compaction.is_some()
 }
 
-pub(crate) fn now_secs_i64() -> Result<i64, &'static str> {
-    tracedecay_maintenance::clock::now_secs_i64()
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1475,77 +1712,17 @@ mod tests {
     use std::time::Duration;
 
     use tokio::sync::Notify;
-    use tracedecay_contracts::storage::{
-        StorageByteSizeV1, StoreKeyV1, TableGrowthTelemetryReadV1, TableNameV1,
-    };
-    use tracedecay_domain::UtcMicros;
 
-    use super::{MaintenanceCoordinator, run_resident_memory_sampler_loop};
-    use tracedecay_maintenance::loop_run::{
-        MaintenanceWake, maintenance_futures_active, run_maintenance_loop,
-    };
-    use tracedecay_maintenance::telemetry::{
-        StoreTelemetrySamplingRegistry, TableGrowthObservation, compare_table_growth,
-    };
+    use super::{MaintenanceCoordinator, NativeTask, run_resident_memory_sampler_loop};
+    use tracedecay_maintenance::telemetry::StoreTelemetrySamplingRegistry;
     use tracedecay_maintenance::tick::{
-        CadenceInstant, MaintenanceCadence, MaintenanceContinuation, MaintenanceTickOutcome,
+        MaintenanceCadence, MaintenanceContinuation, MaintenanceTickOutcome,
         cursor_after_attempted_units, select_store_window,
     };
 
     #[test]
-    fn table_growth_preview_never_mutates_the_maintenance_baseline() {
-        let store = StoreKeyV1::new("project.db").expect("store key");
-        let table = TableNameV1::new("messages").expect("table name");
-        let mut watermarks = None;
-
-        let preview = compare_table_growth(
-            &store,
-            std::collections::BTreeMap::from([(table.clone(), StorageByteSizeV1(10))]),
-            UtcMicros(1),
-            &mut watermarks,
-            TableGrowthObservation::Preview,
-        );
-        assert!(matches!(
-            preview,
-            TableGrowthTelemetryReadV1::Unknown { .. }
-        ));
-        assert!(
-            watermarks.is_none(),
-            "preview must not establish a baseline"
-        );
-
-        let baseline = compare_table_growth(
-            &store,
-            std::collections::BTreeMap::from([(table.clone(), StorageByteSizeV1(10))]),
-            UtcMicros(2),
-            &mut watermarks,
-            TableGrowthObservation::Advance,
-        );
-        assert!(matches!(
-            baseline,
-            TableGrowthTelemetryReadV1::BaselineEstablished {
-                tables_observed: 1,
-                ..
-            }
-        ));
-
-        let observed = compare_table_growth(
-            &store,
-            std::collections::BTreeMap::from([(table, StorageByteSizeV1(20))]),
-            UtcMicros(3),
-            &mut watermarks,
-            TableGrowthObservation::Preview,
-        );
-        let TableGrowthTelemetryReadV1::Observed { samples, .. } = observed else {
-            panic!("preview should compare with the maintenance baseline");
-        };
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].growth_bytes().get(), 10);
-    }
-
-    #[test]
     fn cadence_rate_limits_failures_and_successes() {
-        let started = CadenceInstant::now();
+        let started = std::time::Instant::now();
         let mut cadence = MaintenanceCadence::new(Duration::from_mins(1));
 
         assert!(cadence.reserve(started));
@@ -1683,198 +1860,6 @@ mod tests {
         );
     }
 
-    /// `MAINTENANCE_FUTURES_ACTIVE` is a process-wide counter, so a test that
-    /// observes absolute readings must not overlap another test that runs a
-    /// maintenance loop. Every test that starts `run_maintenance_loop` holds
-    /// this lock for the whole lifetime of its loop.
-    static MAINTENANCE_LOOP_LIFECYCLE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    #[tokio::test(start_paused = true)]
-    async fn repeated_wakes_do_not_move_the_maintenance_due_deadline() {
-        let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
-        let wake = Arc::new(MaintenanceWake::default());
-        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let baseline = maintenance_futures_active();
-        let task_cancellation = cancellation.clone();
-        let task_wake = Arc::clone(&wake);
-        let task_ticks = Arc::clone(&ticks);
-        let task = tokio::spawn(async move {
-            run_maintenance_loop(
-                &task_cancellation,
-                &task_wake,
-                Duration::from_mins(10),
-                move |_| {
-                    let ticks = Arc::clone(&task_ticks);
-                    async move {
-                        ticks.fetch_add(1, Ordering::SeqCst);
-                        MaintenanceTickOutcome::Complete
-                    }
-                },
-            )
-            .await;
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(
-            maintenance_futures_active(),
-            baseline + 1,
-            "the loop lifecycle must become observable while the task is live"
-        );
-
-        for _ in 0..3 {
-            wake.wake();
-            tokio::task::yield_now().await;
-            assert_eq!(ticks.load(Ordering::SeqCst), 0);
-        }
-        tokio::time::advance(Duration::from_secs(59)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(ticks.load(Ordering::SeqCst), 0);
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            ticks.load(Ordering::SeqCst),
-            1,
-            "the original absolute deadline must run exactly once despite early wakes"
-        );
-
-        cancellation.cancel();
-        task.await
-            .expect("maintenance loop joins after cancellation");
-        assert_eq!(
-            maintenance_futures_active(),
-            baseline,
-            "cancellation must drop the lifecycle guard and clear the active count"
-        );
-    }
-
-    /// A due request is the publication signal: it pulls the next tick to at
-    /// most one retry delay away, coalesces with other requests inside that
-    /// window, and never runs a tick while one is in flight.
-    #[tokio::test(start_paused = true)]
-    async fn due_request_pulls_the_next_tick_forward_without_busy_looping() {
-        let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
-        let wake = Arc::new(MaintenanceWake::default());
-        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let task_cancellation = cancellation.clone();
-        let task_wake = Arc::clone(&wake);
-        let task_ticks = Arc::clone(&ticks);
-        let task = tokio::spawn(async move {
-            run_maintenance_loop(
-                &task_cancellation,
-                &task_wake,
-                Duration::from_hours(24),
-                move |_| {
-                    let ticks = Arc::clone(&task_ticks);
-                    async move {
-                        ticks.fetch_add(1, Ordering::SeqCst);
-                        MaintenanceTickOutcome::Complete
-                    }
-                },
-            )
-            .await;
-        });
-        tokio::task::yield_now().await;
-        // The first tick runs one retry delay after start, then the daily
-        // cadence applies.
-        tokio::time::advance(Duration::from_mins(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(ticks.load(Ordering::SeqCst), 1);
-
-        // A plain wake leaves the daily deadline alone.
-        tokio::time::advance(Duration::from_hours(1)).await;
-        wake.wake();
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_mins(5)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(ticks.load(Ordering::SeqCst), 1);
-
-        // Three publications inside one retry delay make exactly one tick due
-        // one retry delay after the first request, not after 24 hours.
-        for _ in 0..3 {
-            wake.request_due();
-            tokio::task::yield_now().await;
-            assert_eq!(
-                ticks.load(Ordering::SeqCst),
-                1,
-                "a due request never runs early"
-            );
-        }
-        tokio::time::advance(Duration::from_secs(59)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(ticks.load(Ordering::SeqCst), 1);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            ticks.load(Ordering::SeqCst),
-            2,
-            "coalesced due requests run one tick after one retry delay"
-        );
-
-        // After that tick the daily cadence is back in force.
-        tokio::time::advance(Duration::from_hours(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(ticks.load(Ordering::SeqCst), 2);
-
-        cancellation.cancel();
-        task.await
-            .expect("maintenance loop joins after cancellation");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn progress_continuation_reenters_only_the_owning_phase() {
-        let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
-        let wake = Arc::new(MaintenanceWake::default());
-        let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let task_cancellation = cancellation.clone();
-        let task_wake = Arc::clone(&wake);
-        let task_phases = Arc::clone(&phases);
-        let task = tokio::spawn(async move {
-            run_maintenance_loop(
-                &task_cancellation,
-                &task_wake,
-                Duration::from_mins(10),
-                move |continuation| {
-                    let phases = Arc::clone(&task_phases);
-                    async move {
-                        let mut phases = phases
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        phases.push(continuation);
-                        if phases.len() == 1 {
-                            MaintenanceTickOutcome::Continue(
-                                MaintenanceContinuation::CodeGenerationRetention,
-                            )
-                        } else {
-                            MaintenanceTickOutcome::Complete
-                        }
-                    }
-                },
-            )
-            .await;
-        });
-        tokio::task::yield_now().await;
-
-        tokio::time::advance(Duration::from_mins(1)).await;
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_mins(1)).await;
-        tokio::task::yield_now().await;
-
-        assert_eq!(
-            *phases
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![None, Some(MaintenanceContinuation::CodeGenerationRetention)],
-            "bounded progress must resume its code-generation phase instead of a full tick"
-        );
-
-        cancellation.cancel();
-        task.await
-            .expect("maintenance loop joins after cancellation");
-    }
-
     fn store_keys(count: usize) -> Vec<String> {
         (0..count).map(|index| format!("s:{index:03}")).collect()
     }
@@ -1906,6 +1891,73 @@ mod tests {
                 "count={count} budget={budget}: not every store reached within {ticks} ticks"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_mounted_store_deleted_under_the_daemon_requires_a_restart() {
+        let temporary = tempfile::tempdir().expect("store identity fixture root");
+        let profile_root = temporary.path().join("profile");
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+            .expect("profile identity");
+        let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
+            &profile_root,
+            44,
+            "maintenance store identity",
+        )
+        .expect("daemon database scope");
+        let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity)
+            .await
+            .expect("daemon session runtime registry");
+        let database_path = temporary.path().join("project.db");
+        tracedecay_global_db::register_registered_schema_installer();
+        let authority = tracedecay_runtime_core::db::DatabaseAuthority::acquire_test(
+            &database_path,
+            "maintenance store identity fixture",
+        )
+        .expect("store identity fixture authority");
+        let (database, _) = tracedecay_runtime_core::db::Database::publish_test_runtime(
+            &database_path,
+            &authority,
+            tracedecay_runtime_core::db::TestDatabaseRuntimeMode::Initialize,
+        )
+        .await
+        .expect("store identity fixture database");
+        let scope = tracedecay_contracts::ResolvedScope::new(
+            tracedecay_domain::ProjectId::new("project.store-identity").expect("project identity"),
+            tracedecay_domain::RepositoryId::new("repository.store-identity")
+                .expect("repository identity"),
+            tracedecay_domain::WorktreeId::new("worktree.store-identity")
+                .expect("worktree identity"),
+            None,
+        )
+        .expect("resolved scope");
+        let sampling = StoreTelemetrySamplingRegistry::default();
+        assert!(sampling.register_port(&database_path, &scope, || {
+            database.storage_telemetry_handle()
+        }));
+        let lost = |registry: &tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1| {
+            registry
+                .reset_required_stores()
+                .into_iter()
+                .filter(|store| store.store == database_path.display().to_string())
+                .map(|store| store.remedy)
+                .collect::<Vec<_>>()
+        };
+
+        super::record_lost_store_files(&sampling, &registry);
+        assert_eq!(
+            lost(&registry),
+            Vec::<String>::new(),
+            "a live store is not lost"
+        );
+
+        std::fs::remove_file(&database_path).expect("delete the mounted store");
+        super::record_lost_store_files(&sampling, &registry);
+        assert_eq!(
+            lost(&registry),
+            [tracedecay_domain::errors::DAEMON_RESTART_COMMAND.to_owned()],
+            "a store deleted under the daemon must be reset-required, naming the restart"
+        );
     }
 
     #[tokio::test]
@@ -2037,8 +2089,9 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn blocked_resident_memory_reclaimer_never_stalls_runtime_or_sampler_cancellation() {
+        const INTERVAL: Duration = Duration::from_millis(200);
         let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
         let started = Arc::new(Notify::new());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2060,54 +2113,55 @@ mod tests {
             }
         });
         let task_cancellation = cancellation.clone();
-        let sampler = tokio::spawn(async move {
-            run_resident_memory_sampler_loop(
-                &task_cancellation,
-                Duration::from_secs(30),
-                fake_reclaimer,
-            )
-            .await;
+        let spawned = std::time::Instant::now();
+        let mut sampler = tokio::spawn(async move {
+            run_resident_memory_sampler_loop(&task_cancellation, INTERVAL, fake_reclaimer).await;
         });
-        tokio::task::yield_now().await;
 
-        tokio::time::advance(Duration::from_secs(29)).await;
-        tokio::task::yield_now().await;
-        let calls_before_deadline = calls.load(Ordering::SeqCst);
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let started_on_deadline =
-            tokio::time::timeout(Duration::from_secs(1), started.notified()).await;
+        let started_after_interval =
+            tokio::time::timeout(Duration::from_secs(10), started.notified()).await;
+        let first_sample_after = spawned.elapsed();
         let heartbeat = tokio::spawn(async { 7_u8 });
         let heartbeat_result = heartbeat.await;
 
         cancellation.cancel();
-        tokio::task::yield_now().await;
-        let cancelled_while_blocked = sampler.is_finished();
+        let cancelled_while_blocked =
+            tokio::time::timeout(Duration::from_secs(10), &mut sampler).await;
 
         let (released, ready) = &*release;
         *released
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         ready.notify_all();
-        let sampler_result = sampler.await;
 
-        assert_eq!(calls_before_deadline, 0);
+        assert!(started_after_interval.is_ok(), "the sampler must run");
         assert!(
-            started_on_deadline.is_ok(),
-            "the sampler must preserve its thirty-second cadence"
+            first_sample_after >= INTERVAL,
+            "the sampler must wait its interval first, sampled after {first_sample_after:?}"
         );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(heartbeat_result.expect("runtime heartbeat"), 7);
-        assert!(
-            cancelled_while_blocked,
-            "cancellation must not wait for a blocked pressure reclaimer"
-        );
-        sampler_result.expect("sampler joins after cancellation");
+        cancelled_while_blocked
+            .expect("cancellation must not wait for a blocked pressure reclaimer")
+            .expect("sampler joins after cancellation");
     }
 
     /// A registered project nothing has mounted since the daemon started is
     /// collected by the first full tick and converges on its continuation,
-    /// instead of waiting for a client to mount it.
-    #[tokio::test]
+    /// instead of waiting for a client to mount it. A tick that runs while a
+    /// capacity release holds the maintenance store clients defers it.
+    #[test]
+    fn a_full_tick_collects_an_unmounted_registered_project_without_a_tokio_runtime() {
+        let hazards = crate::test_support::native_runtime_hazards();
+        tracedecay_runtime_core::native_runtime::block_on(
+            a_full_tick_collects_an_unmounted_registered_project(),
+        )
+        .expect("native runtime");
+        assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
+    }
+
     async fn a_full_tick_collects_an_unmounted_registered_project() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
         let temp = tempfile::TempDir::new().expect("temp root");
         let profile_root = temp.path().join("profile");
         let checkout = temp.path().join("checkout");
@@ -2163,6 +2217,26 @@ mod tests {
         let retention = tracedecay_configuration::RetentionConfig::default();
         let branch_gc = super::BranchStoreGcCadenceV1 { branch_gc_days: 30 };
         assert_eq!(generation_files(), 6);
+
+        let release = administration.maintenance_store_clients().lock().await;
+        let deferred = coordinator
+            .run_tick(
+                &profile_root,
+                &profile_database,
+                &administration,
+                &schedulers,
+                &retention,
+                branch_gc,
+                None,
+            )
+            .await;
+        assert_eq!(deferred, MaintenanceTickOutcome::Retry);
+        assert_eq!(
+            generation_files(),
+            6,
+            "a tick leases no store while a capacity release runs"
+        );
+        drop(release);
 
         coordinator
             .run_tick(
@@ -2334,7 +2408,14 @@ mod tests {
                 "the next ordinary window reaches stores initially outside the budget"
             );
         }
-        administration.close_stores_for_shutdown().await.unwrap();
+        drop((databases, profile_database));
+        administration
+            .close_stores_for_shutdown(
+                std::time::Instant::now()
+                    + tracedecay_daemon_service::shutdown::DAEMON_STORE_CLOSE_RESERVE,
+            )
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -2617,7 +2698,14 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 1);
         drop(snapshot);
-        administration.close_stores_for_shutdown().await.unwrap();
+        drop((stores, failing, profile_database));
+        administration
+            .close_stores_for_shutdown(
+                std::time::Instant::now()
+                    + tracedecay_daemon_service::shutdown::DAEMON_STORE_CLOSE_RESERVE,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2747,20 +2835,189 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_full_tick_sweeps_expired_response_handles_from_the_profile_and_each_store() {
+        tracedecay_runtime_core::native_runtime::block_on(async {
+            use tracedecay_session_memory::response_handles::{
+                inventory_response_handles, store_response_handle,
+            };
+
+            let temp = tempfile::TempDir::new().expect("temp root");
+            let profile_root = temp.path().join("profile");
+            let checkout = temp.path().join("checkout");
+            std::fs::create_dir_all(&checkout).expect("checkout");
+            let runtime =
+                tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
+                    &profile_root,
+                )
+                .await
+                .expect("profile database");
+            let profile_database = runtime.profile_database_arc();
+            let project = profile_database
+                .upsert_code_project("proj_handles", &checkout, None, None, None)
+                .await
+                .expect("register project");
+            let store_root = tracedecay_runtime_core::storage::profile_sharded_data_root(
+                &profile_root,
+                &project.project_id,
+            );
+            std::fs::create_dir_all(&store_root).expect("project store");
+            let roots = [
+                profile_root.join(super::RESPONSE_HANDLES_DIRECTORY),
+                store_root.join(super::RESPONSE_HANDLES_DIRECTORY),
+            ];
+            let now = tracedecay_runtime_core::tracedecay::current_timestamp();
+            for root in &roots {
+                store_response_handle(root, "expired", 1).expect("expired handle");
+                store_response_handle(root, "fresh", now).expect("fresh handle");
+                assert_eq!(inventory_response_handles(root).expect("inventory").file_count, 2);
+            }
+            let coordinator = MaintenanceCoordinator {
+                background_cpu: Some(Arc::new(
+                    tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1::new(
+                        std::num::NonZeroUsize::MIN,
+                    ),
+                )),
+                ..MaintenanceCoordinator::default()
+            };
+
+            coordinator
+                .run_tick(
+                    &profile_root,
+                    &profile_database,
+                    &super::StoreAdministration::default(),
+                    &tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::new(1),
+                    &tracedecay_configuration::RetentionConfig::default(),
+                    super::BranchStoreGcCadenceV1 { branch_gc_days: 30 },
+                    None,
+                )
+                .await;
+
+            for root in &roots {
+                assert_eq!(
+                    inventory_response_handles(root).expect("inventory").file_count,
+                    1,
+                    "the tick removes the expired handle and keeps the fresh one under {}",
+                    root.display()
+                );
+            }
+        })
+        .expect("native runtime");
+    }
+
+    /// Tick state released 200 ms after its tick drops, past the abort
+    /// deadline, as when a loaded host runs an aborted tick's unwind late. The
+    /// release runs on its own thread so no shared runtime worker blocks.
+    struct LateUnwind<T: Send + 'static>(Option<T>);
+
+    impl<T: Send + 'static> Drop for LateUnwind<T> {
+        fn drop(&mut self) {
+            let state = self.0.take();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(state);
+            });
+        }
+    }
+
+    /// The join may abandon an aborted tick whose unwind outlasts the abort
+    /// deadline, so the test waits for the tick's state to drop rather than
+    /// expecting the join to have seen it.
     #[tokio::test]
-    async fn shutdown_aborts_an_in_flight_tick_instead_of_waiting_for_it() {
-        let coordinator = MaintenanceCoordinator::default();
+    async fn shutdown_aborts_a_stuck_tick_at_the_abort_deadline() {
+        let (held_state, released) = tokio::sync::oneshot::channel::<()>();
         let started = Arc::new(Notify::new());
         let task_started = Arc::clone(&started);
-        let handle = tokio::spawn(async move {
+        let handle = NativeTask::spawn(async move {
+            let _held_state = LateUnwind(Some(held_state));
             task_started.notify_one();
             std::future::pending::<()>().await;
-        });
+        })
+        .expect("native task");
+        started.notified().await;
+
+        super::join_cancelled_maintenance_task(
+            Some(handle),
+            "stuck_tick",
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let released = tokio::time::timeout(Duration::from_secs(30), released)
+            .await
+            .expect("a tick stuck past the abort deadline must be aborted");
+        assert!(released.is_err(), "the aborted tick dropped its state");
+    }
+
+    /// A tick cancelled while it awaits blocking store work must not leave
+    /// that work holding its database client past the maintenance join: the
+    /// terminal store close then finds the client lease and skips the WAL
+    /// truncate.
+    #[tokio::test]
+    async fn shutdown_waits_for_the_blocking_store_work_of_a_cancelled_tick() {
+        let coordinator = MaintenanceCoordinator::default();
+        let store_client = Arc::new(());
+        let blocking_client = Arc::clone(&store_client);
+        let started = Arc::new(Notify::new());
+        let task_started = Arc::clone(&started);
+        let handle = NativeTask::spawn(async move {
+            let _ = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
+                task_started.notify_one();
+                std::thread::sleep(Duration::from_millis(300));
+                drop(blocking_client);
+            })
+            .await;
+        })
+        .expect("native task");
         *coordinator.task.lock().await = Some(handle);
         started.notified().await;
 
-        tokio::time::timeout(Duration::from_millis(500), coordinator.shutdown())
+        coordinator.shutdown().await;
+
+        assert_eq!(
+            Arc::strong_count(&store_client),
+            1,
+            "the maintenance join returned while the tick's blocking store work held its client"
+        );
+    }
+
+    /// The coordinator starts its sampler, publication and retention owners
+    /// on the native runtime and joins them at shutdown, with no Tokio
+    /// runtime entered.
+    #[test]
+    fn the_coordinator_runs_and_shuts_down_without_a_tokio_runtime() {
+        let hazards = crate::test_support::native_runtime_hazards();
+        tracedecay_runtime_core::native_runtime::block_on(async {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let temp = tempfile::TempDir::new().expect("temp root");
+            let retention = tracedecay_configuration::RetentionConfig {
+                orphan_store_gc_days: Some(30),
+                ..tracedecay_configuration::RetentionConfig::default()
+            };
+            assert!(super::retention_maintenance_enabled(&retention));
+            let coordinator = MaintenanceCoordinator::spawn(
+                temp.path().join("profile"),
+                super::StoreAdministration::default(),
+                tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::new(1),
+                retention,
+                super::BranchStoreGcCadenceV1 { branch_gc_days: 30 },
+            )
+            .await;
+            assert!(coordinator.task.lock().await.is_some(), "the retention owner started");
+            assert!(
+                coordinator.resident_memory_sampler.lock().await.is_some(),
+                "the sampler started"
+            );
+            tracedecay_runtime_core::native_runtime::timeout(
+                Duration::from_secs(10),
+                coordinator.shutdown(),
+            )
             .await
-            .expect("maintenance shutdown must abort an in-flight tick");
+            .expect("shutdown joins every maintenance owner");
+            assert!(coordinator.task.lock().await.is_none());
+            assert!(coordinator.resident_memory_sampler.lock().await.is_none());
+        })
+        .expect("native runtime");
+        assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
     }
 }

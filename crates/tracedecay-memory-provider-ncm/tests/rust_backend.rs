@@ -29,9 +29,9 @@ mod enabled {
         observation_extensions_digest,
     };
     use tracedecay_memory_provider_ncm::{
-        NCM_PROVIDER_ID, NcmCognitiveSurface, NcmProviderAdapter, NcmSurfaceCall,
-        NcmSurfaceHandshakeRequest, NcmSurfaceHandshakeResponse, RustNcmConfig, RustNcmSurface,
-        RustNcmWorkerOwner, StateRoot, WorkerOptions,
+        NCM_PROVIDER_ID, NcmCognitiveSurface, NcmNamespaceBinding, NcmProviderAdapter,
+        NcmSurfaceCall, NcmSurfaceHandshakeRequest, NcmSurfaceHandshakeResponse, RustNcmConfig,
+        RustNcmSurface, RustNcmWorkerOwner, StateRoot, WorkerOptions,
     };
 
     const RESOLVED_SCOPE_DIGEST: &str =
@@ -829,7 +829,139 @@ mod enabled {
     }
 
     #[test]
-    fn canonical_replay_without_history_authority_preserves_current_state_across_restart() {
+    fn checkout_original_history_replay_keeps_granted_origin_and_public_receipt_after_restart() {
+        use tracedecay_memory_provider_api::contract::SourceDisposition;
+        use tracedecay_memory_provider_api::{
+            CurrentSourceDisposition, OriginScopeEvidence, OriginalSourceIdentity,
+            RecordedValidity, SourceAttribution,
+        };
+        let root = TestRoot::new("checkout-granted-replay");
+        let origin = scope("checkout-granted-replay");
+        let mut destination = origin.clone();
+        destination.agent_session_id = "new-replay-caller".to_owned();
+        destination.resolved_scope_digest = format!("sha256:{}", "33".repeat(32));
+        let mut observation = canonical_observation(
+            &origin,
+            1,
+            "The original history retains compiler identity.",
+        );
+        observation["source_sequence"] = json!(1);
+        observation["idempotency_key"] = json!("granted-original-delivery");
+        let original = observation["source_identity"]["original_source"].clone();
+        let source = &original["source"];
+        let instant = |value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .timestamp_nanos_opt()
+                .unwrap()
+        };
+        let granted = GrantedHistorySource {
+            attribution: SourceAttribution {
+                source: OriginalSourceIdentity {
+                    canonical_provider_id: OwnedProviderId::new("codex").unwrap(),
+                    canonical_session_id: source["canonical_session_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    source_key: source["source_key"].as_str().unwrap().to_owned(),
+                    stable_record_id: Some(source["stable_record_id"].as_str().unwrap().to_owned()),
+                    observation_id: source["observation_id"].as_str().unwrap().to_owned(),
+                    source_revision: Some(source["source_revision"].as_str().unwrap().to_owned()),
+                    content_sha256: source["content_sha256"].as_str().unwrap().to_owned(),
+                },
+                origin_scope: OriginScopeEvidence::Recorded {
+                    scope: origin.clone(),
+                    authority_ref: "host.observation.receipt.v1".to_owned(),
+                },
+                source_sequence: 1,
+                occurred_at_utc_nanos: Some(instant("2025-01-02T12:00:00.123456789Z")),
+                ingested_at_utc_nanos: instant("2025-01-03T12:00:00Z"),
+                validity: RecordedValidity {
+                    valid_from_utc_nanos: Some(instant("2025-01-02T12:00:00.123456789Z")),
+                    ..RecordedValidity::default()
+                },
+            },
+            current_disposition: CurrentSourceDisposition {
+                state: SourceDisposition::Available,
+                authority_ref: "host.current-source.v1".to_owned(),
+                authority_revision: Some(1),
+                checked_at_utc_nanos: instant("2025-02-01T00:00:00Z"),
+            },
+        };
+        let disposition = json!({"state":"available","authority_ref":"host.current-source.v1","authority_revision":1,"checked_at":"2025-02-01T00:00:00Z"});
+        let body = json!({"observation_batch_refs":["history.receipt.1"],
+            "first_source_sequence":1,"last_source_sequence":1,"expected_state_generation":0,"expected_previous_acknowledged_sequence":0,
+            "history_grant":{"authorization_ref":"host.history.checked.v1","policy_revision":1,
+                "destination_scope":exact_scope_value(&destination),"relation":"same_checkout",
+                "sources":[{"attribution":original,"current_disposition":disposition}],
+                "disposition_checkpoint":{"exact_scope":exact_scope_value(&destination),"authority_ref":"host.current-source.v1","authority_revision":1,"checked_at":"2025-02-01T00:00:00Z"}},
+            "resolved_observations":[{"receipt_ref":"history.receipt.1","observation":observation}]});
+        let mut original_receipt = None;
+        let mut original_operation = None;
+        for restarted in [false, true] {
+            let adapter = NcmProviderAdapter::new(surface(&root))
+                .unwrap()
+                .with_namespace_binding(NcmNamespaceBinding::CheckoutObservationsV1)
+                .with_admission_authority(Arc::new(FixtureHistoryAuthority(vec![granted.clone()])));
+            let request = canonical_lifecycle_call(
+                &adapter,
+                &destination,
+                ProviderOperation::Replay,
+                Some("granted-original-page"),
+                body.clone(),
+            );
+            let reply = adapter.invoke(&request);
+            assert_eq!(
+                reply.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{reply:?}"
+            );
+            let effect = reply.terminal.committed_effect();
+            if restarted {
+                assert_eq!(effect.state(), CommittedEffectState::Duplicate, "{reply:?}");
+                assert_eq!(
+                    effect.provider_receipt_sha256(),
+                    original_receipt.as_deref()
+                );
+                assert_eq!(
+                    effect.duplicate_of_operation_id(),
+                    original_operation.as_deref()
+                );
+            } else {
+                assert_eq!(effect.state(), CommittedEffectState::Committed, "{reply:?}");
+                assert_eq!(response_json(&reply)["applied_observations"], 1);
+                original_receipt = effect.provider_receipt_sha256().map(str::to_owned);
+                original_operation = Some(request.operation_id.clone());
+            }
+            assert!(response_json(&reply).get("page_delivery_capsule").is_none());
+            let inspected = adapter.invoke(&canonical_lifecycle_call(&adapter, &destination, ProviderOperation::Inspection, None,
+                json!({"view":"delivery_receipt","selector":{"idempotency_key":"granted-original-page"},"maximum_items":8,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null})));
+            assert_eq!(
+                inspected.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{inspected:?}"
+            );
+            assert_eq!(
+                response_json(&inspected)["items"][0]["provider_receipt_digest"],
+                json!(original_receipt)
+            );
+            assert_eq!(
+                response_json(&inspected)["items"][0]["operation_id"],
+                json!(original_operation)
+            );
+            let native = invoke_after_handshake(
+                &adapter,
+                &destination,
+                ProviderOperation::Inspection,
+                None,
+                json!({}),
+            );
+            assert_eq!(response_json(&native)["records"], 1);
+        }
+    }
+
+    #[test]
+    fn current_memory_survives_new_session_and_restart_without_redelivery_or_history_grants() {
         use tracedecay_memory_provider_registry::recall_admission::{
             AdmittedTemporalQuery, RecallScopeBindingsV1, ScopeBinding, UnknownValidityPolicy,
             admit_recall_reply, decode_recall_outcome,
@@ -851,7 +983,9 @@ mod enabled {
         let mut recalled_source: Option<Value> = None;
         for restarted in [false, true] {
             let worker = surface(&root);
-            let adapter = NcmProviderAdapter::new(worker.clone()).unwrap();
+            let adapter = NcmProviderAdapter::new(worker.clone())
+                .unwrap()
+                .with_namespace_binding(NcmNamespaceBinding::CheckoutObservationsV1);
             if !restarted {
                 let (ready, generation) = canonical_ready(&adapter, &exact);
                 let observed = adapter.invoke(&call(
@@ -1026,9 +1160,14 @@ mod enabled {
             let temporal = AdmittedTemporalQuery::current("2025-02-01T00:00:00Z")
                 .unwrap()
                 .with_unknown_validity_policy(UnknownValidityPolicy::Degrade);
+            let mut recall_scope = exact.clone();
+            if restarted {
+                recall_scope.agent_session_id = "next-agent-session".to_owned();
+                recall_scope.resolved_scope_digest = format!("sha256:{}", "ef".repeat(32));
+            }
             let request = canonical_recall_call(
                 &adapter,
-                &exact,
+                &recall_scope,
                 text,
                 temporal.clone(),
                 "current-recall-after-unavailable-replay",
@@ -1050,6 +1189,17 @@ mod enabled {
             );
             assert_eq!(candidate.source_refs, vec![source_ref.clone()]);
             assert_eq!(candidate.provenance["original_sources"], json!([]));
+            assert_eq!(
+                candidate.exact_scope_identity.scope_binding,
+                ScopeBinding::CheckoutObservations
+            );
+            assert!(candidate.exact_scope_identity.agent_session_id.is_empty());
+            assert!(
+                candidate
+                    .exact_scope_identity
+                    .resolved_scope_digest
+                    .is_empty()
+            );
             assert!(candidate.validity.observed_at.is_none());
             assert!(candidate.validity.source_revision.is_none());
             assert!(candidate.validity.valid_from.is_none());
@@ -1057,12 +1207,49 @@ mod enabled {
                 &request,
                 &temporal,
                 4,
-                &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+                &RecallScopeBindingsV1::new([
+                    ScopeBinding::ExactCodingScope,
+                    ScopeBinding::CheckoutObservations,
+                ]),
                 &reply,
             )
             .unwrap();
             assert_eq!(admitted.report.admitted_count, 1);
             assert!(admitted.report.degraded);
+            if restarted {
+                let old_alias = exact.session_forget_source_key("current-replay-session");
+                assert_ne!(
+                    old_alias,
+                    recall_scope.session_forget_source_key("current-replay-session")
+                );
+                let mut excluded_request = request.clone();
+                let mut excluded_payload: Value =
+                    serde_json::from_slice(&request.payload.bytes).unwrap();
+                excluded_payload["exclusions"]["source_refs"] = json!([old_alias]);
+                excluded_request.payload = payload(ProviderOperation::Recall, excluded_payload);
+                let excluded = adapter.invoke(&excluded_request);
+                let excluded = decode_recall_outcome(excluded.payload.as_ref().unwrap()).unwrap();
+                assert!(
+                    excluded.candidates.is_empty(),
+                    "old delivery alias must remain an exclusion in a later session"
+                );
+                let exclude_temporal = temporal
+                    .clone()
+                    .with_unknown_validity_policy(UnknownValidityPolicy::Exclude);
+                let excluded_request = canonical_recall_call(
+                    &adapter,
+                    &recall_scope,
+                    text,
+                    exclude_temporal,
+                    "unknown-validity-excluded-new-session",
+                );
+                let excluded = adapter.invoke(&excluded_request);
+                let excluded = decode_recall_outcome(excluded.payload.as_ref().unwrap()).unwrap();
+                assert!(
+                    excluded.candidates.is_empty(),
+                    "checkout sharing must not invent occurrence validity"
+                );
+            }
             let current = json!({"stable_memory_ref":candidate.stable_memory_ref,
                 "content":candidate.content,"content_sha256":candidate.content_sha256,
                 "source_refs":candidate.source_refs,"provenance":candidate.provenance,"validity":candidate.validity});
@@ -2272,6 +2459,193 @@ mod enabled {
             recalled.terminal.terminal_code(),
             TerminalCode::SuccessZeroResults
         );
+    }
+
+    #[test]
+    fn checkout_caller_keys_are_exact_scoped_and_retries_survive_restart() {
+        let root = TestRoot::new("checkout-caller-keys");
+        let first_scope = scope("checkout-caller-keys");
+        let mut second_scope = first_scope.clone();
+        second_scope.agent_session_id = "second-caller".to_owned();
+        second_scope.resolved_scope_digest = format!("sha256:{}", "22".repeat(32));
+        let first_value = current_observation(
+            &first_scope,
+            "canonical-first",
+            1,
+            "The first session stores compiler identity.",
+        );
+        let second_value = current_observation(
+            &second_scope,
+            "canonical-second",
+            2,
+            "The second session stores dependency identity.",
+        );
+        let original_operation = "shared-public-operation";
+        let original_key = "shared-public-key";
+        let first_receipt;
+        let mut committed_receipts = Vec::new();
+        {
+            let adapter = NcmProviderAdapter::new(surface(&root))
+                .unwrap()
+                .with_namespace_binding(NcmNamespaceBinding::CheckoutObservationsV1);
+            for (exact, value) in [(&first_scope, &first_value), (&second_scope, &second_value)] {
+                let (ready, generation) = canonical_ready(&adapter, exact);
+                let mut request = call(
+                    ProviderOperation::Observe,
+                    exact,
+                    &ready,
+                    generation,
+                    Some(original_key),
+                    value.clone(),
+                    10_000,
+                );
+                request.request_id = "shared-public-request".to_owned();
+                request.operation_id = original_operation.to_owned();
+                let committed = adapter.invoke(&request);
+                assert_eq!(
+                    committed.terminal.terminal_code(),
+                    TerminalCode::Success,
+                    "{committed:?}"
+                );
+                assert_eq!(
+                    committed.terminal.committed_effect().state(),
+                    CommittedEffectState::Committed,
+                    "{committed:?}"
+                );
+                assert!(committed.state_generation > generation);
+                committed_receipts.push((
+                    committed
+                        .terminal
+                        .committed_effect()
+                        .provider_receipt_sha256()
+                        .unwrap()
+                        .to_owned(),
+                    response_json(&committed)["stable_memory_ref"].clone(),
+                ));
+            }
+            for (exact, (receipt, stable)) in [&first_scope, &second_scope]
+                .into_iter()
+                .zip(&committed_receipts)
+            {
+                let inspected = adapter.invoke(&canonical_lifecycle_call(&adapter, exact, ProviderOperation::Inspection, None,
+                    json!({"view":"delivery_receipt","selector":{"idempotency_key":original_key},"maximum_items":8,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null})));
+                assert_eq!(
+                    inspected.terminal.terminal_code(),
+                    TerminalCode::Success,
+                    "{inspected:?}"
+                );
+                assert_eq!(
+                    response_json(&inspected)["items"],
+                    json!([{"operation_id":original_operation,"idempotency_key":original_key,"provider_receipt_digest":receipt,"stable_memory_ref":stable}])
+                );
+            }
+            let (ready, generation) = canonical_ready(&adapter, &first_scope);
+            let retry = call(
+                ProviderOperation::Observe,
+                &first_scope,
+                &ready,
+                generation,
+                Some(original_key),
+                first_value.clone(),
+                10_000,
+            );
+            let duplicate = adapter.invoke(&retry);
+            assert_eq!(
+                duplicate.terminal.committed_effect().state(),
+                CommittedEffectState::Duplicate,
+                "{duplicate:?}"
+            );
+            assert_eq!(duplicate.state_generation, generation);
+            first_receipt = duplicate
+                .terminal
+                .committed_effect()
+                .provider_receipt_sha256()
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                duplicate
+                    .terminal
+                    .committed_effect()
+                    .duplicate_of_operation_id(),
+                Some(original_operation)
+            );
+        }
+        let adapter = NcmProviderAdapter::new(surface(&root))
+            .unwrap()
+            .with_namespace_binding(NcmNamespaceBinding::CheckoutObservationsV1);
+        for (exact, (receipt, stable)) in [&first_scope, &second_scope]
+            .into_iter()
+            .zip(&committed_receipts)
+        {
+            let inspected = adapter.invoke(&canonical_lifecycle_call(&adapter, exact, ProviderOperation::Inspection, None,
+                json!({"view":"delivery_receipt","selector":{"idempotency_key":original_key},"maximum_items":8,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null})));
+            assert_eq!(
+                inspected.terminal.terminal_code(),
+                TerminalCode::Success,
+                "{inspected:?}"
+            );
+            assert_eq!(
+                response_json(&inspected)["items"],
+                json!([{"operation_id":original_operation,"idempotency_key":original_key,"provider_receipt_digest":receipt,"stable_memory_ref":stable}])
+            );
+        }
+        let (ready, generation) = canonical_ready(&adapter, &first_scope);
+        let retry = call(
+            ProviderOperation::Observe,
+            &first_scope,
+            &ready,
+            generation,
+            Some(original_key),
+            first_value.clone(),
+            10_000,
+        );
+        let duplicate = adapter.invoke(&retry);
+        assert_eq!(
+            duplicate.terminal.committed_effect().state(),
+            CommittedEffectState::Duplicate,
+            "{duplicate:?}"
+        );
+        assert_eq!(duplicate.state_generation, generation);
+        assert_eq!(
+            duplicate
+                .terminal
+                .committed_effect()
+                .provider_receipt_sha256(),
+            Some(first_receipt.as_str())
+        );
+        assert_eq!(
+            duplicate
+                .terminal
+                .committed_effect()
+                .duplicate_of_operation_id(),
+            Some(original_operation)
+        );
+        assert_eq!(
+            duplicate
+                .terminal
+                .committed_effect()
+                .duplicate_of_idempotency_key(),
+            Some(original_key)
+        );
+        let mut changed = first_value;
+        changed["canonical_payload"]["facts"][0]["content"] =
+            json!("A changed payload cannot reuse the first caller key.");
+        let (ready, generation) = canonical_ready(&adapter, &first_scope);
+        let conflict = adapter.invoke(&call(
+            ProviderOperation::Observe,
+            &first_scope,
+            &ready,
+            generation,
+            Some(original_key),
+            changed,
+            10_000,
+        ));
+        assert_eq!(
+            conflict.terminal.terminal_code(),
+            TerminalCode::Conflict,
+            "{conflict:?}"
+        );
+        assert_eq!(conflict.state_generation, generation);
     }
 
     #[test]

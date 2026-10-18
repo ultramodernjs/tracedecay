@@ -68,7 +68,7 @@ async fn stored_cursors(conn: &impl QueryExecutor) -> Vec<ObservationSourceCurso
 /// A store can hold committed observations with no `source_cursors` row at all
 ///, an older writer, or a crash between the two writes. Repair reconstructs
 /// the frontier from the commit itself instead of restarting the source.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_reconstructs_a_missing_committed_source_cursor() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "missing").await;
@@ -82,7 +82,7 @@ async fn repair_reconstructs_a_missing_committed_source_cursor() {
 
 /// A frontier behind its last committed observation would replay work that is
 /// already durable, so repair pulls it forward to the commit.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_advances_a_stale_present_committed_source_cursor() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "stale").await;
@@ -98,7 +98,7 @@ async fn repair_advances_a_stale_present_committed_source_cursor() {
 /// A frontier ahead of the last commit with no coverage receipt is progress an
 /// older build recorded without durable evidence. Leaving it would drop the
 /// uncovered suffix forever, so repair rewinds to the last canonical commit.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_rewinds_unreceipted_cursor_progress() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "unreceipted").await;
@@ -114,7 +114,7 @@ async fn repair_rewinds_unreceipted_cursor_progress() {
 /// The mirror case: the same forward frontier *with* an exact advance receipt
 /// is real covered progress over frames that produced no observation. Rewinding
 /// it would replay them, so repair must leave it untouched.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_preserves_receipted_nondurable_cursor_progress() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "receipted").await;
@@ -132,7 +132,7 @@ async fn repair_preserves_receipted_nondurable_cursor_progress() {
 /// Source generations are opaque `u64` identities, not SQLite signed
 /// integers. An exact receipt for a generation above `i64::MAX` must still
 /// authorize its current frontier on reopen.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_preserves_exact_opaque_u64_generation_receipt() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "opaque-generation").await;
@@ -174,7 +174,7 @@ async fn repair_preserves_exact_opaque_u64_generation_receipt() {
 /// A replacement generation identity is different, not greater. A zero
 /// frontier in a numerically smaller opaque generation must not be pulled
 /// backward into the last committed generation during reopen repair.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_preserves_numerically_smaller_replacement_generation_frontier() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "replacement-generation").await;
@@ -198,7 +198,7 @@ async fn repair_preserves_numerically_smaller_replacement_generation_frontier() 
 /// Cursor rows are keyed by serialized scope JSON. A scope written by a build
 /// that ordered its keys differently must still resolve to the same row rather
 /// than minting a second frontier for the same source.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_matches_a_reordered_scope_json_key() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "scope-order").await;
@@ -232,7 +232,7 @@ async fn repair_matches_a_reordered_scope_json_key() {
 /// Repair is not allowed to paper over a frontier it cannot explain. A cursor
 /// that is neither the commit, a new-generation frontier, nor covered by a
 /// receipt has to surface as an authority violation.
-#[tokio::test]
+#[asupersync::test]
 async fn cursor_coverage_validation_rejects_an_unexplained_frontier() {
     let (_directory, conn) = open_registered().await;
     let (_, committed) = seed_observation(&conn, 0, "unexplained").await;
@@ -252,7 +252,7 @@ async fn cursor_coverage_validation_rejects_an_unexplained_frontier() {
 
 /// A committed observation with no source cursor row must be reported, not
 /// tolerated, when the validator runs without a preceding repair.
-#[tokio::test]
+#[asupersync::test]
 async fn cursor_coverage_validation_rejects_a_missing_cursor_row() {
     let (_directory, conn) = open_registered().await;
     seed_observation(&conn, 0, "absent").await;
@@ -318,7 +318,7 @@ async fn seed_disposition(conn: &impl Executor, observation: &DurableObservation
 
 /// The queue is derived state. Whatever it held before the crash, repair must
 /// leave exactly the observations after the repaired checkpoint queued.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_rebuilds_the_projection_queue_from_the_checkpoint_frontier() {
     let (_directory, conn) = open_registered().await;
     for index in 0..3 {
@@ -351,7 +351,7 @@ async fn repair_rebuilds_the_projection_queue_from_the_checkpoint_frontier() {
 /// A checkpoint claiming coverage it cannot show has to come down. Repair walks
 /// forward from the trusted point and stops at the first observation with no
 /// disposition, then requeues everything from there.
-#[tokio::test]
+#[asupersync::test]
 async fn repair_lowers_a_checkpoint_without_contiguous_projection_evidence() {
     let (_directory, conn) = open_registered().await;
     for index in 0..3 {
@@ -386,7 +386,7 @@ async fn repair_lowers_a_checkpoint_without_contiguous_projection_evidence() {
 
 /// A disposition missing in the middle of the audited range invalidates every
 /// later claim, not just its own row.
-#[tokio::test]
+#[asupersync::test]
 async fn checkpoint_with_a_missing_disposition_requeues_the_entire_suffix() {
     let (_directory, conn) = open_registered().await;
     for index in 0..4 {
@@ -415,7 +415,7 @@ async fn checkpoint_with_a_missing_disposition_requeues_the_entire_suffix() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn pending_cursor_repair_audits_a_new_generation_before_reconciling() {
     let (_directory, conn) = open_registered().await;
     let (_, older) = seed_observation(&conn, 0, "concurrent-generation").await;
@@ -483,7 +483,7 @@ async fn pending_cursor_repair_audits_a_new_generation_before_reconciling() {
     assert_eq!(stored_cursors(&conn).await, vec![newer_cursor]);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn projection_queue_repair_resumes_from_a_committed_page() {
     let (_directory, fixture) = open_registered().await;
     let transaction = fixture.database().begin_write_transaction().await.unwrap();

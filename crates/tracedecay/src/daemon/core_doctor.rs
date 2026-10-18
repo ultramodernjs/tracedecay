@@ -3,9 +3,10 @@
 
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use tokio::time::{Duration, timeout};
+use std::time::Duration;
+use tracedecay_runtime_core::native_runtime::timeout;
 
-use super::{DaemonHandshake, projectless_tool_call, write_json_rpc_response};
+use super::{DaemonHandshake, projectless_tool_call, write_daemon_response};
 use tracedecay_contracts::project_open::{ProjectOpenStatusStateV1, ProjectOpenStatusV1};
 use tracedecay_daemon_service::shutdown::DaemonActivity;
 use tracedecay_domain::errors::Result;
@@ -388,18 +389,17 @@ async fn doctor_runtime_value_inner(
     let page_size = page_counts.map(|(page_size, _, _)| page_size);
     let expected_schema_version = tracedecay_runtime_core::db::migrations::SCHEMA_VERSION;
     let schema_version = if route_live {
-        // Retained admission is not a schema observation. Leave the pragma
+        // Retained admission is not a schema observation. Leave the stamp
         // unread rather than inventing the compiled version.
         None
     } else {
-        match Box::pin(
-            graph
-                .db()
-                .query_scalar_i64("Doctor project schema inspection", "PRAGMA user_version"),
-        )
+        match Box::pin(tracedecay_runtime_core::db::schema_version::read_version(
+            &graph.db().read_connection(),
+            tracedecay_runtime_core::db::schema_version::GRAPH_COMPONENT,
+        ))
         .await
         {
-            Ok(version) => Some(version),
+            Ok(version) => Some(version.unwrap_or(0)),
             Err(_) => {
                 return doctor_runtime_unavailable(
                     build_version,
@@ -451,29 +451,10 @@ async fn doctor_runtime_value_inner(
     // A retained registry handle only proves the schema contract held at
     // publication; it is not evidence that the invariant pass ran now.
     let (authority_ok, authority_reason, authority_detail) = match registry.as_ref() {
-        Some(registry) => match Box::pin(registry.health_read_snapshot()).await {
-            Ok(snapshot) => {
-                match Box::pin(
-                    tracedecay_global_db::schema_stages::validate_observation_authority_connection(
-                        &snapshot,
-                    ),
-                )
-                .await
-                {
-                    Ok(()) => (Some(true), None, None),
-                    Err(error) => (
-                        Some(false),
-                        Some("authority_invariant_failed"),
-                        Some(error.to_string()),
-                    ),
-                }
-            }
-            Err(error) => (
-                None,
-                Some("authority_store_unavailable"),
-                Some(error.to_string()),
-            ),
-        },
+        Some(registry) => {
+            let audit = Box::pin(registry.observation_authority_audit()).await;
+            (audit.verdict(), audit.reason(), audit.detail())
+        }
         None if handshake.client_identity.global_db_path.is_file() => {
             (None, Some("authority_store_unavailable"), None)
         }
@@ -607,7 +588,7 @@ pub(in crate::daemon) async fn write_doctor_runtime_response(
         });
     }
     let result = doctor_runtime_tool_result(value);
-    Box::pin(write_json_rpc_response(
+    Box::pin(write_daemon_response(
         transport,
         &JsonRpcResponse::success(request.id, result),
     ))
@@ -689,7 +670,7 @@ where
             id,
         ))
         .await?;
-        Box::pin(write_json_rpc_response(transport, &response)).await?;
+        Box::pin(write_daemon_response(transport, &response)).await?;
         return Ok(None);
     }
     let Some(request) = doctor_runtime_request(first_request.parsed()) else {
@@ -704,7 +685,7 @@ where
             || super::stalled_project_open_error(project_open),
             super::ProjectOpenFailure::to_error,
         );
-        Box::pin(write_json_rpc_response(
+        Box::pin(write_daemon_response(
             transport,
             &super::project_open_handshake::project_open_error_response(request.id.clone(), &error),
         ))
@@ -726,7 +707,7 @@ where
                     || tracedecay_mcp::reset_required_context(&error).is_some() =>
             {
                 drop(setup_activity);
-                Box::pin(write_json_rpc_response(
+                Box::pin(write_daemon_response(
                     transport,
                     &super::project_open_handshake::project_open_error_response(
                         request.id.clone(),
@@ -820,7 +801,7 @@ mod doctor_runtime_route_tests {
         }
     }
 
-    async fn initialize_test_project(
+    pub(super) async fn initialize_test_project(
         project_root: &Path,
         profile_root: &Path,
     ) -> tracedecay_runtime_core::storage::StoreLayout {

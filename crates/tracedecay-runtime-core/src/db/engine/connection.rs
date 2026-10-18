@@ -1,23 +1,28 @@
+use asupersync::Budget;
 use std::{sync::Arc, time::Duration};
 
 use tracedecay_store::{OperationPriorityV1, StoreRuntimeBindingV1};
 
 use tracedecay_rusqlite_runtime::exact_sql::{
-    ExactSqlHandle, ExactSqlStatement, MemoryReleaseOutcome,
+    ExactSqlHandle, ExactSqlStatement, JobPolicy, MemoryReleaseOutcome,
 };
 pub use tracedecay_rusqlite_runtime::reader::{ReaderPoolSnapshot, ReaderPoolState};
 
 #[cfg(any(test, feature = "test-helpers"))]
 use super::Statement;
 use super::{
-    Error, IntoParams, ReadSnapshot, Result, Rows, Transaction, TransactionBehavior, WriteStatement,
+    Error, IntoParams, ReadSnapshot, Result, Rows, Transaction, TransactionBehavior,
+    WriteStatement, WriteTx,
 };
 
 const READER_WAIT: Duration = Duration::from_secs(5);
-/// Doctor and other health probes must not sit behind a writer or a saturated
-/// general lane. The reserved health reader either admits immediately or the
-/// caller reports a typed locked/unavailable state.
-const HEALTH_READER_WAIT: Duration = Duration::ZERO;
+/// Health probes read through the reserved health lane, so they never queue
+/// behind a writer or a saturated general lane. That one-worker lane is shared
+/// with the store-size and table-growth telemetry Doctor samples concurrently,
+/// and each health snapshot retires its worker. A zero wait therefore loses to
+/// whichever bounded sibling probe or worker reopen got there first, and
+/// reports a healthy store as only partially observed.
+const HEALTH_READER_WAIT: Duration = READER_WAIT;
 
 #[derive(Clone)]
 pub struct Connection {
@@ -152,7 +157,7 @@ impl Connection {
         let runtime = Arc::clone(&self.runtime);
         // Once admitted, a batch continues through its first error even if its
         // caller stops waiting. Separate dispatches preserve writer interleaving.
-        tokio::spawn(async move {
+        crate::native_runtime::settle(async move {
             let mut results = Vec::with_capacity(statements.len());
             for (index, statement) in statements.into_iter().enumerate() {
                 let result = runtime
@@ -165,7 +170,6 @@ impl Connection {
             Ok(results)
         })
         .await
-        .map_err(join_error)?
     }
 
     pub async fn query<P>(&self, sql: &str, params: P) -> Result<Rows>
@@ -175,11 +179,10 @@ impl Connection {
         let statement = statement(sql, params)?;
         let runtime = Arc::clone(&self.runtime);
         let priority = self.read_priority;
-        let rows = tokio::task::spawn_blocking(move || {
+        let rows = run_blocking("SQL reader", join_error, move || {
             runtime.query_with_priority(statement, priority, READER_WAIT)
         })
-        .await
-        .map_err(join_error)??;
+        .await??;
         Ok(Rows::from_exact(rows))
     }
 
@@ -201,7 +204,14 @@ impl Connection {
 
     pub async fn release_connection_memory(&self) -> Result<MemoryReleaseOutcome> {
         let runtime = Arc::clone(&self.runtime);
-        tokio::spawn(async move { runtime.release_connection_memory_async().await })
+        let settlement = crate::native_runtime::handle()
+            .ok_or(Error::RuntimeContextUnavailable)?
+            .try_request_cx_with_budget(Budget::INFINITE)
+            .map_err(|error| Error::Runtime(format!("failed to admit memory release: {error}")))?;
+        let mut task = settlement
+            .spawn(move |cx| async move { runtime.release_connection_memory_async(&cx).await })
+            .map_err(|error| Error::Runtime(format!("failed to spawn memory release: {error}")))?;
+        std::future::poll_fn(|context| task.poll_join(context))
             .await
             .map_err(join_error)?
             .map_err(Into::into)
@@ -228,22 +238,22 @@ impl Connection {
     pub async fn read_snapshot(&self) -> Result<ReadSnapshot> {
         let runtime = Arc::clone(&self.runtime);
         let priority = self.read_priority;
-        tokio::task::spawn_blocking(move || {
+        run_blocking("SQL snapshot", join_error, move || {
             runtime.begin_read_snapshot_with_priority(priority, READER_WAIT)
         })
-        .await
-        .map_err(join_error)?
+        .await?
         .map(ReadSnapshot::from_runtime)
         .map_err(Into::into)
     }
 
     pub(crate) async fn health_read_snapshot(&self) -> Result<ReadSnapshot> {
         let runtime = Arc::clone(&self.runtime);
-        tokio::task::spawn_blocking(move || runtime.begin_health_read_snapshot(HEALTH_READER_WAIT))
-            .await
-            .map_err(join_error)?
-            .map(ReadSnapshot::from_runtime)
-            .map_err(Into::into)
+        run_blocking("SQL health snapshot", join_error, move || {
+            runtime.begin_health_read_snapshot(HEALTH_READER_WAIT)
+        })
+        .await?
+        .map(ReadSnapshot::from_runtime)
+        .map_err(Into::into)
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -278,6 +288,25 @@ impl Connection {
         }
     }
 
+    /// Runs `body` as one write job on the writer: commit when it returns
+    /// `Ok`, rollback when it returns `Err` or awaits anything but its own
+    /// statements ([`Error::JobAwaitedForeignFuture`]).
+    pub(crate) async fn transact<R, E, F>(
+        &self,
+        policy: JobPolicy,
+        body: F,
+    ) -> Result<std::result::Result<R, E>>
+    where
+        F: AsyncFn(&WriteTx<'_, '_>) -> std::result::Result<R, E> + Send + Sync + 'static,
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.runtime
+            .transact_async(policy, async move |job| body(&WriteTx::new(job)).await)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Begins the authority-bound transaction whose lease renews on progress.
     ///
     /// Reserved for schema installation on a fresh or index-less store and for
@@ -298,8 +327,27 @@ impl Connection {
     }
 }
 
-fn join_error(error: tokio::task::JoinError) -> super::Error {
+fn join_error(error: asupersync::runtime::JoinError) -> super::Error {
     super::Error::Runtime(format!("exact SQL worker task failed: {error}"))
+}
+
+/// Runs `work` on the native blocking pool and joins it through a request
+/// context. Boxed: a future that holds the context across the join sits
+/// dozens of levels deep, and every SQL caller would repeat that `Send` proof
+/// (rust-lang/rust#159228).
+pub(super) fn run_blocking<T: Send + 'static>(
+    admission: &'static str,
+    join_failure: fn(asupersync::runtime::JoinError) -> Error,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>> {
+    Box::pin(async move {
+        let cx = crate::native_runtime::cx().ok_or(Error::RuntimeContextUnavailable)?;
+        cx.spawn_blocking(move |_cx| work())
+            .map_err(|error| Error::Runtime(format!("failed to admit {admission}: {error}")))?
+            .join(&cx)
+            .await
+            .map_err(join_failure)
+    })
 }
 
 pub(super) fn statement<P>(sql: &str, params: P) -> Result<ExactSqlStatement>
@@ -331,7 +379,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn long_lease_entrypoint_requires_attached_write_authority() {
         let directory = tempfile::TempDir::new().unwrap();
         let plain =

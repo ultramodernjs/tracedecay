@@ -1,10 +1,11 @@
 use rusqlite::{OptionalExtension, Savepoint, Transaction, params, params_from_iter};
 use tracedecay_domain::{
     CodeGenerationId, DiagnosticEvidenceClassV1, DiagnosticProducerKindV1, DiagnosticProvenanceV1,
-    DiagnosticRecordStateV1, DiagnosticSeverityV1, FileOccurrenceId, GenerationDiagnosticV1,
-    RetrievalAnchorId, SourceSpan, UtcMicros,
+    DiagnosticSeverityV1, FileOccurrenceId, GenerationDiagnosticV1, RetrievalAnchorId, SourceSpan,
+    UtcMicros,
 };
 use tracedecay_store::{
+    CLEAR_CURRENT_DIAGNOSTIC_PUBLICATION_SQL, CLEAR_CURRENT_DIAGNOSTICS_SQL,
     DIAGNOSTIC_STATE_CLEARED, DIAGNOSTIC_STATE_CURRENT, DiagnosticReadOperationV1,
     DiagnosticReadResultV1, DiagnosticRecordStateKindV1, SanitizedCleanDiagnosticSnapshotV1,
     diagnostic_evidence_class_name, diagnostic_producer_kind_name, diagnostic_severity_name,
@@ -104,21 +105,12 @@ impl DiagnosticExecutor {
         }
 
         savepoint.execute(
-            "UPDATE generation_diagnostics
-             SET record_state = ?1, state_generation = ?2
-             WHERE record_state = ?3 AND generation_id != ?2
-             AND (generation_id, publication_revision) IN (
-               SELECT generation_id, publication_revision
-               FROM diagnostic_generation_publications
-               WHERE record_state = ?3
-             )",
+            CLEAR_CURRENT_DIAGNOSTICS_SQL,
             params![CLEARED, generation.as_str(), CURRENT],
         )?;
         savepoint.execute(
-            "UPDATE diagnostic_generation_publications
-             SET record_state = ?1, state_generation = ?2
-             WHERE record_state = ?3",
-            params![CLEARED, generation.as_str(), CURRENT],
+            CLEAR_CURRENT_DIAGNOSTIC_PUBLICATION_SQL,
+            params![CLEARED, generation.as_str()],
         )?;
         for record in snapshot.records() {
             insert_record(savepoint, publication_revision, record)?;
@@ -219,7 +211,7 @@ fn insert_record(
     record: &GenerationDiagnosticV1,
 ) -> rusqlite::Result<()> {
     record.validate().map_err(invalid)?;
-    let (state, state_generation) = state_columns(&record.state);
+    let (state, state_generation) = diagnostic_state_columns(&record.state);
     savepoint.execute(
         "INSERT INTO generation_diagnostics (
             diagnostic_anchor, generation_id, publication_revision,
@@ -250,10 +242,10 @@ fn insert_record(
             u64_to_i64(record.span.start_byte, "diagnostic span start")?,
             u64_to_i64(record.span.end_byte, "diagnostic span end")?,
             record.code,
-            severity_name(record.severity),
+            diagnostic_severity_name(record.severity),
             record.message,
             record.message_digest.as_str(),
-            producer_name(record.provenance.producer_kind),
+            diagnostic_producer_kind_name(record.provenance.producer_kind),
             record.provenance.producer.as_str(),
             record.provenance.analyzer_revision.as_str(),
             record.provenance.configuration_revision.as_str(),
@@ -262,7 +254,7 @@ fn insert_record(
                 .sanitization_receipt
                 .as_ref()
                 .map(|value| value.as_str()),
-            evidence_name(record.evidence_class),
+            diagnostic_evidence_class_name(record.evidence_class),
             record.collected_at.0,
             state,
             state_generation,
@@ -377,24 +369,12 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GenerationDiagno
     Ok(record)
 }
 
-// The mappings below delegate to the shared store codec; only the failure
+// The parsers below delegate to the shared store codec; only the failure
 // wording stays local, because it is observable in this adapter's errors.
-
-fn state_columns(state: &DiagnosticRecordStateV1) -> (&'static str, Option<&str>) {
-    diagnostic_state_columns(state)
-}
-
-fn severity_name(value: DiagnosticSeverityV1) -> &'static str {
-    diagnostic_severity_name(value)
-}
 
 fn parse_severity(value: &str) -> rusqlite::Result<DiagnosticSeverityV1> {
     parse_diagnostic_severity(value)
         .ok_or_else(|| conversion(format!("unknown diagnostic severity {value}")))
-}
-
-fn producer_name(value: DiagnosticProducerKindV1) -> &'static str {
-    diagnostic_producer_kind_name(value)
 }
 
 fn parse_producer(value: &str) -> rusqlite::Result<DiagnosticProducerKindV1> {
@@ -402,11 +382,48 @@ fn parse_producer(value: &str) -> rusqlite::Result<DiagnosticProducerKindV1> {
         .ok_or_else(|| conversion(format!("unknown diagnostic producer {value}")))
 }
 
-fn evidence_name(value: DiagnosticEvidenceClassV1) -> &'static str {
-    diagnostic_evidence_class_name(value)
-}
-
 fn parse_evidence(value: &str) -> rusqlite::Result<DiagnosticEvidenceClassV1> {
     parse_diagnostic_evidence_class(value)
         .ok_or_else(|| conversion(format!("unknown diagnostic evidence class {value}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::NamedTempFile;
+    use tracedecay_store::{
+        CLEAR_CURRENT_DIAGNOSTIC_PUBLICATION_SQL, CLEAR_CURRENT_DIAGNOSTICS_SQL,
+        GENERATION_DIAGNOSTICS_SCHEMA_DDL,
+    };
+
+    use crate::connection::{ConnectionMode, open};
+
+    #[test]
+    fn clearing_the_current_publication_searches_its_partial_index() {
+        let file = NamedTempFile::new().expect("temporary database");
+        let connection = open(file.path(), ConnectionMode::Writer).expect("writer policy");
+        connection
+            .execute_batch(GENERATION_DIAGNOSTICS_SCHEMA_DDL)
+            .expect("install diagnostics schema");
+        for sql in [
+            CLEAR_CURRENT_DIAGNOSTICS_SQL,
+            CLEAR_CURRENT_DIAGNOSTIC_PUBLICATION_SQL,
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("explain diagnostics clear");
+            let unbound = vec![rusqlite::types::Null; statement.parameter_count()];
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(unbound), |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("read query plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("query plan detail");
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains("idx_diagnostic_generation_current")),
+                "{sql}\nmust search the current-publication partial index: {plan:?}"
+            );
+        }
+    }
 }

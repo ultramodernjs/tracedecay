@@ -41,9 +41,9 @@ use tracedecay_runtime_core::git_repository::GIT_STATUS_MODIFICATION_CHECK_THREA
 
 use super::reconcile::cancelled_code_index_reconcile;
 use super::{CodeIndexSchedulerErrorV1, classification, ignored_dependencies, privacy};
-use crate::code_index::chunks::content_digest;
-use crate::code_index::languages::{LanguageRegistry, StaticLanguageRegistry};
-use crate::code_index::parallelism;
+use tracedecay_code_index::chunks::content_digest;
+use tracedecay_code_index::languages::{LanguageRegistry, StaticLanguageRegistry};
+use tracedecay_code_index::parallelism;
 
 const FRESHNESS_WITNESS_FILE_NAME: &str = "freshness_witness.v1";
 
@@ -455,10 +455,10 @@ impl Delegate for DirectoryEvidenceV1 {
             worktree_root_is_repository,
         );
         if recurse && self.settled {
-            let directory = self
-                .root
-                .join(gix::path::from_bstr(entry.rela_path.as_ref()));
-            self.record_directory(directory);
+            match gix::path::from_bstr(entry.rela_path.as_ref()) {
+                Ok(relative) => self.record_directory(self.root.join(relative)),
+                Err(_) => self.settled = false,
+            }
         }
         recurse
     }
@@ -604,7 +604,7 @@ impl SourceSweepCacheV1 {
             }
         };
         let present_unrepresentable = stat_concurrently(&unrepresentable, |git_path| {
-            gix::path::try_from_byte_slice(git_path)
+            gix::path::from_byte_slice(git_path)
                 .is_ok_and(|relative| project_root.join(relative).is_file())
         })
         .into_iter()

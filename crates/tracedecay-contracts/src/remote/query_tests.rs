@@ -12,8 +12,8 @@ use super::composition::{
 use super::protocol::{RemoteProtocolFailureV1, RemoteProtocolPortV1, RemoteProtocolRequestV1};
 use super::query::{
     REMOTE_QUERY_SCHEMA_REVISION_V1, RemoteExactObservationQueryCommandV1,
-    RemoteExactObservationQueryErrorV1, RemoteExactObservationQueryOutcomeV1,
-    RemoteExactObservationQueryProtocolAdapterV1, RemoteExactObservationQueryReadPortV1,
+    RemoteExactObservationQueryErrorV1, RemoteExactObservationQueryProtocolAdapterV1,
+    RemoteExactObservationQueryReadFutureV1, RemoteExactObservationQueryReadPortV1,
     RemoteExactObservationQueryServiceV1, RemoteExactObservationResultV1,
     RemoteQueryAuthorizationEvidenceV1, RemoteQueryAuthorizationPortV1, RemoteQueryClockPortV1,
     RemoteQueryCompleteValueV1, RemoteQueryOperationV1, RemoteQueryRequestV1, RemoteQueryResultV1,
@@ -519,6 +519,17 @@ fn faulty_adapter_repository_provenance_is_rejected() {
         .to_string(),
         "remote exact observation query receipt is mismatched"
     );
+    assert_eq!(
+        validate_returned_provenance(
+            &EvidenceAvailabilityV1::Unavailable,
+            None,
+            &observation_id,
+            &generation,
+            &expected_scope,
+        ),
+        Ok(()),
+        "a row without a repository capture reports its absence"
+    );
     let wrong_generation = ProjectionGenerationId::new("generation.other").unwrap();
     assert_eq!(
         validate_returned_provenance(
@@ -578,10 +589,10 @@ impl RemoteEnrollmentCredentialLookupPortV1 for UnavailableCredentials {
 struct UnreachableRead;
 
 impl RemoteExactObservationQueryReadPortV1 for UnreachableRead {
-    fn read_exact_observation(
-        &self,
-        _command: &RemoteExactObservationQueryCommandV1,
-    ) -> Result<RemoteExactObservationQueryOutcomeV1, RemoteExactObservationQueryErrorV1> {
+    fn read_exact_observation<'a>(
+        &'a self,
+        _command: &'a RemoteExactObservationQueryCommandV1,
+    ) -> RemoteExactObservationQueryReadFutureV1<'a> {
         panic!("credential or cancellation denial must precede storage")
     }
 }
@@ -617,8 +628,8 @@ impl RemoteQueryClockPortV1 for UnavailableClock {
     }
 }
 
-#[test]
-fn clock_failure_is_typed_rather_than_a_fabricated_stamp() {
+#[asupersync::test]
+async fn clock_failure_is_typed_rather_than_a_fabricated_stamp() {
     // A host clock before the Unix epoch or past `i64::MAX` microseconds must
     // reach the caller as a clock failure, never as a deadline or receipt
     // verdict computed from a fabricated timestamp.
@@ -639,6 +650,7 @@ fn clock_failure_is_typed_rather_than_a_fabricated_stamp() {
             protocol_request(UtcMicros(10)),
             OpaqueRemoteCredential::new(vec![b'q'; 32].into_boxed_slice()).unwrap(),
         )
+        .await
         .unwrap();
 
     assert!(response.result.is_err());
@@ -677,14 +689,15 @@ fn unavailable_service() -> RemoteExactObservationQueryServiceV1 {
     )
 }
 
-#[test]
-fn protocol_failure_uses_server_clock_and_never_returns_partial_success() {
+#[asupersync::test]
+async fn protocol_failure_uses_server_clock_and_never_returns_partial_success() {
     let adapter = RemoteExactObservationQueryProtocolAdapterV1::new(unavailable_service());
     let response = adapter
         .execute(
             protocol_request(UtcMicros(10)),
             OpaqueRemoteCredential::new(vec![b'q'; 32].into_boxed_slice()).unwrap(),
         )
+        .await
         .unwrap();
 
     assert!(response.result.is_err());

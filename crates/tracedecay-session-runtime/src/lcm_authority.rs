@@ -68,15 +68,17 @@ impl LcmDaemonStore for RegisteredLcmDaemonStore {
     }
 
     fn status(&self, query: LcmStatusQuery) -> StoreFuture<'_, LcmStatus> {
+        let database = self.database.clone();
         Box::pin(async move {
-            self.database
-                .lcm_status_with_options(
+            let gc_config = LcmGcConfig::default();
+            let status: Pin<Box<dyn Future<Output = Result<LcmStatus, LcmError>> + Send>> =
+                Box::pin(database.lcm_status_with_options(
                     &query.provider,
                     query.session_id.as_deref(),
                     query.deep,
-                    &LcmGcConfig::default(),
-                )
-                .await
+                    &gc_config,
+                ));
+            status.await
         })
     }
 
@@ -190,6 +192,18 @@ impl DaemonLcmAuthority {
             let interruption = match admission {
                 RequestAdmission::Cancelled => RequestInterruption::Cancelled,
                 RequestAdmission::TimedOut => RequestInterruption::DeadlineExceeded,
+                RequestAdmission::GrantExpired => {
+                    return terminal(
+                        &invocation.context,
+                        operation,
+                        started_at,
+                        LcmAuthorityOutcome::Denied,
+                        OperationTermination::Failed,
+                        None,
+                        None,
+                        None,
+                    );
+                }
                 RequestAdmission::Admitted => {
                     return terminal_failure(
                         &invocation.context,
@@ -255,31 +269,34 @@ impl DaemonLcmAuthority {
 
         match invocation.request {
             LcmAuthorityRequest::Compact(command) => {
-                self.execute_compaction(
-                    &invocation.context,
-                    &invocation.cancellation,
-                    started_at,
-                    *command,
-                )
-                .await
+                let compaction: Pin<Box<dyn Future<Output = LcmAuthorityResponse> + Send + '_>> =
+                    Box::pin(self.execute_compaction(
+                        &invocation.context,
+                        &invocation.cancellation,
+                        started_at,
+                        *command,
+                    ));
+                compaction.await
             }
             LcmAuthorityRequest::Status(query) => {
-                self.execute_status(
-                    &invocation.context,
-                    &invocation.cancellation,
-                    started_at,
-                    query,
-                )
-                .await
+                let status: Pin<Box<dyn Future<Output = LcmAuthorityResponse> + Send + '_>> =
+                    Box::pin(self.execute_status(
+                        &invocation.context,
+                        &invocation.cancellation,
+                        started_at,
+                        query,
+                    ));
+                status.await
             }
             LcmAuthorityRequest::Doctor(query) => {
-                self.execute_doctor(
-                    &invocation.context,
-                    &invocation.cancellation,
-                    started_at,
-                    query,
-                )
-                .await
+                let doctor: Pin<Box<dyn Future<Output = LcmAuthorityResponse> + Send + '_>> =
+                    Box::pin(self.execute_doctor(
+                        &invocation.context,
+                        &invocation.cancellation,
+                        started_at,
+                        query,
+                    ));
+                doctor.await
             }
         }
     }
@@ -340,6 +357,18 @@ impl DaemonLcmAuthority {
                     started_at,
                     RequestInterruption::DeadlineExceeded,
                     CancellationStage::BeforeAdmission,
+                    None,
+                );
+            }
+            RequestAdmission::GrantExpired => {
+                return terminal(
+                    context,
+                    operation,
+                    started_at,
+                    LcmAuthorityOutcome::Denied,
+                    OperationTermination::Failed,
+                    None,
+                    None,
                     None,
                 );
             }

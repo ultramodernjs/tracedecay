@@ -11,7 +11,7 @@ use std::{
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tracedecay_application::code_index::open_production_code_index_owner_v1;
+use tracedecay_code_index::production::CodeIndexProductionOwnerV1;
 use tracedecay_code_index_retention::code_index_generations::DurablePublicationPointerV1;
 use tracedecay_contracts::{
     CancellationContext, CapabilityGrantSnapshot, Deadline, DisclosureClass, OpaqueCursor,
@@ -46,10 +46,12 @@ mod ignored_dependency_seat_tests;
 mod index_path_policy_tests;
 mod noop_reconcile_tests;
 mod publication_store;
+#[path = "../../../tests/code_index_scheduler/reconcile.rs"]
 mod reconcile;
 mod residency;
 mod retained_configuration_tests;
 mod search_permit_release;
+#[path = "../../../tests/code_index_scheduler/serving.rs"]
 mod serving;
 mod text_artifact_carry_tests;
 
@@ -224,7 +226,32 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
-fn git(root: &Path, args: &[&str]) {
+/// Run one Git fixture command under a fixed test author and committer.
+pub(super) fn run_git_in(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "TraceDecay Test")
+        .env("GIT_AUTHOR_EMAIL", "test@tracedecay.invalid")
+        .env("GIT_COMMITTER_NAME", "TraceDecay Test")
+        .env("GIT_COMMITTER_EMAIL", "test@tracedecay.invalid")
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Initialize `project` on `main` and commit everything already written there.
+pub(super) fn commit_fixture_checkout(project: &Path) {
+    run_git_in(project, &["init", "-q", "-b", "main"]);
+    run_git_in(project, &["add", "."]);
+    run_git_in(project, &["commit", "-qm", "fixture"]);
+}
+
+pub(super) fn git(root: &Path, args: &[&str]) {
     let status = Command::new(
         tracedecay_runtime_core::git::try_git_program()
             .expect("absolute git executable should resolve"),
@@ -252,7 +279,7 @@ pub(super) fn stage_raw_git_path(root: &Path, git_path: &[u8], source: &str) {
     assert!(output.status.success(), "stage raw Git path: {output:?}");
 }
 
-fn git_stdout(root: &Path, args: &[&str]) -> String {
+pub(super) fn git_stdout(root: &Path, args: &[&str]) -> String {
     let output = Command::new(
         tracedecay_runtime_core::git::try_git_program()
             .expect("absolute git executable should resolve"),
@@ -293,13 +320,10 @@ fn scheduler(
 fn replace_scheduler_policy_revision(scheduler: &mut CodeIndexWorktreeSchedulerV1, revision: &str) {
     let mut config = scheduler.production_config.clone();
     config.policy_revision = PolicyRevisionId::new(revision).expect("policy revision");
-    scheduler.owner = open_production_code_index_owner_v1(
-        config.clone(),
-        scheduler.publication.clone(),
-        super::DaemonProjectionSinkV1,
-    )
-    .expect("open reconfigured production owner")
-    .with_physical_artifact_pool(scheduler.byte_pool.physical_artifacts.clone());
+    scheduler.owner =
+        CodeIndexProductionOwnerV1::new(config.clone(), scheduler.publication.clone())
+            .expect("open reconfigured production owner")
+            .with_physical_artifact_pool(scheduler.byte_pool.physical_artifacts.clone());
     scheduler.production_config = config;
 }
 
@@ -309,13 +333,10 @@ fn replace_scheduler_chunker_revision(
 ) {
     let mut config = scheduler.production_config.clone();
     config.chunker_revision = ChunkerRevision::new(revision).expect("chunker revision");
-    scheduler.owner = open_production_code_index_owner_v1(
-        config.clone(),
-        scheduler.publication.clone(),
-        super::DaemonProjectionSinkV1,
-    )
-    .expect("open reconfigured production owner")
-    .with_physical_artifact_pool(scheduler.byte_pool.physical_artifacts.clone());
+    scheduler.owner =
+        CodeIndexProductionOwnerV1::new(config.clone(), scheduler.publication.clone())
+            .expect("open reconfigured production owner")
+            .with_physical_artifact_pool(scheduler.byte_pool.physical_artifacts.clone());
     scheduler.production_config = config;
 }
 
@@ -1243,7 +1264,7 @@ fn flip_trailing_hex(value: &str) -> String {
 /// generation id advances to an unseated successor, replacing the
 /// predecessor's index entry (same-revision entries are replaced, not
 /// appended), while the sealed artifact and Git evidence stay in place.
-/// `drift_content` additionally flips the sealed source content identity,
+/// `drift_content` also flips the sealed source content identity,
 /// staging a successor sealed from different bytes.
 fn advance_pointer_to_unseated_successor(scoped_store_root: &Path, drift_content: bool) {
     use tracedecay_code_index_retention::code_index_generations::durable_generation_index_digest;
@@ -1484,7 +1505,7 @@ async fn hold_scheduler_for_root(
     project_root: &Path,
 ) -> HeldSchedulerV1 {
     let scheduler = registry
-        .scheduler_for_root(project_root)
+        .scheduler_handle(project_root)
         .await
         .expect("mounted scheduler");
     let (release, released) = tokio::sync::oneshot::channel();

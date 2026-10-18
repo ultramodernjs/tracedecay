@@ -3,7 +3,7 @@ use std::path::Path;
 use tracedecay_automation_runtime::automation::config_error;
 use tracedecay_contracts::retrieval::{HookRuntimeResultV1, HookRuntimeSurfaceRequestV1};
 use tracedecay_domain::errors::Result;
-use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use tracedecay_host_admission::SharedHostAdmissionBroker;
 use tracedecay_project::project::TraceDecay;
 use tracedecay_sessions::admission::HostAdmissionOutcome;
@@ -14,6 +14,7 @@ mod admission;
 mod context_scout;
 mod envelope;
 mod hermes;
+mod hint_settlement;
 mod ingest;
 
 #[cfg(test)]
@@ -32,7 +33,7 @@ pub use hermes::replay_projectless_hermes_host_admission;
 use crate::map_host_admission_outcome;
 use admission::{hook_v2_admit, hook_v2_profile_admit};
 use context_scout::{hook_v2_delivery_receipt, hook_v2_feedback_notice_delivery};
-use hermes::{hermes_receipt, user_review_unavailable};
+use hermes::hermes_receipt;
 use ingest::{claude_compact, codex_compact, cursor_compact, ingest_transcript};
 
 const TOOL_NAME: &str = "tracedecay_hook_runtime";
@@ -69,20 +70,43 @@ pub async fn compute_hook_runtime(
     cg: &TraceDecay,
     request: HookRuntimeSurfaceRequestV1,
     profile_root: Option<&Path>,
-    global_db: Option<&RegisteredGlobalDb>,
+    global_db: Option<&RegisteredGlobalDbLeaseV1>,
     session_authorities: SessionAuthorities<'_>,
 ) -> Result<HookRuntimeResultV1> {
     use HookRuntimeSurfaceRequestV1 as Request;
+    // Codex prompts reset the counter, and Codex and Cursor session starts
+    // admit a session boundary; those are the project-routed actions every
+    // hint-producing host reaches, so they settle hint outcomes.
+    let project_sessions = session_authorities.project;
+    let spawn_hint_settlement = || {
+        hint_settlement::spawn_hint_settlement(
+            cg.project_root(),
+            profile_root,
+            global_db,
+            project_sessions,
+        );
+    };
     Ok(match request {
         Request::ResetCounter {} => {
             cg.reset_local_counter().await?;
+            spawn_hint_settlement();
             HookRuntimeResultV1::ResetCounter { reset: true }
         }
         Request::HookV2Admit(request) => {
+            let session_boundary =
+                envelope::hook_v2_envelope(request.envelope.clone()).is_ok_and(|envelope| {
+                    matches!(
+                        envelope.event,
+                        tracedecay_hooks::HookEventV2::SessionBoundary { .. }
+                    )
+                });
+            if session_boundary {
+                spawn_hint_settlement();
+            }
             HookRuntimeResultV1::HookV2Admit(hook_v2_admit(cg, request, session_authorities).await?)
         }
         Request::HookV2DeliveryReceipt { receipt } => HookRuntimeResultV1::HookV2DeliveryReceipt {
-            status: hook_v2_delivery_receipt(cg, receipt).await?,
+            status: hook_v2_delivery_receipt(cg, receipt, global_db.map(AsRef::as_ref)).await?,
         },
         Request::HookV2FeedbackNoticeDelivery {
             envelope,
@@ -106,7 +130,7 @@ pub async fn compute_hook_runtime(
                     Some(cg),
                     &request,
                     profile_root,
-                    global_db,
+                    global_db.map(AsRef::as_ref),
                     session_authorities,
                 ))
                 .await?,
@@ -127,7 +151,6 @@ pub async fn compute_hook_runtime(
         Request::CursorCompact { event_json } => HookRuntimeResultV1::CursorCompact(
             cursor_compact(&event_json, session_authorities).await?,
         ),
-        Request::UserReview { .. } => return Err(requires_projectless_routing("user_review")),
         Request::HermesReceipt { .. } => {
             return Err(requires_projectless_routing("hermes_receipt"));
         }
@@ -150,8 +173,8 @@ pub async fn compute_projectless_hook_runtime(
     use HookRuntimeSurfaceRequestV1 as Request;
     Ok(match request {
         // Projectless (user-scope) ingest has no project session store to
-        // correlate hint outcomes against; the settlement runs on
-        // project-scope ingests only.
+        // correlate hint outcomes against; settlement runs on project-routed
+        // actions only.
         Request::IngestTranscript(request) if request.user_scope => {
             HookRuntimeResultV1::IngestTranscript(Box::new(
                 ingest_transcript(
@@ -164,7 +187,6 @@ pub async fn compute_projectless_hook_runtime(
                 .await?,
             ))
         }
-        Request::UserReview { .. } => return Err(user_review_unavailable()),
         Request::HermesReceipt { event } => {
             let host_admission_broker =
                 host_admission_broker.map_err(|outcome| map_host_admission_outcome(&outcome))?;

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
+use crate::{GraphQueryError, GraphQueryResult as Result};
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_code_index::is_test_file;
 use tracedecay_contracts::retrieval::{
@@ -8,7 +9,6 @@ use tracedecay_contracts::retrieval::{
     TestRiskConfidenceV1, TestRiskEntryV1, TestRiskResultV1, TestRiskSummaryV1,
 };
 use tracedecay_domain::code_intelligence::NodeKind;
-use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{
     CanonicalRelationEdgeV1, ComplexityAnalysisV1, RelationEdgeKindV1, SymbolOccurrenceId,
 };
@@ -196,8 +196,7 @@ pub async fn analyze_test_risk(
     let top_risk_untested = risks
         .iter()
         .find(|risk| !risk.has_test())
-        .map(|risk| risk.name.clone())
-        .unwrap_or_default();
+        .map_or_default(|risk| risk.name.clone());
     let reachable_unattributed = source_fns
         .iter()
         .filter(|n| {
@@ -313,7 +312,11 @@ pub fn verified_test_evidence(
         None => (
             graph.edges_among(
                 &occurrences,
-                &[RelationEdgeKindV1::Calls, RelationEdgeKindV1::Annotates],
+                &[
+                    RelationEdgeKindV1::Calls,
+                    RelationEdgeKindV1::Annotates,
+                    RelationEdgeKindV1::Contains,
+                ],
                 MAX_TEST_RISK_RELATIONS,
             )?,
             Vec::new(),
@@ -404,7 +407,7 @@ fn rust_test_module_declarers(
         .collect::<Vec<_>>();
     let edges = graph.edges_among(
         &occurrences,
-        &[RelationEdgeKindV1::Annotates],
+        &[RelationEdgeKindV1::Annotates, RelationEdgeKindV1::Contains],
         MAX_TEST_RISK_RELATIONS,
     )?;
     Ok((page.symbols, edges))
@@ -477,6 +480,21 @@ fn scoped_test_edges(
         edges.push(edge.edge);
         neighbors.push(edge.neighbor);
     }
+    // `#[cfg(test)]` containment is intra-file, so every member a gate
+    // encloses sits inside the scoped census.
+    let remaining = MAX_TEST_RISK_RELATIONS
+        .checked_sub(edges.len())
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            test_risk_graph_problem("verified test-risk relation census exceeded its budget")
+        })?;
+    let contained = graph.edges_among(occurrences, &[RelationEdgeKindV1::Contains], remaining)?;
+    if edges.len().saturating_add(contained.len()) > MAX_TEST_RISK_RELATIONS {
+        return Err(test_risk_graph_problem(
+            "verified test-risk relation census exceeded its budget",
+        ));
+    }
+    edges.extend(contained);
     Ok((edges, neighbors))
 }
 
@@ -502,8 +520,11 @@ pub fn verified_test_symbol_parts(
     Ok((metadata, file))
 }
 
-fn test_risk_graph_problem(detail: &str) -> TraceDecayError {
-    TraceDecayError::project_route("verified-test-evidence-unavailable", false, detail)
+fn test_risk_graph_problem(detail: &str) -> GraphQueryError {
+    GraphQueryError::EvidenceUnavailable {
+        reason_code: "verified-test-evidence-unavailable",
+        detail: detail.to_owned(),
+    }
 }
 
 #[tracing::instrument(name = "graph.health.test_risk.attribution", level = "trace", skip_all)]

@@ -18,8 +18,8 @@ use tracedecay_memory_provider_api::{
     observation_extensions_digest,
 };
 use tracedecay_memory_provider_ncm::{
-    NCM_PROVIDER_ID, NcmAdapterError, NcmCognitiveSurface, NcmNamespace, NcmProviderAdapter,
-    NcmSurfaceCall, NcmSurfaceHandshakeRequest, NcmSurfaceHandshakeResponse,
+    NCM_PROVIDER_ID, NcmAdapterError, NcmCognitiveSurface, NcmNamespace, NcmNamespaceBinding,
+    NcmProviderAdapter, NcmSurfaceCall, NcmSurfaceHandshakeRequest, NcmSurfaceHandshakeResponse,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -1091,6 +1091,47 @@ fn constructor_rejects_a_non_ncm_surface() {
     );
 }
 
+fn checkout_namespace(scope: &OwnedExactScope) -> NcmNamespace {
+    NcmNamespace::from_scope(scope, NcmNamespaceBinding::CheckoutObservationsV1)
+}
+
+#[test]
+fn legacy_namespace_default_keeps_persisted_identity_bytes() {
+    let exact = OwnedExactScope::new(
+        "profile",
+        "project",
+        "repository",
+        "worktree",
+        "master",
+        "session",
+        format!("sha256:{}", "ab".repeat(32)),
+    )
+    .expect("scope");
+    assert_eq!(
+        NcmNamespaceBinding::default(),
+        NcmNamespaceBinding::ExactSessionV1
+    );
+    assert_eq!(
+        NcmNamespace::from_exact_scope(&exact).as_str(),
+        "d3edecaca5ee5a69ae69f74669c509b38d71a10831583941baef6f9ae88bb64b"
+    );
+    assert_eq!(
+        NcmNamespace::from_scope(&exact, NcmNamespaceBinding::default()),
+        NcmNamespace::from_exact_scope(&exact)
+    );
+    assert_ne!(
+        checkout_namespace(&exact),
+        NcmNamespace::from_exact_scope(&exact)
+    );
+    let mut next = exact.clone();
+    next.agent_session_id = "next-session".to_owned();
+    assert_ne!(
+        NcmNamespace::from_exact_scope(&next),
+        NcmNamespace::from_exact_scope(&exact)
+    );
+    assert_eq!(checkout_namespace(&next), checkout_namespace(&exact));
+}
+
 #[test]
 fn namespace_is_deterministic_and_opaque() {
     let first = NcmNamespace::from_exact_scope(&scope());
@@ -1108,7 +1149,7 @@ fn namespace_is_deterministic_and_opaque() {
 }
 
 #[test]
-fn namespace_isolates_worktree_branch_and_session() {
+fn namespace_isolates_worktree_and_branch() {
     let original = scope();
     let mut changed_worktree = original.clone();
     changed_worktree.worktree_identity = "worktree-b".to_owned();
@@ -1117,18 +1158,21 @@ fn namespace_isolates_worktree_branch_and_session() {
     let mut changed_session = original.clone();
     changed_session.agent_session_id = "session-b".to_owned();
     let values = [
-        NcmNamespace::from_exact_scope(&original),
-        NcmNamespace::from_exact_scope(&changed_worktree),
-        NcmNamespace::from_exact_scope(&changed_branch),
-        NcmNamespace::from_exact_scope(&changed_session),
+        checkout_namespace(&original),
+        checkout_namespace(&changed_worktree),
+        checkout_namespace(&changed_branch),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    assert_eq!(values.len(), 4);
+    assert_eq!(values.len(), 3);
+    assert_eq!(
+        checkout_namespace(&original),
+        checkout_namespace(&changed_session)
+    );
 }
 
 #[test]
-fn namespace_isolates_profile_project_repository_and_resolved_scope_digest() {
+fn namespace_isolates_profile_project_and_repository() {
     let original = scope();
     let mut changed_profile = original.clone();
     changed_profile.profile_id = "profile-b".to_owned();
@@ -1139,15 +1183,18 @@ fn namespace_isolates_profile_project_repository_and_resolved_scope_digest() {
     let mut changed_resolved_scope = original.clone();
     changed_resolved_scope.resolved_scope_digest = format!("sha256:{PROVIDER_RECEIPT_SHA}");
     let values = [
-        NcmNamespace::from_exact_scope(&original),
-        NcmNamespace::from_exact_scope(&changed_profile),
-        NcmNamespace::from_exact_scope(&changed_project),
-        NcmNamespace::from_exact_scope(&changed_repository),
-        NcmNamespace::from_exact_scope(&changed_resolved_scope),
+        checkout_namespace(&original),
+        checkout_namespace(&changed_profile),
+        checkout_namespace(&changed_project),
+        checkout_namespace(&changed_repository),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    assert_eq!(values.len(), 5);
+    assert_eq!(values.len(), 4);
+    assert_eq!(
+        checkout_namespace(&original),
+        checkout_namespace(&changed_resolved_scope)
+    );
 }
 
 #[test]
@@ -1200,6 +1247,61 @@ fn handshake_exposes_only_namespace_to_surface_and_reattaches_scope() {
     );
     request.control.cancellation().cancel();
     assert_eq!(mapped.control.snapshot(), Err(TerminalCode::Cancelled));
+}
+
+#[test]
+fn checkout_namespace_sharing_never_shares_exact_readiness() {
+    let surface = Arc::new(MockSurface::new(NCM_PROVIDER_ID, &[], false));
+    let provider = NcmProviderAdapter::new(surface.clone())
+        .expect("adapter")
+        .with_namespace_binding(NcmNamespaceBinding::CheckoutObservationsV1);
+    let first = provider.handshake(&handshake(NCM_PROVIDER_ID));
+    let mut first_call = call(NCM_PROVIDER_ID, ProviderOperation::Recall);
+    first_call.ready_receipt_sha256 = first.ready_receipt_sha256.clone().expect("receipt");
+    let mut other = first_call.clone();
+    other.exact_scope.agent_session_id = "session-b".to_owned();
+    other.exact_scope.resolved_scope_digest = format!("sha256:{PROVIDER_RECEIPT_SHA}");
+    assert_eq!(
+        provider.invoke(&other).terminal.terminal_code(),
+        TerminalCode::StaleIdentity
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Acquire), 0);
+    let mut second_handshake = handshake(NCM_PROVIDER_ID);
+    second_handshake.exact_scope = other.exact_scope.clone();
+    let second = provider.handshake(&second_handshake);
+    assert_eq!(second.state_namespace, first.state_namespace);
+    assert_ne!(second.ready_receipt_sha256, first.ready_receipt_sha256);
+    other.ready_receipt_sha256 = second.ready_receipt_sha256.expect("receipt");
+    assert_eq!(
+        provider.invoke(&other).terminal.terminal_code(),
+        TerminalCode::Success
+    );
+    let second_mapped = surface
+        .last_call
+        .lock()
+        .expect("call lock")
+        .clone()
+        .expect("mapped call");
+    assert_eq!(
+        provider.invoke(&first_call).terminal.terminal_code(),
+        TerminalCode::StaleIdentity
+    );
+    let refreshed = provider.handshake(&handshake(NCM_PROVIDER_ID));
+    first_call.ready_receipt_sha256 = refreshed.ready_receipt_sha256.expect("receipt");
+    assert_eq!(
+        provider.invoke(&first_call).terminal.terminal_code(),
+        TerminalCode::Success
+    );
+    let first_mapped = surface
+        .last_call
+        .lock()
+        .expect("call lock")
+        .clone()
+        .expect("mapped call");
+    assert_eq!(first_mapped.namespace, second_mapped.namespace);
+    assert_ne!(first_mapped.request_id, second_mapped.request_id);
+    assert_ne!(first_mapped.operation_id, second_mapped.operation_id);
+    assert_eq!(surface.invoke_calls.load(Ordering::Acquire), 2);
 }
 
 #[test]

@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Instant;
 
+use crate::code_index_task_support::spawn_detached;
+
 use tracedecay_code_index::graph_projection::{
     CodeGraphCatalogReleaseV1, CodeGraphEngineReleaseV1,
 };
@@ -65,6 +67,39 @@ pub(super) struct WorktreeResidencyV1 {
     last_used: Mutex<Instant>,
     refresh_waits_for_memory: AtomicBool,
     park_release_after_pass_armed: AtomicBool,
+    park_release_after_reads_drain_retrying: AtomicBool,
+    pub(super) park_headroom: ParkHeadroomV1,
+}
+
+/// The owner-headroom epochs a worktree's own park releases advanced.
+///
+/// A parked worktree gives back the decode and graph its last pass seated,
+/// and a retry of work it parked on memory decodes that same generation
+/// again, so its own release cannot help it (issue #3588). Waiters subtract
+/// these epochs from the shared epoch and wake only on what other owners gave
+/// back. Coalesced epochs stay countable: another owner's release that lands
+/// beside this worktree's own still leaves the difference ahead.
+#[derive(Default)]
+pub(super) struct ParkHeadroomV1(AtomicU64);
+
+impl ParkHeadroomV1 {
+    fn note(&self, owners: &ResidentOwnersV1) {
+        // Counted before the epoch moves, so a reader never attributes this
+        // release to another owner.
+        self.0.fetch_add(1, Ordering::AcqRel);
+        owners.note_headroom();
+    }
+
+    /// The headroom epochs other owners advanced, up to the epoch `headroom`
+    /// now holds. A park release counted but not yet published reads as a
+    /// lower value; its epoch moving wakes the reader to count again.
+    pub(super) fn released_by_others(
+        &self,
+        headroom: &mut asupersync::channel::watch::Receiver<u64>,
+    ) -> u64 {
+        let epoch = *headroom.borrow_and_update();
+        epoch.saturating_sub(self.0.load(Ordering::Acquire))
+    }
 }
 
 pub(super) struct WorktreeResidencyPartsV1 {
@@ -94,12 +129,13 @@ impl WorktreeResidencyV1 {
             last_used: Mutex::new(Instant::now()),
             refresh_waits_for_memory: AtomicBool::new(false),
             park_release_after_pass_armed: AtomicBool::new(false),
+            park_release_after_reads_drain_retrying: AtomicBool::new(false),
+            park_headroom: ParkHeadroomV1::default(),
         }
     }
 
     /// Record whether this worktree's last reconcile was refused for resident
-    /// memory. While it is, memory given back anywhere in the process is its
-    /// retry.
+    /// memory. While it is, memory another owner gives back is its retry.
     pub(super) fn set_refresh_waits_for_memory(&self, waits: bool) {
         self.refresh_waits_for_memory
             .store(waits, Ordering::Release);
@@ -161,7 +197,8 @@ impl WorktreeResidencyV1 {
     /// `code_graph_serving` reports `warming` while they are absent and the
     /// next graph read reseats them. Do not clear `complete_generation_requested`: a demand that
     /// arrives during the take must still wake a successor pass to
-    /// re-decode.
+    /// re-decode. The decode is announced as this worktree's own park
+    /// release: a retry re-decodes it (issue #3588).
     pub(super) fn release_decode_when_parked(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
         if self.busy() {
             self.arm_park_release_after_pass_settles(owners);
@@ -173,7 +210,7 @@ impl WorktreeResidencyV1 {
         {
             return;
         }
-        let mut released = Vec::new();
+        let mut decode_released = Vec::new();
         if !self.complete_generation_requested.load(Ordering::Acquire) {
             let seated = {
                 let mut slot = self
@@ -199,16 +236,16 @@ impl WorktreeResidencyV1 {
                     .collect(),
             );
             let superseded = HeldDecodesV1::release(self.publication.release_superseded_decodes());
-            released.extend([serving, superseded].into_iter().filter_map(
-                |release| match release {
+            decode_released.extend([serving, superseded].into_iter().filter_map(|release| {
+                match release {
                     ResidentOwnerReleaseV1::Released { bytes } => Some(bytes),
                     ResidentOwnerReleaseV1::Busy | ResidentOwnerReleaseV1::Empty => None,
-                },
-            ));
-            if !released.is_empty() {
+                }
+            }));
+            if !decode_released.is_empty() {
                 tracing::info!(
                     event = "code_index_serving_decode_released_on_park",
-                    bytes = released
+                    bytes = decode_released
                         .iter()
                         .map(|bytes| bytes.measured().unwrap_or(0))
                         .sum::<u64>(),
@@ -225,8 +262,8 @@ impl WorktreeResidencyV1 {
             }) {
                 self.arm_park_release_after_first_catalog_warm(owners);
             }
-            if !released.is_empty() {
-                owners.note_headroom();
+            if !decode_released.is_empty() {
+                self.park_headroom.note(owners);
             }
             return;
         }
@@ -237,17 +274,13 @@ impl WorktreeResidencyV1 {
             text.code_graph_serving_readiness() == CodeGraphServingReadinessV1::Ready
         }) {
             self.arm_park_release_after_first_catalog_warm(owners);
-            // The first warm may have settled between the check and the arm.
-            // Re-check before returning so that permit is not the only retry.
-            if !self.serving_text().is_some_and(|text| {
-                text.code_graph_serving_readiness() == CodeGraphServingReadinessV1::Ready
-            }) {
-                if !released.is_empty() {
-                    owners.note_headroom();
-                }
-                return;
+            if !decode_released.is_empty() {
+                self.park_headroom.note(owners);
             }
+            return;
         }
+        let mut graph_released = false;
+        let mut graph_busy = false;
         for (kind, release) in [
             (
                 ResidentOwnerKindV1::GraphCatalog,
@@ -262,20 +295,76 @@ impl WorktreeResidencyV1 {
                 OutgoingGraphOwnerV1(Arc::clone(self)).release(),
             ),
         ] {
-            if let ResidentOwnerReleaseV1::Released { bytes } = release {
-                tracing::info!(
-                    event = "code_index_serving_graph_released_on_park",
-                    kind = kind.as_str(),
-                    bytes = bytes.measured(),
-                    "a parked worktree gave back its catalog or engine; the next graph read reseats it"
-                );
-                released.push(bytes);
+            match release {
+                ResidentOwnerReleaseV1::Released { bytes } => {
+                    tracing::info!(
+                        event = "code_index_serving_graph_released_on_park",
+                        kind = kind.as_str(),
+                        bytes = bytes.measured(),
+                        "a parked worktree gave back its catalog or engine; the next graph read reseats it"
+                    );
+                    graph_released = true;
+                }
+                ResidentOwnerReleaseV1::Busy => {
+                    graph_busy = true;
+                }
+                ResidentOwnerReleaseV1::Empty => {}
             }
         }
-        if released.is_empty() {
+        if !decode_released.is_empty() {
+            self.park_headroom.note(owners);
+        }
+        if graph_busy {
+            self.arm_park_release_after_graph_reads_drain(owners);
+        }
+        if !graph_released {
             return;
         }
-        owners.note_headroom();
+        // A refresh waiting on memory replaces this serving graph instead of
+        // re-decoding it, so its park release is headroom like any other
+        // owner's. A graph-only retry warms these owners back and its own
+        // release cannot help it.
+        if self.refresh_waits_for_memory() {
+            owners.note_headroom();
+        } else {
+            self.park_headroom.note(owners);
+        }
+    }
+
+    /// A graph owner a live read holds Busy is freed only when that read
+    /// ends, and nothing else would retry the release then. The read's last
+    /// lease drops on whatever thread ends it, so the armed retry is spawned
+    /// on the native runtime rather than run there. With no read live
+    /// the Busy already drained and the release runs again now; the
+    /// `retrying` flag stops a hold that is not a read from recursing.
+    fn arm_park_release_after_graph_reads_drain(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
+        let Some(store) = self
+            .serving_text()
+            .and_then(|text| text.interactive_graph_store().ok())
+        else {
+            return;
+        };
+        if self
+            .park_release_after_reads_drain_retrying
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let residency = Arc::downgrade(self);
+        let weak_owners = Arc::downgrade(owners);
+        let armed = store.park_release_after_reads_drain(Arc::new(move || {
+            let (residency, owners) = (Weak::clone(&residency), Weak::clone(&weak_owners));
+            spawn_detached("code_index_park_release_after_reads", async move {
+                if let (Some(residency), Some(owners)) = (residency.upgrade(), owners.upgrade()) {
+                    residency.release_decode_when_parked(&owners);
+                }
+            });
+        }));
+        if !armed {
+            self.release_decode_when_parked(owners);
+        }
+        self.park_release_after_reads_drain_retrying
+            .store(false, Ordering::Release);
     }
 
     fn arm_park_release_after_pass_settles(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
@@ -289,7 +378,7 @@ impl WorktreeResidencyV1 {
         let mut passes = self.reconcile_in_progress.subscribe();
         let residency = Arc::downgrade(self);
         let owners = Arc::downgrade(owners);
-        tokio::spawn(async move {
+        spawn_detached("code_index_park_release_after_pass", async move {
             if passes.wait_for(|passes| !passes.running()).await.is_err() {
                 return;
             }
@@ -305,6 +394,8 @@ impl WorktreeResidencyV1 {
     /// The first catalog warm finishes on a blocking task and does not wake
     /// the parked worker. Arm one waiter that retries this release when that
     /// warm settles; generation/owner checks stay in [`Self::release_decode_when_parked`].
+    /// The settle hook and the waiter share one retry that runs once: a
+    /// second run would evict a graph that a read reseated in between.
     fn arm_park_release_after_first_catalog_warm(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
         let Some(text) = self.serving_text() else {
             return;
@@ -314,14 +405,18 @@ impl WorktreeResidencyV1 {
         }
         let residency = Arc::downgrade(self);
         let owners = Arc::downgrade(owners);
+        let retried = AtomicBool::new(false);
         let retry: ParkedGraphReleaseCallback = Arc::new(move || {
+            if retried.swap(true, Ordering::AcqRel) {
+                return;
+            }
             if let (Some(residency), Some(owners)) = (residency.upgrade(), owners.upgrade()) {
                 residency.release_decode_when_parked(&owners);
             }
         });
         text.bind_parked_graph_release(Arc::clone(&retry));
         let settled = text.catalog_warm_notify();
-        tokio::spawn(async move {
+        spawn_detached("code_index_park_release_after_catalog_warm", async move {
             settled.notified().await;
             retry();
         });
@@ -550,8 +645,8 @@ impl ResidentOwnerV1 for SupersededDecodesOwnerV1 {
     }
 }
 
-/// The documents the worktree's increments retained for incremental reparse,
-/// charged by the pages of the pool's own heap.
+/// The documents the worktree's increments retained for incremental reparse.
+/// Nothing sizes their trees and artifacts, so the pool reports unmeasured.
 struct RetainedParsesOwnerV1(Arc<WorktreeResidencyV1>);
 
 impl ResidentOwnerV1 for RetainedParsesOwnerV1 {
@@ -559,10 +654,7 @@ impl ResidentOwnerV1 for RetainedParsesOwnerV1 {
         let held = self.0.retained_parses.holding()?;
         Some(ResidentOwnerSampleV1 {
             holding: ResidentHoldingV1::Worktree,
-            bytes: held.bytes.map_or(
-                ResidentOwnerBytesV1::Unmeasured,
-                ResidentOwnerBytesV1::Measured,
-            ),
+            bytes: ResidentOwnerBytesV1::Unmeasured,
             last_used: held.last_retained,
             serving: false,
             shared: None,
@@ -571,13 +663,9 @@ impl ResidentOwnerV1 for RetainedParsesOwnerV1 {
 
     fn release(&self) -> ResidentOwnerReleaseV1 {
         match self.0.retained_parses.release() {
-            RetainedParsePoolReleaseV1::Released { bytes } => ResidentOwnerReleaseV1::Released {
-                bytes: bytes.map_or(
-                    ResidentOwnerBytesV1::Unmeasured,
-                    ResidentOwnerBytesV1::Measured,
-                ),
+            RetainedParsePoolReleaseV1::Released => ResidentOwnerReleaseV1::Released {
+                bytes: ResidentOwnerBytesV1::Unmeasured,
             },
-            RetainedParsePoolReleaseV1::Busy => ResidentOwnerReleaseV1::Busy,
             RetainedParsePoolReleaseV1::Empty => ResidentOwnerReleaseV1::Empty,
         }
     }
@@ -780,5 +868,39 @@ impl ResidentOwnerV1 for OutgoingGraphOwnerV1 {
                 ResidentOwnerBytesV1::Measured(engine.saturating_add(catalog))
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tracedecay_runtime_core::resident_memory::ResidentOwnersV1;
+
+    use super::ParkHeadroomV1;
+
+    /// Issue #3588: a waiter skips the epochs its own park releases advanced,
+    /// and still sees another owner's release that coalesced with one.
+    #[test]
+    fn only_other_owners_headroom_counts() {
+        let owners = ResidentOwnersV1::new(Duration::from_mins(10));
+        let mut headroom = owners.subscribe_headroom();
+        let park = ParkHeadroomV1::default();
+        let seen = park.released_by_others(&mut headroom);
+
+        park.note(&owners);
+        assert_eq!(
+            park.released_by_others(&mut headroom),
+            seen,
+            "own release only"
+        );
+
+        owners.note_headroom();
+        park.note(&owners);
+        assert_eq!(
+            park.released_by_others(&mut headroom),
+            seen + 1,
+            "another owner's release coalesced with this worktree's own"
+        );
     }
 }

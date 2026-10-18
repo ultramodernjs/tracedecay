@@ -18,7 +18,9 @@ use crate::capability_manifest::{
     ApplicationCapabilityManifestInput, application_capability_manifest,
 };
 use crate::error::ApplicationContractError;
-use crate::handlers::{ApplicationHandlerDescriptor, ApplicationOperation};
+use crate::handlers::{
+    ApplicationHandlerDescriptor, ApplicationOperation, capability_executable_schema,
+};
 use crate::result::ResultContractRef;
 use crate::retrieval::catalog::{
     APPLICATION_COMPACT_PROFILE_ID, APPLICATION_DEFAULT_PROFILE_ID, application_profile_ids,
@@ -355,20 +357,13 @@ where
     Request: JsonSchema,
     Response: JsonSchema,
 {
-    let capability_id = CapabilityId::new(capability)?;
-    let manifest = contribution
-        .capabilities()
-        .iter()
-        .find(|manifest| manifest.capability_id() == &capability_id)
-        .ok_or(ApplicationContractError::Inconsistent {
-            field: "feedback schema capability",
-        })?;
-    Ok(ExecutableSchemaAuthority::for_types_at_paths::<
-        Request,
-        Response,
-    >(
-        manifest, request_rust_type_path, result_rust_type_path
-    )?)
+    capability_executable_schema::<Request, Response>(
+        contribution,
+        &CapabilityId::new(capability)?,
+        "feedback schema capability",
+        request_rust_type_path,
+        result_rust_type_path,
+    )
 }
 
 pub fn feedback_surface_handler_descriptors()
@@ -505,8 +500,7 @@ mod tests {
     fn property_keys(body: &Value) -> Vec<&str> {
         let mut keys = body["properties"]
             .as_object()
-            .map(|properties| properties.keys().map(String::as_str).collect::<Vec<_>>())
-            .unwrap_or_default();
+            .map_or_default(|properties| properties.keys().map(String::as_str).collect::<Vec<_>>());
         keys.sort_unstable();
         keys
     }

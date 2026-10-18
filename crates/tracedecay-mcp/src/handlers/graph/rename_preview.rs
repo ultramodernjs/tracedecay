@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
+use tracedecay_code_index_runtime::code_index_scheduler::sealed_source_bytes;
 use tracedecay_code_index_runtime::code_index_scheduler::with_sealed_form_reader;
 use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
 use tracedecay_contracts::retrieval::{
@@ -18,7 +19,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{ContentDigest, LanguageId};
 
 use crate::McpToolContext;
-use crate::handlers::bounded_search::CancelSearchOnDrop;
+use crate::handlers::bounded_search::SetFlagOnDrop;
 use crate::handlers::support::{decode_primitive_request, unique_file_paths};
 use crate::server::{DispatchSettlement, dispatch_cancelled_error};
 use crate::tools::dispatch_ceiling::{tool_dispatch_budget, tool_dispatch_deadline_error};
@@ -27,10 +28,6 @@ use super::{
     graph_occurrence_id, graph_symbol_corrupt, graph_tool_completion, node_not_found_result,
     required_graph_file_path, required_graph_metadata, single_graph_adjacency_batch, user_line,
 };
-
-/// Most file records one preview consults for sealed digests; the same
-/// ceiling the analysis handlers read file records under.
-const SEALED_FILE_BUDGET: usize = 500_000;
 
 struct PreviewSource {
     text: String,
@@ -192,9 +189,9 @@ struct PreviewFileWalk {
 }
 
 impl PreviewFileWalk {
-    fn run(mut self) -> Result<RenamePreviewPrimitiveResultV1> {
+    fn run(self) -> Result<RenamePreviewPrimitiveResultV1> {
         let project_root = self.project_root.clone();
-        let sealed_files = std::mem::take(&mut self.sealed_files);
+        let sealed_files = self.sealed_files.clone();
         let sealed = |file: &str| sealed_files.get(file).cloned();
         with_sealed_form_reader(&project_root, &sealed, |read_source| self.walk(read_source))
     }
@@ -230,6 +227,37 @@ impl PreviewFileWalk {
                 Err(_) => continue,
             };
             let source = PreviewSource::new(text, &self.control)?;
+            // Evidence offsets index the bytes the generation sealed. A
+            // checkout whose git clean filters rewrite the file (CRLF under
+            // `core.autocrlf=true`) still holds them; once the file changes
+            // after the seal only its current text remains to map against.
+            let sealed = match self.sealed_files.get(&file) {
+                Some((language, digest)) => sealed_source_bytes(
+                    &self.project_root,
+                    &file,
+                    language,
+                    digest,
+                )
+                .map_err(|error| {
+                    TraceDecayError::project_route(
+                        "verified-reference-source-unavailable",
+                        true,
+                        format!(
+                            "cannot read the bytes the indexed graph sealed for '{file}': {error}"
+                        ),
+                    )
+                })?,
+                None => None,
+            };
+            let evidence = sealed
+                .map(|bytes| {
+                    let text = String::from_utf8(bytes).map_err(|_| {
+                        graph_symbol_corrupt(format!("the sealed source of '{file}' is not UTF-8"))
+                    })?;
+                    PreviewSource::new(text, &self.control)
+                })
+                .transpose()?;
+            let evidence = evidence.as_ref().unwrap_or(&source);
             if file == self.result.node.file {
                 decl_snippet = source
                     .line(self.declaration_line as usize)
@@ -237,7 +265,7 @@ impl PreviewFileWalk {
             }
             while let Some(input) = reference_inputs.next_if(|input| input.file == file) {
                 self.control.check()?;
-                let line = source.line_for_byte_offset(input.evidence_start_byte)?;
+                let line = evidence.line_for_byte_offset(input.evidence_start_byte)?;
                 let snippet = reference_line_snippet(&source, Some(line), &self.result.symbol);
                 references.push((
                     input.ordinal,
@@ -311,7 +339,7 @@ pub async fn compute_rename_preview(
     let mut touched: Vec<String> = Vec::new();
     // Graph phase: extract owned declaration fields and per-reference-site
     // inputs so the blocking file walk below needs no graph value at all.
-    let (declaration, declaration_line, symbol_name, reference_inputs) = {
+    let (declaration, declaration_line, symbol_name, reference_inputs, sealed_files) = {
         let _span = tracing::trace_span!("mcp.graph.rename_preview.graph").entered();
         {
             let Some(node) = graph.symbol_summary(&occurrence)? else {
@@ -348,12 +376,24 @@ pub async fn compute_rename_preview(
             )?)?;
             let mut reference_inputs =
                 Vec::<RenameReferenceSiteInput>::with_capacity(incoming.len());
+            let mut sealed_files = HashMap::new();
             for (ordinal, edge) in incoming.into_iter().enumerate() {
                 let source_node = edge.neighbor;
                 let source_metadata = required_graph_metadata(&source_node)?;
                 let source_file = required_graph_file_path(&source_node)?;
                 touched.push(source_file.to_owned());
                 *graph_counts.entry(source_file.to_owned()).or_default() += 1;
+                if !sealed_files.contains_key(source_file) {
+                    let sealed = graph
+                        .file_by_logical_path(source_file)?
+                        .and_then(|file| Some((file.language?, file.content_digest)))
+                        .ok_or_else(|| {
+                            graph_symbol_corrupt(format!(
+                                "graph references name '{source_file}' but the graph has no sealed source record for it"
+                            ))
+                        })?;
+                    sealed_files.insert(source_file.to_owned(), sealed);
+                }
                 reference_inputs.push(RenameReferenceSiteInput {
                     ordinal,
                     from_node_id: source_node.occurrence.as_str().to_owned(),
@@ -369,28 +409,15 @@ pub async fn compute_rename_preview(
                 node_metadata.start_line,
                 symbol_name,
                 reference_inputs,
+                sealed_files,
             )
         }
     };
 
     let touched_files = unique_file_paths(touched.iter().map(std::string::String::as_str));
-    let sealed_files = {
-        let _span = tracing::trace_span!("mcp.graph.rename_preview.sealed_files").entered();
-        let touched: std::collections::HashSet<&str> =
-            touched_files.iter().map(String::as_str).collect();
-        graph
-            .files(SEALED_FILE_BUDGET)?
-            .into_iter()
-            .filter(|file| touched.contains(file.logical_path.as_str()))
-            .filter_map(|file| {
-                let language = file.language?;
-                Some((file.logical_path, (language, file.content_digest)))
-            })
-            .collect::<HashMap<_, _>>()
-    };
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_on_drop = CancelSearchOnDrop::new(Arc::clone(&cancelled));
+    let cancel_on_drop = SetFlagOnDrop::new(Arc::clone(&cancelled));
     let budget = tool_dispatch_budget("tracedecay_rename_preview", ctx.deadline())
         .ok_or_else(|| tool_dispatch_deadline_error("tracedecay_rename_preview", Duration::ZERO))?;
     let control = PreviewWalkControl {
@@ -426,11 +453,13 @@ pub async fn compute_rename_preview(
         control,
     };
     let walk_span = tracing::trace_span!("mcp.graph.rename_preview.walk");
-    let result = tokio::task::spawn_blocking(move || walk_span.in_scope(|| walk.run()))
-        .await
-        .map_err(|join_error| TraceDecayError::Config {
-            message: format!("rename preview file scan task failed: {join_error}"),
-        })??;
+    let result = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
+        walk_span.in_scope(|| walk.run())
+    })
+    .await
+    .map_err(|join_error| TraceDecayError::Config {
+        message: format!("rename preview file scan task failed: {join_error}"),
+    })??;
     drop(cancel_on_drop);
     Ok(graph_tool_completion(
         GraphToolResultV1::RenamePreview(RenamePreviewPrimitiveOutcomeV1::Preview(result)),

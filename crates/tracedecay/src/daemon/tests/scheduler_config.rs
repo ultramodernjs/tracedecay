@@ -166,7 +166,7 @@ async fn fresh_v2_project_starts_the_required_automation_scheduler() {
         .lock()
         .await;
     assert!(schedulers.contains_key(&key));
-    drop(schedulers);
+    drop((schedulers, cg, server));
     engine.shutdown_all().await;
 }
 
@@ -312,7 +312,7 @@ async fn disabled_finished_scheduler_reenables_with_a_fresh_owner() {
     let server = save_scheduled_automation(&engine, &handshake, false).await;
     let cg = server.cg().await;
     let key = ProjectServerKey::from_open_project(&cg, &handshake).expect("owner key");
-    let finished = tokio::spawn(async {});
+    let finished = NativeTask::spawn(async {}).expect("native task");
     wait_for_finished_task(
         &finished,
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(2),
@@ -346,7 +346,7 @@ async fn disabled_finished_scheduler_reenables_with_a_fresh_owner() {
             .is_finished(),
         "re-enable must replace a finished scheduler handle"
     );
-    drop(schedulers);
+    drop((schedulers, cg, server));
     engine.shutdown_all().await;
 }
 
@@ -371,14 +371,16 @@ async fn concurrent_reenable_creates_one_live_scheduler_owner() {
     let server = save_scheduled_automation(&engine, &handshake, true).await;
     let cg = server.cg().await;
     let key = ProjectServerKey::from_open_project(&cg, &handshake).expect("owner key");
-    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-    let finished = tokio::spawn(async move {
-        let _ = finished_tx.send(());
-    });
-    tokio::time::timeout(tokio::time::Duration::from_secs(2), finished_rx)
-        .await
-        .expect("finished owner barrier timed out")
-        .expect("finished owner barrier sender dropped");
+    let finished = NativeTask::spawn(async {}).expect("native task");
+    // The planted owner must read as finished to both re-enables. A signal
+    // sent from inside its body precedes the task's end, and a task that has
+    // not ended is a live owner the re-enables rightly notify.
+    assert!(matches!(
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), finished.wait())
+            .await
+            .expect("finished owner barrier timed out"),
+        tracedecay_runtime_core::native_runtime::NativeTaskOutcome::Completed(())
+    ));
     engine
         .automation_configured_override
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -453,19 +455,23 @@ async fn concurrent_reenable_creates_one_live_scheduler_owner() {
             .expect("live scheduler task")
             .is_finished()
     );
-    drop(schedulers);
+    drop((schedulers, cg, server));
     engine.shutdown_all().await;
 
-    assert!(matches!(
-        (first, second),
-        (
-            tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::Started,
-            tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::RunningNotified
-        ) | (
-            tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::RunningNotified,
-            tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::Started
-        )
-    ));
+    assert!(
+        matches!(
+            (first, second),
+            (
+                tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::Started,
+                tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::RunningNotified
+            ) | (
+                tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::RunningNotified,
+                tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::Started
+            )
+        ),
+        "one re-enable must start the owner and the other must notify it: {:?}",
+        (first, second)
+    );
 }
 
 #[cfg(unix)]
@@ -655,14 +661,9 @@ async fn profile_reconcile_broadcasts_to_cached_projects_without_opening_uncache
                         inside an initialized project or pass --project <path>"
         })
     );
-    wait_for_automation_scheduler_state(
-        &engine,
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(4),
-        "profile scheduler broadcast",
-        |schedulers| schedulers.len() == 2,
-    )
-    .await;
+    wait_for_automation_scheduler_state(&engine, |schedulers| schedulers.len() == 2).await;
 
+    drop((first_server, second_server));
     engine.shutdown_all().await;
 }
 
@@ -727,13 +728,7 @@ async fn cached_project_reconciles_cli_enabled_automation_without_cache_probe() 
     // increments when the probe starts, before the configuration read and
     // well before registration. Settle on the registered owner instead of
     // sampling the window before it appears.
-    wait_for_automation_scheduler_state(
-        &engine,
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(20),
-        "initial automation scheduler activation",
-        |schedulers| schedulers.contains_key(&key),
-    )
-    .await;
+    wait_for_automation_scheduler_state(&engine, |schedulers| schedulers.contains_key(&key)).await;
 
     apply_project_automation_patch_via_surface(
         &engine,
@@ -751,7 +746,7 @@ async fn cached_project_reconciles_cli_enabled_automation_without_cache_probe() 
     )
     .await;
 
-    let finished = tokio::spawn(async {});
+    let finished = NativeTask::spawn(async {}).expect("native task");
     wait_for_finished_task(
         &finished,
         tokio::time::Instant::now() + tokio::time::Duration::from_secs(2),
@@ -793,13 +788,7 @@ async fn cached_project_reconciles_cli_enabled_automation_without_cache_probe() 
         report["outcome"], "started",
         "a finished handle must not be reported as a successful notification"
     );
-    wait_for_automation_scheduler_state(
-        &engine,
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(4),
-        "automation scheduler reconciliation",
-        |schedulers| schedulers.contains_key(&key),
-    )
-    .await;
+    wait_for_automation_scheduler_state(&engine, |schedulers| schedulers.contains_key(&key)).await;
 
     let schedulers = engine
         .store_administration
@@ -816,7 +805,7 @@ async fn cached_project_reconciles_cli_enabled_automation_without_cache_probe() 
             .is_finished(),
         "finished handle notification must be replaced, not reported as success"
     );
-    drop(schedulers);
+    drop((schedulers, cg, server, cached));
     engine.shutdown_all().await;
 }
 
@@ -946,7 +935,7 @@ async fn disabled_scheduler_reconcile_cannot_acknowledge_an_owner_that_then_exit
         .get(&key)
         .and_then(|owner| owner.task.as_ref())
         .is_some_and(|task| !task.is_finished());
-    drop(schedulers);
+    drop((schedulers, cg, server));
     engine.shutdown_all().await;
     drop(barrier_release);
 
@@ -1000,29 +989,214 @@ async fn cancel_stops_the_automation_loop_while_the_scheduler_map_is_held() {
         .ensure_automation_scheduler(key.clone(), project, handshake)
         .await;
 
-    let schedulers = engine
+    let mut schedulers = engine
         .store_administration
         .automation_schedulers()
         .lock()
         .await;
     let automation_loop = schedulers
-        .get(&key)
-        .and_then(|handle| handle.task.as_ref())
-        .expect("started automation loop")
-        .abort_handle();
+        .get_mut(&key)
+        .and_then(|handle| handle.task.take())
+        .expect("started automation loop");
     engine.cancel_automation_schedulers();
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     drop(schedulers);
-    let mut waited = tokio::time::Duration::ZERO;
-    while !automation_loop.is_finished() && waited < tokio::time::Duration::from_secs(2) {
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        waited += tokio::time::Duration::from_millis(10);
+    // The loop's tick is 60 s: only the cancel can end it inside this bound.
+    let stopped_before_join = tracedecay_runtime_core::native_runtime::timeout(
+        std::time::Duration::from_secs(20),
+        automation_loop.wait(),
+    )
+    .await
+    .is_ok();
+    if !stopped_before_join
+        && let Some(handle) = engine
+            .store_administration
+            .automation_schedulers()
+            .lock()
+            .await
+            .get_mut(&key)
+    {
+        // Hand the live loop back so shutdown can abort it.
+        handle.task = Some(automation_loop);
     }
-    let stopped_before_join = automation_loop.is_finished();
+    drop((cg, server));
     engine.shutdown_all().await;
 
     assert!(
         stopped_before_join,
         "a cancel issued while the scheduler map was held must still end the loop"
     );
+}
+
+/// A reconcile from a caller with no Tokio runtime starts the automation
+/// loop, and the loop reads its disabled configuration and commits its exit
+/// on the native runtime.
+#[cfg(unix)]
+#[test]
+fn the_automation_loop_starts_and_exits_without_a_tokio_runtime() {
+    let tokio = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let dir = TempDir::new().expect("temp dir");
+    let project = dir.path().join("project");
+    let client_identity = test_client_identity_for(dir.path().join("profile"));
+    std::fs::create_dir_all(project.join("src")).expect("src dir");
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("source file");
+    tokio.block_on(initialize_test_project(&project, &client_identity));
+    let handshake = DaemonHandshake {
+        project_path: Some(project.clone()),
+        client_identity,
+        ..test_handshake_defaults()
+    };
+    let engine = test_daemon_engine_for_profile(&handshake.client_identity.profile_root);
+    let _database_scope = enter_test_daemon_database_scope(
+        &handshake.client_identity.profile_root,
+        "scheduler-off-tokio-test",
+    );
+    let server = tokio.block_on(save_scheduled_automation(&engine, &handshake, false));
+    let cg = tokio.block_on(server.cg());
+    let key = ProjectServerKey::from_open_project(&cg, &handshake).expect("owner key");
+    let barrier = Arc::new(AutomationSchedulerExitBarrier::new());
+    let _barrier_release = AutomationExitBarrierRelease(Arc::clone(&barrier));
+    // Project open started its own loop; retire it so the reconcile below
+    // starts the one under test.
+    tokio.block_on(async {
+        if let Some(retirement) = engine.retire_automation_scheduler_locked(&key).await {
+            retirement.wait().await;
+        }
+        engine
+            .store_administration
+            .wait_for_retirement_reaper_count_for_test(0)
+            .await;
+        *engine.automation_scheduler_exit_barrier.lock().await = Some(Arc::clone(&barrier));
+    });
+    engine
+        .automation_configured_override
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let hazards = crate::test_support::native_runtime_hazards();
+    let decision = tracedecay_runtime_core::native_runtime::block_on(async {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let outcome = engine
+            .ensure_automation_scheduler(key.clone(), project.clone(), handshake.clone())
+            .await;
+        assert_eq!(
+            outcome,
+            tracedecay_contracts::retrieval::AutomationSchedulerReconcileOutcome::Started
+        );
+        tracedecay_runtime_core::native_runtime::timeout(
+            std::time::Duration::from_secs(20),
+            barrier.wait_until_reached(),
+        )
+        .await
+        .expect("the loop read its disabled configuration");
+        barrier.release();
+        tracedecay_runtime_core::native_runtime::timeout(
+            std::time::Duration::from_secs(20),
+            barrier.wait_for_decision(),
+        )
+        .await
+        .expect("the loop decided whether to exit")
+    })
+    .expect("native runtime");
+    assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
+    assert_eq!(decision, AutomationSchedulerExitBarrier::EXIT);
+    drop((cg, server));
+    tokio.block_on(engine.shutdown_all());
+}
+
+/// Project-open activation runs on the native runtime: with no Tokio runtime
+/// it reconciles reserved automation effects, probes the project's automation
+/// configuration and starts its loop.
+#[cfg(unix)]
+#[test]
+fn project_open_activation_starts_the_automation_loop_without_a_tokio_runtime() {
+    let tokio = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let dir = TempDir::new().expect("temp dir");
+    let project = dir.path().join("project");
+    let client_identity = test_client_identity_for(dir.path().join("profile"));
+    std::fs::create_dir_all(project.join("src")).expect("src dir");
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").expect("source file");
+    tokio.block_on(initialize_test_project(&project, &client_identity));
+    let handshake = DaemonHandshake {
+        project_path: Some(project.clone()),
+        client_identity,
+        ..test_handshake_defaults()
+    };
+    let engine = test_daemon_engine_for_profile(&handshake.client_identity.profile_root);
+    let _database_scope = enter_test_daemon_database_scope(
+        &handshake.client_identity.profile_root,
+        "activation-off-tokio-test",
+    );
+    let server = tokio
+        .block_on(engine.project_server(&handshake))
+        .expect("open project");
+    let cg = tokio.block_on(server.cg());
+    let key = ProjectServerKey::from_open_project(&cg, &handshake).expect("owner key");
+    // Project open activated its own loop; retire it so the activation below
+    // starts the one under test.
+    tokio.block_on(async {
+        wait_for_automation_scheduler_state(&engine, |schedulers| schedulers.contains_key(&key))
+            .await;
+        if let Some(retirement) = engine.retire_automation_scheduler_locked(&key).await {
+            retirement.wait().await;
+        }
+        engine
+            .store_administration
+            .wait_for_retirement_reaper_count_for_test(0)
+            .await;
+    });
+    let probes = engine
+        .automation_config_probe_attempts
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let hazards = crate::test_support::native_runtime_hazards();
+    tracedecay_runtime_core::native_runtime::block_on(async {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        super::super::project_open_orchestration::spawn_lifecycle_automation_scheduler_activation(
+            engine.lifecycle.clone(),
+            crate::daemon::project_open_owners::reconcile_project_open_automation_effects(
+                Arc::clone(&cg),
+            ),
+        );
+        let activation_engine = engine.clone();
+        let activation_key = key.clone();
+        let activation_cg = Arc::clone(&cg);
+        super::super::project_open_orchestration::spawn_lifecycle_automation_scheduler_activation(
+            engine.lifecycle.clone(),
+            async move {
+                activation_engine
+                    .activate_automation_scheduler_for_open_project(
+                        activation_key,
+                        project,
+                        handshake,
+                        activation_cg,
+                    )
+                    .await;
+            },
+        );
+        tracedecay_runtime_core::native_runtime::timeout(
+            std::time::Duration::from_secs(20),
+            wait_for_automation_scheduler_state(&engine, |schedulers| {
+                schedulers.contains_key(&key)
+            }),
+        )
+        .await
+        .expect("the activation starts the project's automation loop");
+    })
+    .expect("native runtime");
+    assert_eq!(crate::test_support::native_runtime_hazards(), hazards);
+    assert!(
+        engine
+            .automation_config_probe_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > probes,
+        "the activation probed the automation configuration"
+    );
+    drop((cg, server));
+    tokio.block_on(engine.shutdown_all());
 }

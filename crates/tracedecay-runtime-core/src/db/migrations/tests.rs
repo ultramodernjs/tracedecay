@@ -55,15 +55,45 @@ async fn create_schema_db() -> (TestConnection, TempDir) {
     (conn, dir)
 }
 
-/// Sets PRAGMA `user_version` on the connection.
 async fn set_user_version(conn: &Connection, version: u32) {
+    if ledger_table_exists(conn).await {
+        crate::db::schema_version::record_version(
+            conn,
+            crate::db::schema_version::GRAPH_COMPONENT,
+            i64::from(version),
+        )
+        .await
+        .expect("failed to set schema version");
+        return;
+    }
     conn.execute(&format!("PRAGMA user_version = {version}"), ())
         .await
         .expect("failed to set user_version");
 }
 
-/// Reads PRAGMA `user_version` from the connection.
+async fn ledger_table_exists(conn: &Connection) -> bool {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tracedecay_schema_version'",
+            (),
+        )
+        .await
+        .expect("probe schema ledger");
+    rows.next()
+        .await
+        .expect("read schema ledger probe")
+        .is_some()
+}
+
 async fn get_user_version(conn: &Connection) -> u32 {
+    let version =
+        crate::db::schema_version::read_version(conn, crate::db::schema_version::GRAPH_COMPONENT)
+            .await
+            .expect("failed to read schema version");
+    u32::try_from(version.unwrap_or(0)).expect("schema version fits u32")
+}
+
+async fn pragma_user_version(conn: &Connection) -> u32 {
     let mut rows = conn
         .query("PRAGMA user_version", ())
         .await
@@ -73,8 +103,8 @@ async fn get_user_version(conn: &Connection) -> u32 {
         .await
         .expect("failed to read user_version row")
         .expect("user_version should return a row");
-    let v: i64 = row.get(0).expect("failed to read user_version value");
-    v as u32
+    let version: i64 = row.get(0).expect("failed to read user_version value");
+    u32::try_from(version).expect("user_version fits u32")
 }
 
 /// Checks whether a table exists in `sqlite_master`.
@@ -132,7 +162,7 @@ async fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 
 /// Every stamp but the current one, including the released v34 and v35
 /// stores, is refused without mutation: nothing upgrades in place.
-#[tokio::test]
+#[asupersync::test]
 async fn a_store_at_another_schema_version_is_refused_with_a_fresh_start_remedy() {
     for stamped in [1_u32, 18, 24, 33, 34, 35, SCHEMA_VERSION + 1] {
         let (conn, _dir) = create_schema_db().await;
@@ -167,7 +197,7 @@ async fn a_store_at_another_schema_version_is_refused_with_a_fresh_start_remedy(
 /// The handoff grant store lives in the project session store: a fresh graph
 /// store has no copy of it, and a v38 store that still carries one is refused
 /// for reset rather than admitted or rewritten.
-#[tokio::test]
+#[asupersync::test]
 async fn the_graph_store_has_no_handoff_table_and_refuses_the_v38_shape_that_did() {
     let (fresh, _fresh_dir) = create_schema_db().await;
     assert!(!table_exists(&fresh, "handoff_open_grants_v1").await);
@@ -197,7 +227,7 @@ async fn the_graph_store_has_no_handoff_table_and_refuses_the_v38_shape_that_did
     assert_eq!(get_user_version(&v38).await, 38);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn the_former_v26_shape_is_refused_without_mutation() {
     let (conn, _dir) = create_raw_db().await;
     conn.execute_batch(
@@ -235,7 +265,7 @@ async fn the_former_v26_shape_is_refused_without_mutation() {
     assert!(!column_exists(&conn, "graph_publication_replay_v1", "expected_prior_head").await);
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn a_current_stamp_with_retired_code_graph_tables_is_reset_required() {
     for retired in [
         "nodes",
@@ -270,7 +300,7 @@ async fn a_current_stamp_with_retired_code_graph_tables_is_reset_required() {
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn a_current_stamp_with_retired_memory_projection_objects_is_reset_required() {
     for retired in [
         "memory_facts",
@@ -326,7 +356,7 @@ async fn a_current_stamp_with_retired_memory_projection_objects_is_reset_require
 /// v36 retired the semantic-vector staging family with dense code retrieval.
 /// A leftover object of that family on the current stamp is refused by the
 /// writer ladder and by the read-only verifier, and the refusal names it.
-#[tokio::test]
+#[asupersync::test]
 async fn a_retired_semantic_vector_staging_object_is_reset_required_on_every_stamp() {
     for (retired, ddl) in [
         (
@@ -379,7 +409,7 @@ async fn a_retired_semantic_vector_staging_object_is_reset_required_on_every_sta
     }
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn a_current_stamp_with_retired_memory_projection_columns_is_reset_required() {
     for retired in ["source_label", "projection_state", "vector_watermark_json"] {
         let (conn, _dir) = create_schema_db().await;
@@ -409,7 +439,7 @@ async fn a_current_stamp_with_retired_memory_projection_columns_is_reset_require
 
 /// Creation is atomic: an interrupted create leaves neither DDL nor a version
 /// stamp behind, and the retry still produces the full shape.
-#[tokio::test]
+#[asupersync::test]
 async fn interrupted_fresh_schema_rolls_back_ddl_and_version_before_retry() {
     let (conn, _dir) = create_raw_db().await;
     super::configure_fresh_auto_vacuum(&conn, "test interrupted fresh schema")
@@ -439,7 +469,7 @@ async fn interrupted_fresh_schema_rolls_back_ddl_and_version_before_retry() {
 /// The creation DDL installs the retained relational shape in one transaction:
 /// canonical memory, evidence assembly, external sources, and graph publication
 /// manifests, without recreating either superseded `SQLite` projection.
-#[tokio::test]
+#[asupersync::test]
 async fn fresh_creation_installs_every_stage_of_the_final_shape() {
     let (conn, _dir) = create_schema_db().await;
 
@@ -686,7 +716,7 @@ async fn digest_rows(conn: &Connection) -> Vec<(String, String)> {
     values
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn deleting_a_payload_drops_its_digest_and_digests_never_update() {
     let (conn, _dir) = create_schema_db().await;
     for (ordinal, content) in PAYLOAD_FIXTURE_CONTENTS.iter().enumerate() {
@@ -736,7 +766,7 @@ async fn deleting_a_payload_drops_its_digest_and_digests_never_update() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn the_content_digest_lookup_is_an_indexed_point_read() {
     let (conn, _dir) = create_schema_db().await;
     let mut rows = conn
@@ -777,4 +807,41 @@ async fn the_content_digest_lookup_is_an_indexed_point_read() {
         !plan.contains("SCAN digests"),
         "the digest lookup must never scan the digest table: {plan}"
     );
+}
+
+#[asupersync::test]
+async fn a_user_version_stamp_at_the_current_schema_upgrades_onto_the_ledger() {
+    let (conn, _dir) = create_schema_db().await;
+    conn.execute_batch("DROP TABLE tracedecay_schema_version")
+        .await
+        .expect("remove the adopted ledger");
+    conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), ())
+        .await
+        .expect("restore the legacy stamp");
+
+    ensure_schema_current_connection(&conn)
+        .await
+        .expect("current legacy stamp must be admitted and adopted");
+
+    assert_eq!(get_user_version(&conn).await, SCHEMA_VERSION);
+    assert_eq!(pragma_user_version(&conn).await, 0);
+    assert!(ledger_table_exists(&conn).await);
+}
+
+#[asupersync::test]
+async fn an_older_user_version_is_refused_without_adopting_it() {
+    let (conn, _dir) = create_schema_db().await;
+    conn.execute_batch("DROP TABLE tracedecay_schema_version")
+        .await
+        .expect("remove the adopted ledger");
+    conn.execute("PRAGMA user_version = 38", ())
+        .await
+        .expect("stamp the previous graph schema");
+
+    let error = ensure_schema_current_connection(&conn)
+        .await
+        .expect_err("an older pragma must be refused");
+    assert!(error.to_string().contains("database schema v38"), "{error}");
+    assert_eq!(pragma_user_version(&conn).await, 38);
+    assert!(!ledger_table_exists(&conn).await);
 }

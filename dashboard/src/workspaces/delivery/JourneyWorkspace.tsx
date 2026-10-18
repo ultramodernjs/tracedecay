@@ -4,6 +4,7 @@ import type {
   DeliveryMembershipEdgeV1,
   DeliveryOverviewV1,
 } from '../../contracts/generated.ts';
+import { useScope } from '../../data/scope/store.ts';
 import { ReadSection } from '../../ui/ReadSection.tsx';
 import { StateChip } from '../../ui/StateChip.tsx';
 import { ReadoutBar } from '../../ui/instrument.tsx';
@@ -14,9 +15,9 @@ import {
   GradeMark,
   IdentityRow,
   ReadOnlyProviderBadge,
-  microsToIso,
   shortSha,
 } from './deliveryChrome.tsx';
+import { formatMicrosUtc } from '../../ui/format.ts';
 import { projectFor } from './inboxFilter.ts';
 import {
   agentTokenLabel,
@@ -71,7 +72,8 @@ function JourneyBody({
   overview: DeliveryOverviewV1;
 }) {
   const { navigate, location } = context;
-  const model = useMemo(() => buildJourney(overview, { row, edges }), [overview, row, edges]);
+  const scope = useScope((state) => state.scope);
+  const model = useMemo(() => buildJourney(overview, { row, edges }, scope), [overview, row, edges, scope]);
   const transit = useMemo(() => buildTransit(row, edges, model), [row, edges, model]);
   const selected = model.episodes.find((episode) => episode.id === location.episode) ?? null;
   const project = projectFor(context.inbox, row.project_id);
@@ -140,7 +142,7 @@ function spanLabel(model: JourneyModel): string {
 
 /** `YYYY-MM-DD HH:MM` at 16, `YYYY-MM-DD HH:MM:SS` at 19. */
 function utcStamp(micros: number, length: 16 | 19): string {
-  return microsToIso(micros).slice(0, length).replace('T', ' ');
+  return formatMicrosUtc(micros).slice(0, length).replace('T', ' ');
 }
 
 function timeKindLabel(kind: JourneyEpisode['timeKind']): string {
@@ -178,7 +180,7 @@ function EpisodeInspector({ episode }: { episode: JourneyEpisode | null }) {
             <p className="mt-2 text-3xs leading-relaxed text-text-secondary">{episode.detail}</p>
           </header>
           <div className="px-3 py-2">
-            <IdentityRow label="time" value={`${episode.at === null ? '—' : microsToIso(episode.at)} · ${timeKindLabel(episode.timeKind)}`} />
+            <IdentityRow label="time" value={`${episode.at === null ? '—' : formatMicrosUtc(episode.at)} · ${timeKindLabel(episode.timeKind)}`} />
             <IdentityRow label="lane" value={laneLabel(episode.lane)} />
             <IdentityRow label="episode id" value={episode.id} />
           </div>
@@ -230,7 +232,7 @@ function RefIdentity({ episodeRef: ref }: { episodeRef: EpisodeRef }) {
         <>
           <IdentityRow label="operation" value={ref.operation} />
           <IdentityRow label="outcome" value={ref.outcome} />
-          <IdentityRow label="fetched" value={microsToIso(ref.fetchedAtMicros)} />
+          <IdentityRow label="fetched" value={formatMicrosUtc(ref.fetchedAtMicros)} />
         </>
       );
     case 'review': {

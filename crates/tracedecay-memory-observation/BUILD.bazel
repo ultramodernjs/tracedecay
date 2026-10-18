@@ -16,7 +16,7 @@ rust_library(
     edition = crate_edition(),
     compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
         + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True) + ["//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     aliases = aliases(normal = True),
@@ -32,7 +32,7 @@ rust_library(
     edition = crate_edition(),
     compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
         + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True) + ["//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     aliases = aliases(normal = True),
@@ -45,14 +45,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/admission_and_idempotency.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -60,14 +60,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/backpressure_and_load_shedding.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -75,14 +75,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/bounded_dispatcher.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -90,14 +90,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/crash_safety_commit_to_ack.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -105,14 +105,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/delivery_receipts_and_replay.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -120,14 +120,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/journal_correctness_regressions.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -135,14 +135,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/native_fact_non_authority.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -150,14 +150,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/orphaned_attempt_audit.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -165,14 +165,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/provider_source_fences.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -180,14 +180,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/recovery_replay.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -195,14 +195,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/restart_survival.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -210,14 +210,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/retention_and_privacy_deletion.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -225,14 +225,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/retention_sweep_cadence.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -240,14 +240,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/runtime_ingress_and_dispatch.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -255,14 +255,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/sanitization_seam.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -270,14 +270,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/schema_migration.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -285,14 +285,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/source_delivery_evidence.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -300,14 +300,14 @@ rust_test(
     srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
     crate_root = "tests/volume_and_backpressure_soak.rs",
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-observation:tracedecay-memory-observation__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
     rustc_flags = perf_rustc_flags(1),
     crate_features = [],
-    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
+    data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -315,7 +315,7 @@ rust_test(
     crate = ":tracedecay-memory-observation__dev",
     crate_features = [],
     edition = crate_edition(),
-    version = "1.0.0-beta.85",
+    version = "1.0.0-beta.88",
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),

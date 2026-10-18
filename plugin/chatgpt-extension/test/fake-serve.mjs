@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Stands in for `tracedecay serve` where a test needs exact daemon tool results.
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 
 const server = new McpServer({ name: "fake-tracedecay-serve", version: "0.0.0" });
 
@@ -27,5 +27,18 @@ server.registerTool("node_not_found", {}, async () => ({
     },
   ],
 }));
+
+server.registerTool("hinted_read", {}, async () => ({
+  content: [
+    { type: "text", text: JSON.stringify({ ok: true }) },
+    { type: "text", text: "\ntracedecay_metrics: response_tokens=4" },
+    {
+      type: "text",
+      text: "tracedecay_repeated_query: this tracedecay_search call shares 100% of its query words with the tracedecay_search call 2 calls earlier in this session",
+    },
+  ],
+}));
+
+server.registerTool("plain_read", {}, async () => ({ content: [{ type: "text", text: JSON.stringify({ ok: true }) }] }));
 
 await server.connect(new StdioServerTransport());

@@ -1,11 +1,11 @@
 //! `tracedecay_similar` and `tracedecay_redundancy`: the clone-family reads.
 
 use serde_json::Value;
+use tracedecay_code_index::clones::{CloneBodyEligibilityV1, CloneNormalizationClassV1};
 use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
 use tracedecay_contracts::retrieval::{
     RedundancyScopeV1, RedundancySurfaceRequestV1, SimilarCoverageV1, SimilarFamilyV1,
-    SimilarMatchClassV1, SimilarOccurrenceV1, SimilarResultV1, SimilarSurfaceRequestV1,
-    SimilarTargetV1,
+    SimilarMatchClassV1, SimilarResultV1, SimilarSurfaceRequestV1, SimilarTargetV1,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{CursorBindingV1, decode_bound_cursor, encode_bound_cursor};
@@ -46,14 +46,7 @@ pub async fn compute_similar(
     let match_classes = request
         .match_classes
         .iter()
-        .map(|class| match class {
-            SimilarMatchClassV1::ConservativeExact => {
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative
-            }
-            SimilarMatchClassV1::RenameNormalizedExact => {
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename
-            }
-        })
+        .map(|class| clone_normalization_class(*class))
         .collect();
     let cursor = request
         .cursor
@@ -101,7 +94,7 @@ pub async fn compute_similar(
             "the selected source is outside the authorized repository scope",
         ));
     }
-    let source = similar_occurrence(&similar.source.occurrence);
+    let source = similar.source.occurrence.similar_occurrence();
     let mut touched_files = vec![source.path.clone()];
     let mut complete = true;
     let families = similar
@@ -109,14 +102,6 @@ pub async fn compute_similar(
         .into_iter()
         .map(|group| -> Result<SimilarFamilyV1> {
             complete &= group.complete;
-            let match_class = match group.key.class {
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative => {
-                    SimilarMatchClassV1::ConservativeExact
-                }
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename => {
-                    SimilarMatchClassV1::RenameNormalizedExact
-                }
-            };
             let members = group
                 .members
                 .into_iter()
@@ -125,7 +110,7 @@ pub async fn compute_similar(
                         && member.occurrence.repository_id == repository_id
                 })
                 .map(|member| {
-                    let occurrence = similar_occurrence(&member.occurrence);
+                    let occurrence = member.occurrence.similar_occurrence();
                     touched_files.push(occurrence.path.clone());
                     occurrence
                 })
@@ -139,7 +124,7 @@ pub async fn compute_similar(
                     message: format!("failed to encode tracedecay_similar cursor: {error}"),
                 })?;
             Ok(SimilarFamilyV1 {
-                match_class,
+                match_class: similar_match_class(group.key.class),
                 normalization_revision: group.key.normalization_revision,
                 family_digest: group.key.digest,
                 representative_payload_digest: similar.source.payload.payload_digest.clone(),
@@ -152,27 +137,7 @@ pub async fn compute_similar(
         .collect::<Result<Vec<_>>>()?;
     touched_files.sort();
     touched_files.dedup();
-    let coverage = match similar.source.occurrence.eligibility {
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible if complete => {
-            SimilarCoverageV1::Complete
-        }
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible => {
-            SimilarCoverageV1::Partial
-        }
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedTooSmall {
-            minimum_tokens,
-        } => SimilarCoverageV1::ExcludedTooSmall { minimum_tokens },
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedTooLarge {
-            maximum_tokens,
-            maximum_bytes,
-        } => SimilarCoverageV1::ExcludedTooLarge {
-            maximum_tokens,
-            maximum_bytes,
-        },
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedIncompleteTokenization => {
-            SimilarCoverageV1::ExcludedIncompleteTokenization
-        }
-    };
+    let coverage = similar_coverage(similar.source.occurrence.eligibility, complete);
     let result = SimilarResultV1 {
         source_generation: source.source_generation.clone(),
         source,
@@ -184,6 +149,43 @@ pub async fn compute_similar(
         GraphToolResultV1::Similar(result),
         touched_files,
     ))
+}
+
+/// Wire match class to the clone index normalization class it selects.
+pub fn clone_normalization_class(class: SimilarMatchClassV1) -> CloneNormalizationClassV1 {
+    match class {
+        SimilarMatchClassV1::ConservativeExact => CloneNormalizationClassV1::Conservative,
+        SimilarMatchClassV1::RenameNormalizedExact => CloneNormalizationClassV1::Rename,
+    }
+}
+
+/// Clone index normalization class to the wire match class that names it.
+pub fn similar_match_class(class: CloneNormalizationClassV1) -> SimilarMatchClassV1 {
+    match class {
+        CloneNormalizationClassV1::Conservative => SimilarMatchClassV1::ConservativeExact,
+        CloneNormalizationClassV1::Rename => SimilarMatchClassV1::RenameNormalizedExact,
+    }
+}
+
+/// Source eligibility plus family completeness to the similar-read coverage.
+pub fn similar_coverage(eligibility: CloneBodyEligibilityV1, complete: bool) -> SimilarCoverageV1 {
+    match eligibility {
+        CloneBodyEligibilityV1::Eligible if complete => SimilarCoverageV1::Complete,
+        CloneBodyEligibilityV1::Eligible => SimilarCoverageV1::Partial,
+        CloneBodyEligibilityV1::ExcludedTooSmall { minimum_tokens } => {
+            SimilarCoverageV1::ExcludedTooSmall { minimum_tokens }
+        }
+        CloneBodyEligibilityV1::ExcludedTooLarge {
+            maximum_tokens,
+            maximum_bytes,
+        } => SimilarCoverageV1::ExcludedTooLarge {
+            maximum_tokens,
+            maximum_bytes,
+        },
+        CloneBodyEligibilityV1::ExcludedIncompleteTokenization => {
+            SimilarCoverageV1::ExcludedIncompleteTokenization
+        }
+    }
 }
 
 /// The one clone-family unavailable wire shape. `tracedecay_similar` and
@@ -203,7 +205,9 @@ fn clone_lane_unavailable_error(
         return TraceDecayError::project_route(
             "application_surface_invalid_request",
             false,
-            format!("the maintained clone {lane} lane refused the request as invalid"),
+            format!(
+                "the maintained clone {lane} lane refused the request as invalid; check its limits, match_classes, and paths against the tool schema"
+            ),
         );
     }
     TraceDecayError::ProjectRoute {
@@ -252,14 +256,7 @@ pub async fn compute_redundancy(
     let match_classes = request
         .match_classes
         .iter()
-        .map(|class| match class {
-            SimilarMatchClassV1::ConservativeExact => {
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative
-            }
-            SimilarMatchClassV1::RenameNormalizedExact => {
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename
-            }
-        })
+        .map(|class| clone_normalization_class(*class))
         .collect();
     let scope = match request.scope {
         RedundancyScopeV1::Repository => {
@@ -335,21 +332,6 @@ pub async fn compute_redundancy(
     ))
 }
 
-fn similar_occurrence(
-    occurrence: &tracedecay_code_index::clones::CloneBodyOccurrenceV1,
-) -> SimilarOccurrenceV1 {
-    SimilarOccurrenceV1 {
-        project_id: occurrence.project_id.clone(),
-        repository_id: occurrence.repository_id.clone(),
-        worktree_id: occurrence.worktree_id.clone(),
-        source_generation: occurrence.source_generation.clone(),
-        snapshot_digest: occurrence.snapshot_digest.clone(),
-        symbol_occurrence_id: occurrence.symbol_occurrence_id.clone(),
-        path: occurrence.path.clone(),
-        body_span: occurrence.body_span,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,7 +395,7 @@ mod tests {
             Some((
                 "application_surface_invalid_request",
                 false,
-                "the maintained clone similarity lane refused the request as invalid",
+                "the maintained clone similarity lane refused the request as invalid; check its limits, match_classes, and paths against the tool schema",
             ))
         );
     }

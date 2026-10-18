@@ -1,39 +1,41 @@
 use std::sync::Arc;
 
+use tracedecay_rusqlite_runtime::native_runtime;
 use tracedecay_store::RuntimeSubmitOutcomeV1;
 
 use super::runtime_test_support::{
-    Probe, TestDatabase, outbox_request, run, writer, writer_runtime_fixture,
+    Probe, TestDatabase, diagnostics_request, run, writer, writer_runtime_fixture,
 };
 
 #[test]
 fn writer_serializes_concurrent_commits_into_ordered_receipts() {
     let fixture = writer_runtime_fixture();
     let database = TestDatabase::new("writer-serialized.sqlite3");
-    let first = outbox_request(
+    let first = diagnostics_request(
         &fixture.origin_binding,
-        &fixture.target_binding,
         "operation.runtime.serialized.first",
-        &format!("{}.first", fixture.effect_id),
-        &format!("{}.first", fixture.ordering_key),
     );
-    let second = outbox_request(
+    let second = diagnostics_request(
         &fixture.origin_binding,
-        &fixture.target_binding,
         "operation.runtime.serialized.second",
-        &format!("{}.second", fixture.effect_id),
-        &format!("{}.second", fixture.ordering_key),
     );
     let writer = Arc::new(writer(&database, &fixture.origin_binding));
 
     let mut sequences = run(async {
         let first_writer = Arc::clone(&writer);
         let first_probe = Probe::for_submit(&first);
-        let first_task = tokio::spawn(async move { first_writer.submit(first, first_probe).await });
+        let first_task = tokio::spawn(async move {
+            first_writer
+                .submit(&native_runtime::cx().unwrap(), first, first_probe)
+                .await
+        });
         let second_writer = Arc::clone(&writer);
         let second_probe = Probe::for_submit(&second);
-        let second_task =
-            tokio::spawn(async move { second_writer.submit(second, second_probe).await });
+        let second_task = tokio::spawn(async move {
+            second_writer
+                .submit(&native_runtime::cx().unwrap(), second, second_probe)
+                .await
+        });
         [first_task.await, second_task.await]
             .into_iter()
             .map(|result| {

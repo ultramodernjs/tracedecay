@@ -23,6 +23,7 @@ use tracedecay_store::observation::ObservationCoverageReason;
 
 use crate::admission::HostAdmission;
 use crate::observation::ObservationCancellation;
+use crate::runtime::ingest::quarantine::SourceSweep;
 use crate::runtime::ingest_byte_budget::IngestByteBudget;
 use crate::runtime::jsonl_observation_admission::{
     JsonlFrameAdmission, JsonlObservationAdmissionProgress, JsonlObservationAdmissionRequest,
@@ -47,12 +48,12 @@ pub use parent_dispatch_index::{
     parent_dispatch_model_for_subagent_with_receipt,
 };
 pub(in crate::runtime) use projection::CursorSweepIngestOutcome;
+pub(super) use projection::drain_cursor_observation_projections;
 pub use projection::{
     CursorTranscriptIngestStats, try_ingest_cursor_project_sweep_capped,
-    try_ingest_cursor_project_sweep_capped_with_admission, try_ingest_cursor_user_sweep_capped,
+    try_ingest_cursor_project_sweep_capped_with_admission,
     try_ingest_cursor_user_sweep_capped_with_admission,
 };
-pub(super) use projection::{cursor_ingest_or_default, drain_cursor_observation_projections};
 pub(in crate::runtime) use sweep_page::CursorSweepCoverage;
 use sweep_page::{CURSOR_SWEEP_FRONTIER_KEY, CursorSweepPage, list_cursor_sweep_corpus};
 
@@ -376,60 +377,9 @@ fn cursor_native_with_context(
 /// Admission is **incremental**: it resumes from each transcript's committed
 /// observation source cursor, so each call only admits lines appended since
 /// the last run. Repeated calls on an unchanged file are a no-op.
-pub async fn ingest_cursor_transcript_event(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    project_id: ProjectId,
-) -> CursorTranscriptIngestStats {
-    cursor_ingest_or_default(
-        &try_ingest_cursor_transcript_event(event_json, admission, project_id).await,
-    )
-}
-
-pub async fn try_ingest_cursor_transcript_event(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    project_id: ProjectId,
-) -> TranscriptIngestResult<CursorTranscriptIngestStats> {
-    try_ingest_cursor_transcript_event_capped(event_json, admission, project_id, None).await
-}
-
-/// Like [`ingest_cursor_transcript_event`], but bounds how many newly-appended
-/// bytes a single call will read. Cursor hooks pass byte caps to stay within hook
-/// budgets. The cap is shared across the parent and every discovered subagent
-/// transcript.
-pub async fn ingest_cursor_transcript_event_capped(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    project_id: ProjectId,
-    max_new_bytes: Option<u64>,
-) -> CursorTranscriptIngestStats {
-    cursor_ingest_or_default(
-        &try_ingest_cursor_transcript_event_capped(
-            event_json,
-            admission,
-            project_id,
-            max_new_bytes,
-        )
-        .await,
-    )
-}
-
-pub async fn try_ingest_cursor_transcript_event_capped(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    project_id: ProjectId,
-    max_new_bytes: Option<u64>,
-) -> TranscriptIngestResult<CursorTranscriptIngestStats> {
-    try_ingest_cursor_transcript_event_capped_with_admission(
-        event_json,
-        project_id,
-        admission,
-        max_new_bytes,
-    )
-    .await
-}
-
+/// `max_new_bytes` bounds the newly appended bytes one call reads, shared
+/// across the parent and every discovered subagent transcript, so hooks stay
+/// within their budgets.
 #[tracing::instrument(
     name = "sessions.hosts.cursor.ingest_event_capped",
     level = "trace",
@@ -507,64 +457,6 @@ pub async fn try_ingest_cursor_transcript_event_capped_with_admission(
         budget.deferred(),
         budget.consumed(),
     ))
-}
-
-pub async fn ingest_cursor_user_transcript_event_capped(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    max_new_bytes: Option<u64>,
-) -> CursorTranscriptIngestStats {
-    cursor_ingest_or_default(
-        &try_ingest_cursor_user_transcript_event_capped(event_json, admission, max_new_bytes).await,
-    )
-}
-
-pub async fn try_ingest_cursor_user_transcript_event_capped(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    max_new_bytes: Option<u64>,
-) -> TranscriptIngestResult<CursorTranscriptIngestStats> {
-    try_ingest_cursor_user_transcript_event_capped_with_registered_roots(
-        event_json,
-        admission,
-        max_new_bytes,
-        &[],
-    )
-    .await
-}
-
-/// User-scope live ingest guarded by a registry snapshot. The unguarded
-/// wrapper remains useful for isolated parsing without a profile registry.
-pub async fn ingest_cursor_user_transcript_event_capped_with_registered_roots(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    max_new_bytes: Option<u64>,
-    registered_roots: &[PathBuf],
-) -> CursorTranscriptIngestStats {
-    cursor_ingest_or_default(
-        &try_ingest_cursor_user_transcript_event_capped_with_registered_roots(
-            event_json,
-            admission,
-            max_new_bytes,
-            registered_roots,
-        )
-        .await,
-    )
-}
-
-pub async fn try_ingest_cursor_user_transcript_event_capped_with_registered_roots(
-    event_json: &str,
-    admission: &dyn HostAdmission,
-    max_new_bytes: Option<u64>,
-    registered_roots: &[PathBuf],
-) -> TranscriptIngestResult<CursorTranscriptIngestStats> {
-    try_ingest_cursor_user_transcript_event_capped_with_admission(
-        event_json,
-        admission,
-        max_new_bytes,
-        registered_roots,
-    )
-    .await
 }
 
 pub async fn try_ingest_cursor_user_transcript_event_capped_with_admission(
@@ -671,6 +563,7 @@ pub(in crate::runtime) fn try_ingest_cursor_project_sweep_capped_with_session_id
     max_new_bytes: Option<u64>,
     skip_session_ids: std::collections::HashSet<String, S>,
     cancellation: &'a ObservationCancellation,
+    sweep: &'a mut SourceSweep,
 ) -> Pin<Box<dyn Future<Output = TranscriptIngestResult<CursorSweepIngestOutcome>> + Send + 'a>> {
     // Rehash into the default (Send) hasher before boxing so the returned
     // future never captures the caller's `S` hasher and stays `Send`.
@@ -687,6 +580,7 @@ pub(in crate::runtime) fn try_ingest_cursor_project_sweep_capped_with_session_id
             max_new_bytes,
             ObservationScopeV1::Project { project_id },
             cancellation,
+            sweep,
         )
         .await
     })
@@ -700,6 +594,7 @@ pub(in crate::runtime) async fn try_ingest_cursor_user_sweep_capped_with_session
     max_new_bytes: Option<u64>,
     skip_session_ids: std::collections::HashSet<String, S>,
     cancellation: &ObservationCancellation,
+    sweep: &mut SourceSweep,
 ) -> TranscriptIngestResult<CursorSweepIngestOutcome> {
     let Some(source) = CursorSweepSource::new() else {
         return Ok(CursorSweepIngestOutcome::default());
@@ -713,6 +608,7 @@ pub(in crate::runtime) async fn try_ingest_cursor_user_sweep_capped_with_session
         max_new_bytes,
         ObservationScopeV1::Profile,
         cancellation,
+        sweep,
     )
     .await
 }
@@ -736,6 +632,7 @@ async fn admit_cursor_sweep_observations_with_session_ids(
     max_new_bytes: Option<u64>,
     scope: ObservationScopeV1,
     cancellation: &ObservationCancellation,
+    sweep: &mut SourceSweep,
 ) -> TranscriptIngestResult<CursorSweepIngestOutcome> {
     if cancellation.is_cancelled() {
         return Err(TranscriptIngestError::Cancelled { provider: "cursor" });
@@ -768,6 +665,9 @@ async fn admit_cursor_sweep_observations_with_session_ids(
             let Some(parent_session_id) = sweep_parent_session_id(path) else {
                 continue;
             };
+            let Some(claim) = sweep.observe_file(path).await? else {
+                continue;
+            };
             let event = cursor_sweep_event(
                 &parent_session_id,
                 project_root,
@@ -793,15 +693,22 @@ async fn admit_cursor_sweep_observations_with_session_ids(
             // scanned. One rescan starts from the peer's durable cursor. If that
             // also loses, the file's cursor is unchanged and the next pass resumes
             // at its session. Do not fail the rest of the sweep.
-            let progress = match admit_file().await {
+            let admitted_file = match admit_file().await {
                 Err(error) if retryable_cursor_conflict(&error) => match admit_file().await {
                     Err(error) if retryable_cursor_conflict(&error) => {
                         unfinished.get_or_insert(page.start + offset);
                         continue;
                     }
-                    other => other?,
+                    other => other,
                 },
-                other => other?,
+                other => other,
+            };
+            let progress = match admitted_file {
+                Ok(progress) => progress,
+                Err(error) => {
+                    sweep.refused(claim, error)?;
+                    continue;
+                }
             };
             if progress.source_deferred {
                 unfinished.get_or_insert(page.start + offset);
@@ -908,8 +815,9 @@ const SLUG_DECODE_PROBE_BUDGET: u32 = 4096;
 
 /// Startup catch-up source for Cursor transcripts.
 ///
-/// The live hook path ([`ingest_cursor_transcript_event`]) only sees turns
-/// that fire while the tracedecay hooks are installed, so transcripts written
+/// The live hook path
+/// ([`try_ingest_cursor_transcript_event_capped_with_admission`]) only sees
+/// turns that fire while the tracedecay hooks are installed, so transcripts written
 /// before a project was indexed could never ingest. This source sweeps
 /// `~/.cursor/projects/<slug>/agent-transcripts/**.jsonl` for the slug that
 /// encodes `project_root`, feeding every file through the same

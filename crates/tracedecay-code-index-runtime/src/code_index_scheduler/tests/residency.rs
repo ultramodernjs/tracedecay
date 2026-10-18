@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use tracedecay_contracts::code_index_freshness::{
-    CodeGraphServingReadinessV1, CodeIndexStalenessStateV1,
+    CodeGraphServingReadinessV1, CodeIndexBuildBlockedReasonV1, CodeIndexStalenessStateV1,
 };
 use tracedecay_domain::{CodeGenerationId, ProjectId, WorktreeId};
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
@@ -965,7 +965,7 @@ async fn a_complete_read_serves_the_seat_its_demand_lands_after_its_miss() {
             registry
                 .latest_complete_fresh_for_scope_awaiting_seat(
                     &scope,
-                    tokio::time::Instant::now() + SERVING_SEAT_FAILURE_CEILING,
+                    std::time::Instant::now() + SERVING_SEAT_FAILURE_CEILING,
                 )
                 .await
         }
@@ -1302,18 +1302,27 @@ async fn a_settled_index_keeps_no_captured_source_allocated() {
     registry.shutdown().await;
 }
 
+/// The receipts retained now, the mark [`next_receipt_trigger`] reads past.
+fn receipt_mark(receipts: &mut tokio::sync::watch::Receiver<CodeIndexCadenceTelemetryV1>) -> usize {
+    receipts.borrow_and_update().receipts().len()
+}
+
+/// The trigger of the first receipt recorded after `mark`. The pass that
+/// answers an action can owe a follow-up whose receipt lands before this
+/// reader runs, so the latest receipt need not be the action's.
 async fn next_receipt_trigger(
     receipts: &mut tokio::sync::watch::Receiver<CodeIndexCadenceTelemetryV1>,
+    mark: usize,
 ) -> CodeIndexCadenceTriggerV1 {
     tokio::time::timeout(Duration::from_mins(1), async {
         loop {
+            if let Some(receipt) = receipts.borrow_and_update().receipts().nth(mark) {
+                return receipt.trigger;
+            }
             receipts
                 .changed()
                 .await
                 .expect("the cadence channel stays open while the registry lives");
-            if let Some(receipt) = receipts.borrow_and_update().latest().cloned() {
-                return receipt.trigger;
-            }
         }
     })
     .await
@@ -1380,11 +1389,12 @@ async fn a_text_build_refused_for_memory_retries_when_memory_is_given_back() {
     let (registry, blocker, mut receipts) =
         mount_with_refused_text_build(&fixture, &store, &owners).await;
 
+    let mark = receipt_mark(&mut receipts);
     drop(blocker);
     owners.note_headroom();
 
     assert_eq!(
-        next_receipt_trigger(&mut receipts).await,
+        next_receipt_trigger(&mut receipts, mark).await,
         CodeIndexCadenceTriggerV1::MemoryHeadroom
     );
     let text = wait_for_queryable_text_generation(&registry, fixture.path()).await;
@@ -1401,10 +1411,11 @@ async fn a_refused_text_build_retries_when_a_reservation_it_waited_on_drops() {
     let (registry, blocker, mut receipts) =
         mount_with_refused_text_build(&fixture, &store, &owners).await;
 
+    let mark = receipt_mark(&mut receipts);
     drop(blocker);
 
     assert_eq!(
-        next_receipt_trigger(&mut receipts).await,
+        next_receipt_trigger(&mut receipts, mark).await,
         CodeIndexCadenceTriggerV1::MemoryHeadroom
     );
     let text = wait_for_queryable_text_generation(&registry, fixture.path()).await;
@@ -1470,6 +1481,25 @@ fn sixteen_gib_authority() -> Arc<ProcessResidentMemoryV1> {
     Arc::new(ProcessResidentMemoryV1::with_pressure(
         limit,
         Arc::new(ResidentMemoryPressureV1::new(limit)),
+    ))
+}
+
+/// A 16 GiB authority reading a fixed process size, so a held ledger refuses
+/// a refresh however much memory the tests beside it hold.
+fn fixed_reading_authority() -> Arc<ProcessResidentMemoryV1> {
+    let limit = NonZeroU64::new(16 * 1024 * 1024 * 1024).unwrap();
+    let process = ProcessResidentSampleV1 {
+        resident_bytes: 256 * 1024 * 1024,
+        unreclaimable_bytes: 256 * 1024 * 1024,
+        swapped_bytes: 0,
+        cgroup_committed_bytes: None,
+    };
+    Arc::new(ProcessResidentMemoryV1::with_pressure(
+        limit,
+        Arc::new(ResidentMemoryPressureV1::with_sampler(
+            limit,
+            Arc::new(move || Some(process)),
+        )),
     ))
 }
 
@@ -1581,22 +1611,7 @@ async fn a_refused_refresh_waits_for_a_release_without_passive_reads_holding_its
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
     let owners = Arc::new(ResidentOwnersV1::new(IDLE_WINDOW));
-    // A fixed process reading, so the held ledger refuses the refresh however
-    // much memory the tests beside this one hold.
-    let limit = NonZeroU64::new(16 * 1024 * 1024 * 1024).unwrap();
-    let process = ProcessResidentSampleV1 {
-        resident_bytes: 256 * 1024 * 1024,
-        unreclaimable_bytes: 256 * 1024 * 1024,
-        swapped_bytes: 0,
-        cgroup_committed_bytes: None,
-    };
-    let resident_memory = Arc::new(ProcessResidentMemoryV1::with_pressure(
-        limit,
-        Arc::new(ResidentMemoryPressureV1::with_sampler(
-            limit,
-            Arc::new(move || Some(process)),
-        )),
-    ));
+    let resident_memory = fixed_reading_authority();
     let (registry, scope) = mounted_core_query_worktree_in(
         CodeIndexSchedulerRegistryV1::with_resident_memory(1, Arc::clone(&resident_memory))
             .with_resident_owners(Arc::clone(&owners)),
@@ -1682,6 +1697,248 @@ async fn a_refused_refresh_waits_for_a_release_without_passive_reads_holding_its
     assert_eq!(blocked_reason().await, None);
 
     registry.shutdown().await;
+}
+
+/// A read holding the serving graph through a refresh's memory refusal keeps
+/// both the refusal's yield and the park release from freeing it. The read
+/// ending is what frees that graph, so it must retry the refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_refused_while_a_read_holds_the_graph_retries_when_the_read_ends() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let owners = Arc::new(ResidentOwnersV1::new(IDLE_WINDOW));
+    let resident_memory = fixed_reading_authority();
+    let (registry, _) = mounted_core_query_worktree_in(
+        CodeIndexSchedulerRegistryV1::with_resident_memory(1, Arc::clone(&resident_memory))
+            .with_resident_owners(Arc::clone(&owners)),
+        &fixture,
+        &store,
+    )
+    .await;
+    wait_for_settled_owner(&registry, fixture.path()).await;
+    let seated = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    let text = wait_for_queryable_text_generation(&registry, fixture.path()).await;
+    install_verified_graph_store_on_text(&text, &seated);
+    drop(seated);
+    let graph_store = text
+        .interactive_graph_store()
+        .expect("installed graph store");
+    graph_store
+        .warm_serving_engine()
+        .expect("pin the serving engine");
+    let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
+    while text.code_graph_serving_readiness() != CodeGraphServingReadinessV1::Ready {
+        assert!(
+            Instant::now() <= deadline,
+            "the installed graph must report ready"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let reader = graph_store
+        .interactive_reader(
+            &text.metadata().manifest().generation_id,
+            &tracedecay_contracts::CancellationSignal::active("cancel.test.graph-reader")
+                .expect("graph cancellation"),
+        )
+        .expect("an open graph read");
+    let blocker = ledger_leaving_one_mib(&resident_memory, "test-other-worktree-build");
+    refresh_refused_for_memory(&registry, &fixture).await;
+    let refused_passes = || async {
+        registry
+            .dashboard_freshness(fixture.path())
+            .await
+            .expect("mounted worktree freshness")
+            .parked
+            .filter(|parked| {
+                parked.blocked_reason == Some(CodeIndexBuildBlockedReasonV1::ResidentMemory)
+            })
+            .map(|parked| parked.observed_passes)
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let before = loop {
+        if let Some(passes) = refused_passes().await {
+            break passes;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "the refresh parks on resident memory"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    // The worker gives back what it can before it reads as parked.
+    wait_for_worker_phase(&registry, fixture.path(), CodeIndexWorkerPhaseV1::Parked).await;
+
+    // A read can end off the runtime (a catalog re-warm thread holds the
+    // last lease) and while a pass runs.
+    let pass = registry
+        .hold_reconcile_pass_for_test(fixture.path())
+        .await
+        .expect("mounted worktree");
+    std::thread::spawn(move || drop(reader))
+        .join()
+        .expect("ending a graph read off the runtime must not panic");
+    drop(pass);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while refused_passes().await == Some(before) {
+        assert!(
+            Instant::now() <= deadline,
+            "the graph the ended read freed is the refused refresh's retry"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    drop(blocker);
+    registry.shutdown().await;
+}
+
+/// A mounted worktree whose native graph activation is refused for resident
+/// memory until the returned guard drops, read once the refusal is parked and
+/// the worker has gone idle on it.
+struct RefusedGraphV1 {
+    fixture: GitFixture,
+    _store: TempDir,
+    registry: CodeIndexSchedulerRegistryV1,
+    worktree_id: WorktreeId,
+}
+
+impl RefusedGraphV1 {
+    async fn mount(owners: &Arc<ResidentOwnersV1>) -> Self {
+        let fixture = GitFixture::new(ALPHA_LIB_V1);
+        let store = TempDir::new().expect("store root");
+        let mut scheduler = super::scheduler(
+            &fixture,
+            super::super::scoped_code_index_store_root(
+                store.path(),
+                &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
+            ),
+            Arc::new(super::SharedCodeIndexBytePoolV1::default()),
+        );
+        super::published(scheduler.reconcile_now().expect("seed generation"));
+        let worktree_id = scheduler
+            .latest_complete()
+            .expect("seeded generation")
+            .generation
+            .snapshot()
+            .worktree
+            .clone()
+            .expect("worktree id");
+        drop(scheduler);
+        super::super::graph_activation::set_injected_resident_memory_refusal(&worktree_id, true);
+        let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1)
+            .with_resident_owners(Arc::clone(owners));
+        registry
+            .mount_worktree(
+                test_project_id(),
+                fixture.path(),
+                store.path().to_path_buf(),
+            )
+            .await
+            .expect("mount retained generation");
+        let refused = Self {
+            fixture,
+            _store: store,
+            registry,
+            worktree_id,
+        };
+        refused.wait_until_parked().await;
+        refused
+    }
+
+    async fn wait_until_parked(&self) {
+        super::wait_for_owner(
+            &self.registry,
+            self.fixture.path(),
+            SERVING_SEAT_FAILURE_CEILING,
+            "a parked resident-memory graph refusal",
+            || async {
+                let freshness = self
+                    .registry
+                    .dashboard_freshness(self.fixture.path())
+                    .await?;
+                let parked = matches!(
+                    freshness.code_graph_serving,
+                    Some(CodeGraphServingReadinessV1::Refused { .. })
+                ) && freshness.staleness_state
+                    == Some(CodeIndexStalenessStateV1::Parked);
+                parked.then_some(())
+            },
+        )
+        .await;
+        wait_for_worker_phase(
+            &self.registry,
+            self.fixture.path(),
+            CodeIndexWorkerPhaseV1::Parked,
+        )
+        .await;
+    }
+
+    fn activation_attempts(&self) -> usize {
+        super::super::graph_activation::injected_activation_attempt_count(&self.worktree_id)
+    }
+
+    async fn shutdown(self) {
+        super::super::graph_activation::set_injected_resident_memory_refusal(
+            &self.worktree_id,
+            false,
+        );
+        self.registry.shutdown().await;
+    }
+}
+
+/// Issue #3588: the decode a refused graph's worktree gives back when it
+/// parks is exactly what a retry decodes again, so that release must not
+/// retry the graph. Before the fix each park release woke the next refused
+/// activation, 10 to 25 a second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_graph_refused_for_memory_is_not_retried_by_its_own_park_release() {
+    let owners = Arc::new(ResidentOwnersV1::new(IDLE_WINDOW));
+    let refused = RefusedGraphV1::mount(&owners).await;
+    let attempts = refused.activation_attempts();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        refused.activation_attempts(),
+        attempts,
+        "no other owner gave memory back, yet the refused graph activated again"
+    );
+    let freshness = refused
+        .registry
+        .dashboard_freshness(refused.fixture.path())
+        .await
+        .expect("mounted worktree freshness");
+    assert!(
+        matches!(
+            freshness.code_graph_serving,
+            Some(CodeGraphServingReadinessV1::Refused { .. })
+        ),
+        "the refusal stays refused while memory stays short: {:?}",
+        freshness.code_graph_serving
+    );
+
+    refused.shutdown().await;
+}
+
+/// Issue #3588: memory another owner gives back still retries the refused
+/// graph, even though the worktree's own park releases no longer do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_owners_release_retries_a_graph_refused_for_memory() {
+    let owners = Arc::new(ResidentOwnersV1::new(IDLE_WINDOW));
+    let refused = RefusedGraphV1::mount(&owners).await;
+    let attempts = refused.activation_attempts();
+
+    owners.note_headroom();
+    super::wait_for_owner(
+        &refused.registry,
+        refused.fixture.path(),
+        SERVING_SEAT_FAILURE_CEILING,
+        "the refused graph's retry after another owner's release",
+        || async { (refused.activation_attempts() > attempts).then_some(()) },
+    )
+    .await;
+    refused.wait_until_parked().await;
+
+    refused.shutdown().await;
 }
 
 /// Retained state another worktree holds, modelled as a ledger reservation so
@@ -1786,7 +2043,7 @@ async fn a_text_build_sheds_retained_state_before_it_refuses() {
     registry.shutdown().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn readers_of_a_build_waiting_for_memory_do_not_spin_the_worker() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
@@ -1794,6 +2051,7 @@ async fn readers_of_a_build_waiting_for_memory_do_not_spin_the_worker() {
     let (registry, blocker, mut receipts) =
         mount_with_refused_text_build(&fixture, &store, &owners).await;
 
+    let mark = receipt_mark(&mut receipts);
     // The first complete-generation demand is new work and wakes one pass,
     // which finds the build still waiting for memory.
     assert!(
@@ -1803,7 +2061,7 @@ async fn readers_of_a_build_waiting_for_memory_do_not_spin_the_worker() {
             .is_none()
     );
     assert_eq!(
-        next_receipt_trigger(&mut receipts).await,
+        next_receipt_trigger(&mut receipts, mark).await,
         CodeIndexCadenceTriggerV1::QueryAdmission
     );
     wait_for_worker_phase(&registry, fixture.path(), CodeIndexWorkerPhaseV1::Parked).await;
@@ -1823,10 +2081,11 @@ async fn readers_of_a_build_waiting_for_memory_do_not_spin_the_worker() {
         "a reader's wake cannot help a build parked on memory, so no pass runs"
     );
 
+    let mark = receipt_mark(&mut receipts);
     drop(blocker);
     owners.note_headroom();
     assert_eq!(
-        next_receipt_trigger(&mut receipts).await,
+        next_receipt_trigger(&mut receipts, mark).await,
         CodeIndexCadenceTriggerV1::MemoryHeadroom
     );
     let text = wait_for_queryable_text_generation(&registry, fixture.path()).await;

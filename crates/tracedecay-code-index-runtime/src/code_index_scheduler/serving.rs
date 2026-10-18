@@ -50,46 +50,36 @@ use tracedecay_runtime_core::resident_memory::{
     release_process_allocator_memory_v1,
 };
 
-use crate::{
-    code_index::{
-        graph_projection::{
-            CodeGraphEvidenceReader, CodeGraphProjectionStore, CodeGraphServingWarmthV1,
-        },
-        production::{
-            CodeIndexExecutionControlV1, CodeIndexProductionErrorV1,
-            CodeIndexPublicationStoreErrorV1, CodeIndexPublishedGenerationV1,
-            SealedGenerationSegmentReadV1, VerifiedSealedLexicalCursorRestoreErrorV1,
-            VerifiedSealedLexicalPageBatchBoundsV1, VerifiedSealedLexicalPageBatchReadV1,
-            VerifiedSealedLexicalPageSourceV1, VerifiedSealedLexicalSourceReceiptV1,
-            VerifiedSealedTextGenerationMetadataV1,
-        },
+use tracedecay_code_index::{
+    graph_projection::{
+        CodeGraphEvidenceReader, CodeGraphProjectionStore, CodeGraphServingWarmthV1,
     },
-    query::retrieval::{
-        exact::{
-            CentralExactAdmissionAuthorityV1, ExactLane, ExactLaneEvidence, ExactLaneRequest,
-            ExactLaneRetriever,
-        },
-        graph::{GraphLane, production_code_index_freshness},
-        lexical::{
-            CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1, CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
-            CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
-            CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
-            CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeExactLexicalArtifactReaderV1,
-            CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
-            CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
-            CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
-            CodeLexicalArtifactRestoreWitnessV1, CodeLexicalCloneIndexCensusV1,
-            CodeLexicalCloneRouteV1, CodeLexicalProjectionMetadataV1, LexicalLane,
-            LexicalLaneEvidence, LexicalLaneRequest, LexicalLaneRetriever,
-            PreparedCodeLexicalArtifactPageV1, code_lexical_artifact_build_memory_budget_for,
-            code_lexical_artifact_content_key,
-        },
-        ports::{
-            RETRIEVAL_CANDIDATE_BATCH_SIZE, RetrievalPortError, TEXT_ARTIFACT_BASE_BATCH_BYTES_V1,
-            TEXT_ARTIFACT_BASE_BATCH_PAGES_V1, TEXT_ARTIFACT_PAGE_BYTES_V1,
-            TEXT_ARTIFACT_PAGE_CHUNKS_V1,
-        },
+    production::{
+        CodeIndexExecutionControlV1, CodeIndexProductionErrorV1, CodeIndexPublicationStoreErrorV1,
+        CodeIndexPublishedGenerationV1, SealedGenerationSegmentReadV1,
+        VerifiedSealedLexicalCursorRestoreErrorV1, VerifiedSealedLexicalPageBatchBoundsV1,
+        VerifiedSealedLexicalPageBatchReadV1, VerifiedSealedLexicalPageSourceV1,
+        VerifiedSealedLexicalSourceReceiptV1, VerifiedSealedTextGenerationMetadataV1,
+    },
+};
+use tracedecay_query::retrieval::{
+    exact::{CentralExactAdmissionAuthorityV1, ExactLane, ExactLaneEvidence, ExactLaneRequest},
+    graph::{GraphLane, production_code_index_freshness},
+    lexical::{
+        CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeExactLexicalArtifactReaderV1,
+        CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
+        CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
+        CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
+        CodeLexicalArtifactRestoreWitnessV1, CodeLexicalCloneIndexCensusV1,
+        CodeLexicalCloneRouteV1, CodeLexicalProjectionMetadataV1, LexicalLane, LexicalLaneEvidence,
+        LexicalLaneRequest, PreparedCodeLexicalArtifactPageV1,
+        code_lexical_artifact_build_memory_budget_for, code_lexical_artifact_content_key,
+    },
+    ports::{
+        RETRIEVAL_CANDIDATE_BATCH_SIZE, RetrievalPortError, TEXT_ARTIFACT_BASE_BATCH_BYTES_V1,
+        TEXT_ARTIFACT_BASE_BATCH_PAGES_V1, TEXT_ARTIFACT_PAGE_BYTES_V1,
+        TEXT_ARTIFACT_PAGE_CHUNKS_V1,
     },
 };
 
@@ -378,8 +368,7 @@ pub struct LatestCompleteCodeIndexV1 {
 
 pub(super) type ParkedGraphReleaseCallback = Arc<dyn Fn() + Send + Sync>;
 
-#[derive(Clone)]
-pub struct LatestCodeTextGenerationV1 {
+pub struct CodeTextGenerationSharedV1 {
     pub(super) metadata: Arc<VerifiedSealedTextGenerationMetadataV1>,
     pub(super) sealed_format_revision: u32,
     pub(super) query_owners: Arc<RwLock<Option<Arc<ProductionCodeIndexQueryOwnersV1>>>>,
@@ -410,9 +399,6 @@ pub struct LatestCodeTextGenerationV1 {
     /// decoded merely to discover text metadata or source layout.
     pub(super) preopened_source: Arc<std::sync::Mutex<Option<VerifiedSealedLexicalPageSourceV1>>>,
     pub(super) publication_binding: Option<Arc<DurableActiveSealedGenerationBindingV1>>,
-    /// The outgoing owner whose warm graph serves reads, stale, until this
-    /// generation's own graph first warms.
-    pub(super) graph_predecessor: Arc<RwLock<Option<LatestCodeTextGenerationV1>>>,
     /// The first catalog warm finishes on a blocking task that does not
     /// wake the parked worker. One permit lets that worker retry park-release
     /// without posting a cadence arrival.
@@ -423,6 +409,32 @@ pub struct LatestCodeTextGenerationV1 {
     /// Bound by the parked worktree so the first catalog warm can retry
     /// park-release on this owner without a cadence arrival.
     pub(super) parked_graph_release: Arc<RwLock<Option<ParkedGraphReleaseCallback>>>,
+}
+
+#[derive(Clone)]
+pub struct LatestCodeTextGenerationV1 {
+    shared: Arc<CodeTextGenerationSharedV1>,
+    /// Nearest predecessor first. The chain is shared generation state, not
+    /// `Self`: a field of type `Self` makes `Send`/`Sync` recurse with no base
+    /// case (rust-lang/rust#159228).
+    predecessors: Arc<RwLock<Vec<Arc<CodeTextGenerationSharedV1>>>>,
+}
+
+impl std::ops::Deref for LatestCodeTextGenerationV1 {
+    type Target = CodeTextGenerationSharedV1;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
+impl LatestCodeTextGenerationV1 {
+    pub(super) fn from_shared(shared: CodeTextGenerationSharedV1) -> Self {
+        Self {
+            shared: Arc::new(shared),
+            predecessors: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -823,10 +835,10 @@ pub(super) enum TextHeadOpenOutcomeV1 {
 fn map_text_artifact_error(error: CodeLexicalArtifactErrorV1) -> RetrievalPortError {
     match error {
         CodeLexicalArtifactErrorV1::Interrupted(
-            crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+            tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
         ) => RetrievalPortError::Cancelled,
         CodeLexicalArtifactErrorV1::Interrupted(
-            crate::code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
+            tracedecay_code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
         ) => RetrievalPortError::BudgetExceeded,
         CodeLexicalArtifactErrorV1::Incompatible(_) => RetrievalPortError::IncompatibleProjection,
         CodeLexicalArtifactErrorV1::Contract(detail) => RetrievalPortError::Contract(detail),
@@ -854,10 +866,10 @@ pub(super) fn map_sealed_page_source_error(
 ) -> RetrievalPortError {
     match error {
         CodeIndexProductionErrorV1::Interrupted(
-            crate::code_index::production::CodeIndexInterruptionV1::Cancelled,
+            tracedecay_code_index::production::CodeIndexInterruptionV1::Cancelled,
         ) => RetrievalPortError::Cancelled,
         CodeIndexProductionErrorV1::Interrupted(
-            crate::code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
+            tracedecay_code_index::production::CodeIndexInterruptionV1::DeadlineExceeded,
         ) => RetrievalPortError::BudgetExceeded,
         CodeIndexProductionErrorV1::Contract(detail)
         | CodeIndexProductionErrorV1::Publication(
@@ -1637,6 +1649,25 @@ pub(super) struct ProductionCodeGraphServingV1 {
     _graph_authority: CodeGraphServingAuthorityV1,
 }
 
+// The serving graph's fields are `Send + Sync`, but proving that walks the
+// canonical graph lease and the evidence lane past the recursion limit
+// (rust-lang/rust#159228). The const check below is the field proof; these
+// impls stop that walk from repeating inside every owner that holds this graph.
+unsafe impl Send for ProductionCodeGraphServingV1 {}
+unsafe impl Sync for ProductionCodeGraphServingV1 {}
+
+const _: fn(&ProductionCodeGraphServingV1) = |value| {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+    let ProductionCodeGraphServingV1 {
+        graph,
+        store,
+        _graph_authority,
+    } = value;
+    assert_send_sync(graph);
+    assert_send_sync(store);
+    assert_send_sync(_graph_authority);
+};
+
 pub(super) enum CodeGraphActivationStateV1 {
     Pending,
     Refused(&'static str),
@@ -1970,10 +2001,6 @@ fn clone_index_observation(
             unique_payloads: Some(census.unique_payloads),
             payloads_reused: update.and_then(|update| update.payloads_reused),
             exact_postings: Some(census.exact_postings),
-            near_fingerprint_bodies: Some(census.near_fingerprint_bodies),
-            near_fingerprint_postings: Some(census.near_fingerprint_postings),
-            hot_postings_skipped: Some(census.hot_postings),
-            hot_posting_rows_skipped: Some(census.hot_posting_rows),
             excluded_too_small_bodies: Some(census.excluded_too_small_bodies),
             excluded_too_large_bodies: Some(census.excluded_too_large_bodies),
             excluded_incomplete_tokenization_bodies: Some(
@@ -1983,16 +2010,7 @@ fn clone_index_observation(
             rename_unsupported_bodies: Some(census.rename_unsupported_bodies),
         },
         budgets: CodeCloneIndexBudgetsV1 {
-            posting_rows: CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1,
-            candidate_bodies: u64::try_from(CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1)
-                .unwrap_or(u64::MAX),
-            verification_bodies: CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
-            verification_token_work: CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
-            hot_posting_rows: CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
             minimum_body_tokens: u64::from(MIN_AUTOMATIC_CLONE_BODY_TOKENS_V1),
-            minimum_directional_coverage_millionths: u64::from(
-                CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1,
-            ),
         },
         resources: CodeCloneIndexResourcesV1 {
             bytes_on_disk: Some(artifact.bytes_on_disk),
@@ -2011,9 +2029,6 @@ fn clone_index_omission_reasons(census: &CodeLexicalCloneIndexCensusV1) -> Vec<S
             "conservative normalization postings do not cover every eligible body".to_owned(),
         );
     }
-    if census.near_fingerprint_bodies != census.eligible_source_bodies {
-        reasons.push("positional fingerprints do not cover every eligible body".to_owned());
-    }
     reasons
 }
 
@@ -2022,8 +2037,8 @@ impl LatestCompleteCodeIndexV1 {
     pub fn exact(
         &self,
     ) -> Result<
-        Arc<Vec<crate::code_index::chunks::ExtractionAdmittedCodeSearchChunkV1>>,
-        crate::code_index::chunks::ChunkingFailureV1,
+        Arc<Vec<tracedecay_code_index::chunks::ExtractionAdmittedCodeSearchChunkV1>>,
+        tracedecay_code_index::chunks::ChunkingFailureV1,
     > {
         self.generation.admitted_chunks()
     }
@@ -2300,22 +2315,24 @@ impl LatestCodeTextGenerationV1 {
         let Some(outgoing) = outgoing.filter(|outgoing| !outgoing.same_text_owner(self)) else {
             return;
         };
-        let inherited = outgoing.take_graph_predecessor();
+        let inherited = outgoing.take_predecessors();
         // An activated outgoing still serves: a released engine or catalog
         // reports `warming` but a read re-warms it, while a cold store passes
         // the hold down to the graph it was itself holding.
         let serves_warm_graph = outgoing.interactive_graph_store().is_ok()
             && outgoing.code_graph_serving_readiness().is_activated();
-        let held = if serves_warm_graph {
-            Some(outgoing.clone())
+        let mut held = if serves_warm_graph {
+            vec![Arc::clone(&outgoing.shared)]
         } else {
             inherited
+        };
+        if held.first().is_some_and(|head| {
+            head.metadata.manifest().generation_id == self.metadata.manifest().generation_id
+        }) {
+            held.clear();
         }
-        .filter(|held| {
-            held.metadata().manifest().generation_id != self.metadata().manifest().generation_id
-        });
         *self
-            .graph_predecessor
+            .predecessors
             .write()
             .unwrap_or_else(PoisonError::into_inner) = held;
     }
@@ -2331,11 +2348,7 @@ impl LatestCodeTextGenerationV1 {
                 CodeGraphServingReadinessV1::Pending | CodeGraphServingReadinessV1::Warming { .. }
             )
         {
-            return self
-                .graph_predecessor
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
+            return self.held_graph_predecessor();
         }
         self.release_graph_predecessor();
         None
@@ -2345,21 +2358,32 @@ impl LatestCodeTextGenerationV1 {
     /// resident-memory inventory must see it: it holds its graph until
     /// released or dropped, not until a read next checks readiness.
     pub(super) fn held_graph_predecessor(&self) -> Option<Self> {
-        self.graph_predecessor
+        let chain = self
+            .predecessors
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .clone();
+        let (head, tail) = chain.split_first()?;
+        Some(Self {
+            shared: Arc::clone(head),
+            predecessors: Arc::new(RwLock::new(tail.to_vec())),
+        })
     }
 
     pub(super) fn release_graph_predecessor(&self) {
-        drop(self.take_graph_predecessor());
-    }
-
-    fn take_graph_predecessor(&self) -> Option<Self> {
-        self.graph_predecessor
+        self.predecessors
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
+            .clear();
+    }
+
+    fn take_predecessors(&self) -> Vec<Arc<CodeTextGenerationSharedV1>> {
+        std::mem::take(
+            &mut *self
+                .predecessors
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
     }
 
     /// Return a graph refused for resident memory to `Pending`, so the next
@@ -3825,8 +3849,7 @@ fn ensure_private_text_artifacts_root(path: &Path) -> Result<(), RetrievalPortEr
                      re-enroll the store",
                     path.display(),
                     observed_unix_mode(path)
-                        .map(|mode| format!(" (mode {mode:o}, need 700)"))
-                        .unwrap_or_default(),
+                        .map_or_default(|mode| format!(" (mode {mode:o}, need 700)")),
                 ))
             })
         }

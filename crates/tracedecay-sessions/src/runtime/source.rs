@@ -31,7 +31,7 @@ pub use tracedecay_domain::canonical_text::canonical_framed_sha256;
 
 pub use super::host_coverage::HostCoverageReason;
 use crate::admission::{HostAdmission, HostAdmissionOutcome};
-pub use crate::runtime::shared::{NewRows, StoredCursor, TranscriptIngestStats};
+pub use crate::runtime::shared::{StoredCursor, TranscriptIngestStats};
 use tracedecay_framing::{WireReadOutcome, read_bounded_to_string};
 
 pub type TranscriptIngestResult<T> = Result<T, TranscriptIngestError>;
@@ -252,12 +252,15 @@ pub enum TranscriptIngestError {
     /// [`Self::NonDurableRecord`] this says nothing about the record itself,
     /// so the admission authority's own retryability verdict must survive to
     /// classification: a still-mounting write authority is a transient race,
-    /// not a permanently blocked projection.
+    /// not a permanently blocked projection. Its status survives for the same
+    /// reason: only a `Degraded` refusal says the record, not the authority,
+    /// is at fault.
     #[error("{provider} observation admission failed: {reason}")]
     HostAdmission {
         provider: &'static str,
         reason: &'static str,
         retryable: bool,
+        status: crate::admission::HostAdmissionStatus,
         detail: Option<String>,
     },
     #[error("{provider} frame state is invalid")]
@@ -435,7 +438,7 @@ pub trait TranscriptSource: Send + Sync {
     }
 }
 
-/// Runs one synchronous transcript discovery/parse section on Tokio's
+/// Runs one synchronous transcript discovery/parse section on the native
 /// blocking pool so historical ingest cannot pin a request-runtime worker.
 ///
 /// [`TranscriptSource`] is deliberately synchronous: adapters walk host
@@ -459,27 +462,26 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(work).await.map_err(|error| {
-        tracing::error!(provider, error = %error, "blocking transcript section failed");
-        TranscriptIngestError::BlockingScanTaskFailed { provider }
-    })
+    tracedecay_runtime_core::native_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| {
+            tracing::error!(provider, error = %error, "blocking transcript section failed");
+            TranscriptIngestError::BlockingScanTaskFailed { provider }
+        })
 }
 
-/// Spawns a task on `handle` and waits for it from a blocking section.
+/// Asserts that a section runs off `caller`, the thread polling ingest.
 ///
-/// On a one-worker multi-thread runtime this only succeeds when the caller
-/// is inside [`run_blocking_transcript_section`]: `spawn_blocking` frees
-/// the worker so the spawned task can run. An inline filesystem/JSONL
-/// section deadlocks until the receive timeout fails.
+/// Only [`run_blocking_transcript_section`] moves filesystem/JSONL work onto
+/// the native blocking pool. An inline or `block_in_place` section runs on
+/// the polling thread and pins that executor worker for its whole duration.
 #[cfg(test)]
-pub(crate) fn require_blocking_section_releases_worker(handle: tokio::runtime::Handle) {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    handle.spawn(async move {
-        let _ = sender.send(());
-    });
-    receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .expect("host transcript filesystem work must release the only Tokio worker");
+pub(crate) fn require_blocking_section_releases_worker(caller: std::thread::ThreadId) {
+    assert_ne!(
+        std::thread::current().id(),
+        caller,
+        "host transcript filesystem work must leave the thread polling ingest"
+    );
 }
 
 mod discovery;

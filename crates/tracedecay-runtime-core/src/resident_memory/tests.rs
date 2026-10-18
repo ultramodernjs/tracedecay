@@ -608,94 +608,6 @@ fn reservation_can_only_adjust_down_to_measured_retained_bytes() {
 }
 
 #[test]
-fn reclaimers_run_outside_the_lock_in_stable_order_until_reservation_fits() {
-    let authority = Arc::new(ProcessResidentMemoryV1::new(bytes(100)));
-    let held = Arc::new(Mutex::new(Some(
-        authority
-            .reserve(
-                key("project-a", "worktree-a", "generation-a", "historical"),
-                bytes(80),
-            )
-            .expect("historical reservation"),
-    )));
-    let calls = Arc::new(Mutex::new(Vec::new()));
-
-    let first_calls = Arc::clone(&calls);
-    let _first = authority
-        .register_reclaimer(
-            10,
-            Arc::new(move |request| {
-                first_calls.lock().expect("call log").push(10);
-                assert_eq!(request.used_bytes, 80);
-                assert_eq!(request.requested_bytes, 30);
-            }),
-        )
-        .expect("first reclaimer");
-    let second_calls = Arc::clone(&calls);
-    let second_held = Arc::clone(&held);
-    let _second = authority
-        .register_reclaimer(
-            20,
-            Arc::new(move |_| {
-                second_calls.lock().expect("call log").push(20);
-                drop(second_held.lock().expect("held reservation").take());
-            }),
-        )
-        .expect("second reclaimer");
-    let third_calls = Arc::clone(&calls);
-    let _third = authority
-        .register_reclaimer(
-            30,
-            Arc::new(move |_| {
-                third_calls.lock().expect("call log").push(30);
-            }),
-        )
-        .expect("third reclaimer");
-
-    let replacement = authority
-        .reserve(
-            key("project-b", "worktree-b", "generation-b", "canonical"),
-            bytes(30),
-        )
-        .expect("second reclaimer releases enough bytes");
-
-    assert_eq!(*calls.lock().expect("call log"), vec![10, 20]);
-    assert_eq!(authority.snapshot().used_bytes, 30);
-    drop(replacement);
-}
-
-#[test]
-fn dropped_reclaimer_registration_is_not_called() {
-    let authority = Arc::new(ProcessResidentMemoryV1::new(bytes(10)));
-    let calls = Arc::new(Mutex::new(0_u64));
-    let callback_calls = Arc::clone(&calls);
-    let registration = authority
-        .register_reclaimer(
-            10,
-            Arc::new(move |_| {
-                *callback_calls.lock().expect("call count") += 1;
-            }),
-        )
-        .expect("reclaimer registration");
-    drop(registration);
-
-    let _held = authority
-        .reserve(
-            key("project-a", "worktree-a", "generation-a", "canonical"),
-            bytes(10),
-        )
-        .expect("full reservation");
-    let _error = authority
-        .reserve(
-            key("project-b", "worktree-b", "generation-b", "canonical"),
-            bytes(1),
-        )
-        .expect_err("no registered reclaimer remains");
-
-    assert_eq!(*calls.lock().expect("call count"), 0);
-}
-
-#[test]
 fn concurrent_reservations_never_overcommit_the_process_ceiling() {
     let authority = Arc::new(ProcessResidentMemoryV1::new(bytes(80)));
     let barrier = Arc::new(std::sync::Barrier::new(9));
@@ -812,7 +724,7 @@ fn a_refused_request_is_announced_once_a_release_makes_it_fit() {
     let [first, second, third, fourth] = held;
     drop(first);
     assert!(
-        !headroom.has_changed().unwrap(),
+        !headroom.has_changed(),
         "a release with nothing refused announces nothing"
     );
     let refill = authority
@@ -824,23 +736,23 @@ fn a_refused_request_is_announced_once_a_release_makes_it_fit() {
             requested,
         )
         .expect_err("a full ledger refuses");
-    assert!(!headroom.has_changed().unwrap());
+    assert!(!headroom.has_changed());
 
     let mut shrinking = second;
     shrinking.shrink_to(requested.get() - 1).unwrap();
     assert!(
-        !headroom.has_changed().unwrap(),
+        !headroom.has_changed(),
         "one byte back does not fit the refused quarter"
     );
     drop(third);
     assert!(
-        headroom.has_changed().unwrap(),
+        headroom.has_changed(),
         "the quarter the refused request needs is back"
     );
     assert_eq!(*headroom.borrow_and_update(), 1);
     drop(fourth);
     assert!(
-        !headroom.has_changed().unwrap(),
+        !headroom.has_changed(),
         "the waiter was satisfied; later releases wait for a new refusal"
     );
 
@@ -853,10 +765,10 @@ fn a_refused_request_is_announced_once_a_release_makes_it_fit() {
         )
         .expect_err("measured RSS leaves no room for the quarter");
     pressure.publish_observed_resident_bytes(observed);
-    assert!(!headroom.has_changed().unwrap());
+    assert!(!headroom.has_changed());
     pressure.publish_observed_resident_bytes(observed - 1);
     assert!(
-        headroom.has_changed().unwrap(),
+        headroom.has_changed(),
         "a sample that fits the refused quarter announces it"
     );
     drop((refill, shrinking));
@@ -1234,7 +1146,6 @@ fn count_installed_thread_collect() {
 const COUNTING_RELEASE: ProcessAllocatorReleaseV1 = ProcessAllocatorReleaseV1 {
     release: count_installed_release,
     collect_calling_thread: count_installed_thread_collect,
-    owner_heaps: None,
 };
 
 /// The allocator the composition root installed is released: glibc's

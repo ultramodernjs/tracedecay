@@ -53,7 +53,7 @@ A `PATH` override alone only fixes (1). The harness must control all three.
 | tracedecay graph/data home | `TRACEDECAY_DATA_DIR` | `src/config.rs::user_data_dir()` returns `$TRACEDECAY_DATA_DIR` when set, else `~/.tracedecay`. |
 | tracedecay daemon socket | derives from the data dir; also pinned via `TRACEDECAY_DAEMON_SOCKET` | `src/daemon/service.rs::default_socket_path()` = `tracedecay_data_dir()/daemon.sock`, overridable by `TRACEDECAY_DAEMON_SOCKET`. Isolating the data dir already isolates the socket, so the harness never fights the real daemon. |
 | Which binary the installer bakes | **staged copy of the dev binary at a non-cargo-target path** | `src/agents/mod.rs::which_tracedecay_from()` deliberately **refuses** a path under a cargo target dir (`target/{debug,release}`) and falls back to `PATH`, which would bake the *system* binary. See below. |
-| Auth for `claude -p` | copy `~/.claude/.credentials.json` into the isolated config (or `ANTHROPIC_API_KEY`) | Smoke test: without it the isolated session prints `Not logged in`; with the copied credential it returns a real result and `session_id`. |
+| Auth for `claude -p` | `CLAUDE_CODE_OAUTH_TOKEN`, a `claude setup-token` grant saved as `$REAL_CLAUDE_DIR/.claude_code_oauth_token`, or `ANTHROPIC_API_KEY`. The harness never copies `.credentials.json`: its refresh token is shared with the real login, so a refresh in the isolated session would sign the real one out. | Smoke test: without a credential the isolated session prints `Not logged in`; with the setup-token it returns a real result and `session_id`. |
 
 `HOME` and `CLAUDE_CONFIG_DIR` are pointed at the **same** physical directory
 (`<env>/home/.claude`) so the installer's `$HOME/.claude` writes and Claude
@@ -90,7 +90,7 @@ warns loudly if it does not.
   env.sh                  sourceable export block (for reuse and manual debugging)
 ```
 
-`smoke` removes the env it created on exit. A `setup` env lives until
+A successful `smoke` removes the env it created. Failed evaluations retain the isolated environment and logs. A `setup` env lives until
 `teardown --env-dir`, which refuses to delete anything that is not an
 `eval-env-*` dir under `$TMPDIR`.
 
@@ -112,7 +112,7 @@ criterion).
 Optional per-scenario fields:
 
 - **`setup_cmd`**, shell command run in `project_dir` before the agent session
-  (restore fixture state between reps).
+  (restore fixture state between reps). A nonzero setup exit records an error and skips the agent and verifier.
 - **`verify_cmd`**, shell command run in `project_dir` after the session with
   the staged dev binary first on `PATH`; non-zero exit fails the scenario.
 - **`attempt_tool`**, tool-name fragment; captured commands containing
@@ -125,8 +125,7 @@ full corpus run; `run --reps N` re-stages fixtures automatically before each
 rep after the first.
 
 `run` executes each `prompt` through the selected `--agent` inside
-`project_dir` (falling back to the indexed default project if the dir is
-missing). Claude mode recovers the `session_id` and reads the isolated
+`project_dir` (using the indexed default only when the scenario omits a project path). A missing explicit project records an error instead of borrowing the default. Claude mode recovers the `session_id` and reads the isolated
 transcript. Codex mode scores the captured `codex exec --json` stream.
 `score.py` classifies MCP tools and CLI commands separately.
 
@@ -233,3 +232,30 @@ Store the baseline the same way the post-merge re-eval protocol above prescribes
 record the per-bucket and overall adoption % as a durable fact via
 `tracedecay_fact_store_add`, so a later rerun makes any regression, or the intended
 improvement, visible against a fixed number.
+
+## Exact-run scoring and process failures
+
+The runner scores only the session belonging to the current invocation. Claude
+evidence requires the reported session ID, one exact transcript, and matching
+recorded project and session metadata; an older or foreign transcript cannot
+serve as fallback evidence. Missing, ambiguous, unreadable, or malformed
+transcripts produce an explicit error row. Codex uses this invocation's captured
+JSONL and recognizes its real MCP tool field.
+
+Each result records the actual `setup_status` and `agent_status`, or null when
+the stage was not run. A nonzero setup exit skips the agent and verifier; a
+nonzero agent exit cannot pass even if it prints a success-looking transcript.
+The `status` field distinguishes `passed`, `failed`, and `error`; `error`
+identifies the failed stage and cause. Results and a Markdown summary are
+written before the batch exits nonzero if any scenario failed or none ran.
+Artifact names include the repetition and scenario ordinal, so duplicate
+scenario IDs do not overwrite another run's evidence.
+
+Run offline behavior tests without model tokens:
+
+```sh
+bazel test //evals/hermetic:score_test //evals/hermetic:run_test \
+  //evals/hermetic:scorecard_test --test_output=errors
+```
+
+Result rows also carry `scenario_index`, the 1-based nonblank corpus entry index, stable across repetitions. The scorecard pairs indexed rows by `(scenario_index, rep)` and validates their display ID/category against the corpus. Older unindexed reports retain the unique-ID rules; mixed identity schemes are rejected. Empty or whitespace-only prompts produce a `scenario/prompt_invalid` error row without running setup, an agent, or verification.

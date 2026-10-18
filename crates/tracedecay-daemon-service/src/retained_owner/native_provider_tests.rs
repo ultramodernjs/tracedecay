@@ -67,6 +67,11 @@ async fn real_project_fixture() -> (tempfile::TempDir, PathBuf, Arc<TraceDecay>,
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )
     .expect("private profile root");
+    // The fixture stands in for the composition root before project open.
+    tracedecay_project::runtime_ports::register_runtime_ports(
+        tracedecay_project::runtime_ports::fixture_daemon_client_ports(),
+    )
+    .expect("runtime port registration");
     let graph = Arc::new(
         TraceDecay::init_with_options(
             &project_root,

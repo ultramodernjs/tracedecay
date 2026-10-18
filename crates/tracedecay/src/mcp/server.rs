@@ -15,6 +15,7 @@ use crate::mcp::project_route::{
 use tracedecay_code_index_runtime::code_index_scheduler::{
     CodeIndexDemandAdmissionV1, CodeIndexDemandUnavailableV1, CodeIndexDemandV1,
 };
+pub(crate) use tracedecay_contracts::code_index_freshness::CODE_INDEX_LINKED_WORKTREE_DISABLED;
 use tracedecay_contracts::code_index_freshness::CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT;
 use tracedecay_contracts::request_identity::{
     McpConnectionIdentityAuthority, mcp_connection_request_key as application_surface_request_id,
@@ -24,9 +25,7 @@ use tracedecay_daemon_service::retained_owner::CognitiveRecallMountError;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_host_admission::TerminalReason;
-use tracedecay_mcp::response_handles::{
-    cleanup_expired_response_handles, response_handle_stats_json,
-};
+use tracedecay_mcp::response_handles::response_handle_stats_json;
 use tracedecay_mcp::tool_analytics::{
     McpToolAnalyticsEvent, hook_route_analytics_event, mcp_tool_analytics_event,
 };
@@ -93,16 +92,14 @@ pub(crate) use tracedecay_mcp::server::{McpMethod, classify_mcp_method};
 
 /// The steering instructions advertised from the `initialize` handshake of a
 /// healthy server.
-pub(crate) const SERVER_INSTRUCTIONS: &str = concat!(
-    "TraceDecay provides code-graph, session, memory, workflow, diagnostics, \
-    and project tools. Choose the tool whose description matches the task. \
-    Tool annotations distinguish read-only operations from tools that mutate \
-    local project state. The same tools are available from the shell: ",
-    tracedecay_agent_hosts::cli_fallback_args_invocation_lit!(),
-    " (`tracedecay tool` lists them and `tracedecay tool <name> --help` \
-    shows parameters). Use that interface for shell workflows or when MCP \
-    is unavailable. Do not query .tracedecay databases directly."
-);
+///
+/// Codex prefixes server instructions to every tool description it lists to
+/// an `exec` program, so each sentence here is paid once per listed tool. The
+/// shell-fallback details live in the `using-the-cli` skill and the hosts'
+/// prompt rules.
+pub(crate) const SERVER_INSTRUCTIONS: &str = "TraceDecay code-graph, memory, session, and \
+    project tools for this repository. `tracedecay tool <name> --args '<json>'` runs \
+    any of them from a shell. Do not query .tracedecay databases directly.";
 
 pub(crate) fn initialize_result(
     instructions: &str,
@@ -132,8 +129,6 @@ impl ServerStats {
         }
     }
 }
-
-pub(crate) const CODE_INDEX_LINKED_WORKTREE_DISABLED: &str = "linked_worktree_disabled";
 
 pub(crate) const CODE_INDEX_SCHEDULER_UNAVAILABLE: &str = "code_index_scheduler_unavailable";
 
@@ -291,7 +286,7 @@ pub struct McpServer {
     branch_reopen: Arc<tokio::sync::Mutex<()>>,
     /// Count of settled branch reopens (success, failure, cancellation, or
     /// shutdown-time rejection) without exposing the retained task handle.
-    branch_reopen_completions: Arc<AtomicU64>,
+    branch_reopen_completions: Arc<tokio::sync::watch::Sender<u64>>,
     /// Retains non-request maintenance futures so shutdown can fence task
     /// admission, cancel every live future, and join it before stores close.
     background_tasks: Arc<McpBackgroundTaskOwner>,
@@ -676,13 +671,18 @@ impl McpServer {
             && let Some(project_session_db) = context.project_session_db.as_ref()
         {
             let database_path = project_session_db.db_path().to_path_buf();
-            let admission_runtime = tokio::task::spawn_blocking(move || {
-                tracedecay_host_admission::HostAdmissionRuntime::open_for_database(&database_path)
-            })
-            .await
-            .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
-                message: format!("test server host-admission task failed: {error}"),
-            })?;
+            let admission_runtime =
+                tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
+                    tracedecay_host_admission::HostAdmissionRuntime::open_for_database(
+                        &database_path,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    tracedecay_domain::errors::TraceDecayError::Config {
+                        message: format!("test server host-admission task failed: {error}"),
+                    }
+                })?;
             let (admission_runtime, _) = admission_runtime?;
             context.host_admission_broker = Some(Arc::new(
                 tracedecay_host_admission::HostAdmissionBroker::new(admission_runtime),
@@ -867,7 +867,6 @@ impl McpServer {
             host_admission_test_runtime,
         } = context;
         let file_token_map = HashMap::new();
-        let response_handle_root = cg.store_layout().response_handle_root.clone();
         let persisted_tokens_saved = match cg.get_tokens_saved().await {
             Ok(persisted) => Some(persisted),
             Err(error) => {
@@ -914,7 +913,7 @@ impl McpServer {
             let project_root = cg.project_root().to_path_buf();
             let scope_prefix = scope_prefix.clone();
             tracing::Instrument::instrument(
-                tokio::task::spawn_blocking(move || {
+                tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
                     tracedecay_runtime_core::worktree::detect_scoped_worktree_index_mismatch(
                         &project_root,
                         scope_prefix.as_deref(),
@@ -1021,7 +1020,7 @@ impl McpServer {
         let server = Arc::new_cyclic(|dispatch_server| Self {
             cg: Arc::new(tokio::sync::RwLock::new(cg)),
             branch_reopen: Arc::new(tokio::sync::Mutex::new(())),
-            branch_reopen_completions: Arc::new(AtomicU64::new(0)),
+            branch_reopen_completions: Arc::new(tokio::sync::watch::Sender::new(0)),
             background_tasks: Arc::new(McpBackgroundTaskOwner::default()),
             hook_replay_owned: Arc::new(AtomicBool::new(false)),
             tool_activity_publish_running: Arc::new(AtomicBool::new(false)),
@@ -1123,12 +1122,6 @@ impl McpServer {
             dispatch_authority: RetainedDispatchAuthority::new(dispatch_server.clone()),
         });
 
-        tokio::task::spawn_blocking(move || {
-            let _ = cleanup_expired_response_handles(
-                &response_handle_root,
-                tracedecay_runtime_core::tracedecay::current_timestamp(),
-            );
-        });
         if own_project_host_admission_replay
             && let Some(broker) = server.host_admission_broker.clone()
         {
@@ -1168,10 +1161,15 @@ impl McpServer {
             && server.startup_catch_up.try_claim_dispatch()
         {
             let s = Arc::clone(&server);
-            let task = tokio::spawn(async move {
+            match tracedecay_runtime_core::native_runtime::NativeTask::spawn(async move {
                 s.run_startup_catch_up_sync().await;
-            });
-            server.startup_catch_up.install_sync_task(task);
+            }) {
+                Ok(task) => server.startup_catch_up.install_sync_task(task),
+                Err(error) => {
+                    tracing::error!(%error, "startup catch-up could not start");
+                    server.startup_catch_up.settle();
+                }
+            }
         }
 
         server
@@ -1407,6 +1405,13 @@ impl McpServer {
         self.cg.read().await.clone()
     }
 
+    /// The served-instance slot, for readers that must not keep the server
+    /// itself alive: a server handle counts as a client lease and blocks
+    /// bounded eviction.
+    pub(crate) fn graph_slot(&self) -> Arc<tokio::sync::RwLock<Arc<TraceDecay>>> {
+        Arc::clone(&self.cg)
+    }
+
     #[tracing::instrument(name = "mcp.server.stats_snapshot", level = "trace", skip_all)]
     pub async fn server_stats_json(&self) -> Value {
         let uptime = self.stats.started_at.elapsed();
@@ -1432,8 +1437,7 @@ impl McpServer {
         let file_token_entries = self
             .file_token_map
             .lock()
-            .map(|tokens| tokens.len())
-            .unwrap_or_default();
+            .map_or_default(|tokens| tokens.len());
         let ratio = |n: u64| {
             if total_requests == 0 {
                 0.0

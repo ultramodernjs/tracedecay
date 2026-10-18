@@ -13,6 +13,7 @@ import type {
   DeliveryReviewItemV1,
   DeliveryReviewObservationV1,
 } from '../../contracts/generated.ts';
+import type { DashboardScope } from '../../data/scope/store.ts';
 import type { DomainStateKind } from '../../ui/StateChip.tsx';
 import {
   membershipGrade,
@@ -90,7 +91,7 @@ export interface JourneyEpisode {
   readonly ref: EpisodeRef;
 }
 
-export interface JourneyLane {
+interface JourneyLane {
   readonly id: JourneyLaneId;
   readonly label: string;
   readonly source: SourceClass;
@@ -286,7 +287,7 @@ function quarantinedDetail(quarantined: readonly DeliveryGitHubQuarantinedCommen
   return [`${quarantined.length} quarantined (${reasons.join(', ')})`];
 }
 
-export interface JourneySelection {
+interface JourneySelection {
   readonly row: DeliveryInboxPullRequestV1;
   readonly edges: readonly DeliveryMembershipEdgeV1[];
 }
@@ -294,6 +295,7 @@ export interface JourneySelection {
 export function buildJourney(
   overview: DeliveryOverviewV1,
   selection: JourneySelection,
+  scope: DashboardScope,
 ): JourneyModel {
   const gaps: string[] = [];
   const headBranch = selection.row.branch_ref;
@@ -317,7 +319,7 @@ export function buildJourney(
           at: null,
           timeKind: 'undated',
           status: null,
-          href: membershipHref(edge.basis),
+          href: membershipHref(edge.basis, scope),
           ref,
         } satisfies JourneyEpisode,
       ];

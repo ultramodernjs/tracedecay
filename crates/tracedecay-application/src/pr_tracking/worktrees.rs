@@ -1,13 +1,17 @@
 //! Exact Git ownership and managed worktree preparation/retirement.
 
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_private_fs::{FileLease, LockAdmissionError, lock_until};
 use tracedecay_runtime_core::branch::BranchAddOutcome;
+use tracedecay_runtime_core::native_runtime;
 
 use super::{
     PrCommandControlV1, PrGitCommandError, StaleManagedPr, pr_label, pr_tracking_ref,
@@ -148,7 +152,19 @@ pub async fn acquire_manual_branch_lifecycle(
     data_root: &Path,
     branch: &str,
 ) -> std::result::Result<ManualBranchLifecycleLeaseV1, ManualBranchActivationError> {
-    let deadline = Instant::now() + MANUAL_BRANCH_LIFECYCLE_ADMISSION_DEADLINE;
+    acquire_manual_branch_lifecycle_until(
+        data_root,
+        branch,
+        Instant::now() + MANUAL_BRANCH_LIFECYCLE_ADMISSION_DEADLINE,
+    )
+    .await
+}
+
+async fn acquire_manual_branch_lifecycle_until(
+    data_root: &Path,
+    branch: &str,
+    deadline: Instant,
+) -> std::result::Result<ManualBranchLifecycleLeaseV1, ManualBranchActivationError> {
     let artifacts = ManualBranchArtifactsV1::for_branch(data_root, branch);
     let lock_path = artifacts.lifecycle_lock_path(data_root);
     let contended = || {
@@ -157,12 +173,24 @@ pub async fn acquire_manual_branch_lifecycle(
             lock_path.display()
         ))
     };
-    let queued = tokio::time::timeout_at(
-        deadline.into(),
-        manual_branch_lifecycle_owner(&lock_path).lock_owned(),
-    )
-    .await
-    .map_err(|_| contended())?;
+    let queued = {
+        let mut owner = pin!(manual_branch_lifecycle_owner(&lock_path).lock_owned());
+        let mut expiry = pin!(native_runtime::sleep_until(deadline));
+        poll_fn(|task| match owner.as_mut().poll(task) {
+            Poll::Ready(queued) => Poll::Ready(Ok(queued)),
+            Poll::Pending => expiry.as_mut().poll(task).map(Err),
+        })
+        .await
+    };
+    let queued = match queued {
+        Ok(queued) => queued,
+        Err(Ok(())) => return Err(contended()),
+        Err(Err(error)) => {
+            return Err(ManualBranchActivationError::activation_failed(format!(
+                "manual branch lifecycle admission deadline is unavailable: {error}"
+            )));
+        }
+    };
     let lock_directory = lock_path.parent().ok_or_else(|| {
         ManualBranchActivationError::activation_failed(format!(
             "manual branch lifecycle lock '{}' has no parent",
@@ -185,7 +213,7 @@ pub async fn acquire_manual_branch_lifecycle(
                 lock_path.display()
             ))
         })?;
-    let lock = tokio::task::spawn_blocking(move || lock_until(&lock, deadline).map(|()| lock))
+    let lock = native_runtime::spawn_blocking(move || lock_until(&lock, deadline).map(|()| lock))
         .await
         .map_err(|error| {
             ManualBranchActivationError::activation_failed(format!(
@@ -309,29 +337,15 @@ pub fn resolve_branch_head(
         format!("refs/remotes/origin/{branch}"),
     ];
     for reference in candidates {
-        if let Some(sha) = resolve_git_ref(repo_root, &reference, command_control) {
+        if let ExactRefReadV1::Present(sha) =
+            read_exact_ref(repo_root, &reference, command_control)?
+        {
             return Ok(sha);
         }
     }
     Err(ManualBranchActivationError::invalid_ref(format!(
         "branch '{branch}' does not resolve to a git ref"
     )))
-}
-
-fn resolve_git_ref(
-    repo_root: &Path,
-    reference: &str,
-    command_control: &PrCommandControlV1,
-) -> Option<String> {
-    successful_git_with_control(
-        repo_root,
-        &["rev-parse", "--verify", "--end-of-options", reference],
-        command_control,
-    )
-    .ok()
-    .and_then(|output| String::from_utf8(output.stdout).ok())
-    .map(|sha| sha.trim().to_string())
-    .filter(|sha| !sha.is_empty())
 }
 
 pub fn prepare_manual_branch_worktree(
@@ -1038,7 +1052,7 @@ pub async fn cleanup_owned_worktree_off_runtime(
     let tracking_ref = tracking_ref.to_owned();
     let label = label.to_owned();
     let expected_head = expected_head.to_owned();
-    tokio::task::spawn_blocking(move || {
+    native_runtime::spawn_blocking(move || {
         cleanup_owned_worktree(
             &repo_root,
             &worktree,
@@ -1069,7 +1083,7 @@ pub async fn manual_branch_artifact_ownership_off_runtime(
     let tracking_ref = tracking_ref.to_owned();
     let label = label.to_owned();
     let expected_head = expected_head.to_owned();
-    tokio::task::spawn_blocking(move || {
+    native_runtime::spawn_blocking(move || {
         manual_branch_artifact_ownership(
             &repo_root,
             &worktree,
@@ -1096,7 +1110,7 @@ pub async fn manual_branch_artifacts_match_off_runtime(
     let repo_root = repo_root.to_path_buf();
     let artifacts = artifacts.clone();
     let expected_head = expected_head.to_owned();
-    tokio::task::spawn_blocking(move || {
+    native_runtime::spawn_blocking(move || {
         manual_branch_artifacts_match(&repo_root, &artifacts, &expected_head, &command_control)
     })
     .await
@@ -1117,11 +1131,11 @@ pub async fn cleanup_pr_worktree_off_runtime(
     let repo_root = repo_root.to_path_buf();
     let data_root = data_root.to_path_buf();
     let expected_head = expected_head.to_owned();
-    tokio::task::spawn_blocking(move || {
+    native_runtime::spawn_blocking(move || {
         cleanup_pr_worktree(&repo_root, &data_root, pr, &expected_head, &command_control)
     })
     .await
-    .map_err(|error| PrCleanupError::Join(error.to_string()))?
+    .map_err(PrCleanupError::Join)?
 }
 
 #[cfg(test)]
@@ -1129,12 +1143,47 @@ pub async fn cleanup_pr_worktree_off_runtime(
 mod tests {
     use super::{
         ManualBranchActivationError, ManualBranchArtifactsV1, PrCommandControlV1,
+        acquire_manual_branch_lifecycle, acquire_manual_branch_lifecycle_until,
         cleanup_owned_worktree, prepare_manual_branch_worktree, ref_points_to, remove_worktree,
         resolve_branch_head, successful_git_with_control,
     };
     use crate::pr_tracking::default_pr_command_control;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// A same-branch caller still queued when the admission deadline passes
+    /// fails with the typed, retryable contention error instead of waiting
+    /// for the owner.
+    #[tokio::test]
+    async fn a_queued_lifecycle_caller_is_contended_at_its_admission_deadline() {
+        let store = tempfile::tempdir().unwrap();
+        let _owner = acquire_manual_branch_lifecycle(store.path(), "feature/held")
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+
+        let queued = tokio::time::timeout(
+            Duration::from_secs(10),
+            acquire_manual_branch_lifecycle_until(store.path(), "feature/held", deadline),
+        )
+        .await
+        .expect("the admission deadline must end the queued wait");
+
+        assert!(
+            Instant::now() >= deadline,
+            "the deadline must not fire early"
+        );
+        let Err(error) = queued else {
+            panic!("a caller queued past its deadline must not be admitted");
+        };
+        assert!(
+            matches!(
+                error,
+                ManualBranchActivationError::LifecycleContended { .. }
+            ),
+            "{error:?}"
+        );
+    }
 
     /// Git for Windows runs `git worktree add`'s checkout with `GIT_DIR` set to
     /// the new worktree's `.git` and dies with "'$GIT_DIR' too big" past
@@ -1162,6 +1211,45 @@ mod tests {
                 .worktree,
             "each head stages its own worktree"
         );
+    }
+
+    #[test]
+    fn branch_resolution_keeps_unavailable_git_retryable() {
+        let repo = tempfile::tempdir().unwrap();
+        let branch = "feature/resolve-unavailable";
+        init_manual_branch_repo(repo.path(), branch);
+
+        let missing = resolve_branch_head(
+            repo.path(),
+            "definitely-missing",
+            default_pr_command_control(),
+        )
+        .expect_err("absent branch");
+        assert_eq!(missing.reason_code(), "invalid_branch_ref");
+        assert!(!missing.retryable());
+
+        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
+        cancellation.cancel();
+        for (label, control) in [
+            ("deadline", PrCommandControlV1::with_timeout(Duration::ZERO)),
+            (
+                "cancelled",
+                PrCommandControlV1::with_cancellation(cancellation),
+            ),
+        ] {
+            let error = resolve_branch_head(repo.path(), branch, &control)
+                .expect_err("unavailable Git cannot resolve a branch head");
+            assert!(
+                matches!(
+                    &error,
+                    ManualBranchActivationError::GitAuthorityUnavailable { .. }
+                ),
+                "{label}: unavailable Git must not be collapsed into a missing branch: {error}"
+            );
+            assert!(error.retryable(), "{label}: {error}");
+        }
+
+        assert!(resolve_branch_head(repo.path(), branch, default_pr_command_control()).is_ok());
     }
 
     #[test]

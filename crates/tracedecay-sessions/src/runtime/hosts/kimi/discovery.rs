@@ -5,12 +5,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::runtime::host_scan::HostScanBudget;
-use crate::runtime::hosts::codex::SettledTranscript;
-use crate::runtime::source::{
-    FileDiscoveryReport, TranscriptIngestResult, canonical_framed_sha256,
-};
+use crate::runtime::ingest::quarantine::SettledClaim;
+use crate::runtime::source::{FileDiscoveryReport, canonical_framed_sha256};
 
-use super::{MAX_DISCOVERY_FAILURE_EVIDENCE, invalid_frame};
+use super::MAX_DISCOVERY_FAILURE_EVIDENCE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KimiDiscoveryFailureKind {
@@ -46,8 +44,7 @@ pub(super) struct KimiDiscoveryReport {
 /// One Kimi `state.json` that becomes converged when `pending_wires` are
 /// admitted through the identity `settled` observed.
 pub(super) struct KimiStateGate {
-    pub(super) path: PathBuf,
-    pub(super) settled: SettledTranscript,
+    pub(super) settled: SettledClaim,
     pub(super) pending_wires: Vec<PathBuf>,
 }
 
@@ -121,14 +118,4 @@ impl KimiSessionState {
             None => None,
         }
     }
-}
-
-pub(super) fn charge_discovered_path(
-    budget: &mut HostScanBudget,
-    path: &Path,
-) -> TranscriptIngestResult<bool> {
-    let bytes = u64::try_from(path.as_os_str().as_encoded_bytes().len())
-        .map_err(|_| invalid_frame())?
-        .max(1);
-    Ok(budget.try_charge_input(bytes))
 }

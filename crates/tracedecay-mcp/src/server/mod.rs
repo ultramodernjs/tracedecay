@@ -7,6 +7,7 @@ mod project_host_admission_replay;
 mod protocol;
 mod read_coalescing;
 mod rmcp;
+mod session;
 mod settlement;
 
 pub use crate::lifecycle::{
@@ -25,17 +26,20 @@ pub use live_transcript_refresh::{
 pub use project_host_admission_replay::{
     ProjectHostAdmissionReplayTask, ProjectHostAdmissionReplayWorker,
 };
-pub use protocol::{McpMethod, classify_mcp_method, initialize_result, resources_list_result};
+pub use protocol::{
+    McpMethod, classify_mcp_method, initialize_result, request_protocol_version,
+    resources_list_result, speaks_2026_07_28, stamp_2026_07_28_result,
+};
 pub use read_coalescing::{
     IdenticalReadCoalescer, ReadCoalescingSnapshot, ReadFlight, ReadFlightClaim, ReadFlightLeader,
     tool_allows_identical_read_coalescing,
 };
-pub(crate) use rmcp::serve_guarded_rmcp_connection;
 pub use rmcp::{
     RmcpConnectionAdapter, RmcpInitializeResponseDecorator, RmcpSelectedProjectResponseAuthority,
     RmcpWorkDeliverySettlement, attach_stateless_request_context, await_dispatch_with_cancellation,
     opens_rmcp_session, project_server_retired_error, rmcp_response_result,
 };
+pub use session::MAX_PENDING_REQUESTS;
 pub use settlement::{
     ApplicationCancellationRegistration, DispatchControl, DispatchControlRequest, DispatchFailure,
     DispatchSettlement, DispatchToolPolicy, PreparedDispatchControl, RetainedDispatchAuthority,

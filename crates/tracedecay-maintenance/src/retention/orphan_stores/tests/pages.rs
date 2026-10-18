@@ -1,6 +1,6 @@
 use super::*;
 
-#[tokio::test]
+#[asupersync::test]
 async fn sweep_collects_orphan_store_and_retires_row() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -78,10 +78,61 @@ async fn sweep_collects_orphan_store_and_retires_row() {
     );
 }
 
+/// A store minted for a linked worktree outlives the worktree: the repository,
+/// and so the git common directory the registry recorded, stays live. The
+/// store has no enrolled checkout left, so the sweep plans it for collection.
+#[asupersync::test]
+async fn sweep_plans_a_deleted_worktrees_store_while_its_repository_lives() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let profile_root = tmp.path().join("profile");
+    std::fs::create_dir_all(&profile_root).unwrap();
+    let live_common_dir = tmp.path().join("repository/.git");
+    std::fs::create_dir_all(&live_common_dir).unwrap();
+    let deleted_worktree = tmp.path().join("linked-worktree");
+
+    let (_runtime, db) = open_registered_db(&profile_root).await;
+    let base = 1_700_000_000i64;
+    seed_store(
+        &db,
+        &profile_root,
+        "proj_worktree",
+        "store_worktree",
+        &deleted_worktree,
+        base - 100 * DAY,
+    )
+    .await;
+    let transaction = db.begin_write_transaction().await.unwrap();
+    transaction
+        .execute(
+            "UPDATE code_projects SET git_common_dir = ?1 WHERE project_id = 'proj_worktree'",
+            tracedecay_runtime_core::db::engine::params![
+                live_common_dir.to_string_lossy().into_owned()
+            ],
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let report = sweep_orphan_stores(&db, &profile_root, 7 * DAY, base, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report
+            .plan
+            .collect
+            .iter()
+            .map(|finding| finding.store_id.as_str())
+            .collect::<Vec<_>>(),
+        ["store_worktree"],
+        "a live shared git directory must not keep a deleted worktree's store"
+    );
+}
+
 /// The collection plan is only an inspection receipt.  Replacing its directory
 /// with byte-identical contents in the same timestamp second must still abort
 /// the apply rather than retire a newly-created store identity.
-#[tokio::test]
+#[asupersync::test]
 async fn sweep_preserves_immature_sibling_store_identity() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -135,7 +186,7 @@ async fn sweep_preserves_immature_sibling_store_identity() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn sweep_atomically_relinks_moved_store_to_registered_live_project() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -208,7 +259,7 @@ async fn sweep_atomically_relinks_moved_store_to_registered_live_project() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn sweep_resumes_manifest_forward_after_interrupted_relink() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -262,7 +313,7 @@ async fn sweep_resumes_manifest_forward_after_interrupted_relink() {
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn sweep_leaves_relinkable_store_unchanged_without_exact_target_registration() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -311,7 +362,7 @@ async fn sweep_leaves_relinkable_store_unchanged_without_exact_target_registrati
     assert_eq!(unchanged_manifest.project_id.as_deref(), Some("proj_old"));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn registered_store_census_resumes_across_bounded_project_pages() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -349,7 +400,7 @@ async fn registered_store_census_resumes_across_bounded_project_pages() {
 /// A store whose graph database carries durable `memory_facts` rows must
 /// never be collected, even when every registry/manifest/payload revival
 /// check passes and the store is otherwise a textbook orphan.
-#[tokio::test]
+#[asupersync::test]
 async fn census_finds_unregistered_project_dir_and_ignores_registered_ones() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -383,7 +434,76 @@ async fn census_finds_unregistered_project_dir_and_ignores_registered_ones() {
     assert!(findings[0].size_bytes >= 4096);
 }
 
-#[tokio::test]
+/// The daemon's maintenance tick runs the cold-store page; an unregistered
+/// project directory past the window must be collected there, not only when
+/// someone asks Doctor.
+#[asupersync::test]
+async fn the_maintenance_cold_store_page_collects_an_unregistered_project_dir() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let profile_root = tmp.path().join("profile");
+    std::fs::create_dir_all(&profile_root).unwrap();
+    let (_runtime, db) = open_registered_db(&profile_root).await;
+    // A store with a manifest and an inspectable, memory-free SQLite file, but
+    // no registry row: nothing the registered census would ever visit.
+    let unregistered_dir = profile_root.join("projects").join("proj_ghost");
+    std::fs::create_dir_all(&unregistered_dir).unwrap();
+    let graph_db = unregistered_dir.join("tracedecay.db");
+    rusqlite::Connection::open(&graph_db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE padding(value BLOB); INSERT INTO padding VALUES (zeroblob(4096));",
+        )
+        .unwrap();
+    tracedecay_runtime_core::storage::write_store_manifest_to_path(
+        &unregistered_dir.join(tracedecay_runtime_core::storage::STORE_MANIFEST_FILENAME),
+        &StoreManifest {
+            schema_version: STORE_MANIFEST_SCHEMA_VERSION,
+            project_id: Some("proj_ghost".to_owned()),
+            store_kind: StoreKind::CodeProject,
+            storage_mode: StorageMode::ProfileSharded,
+            project_root: tmp.path().join("deleted-checkout"),
+            data_root: unregistered_dir.clone(),
+            graph_db_relpath: PathBuf::from("tracedecay.db"),
+            sessions_db_relpath: PathBuf::from("sessions.db"),
+            branch_meta_relpath: PathBuf::from("branch-meta.json"),
+            sessions_schema_digest: None,
+        },
+    )
+    .unwrap();
+    let memory_dir = profile_root.join("projects").join("proj_ghost_memory");
+    std::fs::create_dir_all(&memory_dir).unwrap();
+    rusqlite::Connection::open(memory_dir.join(tracedecay_runtime_core::config::DB_FILENAME))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE memory_facts (fact_id INTEGER PRIMARY KEY, content TEXT NOT NULL);
+             INSERT INTO memory_facts (fact_id, content) VALUES (1, 'durable fact');",
+        )
+        .unwrap();
+
+    let report = crate::retention::cold_store::run_cold_store_page(
+        &profile_root,
+        &db,
+        Some(0),
+        &BTreeSet::new(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !unregistered_dir.exists(),
+        "an unregistered project directory past the window must be collected"
+    );
+    assert!(report.reclaimed_bytes >= 4096, "{report:?}");
+    assert!(
+        memory_dir
+            .join(tracedecay_runtime_core::config::DB_FILENAME)
+            .is_file(),
+        "an unregistered directory holding durable memory must survive the tick"
+    );
+}
+
+#[asupersync::test]
 async fn sweep_unregistered_stores_protects_unverifiable_payload_and_retains_young() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -443,7 +563,7 @@ async fn sweep_unregistered_stores_protects_unverifiable_payload_and_retains_you
 /// abandoned: its owner can still write into it until it is retired and
 /// joined. Such a store waits out the retention window like one whose root
 /// is present or whose manifest is missing.
-#[tokio::test]
+#[asupersync::test]
 async fn unregistered_store_with_a_vanished_manifest_root_waits_out_the_window() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -518,7 +638,7 @@ async fn unregistered_store_with_a_vanished_manifest_root_waits_out_the_window()
 /// A registered project id must never be treated as an unregistered
 /// candidate, and re-registering between census and collection must abort
 /// the delete for that finding (closing the revival window).
-#[tokio::test]
+#[asupersync::test]
 async fn sweep_unregistered_stores_aborts_when_directory_gets_registered_first() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -605,7 +725,7 @@ fn cancelled_mtime_and_size_walks_stop_before_descending() {
     assert!(data_root.join("a/b/c/payload.bin").is_file());
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn unregistered_store_sweep_applies_one_cursor_page_at_a_time() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -680,7 +800,7 @@ async fn unregistered_store_sweep_applies_one_cursor_page_at_a_time() {
 
 /// A deadline already elapsed at entry must not inspect or advance a cursor
 /// page. `DeadlineExceeded` is distinct from a successful empty page.
-#[tokio::test]
+#[asupersync::test]
 async fn unregistered_store_sweep_elapsed_deadline_does_not_advance_page_state() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -810,7 +930,7 @@ fn portable_inventory_keeps_partial_progress_across_cancelled_pages() {
 
 /// Cancellation is a typed page result and must prevent both inspection and
 /// collection; it is not an empty successful census.
-#[tokio::test]
+#[asupersync::test]
 async fn unregistered_store_sweep_returns_cancelled_without_mutation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");
@@ -844,7 +964,7 @@ async fn unregistered_store_sweep_returns_cancelled_without_mutation() {
 /// A deadline is distinct from cancellation and must also leave the current
 /// page untouched. It is surfaced to the maintenance coordinator so it does
 /// not checkpoint partial unregistered work as successful progress.
-#[tokio::test]
+#[asupersync::test]
 async fn unregistered_store_sweep_returns_deadline_without_mutation() {
     let tmp = tempfile::TempDir::new().unwrap();
     let profile_root = tmp.path().join("profile");

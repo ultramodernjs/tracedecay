@@ -53,6 +53,18 @@ pub fn config_error(message: impl Into<String>) -> tracedecay_domain::errors::Tr
     }
 }
 
+/// Runs filesystem `work` on the native blocking pool, as `tokio::fs` did on
+/// Tokio's. A pool failure becomes an `io::Error`, so callers keep one mapping.
+pub(crate) async fn blocking_fs<T, F>(work: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    tracedecay_runtime_core::native_runtime::spawn_blocking(work)
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Reads a file the automation runtime published moments earlier. On Windows
 /// a scanner or a pending atomic replace briefly denies the open (os error 5,
 /// 32 or 33) although the file is readable milliseconds later, so the read
@@ -60,7 +72,7 @@ pub fn config_error(message: impl Into<String>) -> tracedecay_domain::errors::Tr
 /// reads once.
 pub(crate) async fn read_published_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    blocking_fs(move || {
         let mut bytes = Vec::new();
         tracedecay_runtime_core::storage::retry_transient_file_op(|| {
             bytes = std::fs::read(&path)?;
@@ -69,7 +81,6 @@ pub(crate) async fn read_published_file(path: &std::path::Path) -> std::io::Resu
         Ok(bytes)
     })
     .await
-    .map_err(std::io::Error::other)?
 }
 
 pub(crate) fn job_error<T>(message: &str) -> tracedecay_domain::errors::Result<T> {

@@ -1,3 +1,5 @@
+use asupersync::channel::watch;
+use futures_util::future::AbortHandle;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -6,7 +8,7 @@ use std::num::NonZeroU64;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 
 use tracedecay_domain::{
     ObservationId, ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
@@ -710,6 +712,12 @@ static SHARED_JSONL_WAITER_REGISTRATIONS: OnceLock<Mutex<HashMap<PathBuf, usize>
 #[cfg(test)]
 static SHARED_JSONL_BUILD_GATES: OnceLock<Mutex<HashMap<PathBuf, Arc<std::sync::Barrier>>>> =
     OnceLock::new();
+/// A pin of a gated path meets its test twice: once on entry, so the test
+/// knows the pin is in progress, and once to finish it.
+#[cfg(test)]
+pub(in crate::runtime) static SHARED_JSONL_PIN_GATES: OnceLock<
+    Mutex<HashMap<PathBuf, Arc<std::sync::Barrier>>>,
+> = OnceLock::new();
 
 #[cfg(test)]
 #[derive(Default)]
@@ -953,19 +961,29 @@ pub(crate) struct SharedJsonlPathPin {
     paths: Vec<PathBuf>,
     prefetch_started: std::sync::atomic::AtomicBool,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
-    prefetches: Mutex<Vec<tokio::task::AbortHandle>>,
+    prefetches: Mutex<Vec<AbortHandle>>,
 }
 
 pub(crate) fn pin_shared_jsonl_paths(paths: &[PathBuf]) -> SharedJsonlPathPin {
-    let mut canonical = Vec::with_capacity(paths.len());
-    for path in paths {
-        let Ok(path) = std::fs::canonicalize(path) else {
-            continue;
-        };
-        if !canonical.contains(&path) {
-            canonical.push(path);
-        }
+    #[cfg(test)]
+    let gate = {
+        let mut gates = SHARED_JSONL_PIN_GATES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        paths.iter().find_map(|path| gates.remove(path))
+    };
+    #[cfg(test)]
+    if let Some(gate) = &gate {
+        gate.wait();
+        gate.wait();
     }
+    let mut canonical = paths
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect::<Vec<_>>();
+    canonical.sort_unstable();
+    canonical.dedup();
     let pins = SHARED_JSONL_PATH_PINS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut pins = pins.lock().unwrap_or_else(PoisonError::into_inner);
     for path in &canonical {
@@ -991,10 +1009,14 @@ impl SharedJsonlPathPin {
         self.prefetches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extend(start_shared_jsonl_page_prefetch_with_cancellation(
-                paths,
-                Some(Arc::clone(&self.cancelled)),
-            ));
+            .extend(
+                start_shared_jsonl_page_prefetch_with_cancellation(
+                    paths,
+                    Some(Arc::clone(&self.cancelled)),
+                )
+                .into_iter()
+                .map(|(abort, _task)| abort),
+            );
     }
 }
 
@@ -1325,7 +1347,7 @@ async fn prepare_shared_jsonl_window_with_background_cpu(
     let task_cancellation = cancellation.clone();
     #[cfg(test)]
     let (preparation_file_identity, window_preparations) = (page.file_identity, jobs.len());
-    let prepared = tokio::task::spawn_blocking(move || {
+    let prepared = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         jobs.into_par_iter()
             .map(|(index, bytes, range)| {
                 if task_cancellation.is_cancelled() {
@@ -1478,21 +1500,22 @@ async fn shared_jsonl_page_with_frame_limit_and_cancellation(
         operation: operation_cancellation,
     } = cancellation;
     let identity_path = path.to_path_buf();
-    let (canonical_path, identity) = tokio::task::spawn_blocking(move || {
-        let canonical_path = std::fs::canonicalize(&identity_path).map_err(|source| {
-            TranscriptIngestError::ScanIo {
-                operation: "resolve shared JSONL page identity",
-                path: identity_path.clone(),
-                source,
-            }
-        })?;
-        Ok::<_, TranscriptIngestError>((
-            canonical_path,
-            shared_jsonl_file_identity(&identity_path)?,
-        ))
-    })
-    .await
-    .map_err(|_| TranscriptIngestError::BlockingScanTaskFailed { provider: "jsonl" })??;
+    let (canonical_path, identity) =
+        tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
+            let canonical_path = std::fs::canonicalize(&identity_path).map_err(|source| {
+                TranscriptIngestError::ScanIo {
+                    operation: "resolve shared JSONL page identity",
+                    path: identity_path.clone(),
+                    source,
+                }
+            })?;
+            Ok::<_, TranscriptIngestError>((
+                canonical_path,
+                shared_jsonl_file_identity(&identity_path)?,
+            ))
+        })
+        .await
+        .map_err(|_| TranscriptIngestError::BlockingScanTaskFailed { provider: "jsonl" })??;
     // Preparation policy is part of the page key. Codex prefetch and demand
     // both select `Lazy`, so a pinned page stays raw until ordered admission
     // proves which frames can affect scope. Explicit eager consumers retain
@@ -1547,10 +1570,8 @@ async fn shared_jsonl_page_with_frame_limit_and_cancellation(
             if let Some(cancellation) = &operation_cancellation {
                 tokio::select! {
                     () = notified.as_mut() => {}
-                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                        if cancellation.is_cancelled() {
-                            return Err(TranscriptIngestError::Cancelled { provider: "jsonl" });
-                        }
+                    () = cancellation.cancelled() => {
+                        return Err(TranscriptIngestError::Cancelled { provider: "jsonl" });
                     }
                 }
             } else {
@@ -1622,7 +1643,7 @@ async fn shared_jsonl_page_with_frame_limit_and_cancellation(
         }
     };
     let scan_path = path.to_path_buf();
-    let page = tokio::task::spawn_blocking(move || {
+    let page = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         build_shared_jsonl_page_with_frame_limit(
             scan_path,
             previous,
@@ -1695,20 +1716,31 @@ async fn shared_jsonl_page_with_frame_limit_and_cancellation(
 /// ordered source admission; the canonical admission call waits on the exact
 /// in-flight page it needs and preserves per-source cursor order.
 #[cfg(test)]
-pub(crate) fn start_shared_jsonl_page_prefetch(paths: &[PathBuf]) -> Vec<tokio::task::AbortHandle> {
+pub(crate) fn start_shared_jsonl_page_prefetch(paths: &[PathBuf]) -> Vec<SharedJsonlPrefetchTask> {
     start_shared_jsonl_page_prefetch_with_cancellation(paths, None)
+        .into_iter()
+        .map(|(_abort, task)| task)
+        .collect()
 }
+
+/// Dropping the handle detaches the page task; joining it observes the end
+/// of any build the task started.
+type SharedJsonlPrefetchTask =
+    asupersync::runtime::TaskHandle<Result<(), futures_util::future::Aborted>>;
 
 fn start_shared_jsonl_page_prefetch_with_cancellation(
     paths: &[PathBuf],
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> Vec<tokio::task::AbortHandle> {
+) -> Vec<(AbortHandle, SharedJsonlPrefetchTask)> {
+    let Some(cx) = tracedecay_runtime_core::native_runtime::cx() else {
+        return Vec::new();
+    };
     let workers = shared_jsonl_speculative_capacity_from(shared_jsonl_preparation_capacity());
     let mut prefetches = Vec::with_capacity(workers.min(paths.len()));
     for path in paths.iter().take(workers) {
         let path = path.clone();
         let cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
+        let (prefetch, abort) = futures_util::future::abortable(async move {
             if let Err(error) = shared_jsonl_page_with_cancellation(
                 &path,
                 StoredCursor::default(),
@@ -1733,7 +1765,9 @@ fn start_shared_jsonl_page_prefetch_with_cancellation(
                 );
             }
         });
-        prefetches.push(task.abort_handle());
+        if let Ok(task) = cx.spawn(move |_cx| prefetch) {
+            prefetches.push((abort, task));
+        }
     }
     prefetches
 }

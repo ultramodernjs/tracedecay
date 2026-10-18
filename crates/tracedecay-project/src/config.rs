@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+use tracing::Instrument;
 
 use tracedecay_contracts::clock::now_micros;
 use tracedecay_domain::ProjectId;
@@ -481,12 +485,11 @@ async fn open_runtime_configuration_from_store(
         match check {
             SourceBindingCheck::Verified => break,
             // Exactly one daemon-owned binding for this registry-verified
-            // project whose only drift is the path-derived locator digest:
-            // the checkout moved or was renamed. The registry owns identity,
-            // not the path, and has already resolved this exact
-            // registered project for the current root, so republish the
-            // binding with the new derived digest under compare-and-swap
-            // instead of demanding a reset.
+            // project whose only drift is the locator digest: a binding
+            // published under the retired root-derived digest. The registry
+            // owns identity and has already resolved this exact registered
+            // project, so republish the binding with the project digest under
+            // compare-and-swap instead of demanding a reset.
             SourceBindingCheck::LocatorDigestDrift if !rebind_attempted => {
                 rebind_attempted = true;
                 // A concurrent open may have won the swap; adopt what it
@@ -674,7 +677,6 @@ fn daemon_project_source_binding(
 ) -> Result<ScopeSourceBinding> {
     tracedecay_configuration::config::scope_control::daemon_owned_project_source_binding(
         &target.project_id,
-        &target.project_root,
     )
     .map_err(|error| {
         config_error(format!(
@@ -757,26 +759,32 @@ fn config_error(message: impl Into<String>) -> TraceDecayError {
     }
 }
 
-#[tracing::instrument(name = "daemon.config.discover", level = "trace", skip_all)]
-pub async fn discover_project_root_with_identity(
-    profile: &tracedecay_runtime_core::config::ProfileRoot,
-    start: &Path,
-) -> Option<PathBuf> {
-    if let Some(root) = profile.discover_project_root(start) {
-        return Some(root);
-    }
-    let candidate = tracedecay_runtime_core::worktree::git_worktree_root(start)
-        .unwrap_or_else(|| start.to_path_buf());
-    if crate::project::TraceDecay::has_initialized_store_with_options(
-        &candidate,
-        &crate::project::TraceDecayOpenOptions::for_profile(profile),
+pub fn discover_project_root_with_identity<'a>(
+    profile: &'a tracedecay_runtime_core::config::ProfileRoot,
+    start: &'a Path,
+) -> Pin<Box<dyn Future<Output = Option<PathBuf>> + Send + 'a>> {
+    let span = tracing::trace_span!("daemon.config.discover");
+    Box::pin(
+        async move {
+            if let Some(root) = profile.discover_project_root(start) {
+                return Some(root);
+            }
+            let candidate = tracedecay_runtime_core::worktree::git_worktree_root(start)
+                .unwrap_or_else(|| start.to_path_buf());
+            let options = crate::project::TraceDecayOpenOptions::for_profile(profile);
+            let initialized: Pin<Box<dyn Future<Output = bool> + Send + '_>> = Box::pin(
+                crate::project::TraceDecay::has_initialized_store_with_options(
+                    &candidate, &options,
+                ),
+            );
+            if initialized.await {
+                Some(candidate)
+            } else {
+                None
+            }
+        }
+        .instrument(span),
     )
-    .await
-    {
-        Some(candidate)
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

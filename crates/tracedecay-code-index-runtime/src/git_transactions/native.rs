@@ -534,7 +534,7 @@ impl GitIndexPreviewAssembler for NativeGitIndexPreviewAssembler {
         .map_err(|_| GitIndexTransactionPortError::NativeFailure)?;
         Ok(MaterializedGitIndexPreview {
             preview,
-            execution: completed_execution(request),
+            execution: completed_execution(&request.context, request.observed_at),
             runner,
             patches,
         })
@@ -590,7 +590,7 @@ impl GitIndexPreviewAssembler for NativeGitIndexPreviewAssembler {
         .map_err(|_| GitIndexTransactionPortError::NeedsInspection)?;
         Ok(NativeGitIndexApplyResult {
             receipt,
-            execution: completed_apply_execution(request),
+            execution: completed_execution(&request.context, request.observed_at),
         })
     }
 
@@ -639,22 +639,14 @@ impl GitIndexPreviewAssembler for NativeGitIndexPreviewAssembler {
     }
 }
 
-fn completed_execution(request: &GitIndexPreviewRequestV1) -> OperationReceipt {
+fn completed_execution(
+    context: &tracedecay_contracts::RequestContext,
+    observed_at: UtcMicros,
+) -> OperationReceipt {
     OperationReceipt {
-        started_at: request.observed_at,
-        ended_at: request.observed_at,
-        effective_deadline: request.context.deadline().clone(),
-        cancellation: None,
-        budget: OperationBudgetUsage::default(),
-        termination: OperationTermination::Completed,
-    }
-}
-
-fn completed_apply_execution(request: &GitIndexApplyRequestV1) -> OperationReceipt {
-    OperationReceipt {
-        started_at: request.observed_at,
-        ended_at: request.observed_at,
-        effective_deadline: request.context.deadline().clone(),
+        started_at: observed_at,
+        ended_at: observed_at,
+        effective_deadline: context.deadline().clone(),
         cancellation: None,
         budget: OperationBudgetUsage::default(),
         termination: OperationTermination::Completed,
@@ -761,8 +753,7 @@ fn unsupported_hunk_selection(
             return Some(GitIndexUnsupportedStateV1::RenameOrCopy);
         }
         let line_count = parse_hunk_header(&hunk.hunk_header)
-            .map(|header| header.old_count.max(header.new_count))
-            .unwrap_or_default();
+            .map_or_default(|header| header.old_count.max(header.new_count));
         if hunk.selected_line_bitmap != tracedecay_domain::full_hunk_selection_bitmap(line_count) {
             return Some(GitIndexUnsupportedStateV1::PartialHunkSelection);
         }
@@ -1038,7 +1029,7 @@ fn hunk_commit_matches_preview(
 
 /// Verify the complete operation-specific terminal state before emitting a
 /// success receipt. Native publication proves which process crossed the
-/// boundary; this observation additionally refuses success if HEAD/ref or
+/// boundary; this observation also refuses success if HEAD/ref or
 /// stable repository authority drifted before the terminal receipt.
 fn live_result_matches_preview(
     preview: &GitIndexPreviewV1,
@@ -1099,7 +1090,7 @@ impl<A> FixedDaemonGitIndexExecutor<A> {
 
 impl<A> GitIndexNativeExecutor for FixedDaemonGitIndexExecutor<A>
 where
-    A: GitIndexPreviewAssembler,
+    A: GitIndexPreviewAssembler + Sync,
 {
     #[tracing::instrument(name = "daemon.git.tx.native_preview", level = "trace", skip_all)]
     fn preview(
@@ -1229,7 +1220,7 @@ where
 
 impl<A> GitIndexRecoveryExecutor for FixedDaemonGitIndexExecutor<A>
 where
-    A: GitIndexPreviewAssembler,
+    A: GitIndexPreviewAssembler + Sync,
 {
     fn reconcile(
         &self,

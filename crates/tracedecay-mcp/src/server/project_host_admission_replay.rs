@@ -8,15 +8,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
 use tracedecay_host_admission::{
     REPLAY_BACKOFF_SHIFT_CAP, ReplayPassDecision, SharedHostAdmissionBroker, classify_replay_pass,
     replay_backoff,
 };
+use tracedecay_runtime_core::native_runtime::{self, NativeTask};
 use tracedecay_sessions::admission::HostAdmissionOutcome;
 
 type PassFn =
@@ -24,7 +24,7 @@ type PassFn =
 
 pub struct ProjectHostAdmissionReplayTask {
     worker: Arc<ProjectHostAdmissionReplayWorker>,
-    task: Option<JoinHandle<()>>,
+    task: Option<NativeTask<()>>,
 }
 
 pub struct ProjectHostAdmissionReplayWorker {
@@ -41,24 +41,17 @@ pub struct ProjectHostAdmissionReplayWorker {
 
 impl ProjectHostAdmissionReplayTask {
     pub fn start(broker: SharedHostAdmissionBroker, pass: PassFn) -> Self {
-        let worker = Arc::new(ProjectHostAdmissionReplayWorker {
-            broker,
-            pass,
-            cancel: AtomicBool::new(false),
-            cancel_notify: Notify::new(),
-            dirty: AtomicBool::new(false),
-            busy: AtomicBool::new(false),
-            pass_count: AtomicUsize::new(0),
-            backoff_count: AtomicUsize::new(0),
-            idle: Notify::new(),
-        });
+        let worker = Arc::new(ProjectHostAdmissionReplayWorker::new(broker, pass));
         worker.kick();
         let task_worker = Arc::clone(&worker);
-        let task = tokio::spawn(task_worker.run());
-        Self {
-            worker,
-            task: Some(task),
-        }
+        // A runtime that refuses the worker leaves none running; shutdown then
+        // has nothing to join.
+        let task = NativeTask::spawn(task_worker.run())
+            .inspect_err(|error| {
+                tracing::error!(%error, "project host admission replay worker was not started");
+            })
+            .ok();
+        Self { worker, task }
     }
 
     #[cfg(any(test, feature = "test-transport"))]
@@ -69,7 +62,7 @@ impl ProjectHostAdmissionReplayTask {
     pub async fn shutdown(mut self) {
         self.worker.cancel();
         if let Some(task) = self.task.take() {
-            let _ = task.await;
+            task.wait().await;
         }
     }
 
@@ -94,6 +87,20 @@ impl Drop for ProjectHostAdmissionReplayTask {
 }
 
 impl ProjectHostAdmissionReplayWorker {
+    fn new(broker: SharedHostAdmissionBroker, pass: PassFn) -> Self {
+        Self {
+            broker,
+            pass,
+            cancel: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+            dirty: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+            pass_count: AtomicUsize::new(0),
+            backoff_count: AtomicUsize::new(0),
+            idle: Notify::new(),
+        }
+    }
+
     fn kick(&self) {
         self.dirty.store(true, Ordering::Release);
         self.broker.request_replay();
@@ -180,7 +187,7 @@ impl ProjectHostAdmissionReplayWorker {
                 match classify_replay_pass(pending_before, pending_after, &outcome) {
                     ReplayPassDecision::ProgressPending => {
                         consecutive_retryable = 0;
-                        tokio::task::yield_now().await;
+                        asupersync::runtime::yield_now().await;
                     }
                     ReplayPassDecision::Backoff => {
                         consecutive_retryable = consecutive_retryable.saturating_add(1);
@@ -189,7 +196,17 @@ impl ProjectHostAdmissionReplayWorker {
                         let backoff = project_replay_backoff(consecutive_retryable);
                         tokio::select! {
                             () = self.cancel_notify.notified() => break,
-                            () = tokio::time::sleep(backoff) => {}
+                            slept = native_runtime::sleep_until(Instant::now() + backoff) => {
+                                // Retrying without the delay would spin; the
+                                // record stays dirty for the next kick.
+                                if let Err(error) = slept {
+                                    tracing::warn!(
+                                        event = "project_host_admission_replay_timer_unavailable",
+                                        %error,
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                     ReplayPassDecision::Stop => {
@@ -241,6 +258,56 @@ mod tests {
         assert_eq!(project_replay_backoff(20), Duration::from_secs(2));
     }
 
+    #[test]
+    fn retryable_passes_back_off_on_native_timers_with_no_tokio_runtime_entered() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let temp = tempfile::TempDir::new().unwrap();
+        let (runtime, _) = tracedecay_host_admission::HostAdmissionRuntime::open(
+            temp.path(),
+            tracedecay_host_admission::SpoolBounds::default(),
+        )
+        .unwrap();
+        let broker = Arc::new(tracedecay_host_admission::HostAdmissionBroker::new(runtime));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let third_pass = Arc::new(Notify::new());
+        let pass: PassFn = {
+            let passes = Arc::clone(&passes);
+            let third_pass = Arc::clone(&third_pass);
+            Arc::new(move || {
+                let passes = Arc::clone(&passes);
+                let third_pass = Arc::clone(&third_pass);
+                Box::pin(async move {
+                    if passes.fetch_add(1, Ordering::AcqRel) == 2 {
+                        third_pass.notify_one();
+                    }
+                    HostAdmissionOutcome::retained_unavailable("test_retryable")
+                })
+            })
+        };
+        let worker = Arc::new(ProjectHostAdmissionReplayWorker::new(broker, pass));
+        worker.kick();
+
+        let started = Instant::now();
+        let reached_third_pass = native_runtime::block_on(async {
+            tokio::select! {
+                biased;
+                () = third_pass.notified() => true,
+                () = Arc::clone(&worker).run() => false,
+                _ = native_runtime::sleep_until(started + Duration::from_secs(10)) => false,
+            }
+        })
+        .expect("native runtime");
+        let elapsed = started.elapsed();
+
+        assert!(reached_third_pass, "retryable passes must keep retrying");
+        assert_eq!(passes.load(Ordering::Acquire), 3);
+        let floor = project_replay_backoff(1) + project_replay_backoff(2);
+        assert!(
+            elapsed >= floor,
+            "two backoffs must wait before the third pass; elapsed={elapsed:?} floor={floor:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_retryable_pending_record_stops_until_an_external_kick() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -262,9 +329,11 @@ mod tests {
         });
         let task = ProjectHostAdmissionReplayTask::start(broker, pass);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while task.pass_count() == 0 {
-                tokio::task::yield_now().await;
+        // The worker runs on the native runtime; wait for the pass itself,
+        // which follows a spool read on the blocking pool.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while passes.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -298,9 +367,11 @@ mod tests {
         });
         let task = ProjectHostAdmissionReplayTask::start(broker, pass);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while task.pass_count() == 0 {
-                tokio::task::yield_now().await;
+        // The worker runs on the native runtime; wait for the pass itself,
+        // which follows a spool read on the blocking pool.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while passes.load(Ordering::Acquire) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await

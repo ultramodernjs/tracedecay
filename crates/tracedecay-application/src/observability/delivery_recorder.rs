@@ -1,12 +1,13 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval, timeout};
 use tracedecay_contracts::ApplicationContractError;
 use tracedecay_domain::DeliverySettlementV1;
+use tracedecay_runtime_core::native_runtime::{
+    NativeTask, NativeTaskOutcome, sleep_until, timeout_at,
+};
 
 use super::delivery_spool::{
     DeliveryRecorderSourceReceiptV1, DeliveryRecorderSpoolError, DeliveryRecorderSpoolV1,
@@ -57,7 +58,7 @@ struct DeliverySettlementRecorderCoreV1 {
     state: Arc<AtomicU8>,
     spool: Arc<DeliveryRecorderSpoolV1>,
     admission: Mutex<()>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<NativeTask<()>>>,
 }
 
 /// Bounded, daemon-owned durable write-behind lane for post-delivery receipts.
@@ -82,8 +83,6 @@ impl BoundedDeliverySettlementRecorderV1 {
         if capacity == 0 || capacity > MAX_RECORDER_CAPACITY {
             return Err("delivery_settlement_recorder_capacity");
         }
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| "delivery_settlement_recorder_runtime_unavailable")?;
         let spool = Arc::new(
             DeliveryRecorderSpoolV1::open(authority.spool_root()).map_err(map_spool_start_error)?,
         );
@@ -93,13 +92,14 @@ impl BoundedDeliverySettlementRecorderV1 {
         let worker_state = Arc::clone(&state);
         let worker_spool = Arc::clone(&spool);
         let identity = authority.identity().clone();
-        let worker = runtime.spawn(run_recorder(
+        let worker = NativeTask::spawn(run_recorder(
             Arc::clone(&authority),
             worker_spool,
             wake_rx,
             control_rx,
             worker_state,
-        ));
+        ))
+        .map_err(|_| "delivery_settlement_recorder_worker_unavailable")?;
         let core = Arc::new(DeliverySettlementRecorderCoreV1 {
             identity: identity.clone(),
             wake,
@@ -165,7 +165,19 @@ impl BoundedDeliverySettlementRecorderV1 {
     pub async fn shutdown(
         &self,
     ) -> Result<DeliverySettlementRecorderSummaryV1, ApplicationContractError> {
-        self.core.shutdown().await
+        self.core
+            .shutdown(Instant::now() + RECORDER_SHUTDOWN_DEADLINE)
+            .await
+    }
+
+    /// Shutdown bounded by the caller's deadline instead of the recorder's
+    /// own budget. The final drain waits for the store writer, which a
+    /// daemon shutdown phase can hold past that budget.
+    pub async fn shutdown_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<DeliverySettlementRecorderSummaryV1, ApplicationContractError> {
+        self.core.shutdown(deadline).await
     }
 }
 
@@ -174,6 +186,7 @@ impl DeliverySettlementRecorderCoreV1 {
     /// lifecycle compare-and-swap admits exactly one drain.
     async fn shutdown(
         &self,
+        deadline: Instant,
     ) -> Result<DeliverySettlementRecorderSummaryV1, ApplicationContractError> {
         {
             let _admission = self.admission.lock().map_err(|_| {
@@ -211,7 +224,7 @@ impl DeliverySettlementRecorderCoreV1 {
                 )
             })?
             .take();
-        let summary = match timeout(RECORDER_SHUTDOWN_DEADLINE, result).await {
+        let summary = match timeout_at(deadline, result).await {
             Ok(Ok(summary)) => summary,
             Ok(Err(_)) => {
                 return Err(ApplicationContractError::Domain(
@@ -221,7 +234,7 @@ impl DeliverySettlementRecorderCoreV1 {
             Err(_) => {
                 if let Some(worker) = worker {
                     worker.abort();
-                    let _ = worker.await;
+                    worker.wait().await;
                 }
                 self.state.store(RECORDER_STOPPED, Ordering::Release);
                 return Err(ApplicationContractError::Domain(
@@ -230,11 +243,19 @@ impl DeliverySettlementRecorderCoreV1 {
             }
         };
         if let Some(worker) = worker {
-            worker.await.map_err(|error| {
-                ApplicationContractError::Domain(format!(
-                    "delivery settlement recorder join failed: {error}"
-                ))
-            })?;
+            match worker.wait().await {
+                NativeTaskOutcome::Completed(()) => {}
+                NativeTaskOutcome::Cancelled => {
+                    return Err(ApplicationContractError::Domain(
+                        "delivery settlement recorder join failed: cancelled".to_owned(),
+                    ));
+                }
+                NativeTaskOutcome::Panicked(payload) => {
+                    return Err(ApplicationContractError::Domain(format!(
+                        "delivery settlement recorder join failed: {payload}"
+                    )));
+                }
+            }
         }
         Ok(summary)
     }
@@ -248,25 +269,27 @@ async fn run_recorder(
     state: Arc<AtomicU8>,
 ) {
     let mut summary = DeliverySettlementRecorderSummaryV1::default();
-    let mut retry = interval(RECORDER_RETRY_INTERVAL);
-    retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // A retry that falls behind skips its missed ticks: the next one is a
+    // full interval after the previous pass ends.
+    let mut retry_due = Instant::now();
     loop {
         tokio::select! {
             Some(()) = wake.recv() => {
                 drain_once(authority.as_ref(), spool.as_ref(), &mut summary).await;
             }
-            _ = retry.tick() => {
+            Ok(()) = sleep_until(retry_due) => {
                 drain_once(authority.as_ref(), spool.as_ref(), &mut summary).await;
+                retry_due = Instant::now() + RECORDER_RETRY_INTERVAL;
             }
-            Some(RecorderControl::Shutdown { reply }) = control.recv() => {
-                while wake.try_recv().is_ok() {}
-                while drain_once(authority.as_ref(), spool.as_ref(), &mut summary).await > 0 {}
-                summary.retained = pending_count(spool.as_ref());
-                state.store(RECORDER_STOPPED, Ordering::Release);
-                let _ = reply.send(summary);
-                return;
-            }
-            else => {
+            control = control.recv() => {
+                // A closed lane means every frontend dropped without a
+                // shutdown: stop, leaving pending receipts for restart replay.
+                if let Some(RecorderControl::Shutdown { reply }) = control {
+                    while wake.try_recv().is_ok() {}
+                    while drain_once(authority.as_ref(), spool.as_ref(), &mut summary).await > 0 {}
+                    summary.retained = pending_count(spool.as_ref());
+                    let _ = reply.send(summary);
+                }
                 state.store(RECORDER_STOPPED, Ordering::Release);
                 return;
             }
@@ -333,6 +356,7 @@ const fn map_spool_start_error(error: DeliveryRecorderSpoolError) -> &'static st
         DeliveryRecorderSpoolError::Full => "delivery_settlement_recorder_spool_full",
         DeliveryRecorderSpoolError::UnsafePath => "delivery_settlement_recorder_spool_unsafe",
         DeliveryRecorderSpoolError::Corrupt => "delivery_settlement_recorder_spool_corrupt",
+        DeliveryRecorderSpoolError::Removed => "delivery_settlement_recorder_spool_removed",
         DeliveryRecorderSpoolError::Io => "delivery_settlement_recorder_spool_io",
         DeliveryRecorderSpoolError::InvalidReceipt => "delivery_settlement_recorder_spool_invalid",
         DeliveryRecorderSpoolError::LockPoisoned => {
@@ -347,6 +371,7 @@ const fn map_spool_admission_error(error: DeliveryRecorderSpoolError) -> &'stati
         DeliveryRecorderSpoolError::Busy => "delivery_settlement_recorder_spool_busy",
         DeliveryRecorderSpoolError::UnsafePath => "delivery_settlement_recorder_spool_unsafe",
         DeliveryRecorderSpoolError::Corrupt => "delivery_settlement_recorder_spool_corrupt",
+        DeliveryRecorderSpoolError::Removed => "delivery_settlement_recorder_spool_removed",
         DeliveryRecorderSpoolError::Io => "delivery_settlement_recorder_spool_io",
         DeliveryRecorderSpoolError::InvalidReceipt => "delivery_settlement_recorder_spool_invalid",
         DeliveryRecorderSpoolError::LockPoisoned => {

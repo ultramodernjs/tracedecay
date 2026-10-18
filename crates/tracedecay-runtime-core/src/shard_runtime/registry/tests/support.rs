@@ -4,12 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tracedecay_domain::{
-    BrainId, LocatorDigest, ProjectId, RepositoryId, UserProfileId, UtcMicros, WorktreeId,
+    BrainId, LocatorDigest, ProjectId, RepositoryId, UserProfileId, WorktreeId,
 };
 use tracedecay_store::{
-    CodeShardScopeV1, RuntimeLeaseIdV1, RuntimeLeaseV1, RuntimeMaintenanceStateV1, StoreClientIdV1,
-    StoreIncarnationV1, StoreRuntimeBindingV1, StoreShardIdV1, StoreShardScopeV1,
-    VerifiedStoreLocatorV1,
+    CodeShardScopeV1, RuntimeMaintenanceStateV1, StoreIncarnationV1, StoreRuntimeBindingV1,
+    StoreShardIdV1, StoreShardScopeV1, VerifiedStoreLocatorV1,
 };
 
 use super::super::*;
@@ -128,7 +127,7 @@ pub(super) struct TestPublisher {
     pub(super) calls: AtomicUsize,
     pub(super) block: AtomicBool,
     pub(super) mode: AtomicU8,
-    pub(super) release: tokio::sync::Notify,
+    pub(super) release: asupersync::sync::Notify,
     pub(super) bindings: Mutex<Vec<StoreRuntimeBindingV1>>,
 }
 
@@ -189,8 +188,13 @@ pub(super) fn registry(
 ) -> (StoreRuntimeRegistry, Arc<TestResolver>, Arc<TestPublisher>) {
     let resolver = Arc::new(TestResolver::default());
     let publisher = Arc::new(TestPublisher::default());
-    let registry =
-        StoreRuntimeRegistry::with_config(resolver.clone(), publisher.clone(), config).unwrap();
+    let registry = StoreRuntimeRegistry::with_config(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        resolver.clone(),
+        publisher.clone(),
+        config,
+    )
+    .unwrap();
     (registry, resolver, publisher)
 }
 
@@ -244,22 +248,15 @@ pub(super) fn profile_sessions_request(pin: &ProfileAuthorityPin) -> StoreRuntim
 }
 
 pub(super) async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while calls.load(Ordering::SeqCst) < expected {
-            tokio::task::yield_now().await;
-        }
-    })
+    asupersync::time::timeout(
+        asupersync::Cx::current().unwrap().now(),
+        Duration::from_secs(2),
+        async {
+            while calls.load(Ordering::SeqCst) < expected {
+                asupersync::runtime::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("publisher made progress");
-}
-
-pub(super) fn active_lease(binding: &StoreRuntimeBindingV1, lease_id: &str) -> RuntimeLeaseV1 {
-    let now = utc_now();
-    RuntimeLeaseV1 {
-        lease_id: RuntimeLeaseIdV1::new(lease_id).unwrap(),
-        binding: binding.clone(),
-        holder: StoreClientIdV1::new("client.registry").unwrap(),
-        acquired_at: UtcMicros(now.0.saturating_sub(1_000_000)),
-        expires_at: UtcMicros(now.0.saturating_add(60_000_000)),
-    }
 }

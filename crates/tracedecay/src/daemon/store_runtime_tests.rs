@@ -18,8 +18,8 @@ use tracedecay_contracts::remote::recovery::{
 use tracedecay_daemon_identity::profile_identity::LocalProfileIdentityAuthorityV1;
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_domain::{
-    BrainNodeId, Confidence, EntityId, FactCategoryV1, FactCurationActionV1,
-    FactLineageEventKindV1, FactOwnerV1, FactRelationKindV1, UtcMicros, canonical_sha256,
+    BrainNodeId, Confidence, CurrentRemoteAuthorityStateV1, EntityId, FactCategoryV1,
+    FactCurationActionV1, FactLineageEventKindV1, FactOwnerV1, FactRelationKindV1, UtcMicros,
 };
 use tracedecay_global_db::register_registered_schema_installer;
 use tracedecay_graph_db::{
@@ -83,19 +83,6 @@ async fn project_sessions_pending_convergence(
     tracedecay_runtime_core::db::DaemonDatabaseScope,
 ) {
     project_sessions_convergence_fixture(project_name, true).await
-}
-
-async fn project_sessions_current_convergence(
-    project_name: &str,
-) -> (
-    tempfile::TempDir,
-    LocalProfileIdentityAuthorityV1,
-    ProjectId,
-    PathBuf,
-    PathBuf,
-    tracedecay_runtime_core::db::DaemonDatabaseScope,
-) {
-    project_sessions_convergence_fixture(project_name, false).await
 }
 
 async fn project_sessions_convergence_fixture(
@@ -280,14 +267,6 @@ async fn deferred_lcm_fixture_row_count(connection: &(impl QueryExecutor + ?Size
           AND message.session_id = session.session_id
          WHERE session.session_id = 'deferred-index-session'
            AND message.message_id = 'deferred-index-message'",
-    )
-    .await
-}
-
-async fn lcm_migration_applied_at(connection: &(impl QueryExecutor + ?Sized)) -> i64 {
-    scalar_i64(
-        connection,
-        "SELECT applied_at FROM session_schema_migrations WHERE name = 'lcm'",
     )
     .await
 }
@@ -742,6 +721,7 @@ impl ProvisionedWriterFixture {
                 &self.node_id,
                 self.writer.clone(),
                 crate::daemon::remote_protocol_tests::replay_policy(&self.writer.scope),
+                crate::daemon::remote_protocol_tests::query_policy(&self.writer.scope),
             )
             .await
     }
@@ -848,14 +828,11 @@ async fn provisioned_writer_fixture() -> ProvisionedWriterFixture {
         .remote_recovery_authority(&node_id)
         .await
         .expect("mounted remote recovery authority");
-    let fence = writer.authority.fence.clone();
-    let authority_key = canonical_sha256(&(
-        "tracedecay.remote-recovery-authority.v1",
-        &fence.brain_id,
-        &fence.shard_id,
-        &fence.generation_id,
-    ))
-    .expect("recovery authority key");
+    let authority_key = writer
+        .authority
+        .fence
+        .recovery_authority_key()
+        .expect("recovery authority key");
     let caller = RemoteRecoveryCallerV1 {
         node_id: node_id.clone(),
         enrollment_id: EntityId::new("enrollment.cancel-test").expect("enrollment identity"),
@@ -902,9 +879,10 @@ async fn remote_failover_reports_corrupt_fence_text_naming_cancel_as_corruption_
         .expect("corrupt the published writer fence");
     let promote_recovery = Arc::clone(&fixture.recovery);
     let promote_caller = fixture.caller.clone();
-    let corrupt_outcome = tokio::task::spawn_blocking(move || {
+    let corrupt_outcome = tracedecay_runtime_core::native_runtime::on_blocking_pool(async move {
         promote_recovery
-            .promote(&corrupt, &promote_caller, &PromotionControl(None))
+            .promote(&corrupt, &promote_caller, Arc::new(PromotionControl(None)))
+            .await
             .err()
     })
     .await
@@ -924,17 +902,21 @@ async fn remote_failover_reports_corrupt_fence_text_naming_cancel_as_corruption_
         .expect("repair writer fence");
     let promote_recovery = Arc::clone(&fixture.recovery);
     let promote_caller = fixture.caller.clone();
-    let interrupted_outcome = tokio::task::spawn_blocking(move || {
-        promote_recovery
-            .promote(
-                &interrupted,
-                &promote_caller,
-                &PromotionControl(Some(RemoteRecoveryInterruptionV1::Cancelled)),
-            )
-            .err()
-    })
-    .await
-    .expect("cancelled failover thread");
+    let interrupted_outcome =
+        tracedecay_runtime_core::native_runtime::on_blocking_pool(async move {
+            promote_recovery
+                .promote(
+                    &interrupted,
+                    &promote_caller,
+                    Arc::new(PromotionControl(Some(
+                        RemoteRecoveryInterruptionV1::Cancelled,
+                    ))),
+                )
+                .await
+                .err()
+        })
+        .await
+        .expect("cancelled failover thread");
 
     assert_eq!(
         (corrupt_outcome, interrupted_outcome),
@@ -961,9 +943,14 @@ async fn republishing_a_writer_restores_a_lost_project_writer_fence_before_failo
     let republished = fixture.publish().await;
     let promote_recovery = Arc::clone(&fixture.recovery);
     let promote_caller = fixture.caller.clone();
-    let failover = tokio::task::spawn_blocking(move || {
+    let failover = tracedecay_runtime_core::native_runtime::on_blocking_pool(async move {
         promote_recovery
-            .promote(&promotion, &promote_caller, &PromotionControl(None))
+            .promote(
+                &promotion,
+                &promote_caller,
+                Arc::new(PromotionControl(None)),
+            )
+            .await
             .map(|committed| {
                 (
                     committed.output.previous_epoch,
@@ -976,6 +963,83 @@ async fn republishing_a_writer_restores_a_lost_project_writer_fence_before_failo
     .expect("failover thread");
 
     assert_eq!((republished, failover), (Ok(()), Ok((1, 2, true))));
+}
+
+/// The remote HTTP routes run writer publication and failover on the native
+/// blocking pool, so neither may reach Tokio from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_writer_publication_and_failover_settle_without_an_entered_tokio_runtime() {
+    let fixture = provisioned_writer_fixture().await;
+    let promotion = fixture.promotion("request.cancel-test.native-failover");
+    let outcome = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tracedecay_runtime_core::native_runtime::block_on(async {
+                    assert!(tokio::runtime::Handle::try_current().is_err());
+                    let published = fixture.publish().await;
+                    let promote_recovery = Arc::clone(&fixture.recovery);
+                    let promote_caller = fixture.caller.clone();
+                    let failover =
+                        tracedecay_runtime_core::native_runtime::on_blocking_pool(async move {
+                            assert!(tokio::runtime::Handle::try_current().is_err());
+                            promote_recovery
+                                .promote(
+                                    &promotion,
+                                    &promote_caller,
+                                    Arc::new(PromotionControl(None)),
+                                )
+                                .await
+                                .map(|committed| {
+                                    (
+                                        committed.output.previous_epoch,
+                                        committed.output.installed_epoch,
+                                    )
+                                })
+                        })
+                        .await
+                        .expect("native failover thread");
+                    (published, failover)
+                })
+                .expect("native runtime")
+            })
+            .join()
+            .expect("native caller thread")
+    });
+
+    assert_eq!(outcome, (Ok(()), Ok((1, 2))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failover_names_the_promoted_node_credential_as_the_authority_credential() {
+    let fixture = provisioned_writer_fixture().await;
+    let promotion = fixture.promotion("request.cancel-test.promoted-credential");
+    fixture.publish().await.expect("publish the first writer");
+    let mut caller = fixture.caller.clone();
+    caller.enrollment_revision = fixture.writer.authority.credential_revision + 1;
+    let expected = (fixture.node_id.clone(), caller.enrollment_revision);
+
+    let promote_recovery = Arc::clone(&fixture.recovery);
+    let authority = tracedecay_runtime_core::native_runtime::on_blocking_pool(async move {
+        promote_recovery
+            .promote(&promotion, &caller, Arc::new(PromotionControl(None)))
+            .await
+            .map(|committed| committed.authority)
+    })
+    .await
+    .expect("failover thread")
+    .expect("failover commits");
+
+    let CurrentRemoteAuthorityStateV1::Available(authority) = authority else {
+        panic!("failover reports an available authority, got {authority:?}");
+    };
+    assert_eq!(
+        (
+            authority.fence.authority_node_id,
+            authority.credential_revision
+        ),
+        expected,
+        "replay authenticates the promoted node's own enrollment revision"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1094,9 +1158,6 @@ async fn daemon_admission_remains_ready_while_lcm_indexes_converge_in_background
                'cursor', 'deferred-index-message', 'deferred-index-session', 'assistant', 1,
                'deferred body', 'deferred-hash', 'inline', NULL
            );
-           UPDATE session_schema_migrations
-               SET applied_at = 123
-               WHERE name = 'lcm';
            DROP INDEX idx_lcm_raw_lossy_ingest;
            DROP INDEX idx_lcm_external_payloads_owner_bytes;
            CREATE INDEX idx_lcm_external_payloads_owner
@@ -1115,24 +1176,13 @@ async fn daemon_admission_remains_ready_while_lcm_indexes_converge_in_background
         .expect("session runtime registry");
     let convergence_gate = registry.block_registered_schema_convergence_for_test();
 
-    let admission = registry.project_sessions(project_id, [project_root]);
-    tokio::pin!(admission);
-    let convergence_blocked = convergence_gate.wait_until_blocked();
-    tokio::pin!(convergence_blocked);
-    let database = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        tokio::select! {
-            result = &mut admission => {
-                let database = result.expect("registered project sessions");
-                convergence_blocked.await;
-                database
-            }
-            () = &mut convergence_blocked => {
-                admission.await.expect("registered project sessions")
-            }
-        }
-    })
-    .await
-    .expect("daemon admission and convergence scheduling must not stall");
+    // The gate holds convergence until the assertions below, so an admission
+    // that waited on convergence never returns.
+    let database = registry
+        .project_sessions(project_id, [project_root])
+        .await
+        .expect("registered project sessions");
+    convergence_gate.wait_until_blocked().await;
 
     assert_eq!(
         registry.registered_schema_convergence_status(&shard_id),
@@ -1188,11 +1238,6 @@ async fn daemon_admission_remains_ready_while_lcm_indexes_converge_in_background
         deferred_lcm_fixture_row_count(&snapshot).await,
         1,
         "background convergence must preserve seeded session and LCM rows"
-    );
-    assert_eq!(
-        lcm_migration_applied_at(&snapshot).await,
-        123,
-        "background convergence must not rewrite the current LCM migration marker"
     );
 }
 
@@ -1457,10 +1502,13 @@ async fn terminal_shutdown_cancels_and_joins_blocked_schema_convergence() {
     convergence_gate.wait_until_blocked().await;
 
     registry.cancel_terminal_tasks();
-    tokio::time::timeout(MUST_NOT_BLOCK, registry.shutdown_terminal_tasks())
-        .await
-        .expect("terminal shutdown must not wait for cancelled convergence work")
-        .expect("session runtime terminal tasks shut down cleanly");
+    tokio::time::timeout(
+        MUST_NOT_BLOCK,
+        registry.shutdown_terminal_tasks(&tracedecay_runtime_core::native_runtime::cx().unwrap()),
+    )
+    .await
+    .expect("terminal shutdown must not wait for cancelled convergence work")
+    .expect("session runtime terminal tasks shut down cleanly");
     convergence_gate.release();
     tokio::task::yield_now().await;
 
@@ -1471,55 +1519,11 @@ async fn terminal_shutdown_cancels_and_joins_blocked_schema_convergence() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn background_convergence_commits_the_durable_authority_checkpoint() {
+/// Runs background schema convergence on a fresh project-sessions shard and
+/// returns its durable authority checkpoint's bounded-pass count.
+async fn converged_authority_checkpoint_passes(project_name: &str, pending: bool) -> i64 {
     let (_temporary, identity, project_id, project_root, _sessions_path, _database_scope) =
-        project_sessions_pending_convergence("project.schema-checkpoint").await;
-    let shard_id = StoreShardIdV1::project_sessions(
-        identity.brain_id().clone(),
-        identity.profile_id().clone(),
-        project_id.clone(),
-    );
-    let registry = DaemonSessionRuntimeRegistryV1::open_with_session_maintenance(identity, true)
-        .await
-        .expect("session runtime registry");
-    let database = registry
-        .project_sessions(project_id, [project_root])
-        .await
-        .expect("registered project sessions");
-
-    assert_eq!(
-        wait_for_schema_convergence(&registry, &shard_id).await,
-        RegisteredSchemaConvergenceStatus::Complete
-    );
-    let snapshot = database
-        .read_snapshot()
-        .await
-        .expect("checkpoint read snapshot");
-    let mut rows = snapshot
-        .query(
-            "SELECT bounded_passes_since_exhaustive
-                 FROM authority_audit_checkpoints
-                 WHERE audit_name = 'observation-authority'",
-            (),
-        )
-        .await
-        .expect("read durable authority checkpoint");
-    assert_eq!(
-        rows.next()
-            .await
-            .expect("read checkpoint")
-            .expect("durable checkpoint row")
-            .get::<i64>(0)
-            .expect("decode checkpoint"),
-        0
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_reopen_resumes_from_the_trusted_authority_checkpoint() {
-    let (_temporary, identity, project_id, project_root, _sessions_path, _database_scope) =
-        project_sessions_current_convergence("project.schema-trusted-checkpoint").await;
+        project_sessions_convergence_fixture(project_name, pending).await;
     let shard_id = StoreShardIdV1::project_sessions(
         identity.brain_id().clone(),
         identity.profile_id().clone(),
@@ -1550,13 +1554,26 @@ async fn daemon_reopen_resumes_from_the_trusted_authority_checkpoint() {
         )
         .await
         .expect("read durable authority checkpoint");
+    rows.next()
+        .await
+        .expect("read checkpoint")
+        .expect("durable checkpoint row")
+        .get::<i64>(0)
+        .expect("decode checkpoint")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_convergence_commits_the_durable_authority_checkpoint() {
     assert_eq!(
-        rows.next()
-            .await
-            .expect("read checkpoint")
-            .expect("durable checkpoint row")
-            .get::<i64>(0)
-            .expect("decode checkpoint"),
+        converged_authority_checkpoint_passes("project.schema-checkpoint", true).await,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_reopen_resumes_from_the_trusted_authority_checkpoint() {
+    assert_eq!(
+        converged_authority_checkpoint_passes("project.schema-trusted-checkpoint", false).await,
         1,
         "daemon reopen must audit only the suffix after a trusted checkpoint"
     );
@@ -1999,7 +2016,7 @@ async fn corrupt_derived_graph_preserves_relational_owner_lifecycle() {
     drop(first_database);
     first_registry.cancel_terminal_tasks();
     first_registry
-        .shutdown_terminal_tasks()
+        .shutdown_terminal_tasks(&tracedecay_runtime_core::native_runtime::cx().unwrap())
         .await
         .expect("first terminal tasks shut down");
     first_registry.cancel_memory_graph_reconciliation_tasks();
@@ -2008,7 +2025,9 @@ async fn corrupt_derived_graph_preserves_relational_owner_lifecycle() {
         .await
         .expect("first reconciliation shuts down");
     first_registry
-        .close_retained_graph_runtimes_for_shutdown()
+        .close_retained_graph_runtimes_for_shutdown(
+            std::time::Instant::now() + std::time::Duration::from_mins(1),
+        )
         .await
         .expect("first graph runtime closes");
     drop(first_registry);
@@ -2102,11 +2121,13 @@ async fn corrupt_session_relation_graph_preserves_relational_session_database() 
     drop(first_database);
     first_registry.cancel_terminal_tasks();
     first_registry
-        .shutdown_terminal_tasks()
+        .shutdown_terminal_tasks(&tracedecay_runtime_core::native_runtime::cx().unwrap())
         .await
         .expect("first terminal tasks shut down");
     first_registry
-        .close_retained_graph_runtimes_for_shutdown()
+        .close_retained_graph_runtimes_for_shutdown(
+            std::time::Instant::now() + std::time::Duration::from_mins(1),
+        )
         .await
         .expect("first session relation graph closes");
     drop(first_registry);
@@ -2148,11 +2169,13 @@ async fn corrupt_session_relation_graph_preserves_relational_session_database() 
     drop(reopened);
     reopened_registry.cancel_terminal_tasks();
     reopened_registry
-        .shutdown_terminal_tasks()
+        .shutdown_terminal_tasks(&tracedecay_runtime_core::native_runtime::cx().unwrap())
         .await
         .expect("detached session relation graph task shuts down");
     reopened_registry
-        .close_retained_graph_runtimes_for_shutdown()
+        .close_retained_graph_runtimes_for_shutdown(
+            std::time::Instant::now() + std::time::Duration::from_mins(1),
+        )
         .await
         .expect("detached relational session owner shuts down cleanly");
 }

@@ -7,13 +7,14 @@
 use super::*;
 use tracedecay_daemon_service::shutdown::DaemonLifecycle;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::native_runtime::{self, TimeoutError};
 use tracedecay_runtime_core::path_safety::{plain_host_path, same_canonical_path};
 
 /// Bounds how long a foreground request waits for a route's background open.
 /// The open task itself is deliberately left running after the deadline.
 pub(super) async fn wait_for_project_open_publication<Publication, Output>(
     project_path: &Path,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
     publication: Publication,
 ) -> Result<Output>
 where
@@ -25,11 +26,94 @@ where
     // Callers repair that with `prefer_recorded_open_failure` against the
     // claim's own watch channel instead of weakening the bound.
     tracing::Instrument::instrument(
-        tokio::time::timeout_at(deadline, publication),
+        native_runtime::timeout_at(deadline, publication),
         tracing::trace_span!("daemon.project.open.publication_wait"),
     )
     .await
-    .map_err(|_| project_warming_error(project_path))?
+    .map_err(|error| match error {
+        TimeoutError::Elapsed => project_warming_error(project_path),
+        TimeoutError::TimerUnavailable(_) => TraceDecayError::Config {
+            message: error.to_string(),
+        },
+    })?
+}
+
+/// Ride out one claimed project open for the bounded publication wait.
+///
+/// `published` probes for the published server on every iteration. `ready`
+/// is the final cache check once the open reports Ready: the open task
+/// publishes the server before it flips to Ready, but the waiter read the
+/// cache before it read the state, so a publication that raced the iteration
+/// is honored instead of answering a spurious failure.
+pub(super) async fn await_claimed_project_open<Published, PublishedFuture, Ready, ReadyFuture>(
+    claim: ProjectOpenTaskClaim,
+    project_path: &Path,
+    publication_deadline: Instant,
+    published: Published,
+    ready: Ready,
+) -> Result<Arc<crate::mcp::McpServer>>
+where
+    Published: Fn() -> PublishedFuture,
+    PublishedFuture: std::future::Future<Output = Result<Option<Arc<crate::mcp::McpServer>>>>,
+    Ready: Fn() -> ReadyFuture,
+    ReadyFuture: std::future::Future<Output = Result<Option<Arc<crate::mcp::McpServer>>>>,
+{
+    match claim {
+        ProjectOpenTaskClaim::InFlight(state) => {
+            let recorded = state.clone();
+            let publication = async {
+                let mut state = state;
+                loop {
+                    if let Some(server) = published().await? {
+                        return Ok(server);
+                    }
+                    let current = state.borrow().clone();
+                    match current {
+                        ProjectOpenTaskState::Opening => {
+                            tokio::select! {
+                                changed = state.changed() => {
+                                    changed.map_err(|_| TraceDecayError::Config {
+                                        message: "project open task ended before reporting an outcome"
+                                            .to_string(),
+                                    })?;
+                                }
+                                slept = native_runtime::sleep_until(Instant::now() + Duration::from_millis(25)) => {
+                                    slept.map_err(|message| TraceDecayError::Config { message })?;
+                                }
+                            }
+                        }
+                        ProjectOpenTaskState::Ready => {
+                            if let Some(server) = ready().await? {
+                                return Ok(server);
+                            }
+                            return Err(TraceDecayError::Config {
+                                message: "project open completed without publishing a server"
+                                    .to_string(),
+                            });
+                        }
+                        ProjectOpenTaskState::Failed(failure) => {
+                            return Err(failure.to_error());
+                        }
+                    }
+                }
+            };
+            // Riding out an open is a park, not work: the admission slot is
+            // released for the wait's duration so a tool that needs no project
+            // owner is never shed by a queue of warming clients. The wait stays
+            // bounded by PROJECT_OPEN_REQUEST_DEADLINE inside the helper.
+            prefer_recorded_open_failure(
+                park_admission(wait_for_project_open_publication(
+                    project_path,
+                    publication_deadline,
+                    publication,
+                ))
+                .await,
+                &recorded,
+            )
+        }
+        ProjectOpenTaskClaim::Failed(failure) => Err(failure.to_error()),
+        ProjectOpenTaskClaim::Saturated => Err(project_open_task_capacity_error()),
+    }
 }
 
 #[tracing::instrument(name = "daemon.project.orchestrate.start", level = "trace", skip_all)]
@@ -111,7 +195,8 @@ pub(super) fn spawn_lifecycle_automation_scheduler_activation<ActivationFuture>(
     let Some(activity) = lifecycle.try_enter() else {
         return;
     };
-    tokio::spawn(tracing::Instrument::instrument(
+    // Detached: draining ends it, and its activity permit holds idle until then.
+    let started = native_runtime::NativeTask::spawn(tracing::Instrument::instrument(
         async move {
             let _activity = activity;
             tokio::select! {
@@ -122,6 +207,15 @@ pub(super) fn spawn_lifecycle_automation_scheduler_activation<ActivationFuture>(
         },
         tracing::trace_span!("daemon.project.activate.automation"),
     ));
+    if let Err(error) = started {
+        log_daemon_event(
+            "automation_scheduler_activation",
+            &[
+                ("outcome", "runtime_unavailable".to_string()),
+                ("error", error),
+            ],
+        );
+    }
 }
 
 #[tracing::instrument(name = "daemon.project.enroll.route", level = "trace", skip_all)]
@@ -208,11 +302,20 @@ pub(super) async fn ensure_registered_project_route(
             .profile_root()
             .to_path_buf();
         let probe_path = project_path.clone();
-        if let Some(layout) = bounded_repository_probe(&project_path, move || {
-            tracedecay_runtime_core::storage::resolve_persisted_layout(&probe_path, &profile_root)
-        })
-        .await??
-        {
+        if let Some(layout) = tracedecay_runtime_core::git_discovery::bounded_repository_probe(
+            &project_path,
+            super::core_proxy::repository_discovery_parent_deadline(),
+            move || {
+                tracedecay_runtime_core::storage::resolve_persisted_layout(
+                    &probe_path,
+                    &profile_root,
+                )
+            },
+        )
+        .await
+        .map_err(|reason| {
+            super::core_proxy::repository_discovery_deferred(&project_path, reason)
+        })?? {
             let project_id =
                 layout
                     .identity
@@ -300,20 +403,26 @@ pub(super) async fn durable_enrollment_resolves_existing_store(
     };
     let profile_root = identity.profile_root().to_path_buf();
     let probe_path = project_path.to_path_buf();
-    bounded_repository_probe(project_path, move || {
-        let Ok(Some(layout)) =
-            tracedecay_runtime_core::storage::resolve_persisted_layout(&probe_path, &profile_root)
-        else {
-            return false;
-        };
-        layout.graph_db_path.is_file()
-            || layout.sessions_db_path.is_file()
-            || layout
-                .manifest_path
-                .as_deref()
-                .is_some_and(std::path::Path::is_file)
-    })
+    tracedecay_runtime_core::git_discovery::bounded_repository_probe(
+        project_path,
+        super::core_proxy::repository_discovery_parent_deadline(),
+        move || {
+            let Ok(Some(layout)) = tracedecay_runtime_core::storage::resolve_persisted_layout(
+                &probe_path,
+                &profile_root,
+            ) else {
+                return false;
+            };
+            layout.graph_db_path.is_file()
+                || layout.sessions_db_path.is_file()
+                || layout
+                    .manifest_path
+                    .as_deref()
+                    .is_some_and(std::path::Path::is_file)
+        },
+    )
     .await
+    .map_err(|reason| super::core_proxy::repository_discovery_deferred(project_path, reason))
 }
 
 fn unenrolled_project_route_error(project_path: &Path) -> TraceDecayError {
@@ -540,80 +649,23 @@ pub(super) async fn portable_project_server_for_request(
         // The bound starts here, after the open is claimed. Starting it at
         // connection arrival let route enrollment spend it, and the request
         // then answered warming for a refusal already on the watch.
-        let publication_deadline = project_open_publication_deadline(tokio::time::Instant::now());
-        let result = match claim {
-            ProjectOpenTaskClaim::InFlight(state) => {
-                let recorded = state.clone();
-                let publication = async {
-                    let mut state = state;
-                    loop {
-                        if let Some(server) = portable_cached_project_server(
-                            &store_administration,
-                            &canonical_project_path,
-                            handshake,
-                            requirement,
-                        )
-                        .await?
-                        {
-                            return Ok(server);
-                        }
-                        let current = state.borrow().clone();
-                        match current {
-                            ProjectOpenTaskState::Opening => {
-                                tokio::select! {
-                                    changed = state.changed() => {
-                                        changed.map_err(|_| TraceDecayError::Config {
-                                            message: "project open task ended before reporting an outcome"
-                                                .to_string(),
-                                        })?;
-                                    }
-                                    () = tokio::time::sleep(Duration::from_millis(25)) => {}
-                                }
-                            }
-                            ProjectOpenTaskState::Ready => {
-                                // The open task publishes the server before it
-                                // flips to Ready, but this waiter read the cache
-                                // before it read the state, so a publication that
-                                // raced this iteration must be honored with one
-                                // final cache check instead of a spurious failure.
-                                if let Some(server) = portable_cached_project_server(
-                                    &store_administration,
-                                    &canonical_project_path,
-                                    handshake,
-                                    requirement,
-                                )
-                                .await?
-                                {
-                                    return Ok(server);
-                                }
-                                return Err(TraceDecayError::Config {
-                                    message: "project open completed without publishing a server"
-                                        .to_string(),
-                                });
-                            }
-                            ProjectOpenTaskState::Failed(failure) => {
-                                return Err(failure.to_error());
-                            }
-                        }
-                    }
-                };
-                // Riding out an open is a park, not work: the admission slot is
-                // released for the wait's duration so a tool that needs no project
-                // owner is never shed by a queue of warming clients. The wait stays
-                // bounded by PROJECT_OPEN_REQUEST_DEADLINE inside the helper.
-                prefer_recorded_open_failure(
-                    park_admission(wait_for_project_open_publication(
-                        &canonical_project_path,
-                        publication_deadline,
-                        publication,
-                    ))
-                    .await,
-                    &recorded,
-                )
-            }
-            ProjectOpenTaskClaim::Failed(failure) => Err(failure.to_error()),
-            ProjectOpenTaskClaim::Saturated => Err(project_open_task_capacity_error()),
+        let publication_deadline = project_open_publication_deadline(Instant::now());
+        let probe = || {
+            portable_cached_project_server(
+                &store_administration,
+                &canonical_project_path,
+                handshake,
+                requirement,
+            )
         };
+        let result = await_claimed_project_open(
+            claim,
+            &canonical_project_path,
+            publication_deadline,
+            probe,
+            probe,
+        )
+        .await;
         if project_open_tasks(project_open_gates.as_ref())
             .await
             .admit_explicit_init_retry(

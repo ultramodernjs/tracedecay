@@ -270,8 +270,9 @@ pub(crate) fn project(
                     } else {
                         fields(&value["selector"], &["idempotency_key"])?;
                     }
-                    control["delivery_key"] = json!(opaque_surface_id(
+                    control["delivery_key"] = json!(opaque_caller_id(
                         namespace,
+                        &call.exact_scope,
                         b"idempotency-key",
                         string(&value["selector"]["idempotency_key"])?
                     ));
@@ -337,7 +338,7 @@ pub(crate) fn project(
             if let Some(target) = retained_target {
                 control["target"] = target;
             }
-            let binding = cursor_binding(call, value)?;
+            let binding = cursor_binding(call, namespace, value)?;
             control["after"] = json!(match nullable_string(&value["cursor"])? {
                 None => 0,
                 Some(cursor) => {
@@ -654,6 +655,29 @@ pub(crate) fn project(
     Some(Some(json!({"common_control": control})))
 }
 
+pub(super) fn validate_delivery_caller(
+    call: &ProviderCall,
+    namespace: &NcmNamespace,
+    delivery: &Value,
+) -> Option<()> {
+    if let Some(binding) = delivery.get("caller_binding") {
+        fields(
+            delivery,
+            &["operation_id", "idempotency_key", "caller_binding"],
+        )?;
+        fields(binding, &["version", "exact_scope"])?;
+        if namespace.1 != NcmNamespaceBinding::CheckoutObservationsV1
+            || binding["version"] != 1
+            || scope(&binding["exact_scope"])? != call.exact_scope
+        {
+            return None;
+        }
+    } else {
+        fields(delivery, &["operation_id", "idempotency_key"])?;
+    }
+    Some(())
+}
+
 pub(super) fn decode_receipt_capsule(capsule: &Value) -> Option<Value> {
     fields(capsule, &["version", "bytes", "sha256"])?;
     if capsule["bytes"].as_array()?.len() > 131_072
@@ -664,7 +688,12 @@ pub(super) fn decode_receipt_capsule(capsule: &Value) -> Option<Value> {
     decode_named_capsule(&json!({"receipt": capsule}), "receipt")
 }
 
-fn maintenance_receipt_item(call: &ProviderCall, request: &Value, row: &Value) -> Option<Value> {
+fn maintenance_receipt_item(
+    call: &ProviderCall,
+    namespace: &NcmNamespace,
+    request: &Value,
+    row: &Value,
+) -> Option<Value> {
     fields(row, &["maintenance_receipt", "provider_receipt_digest"])?;
     let retained = &row["maintenance_receipt"];
     fields(
@@ -697,7 +726,7 @@ fn maintenance_receipt_item(call: &ProviderCall, request: &Value, row: &Value) -
     let scanned = outcome["scanned_items"].as_u64()?;
     let changed = outcome["changed_items"].as_u64()?;
     let removed = outcome["removed_items"].as_u64()?;
-    if admission["namespace"] != NcmNamespace::from_exact_scope(&call.exact_scope).as_str()
+    if admission["namespace"] != namespace.as_str()
         || idempotency_key != request["selector"]["idempotency_key"].as_str()?
         || request["selector"]
             .get("operation_id")
@@ -730,7 +759,7 @@ fn maintenance_receipt_item(call: &ProviderCall, request: &Value, row: &Value) -
     )
 }
 
-fn cursor_binding(call: &ProviderCall, value: &Value) -> Option<String> {
+fn cursor_binding(call: &ProviderCall, namespace: &NcmNamespace, value: &Value) -> Option<String> {
     let basis = if value["view"] == "capability_status" {
         json!([
             value["view"],
@@ -746,7 +775,7 @@ fn cursor_binding(call: &ProviderCall, value: &Value) -> Option<String> {
         ])
     };
     Some(opaque_surface_id(
-        &NcmNamespace::from_exact_scope(&call.exact_scope),
+        namespace,
         b"inspection-cursor",
         &serde_json::to_string(&basis).ok()?,
     ))
@@ -754,6 +783,7 @@ fn cursor_binding(call: &ProviderCall, value: &Value) -> Option<String> {
 
 fn reconstruct_feedback_delivery(
     call: &ProviderCall,
+    namespace: &NcmNamespace,
     reply: &mut ProviderReply,
     payload: &Value,
 ) -> Option<()> {
@@ -767,7 +797,6 @@ fn reconstruct_feedback_delivery(
             "request_semantic_sha256",
         ],
     )?;
-    let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
     let request: Value = serde_json::from_slice(&call.payload.bytes).ok()?;
     let expected = project(call, &request, &namespace, None)??;
     let admission =
@@ -817,6 +846,7 @@ pub(crate) fn reconstruct(
     reply: &mut ProviderReply,
     readiness: &crate::AcceptedReadiness,
 ) -> Option<()> {
+    let namespace = &readiness.namespace;
     let payload: Value = serde_json::from_slice(&reply.payload.as_ref()?.bytes).ok()?;
     let mut output = payload.as_object()?.clone();
     if !output.contains_key("common_control") {
@@ -827,7 +857,7 @@ pub(crate) fn reconstruct(
     output.remove("no_change");
     output.remove("_retained_receipt");
     if call.operation == ProviderOperation::Feedback {
-        reconstruct_feedback_delivery(call, reply, &payload)?;
+        reconstruct_feedback_delivery(call, namespace, reply, &payload)?;
         output.remove("feedback_delivery_capsule");
     }
     if call.operation == ProviderOperation::Health {
@@ -851,7 +881,6 @@ pub(crate) fn reconstruct(
         {
             return None;
         }
-        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let projected = project(call, &request, &namespace, None)??;
         let after = projected["common_control"]["after"].as_u64()?;
         let offset = usize::try_from(after).ok()?;
@@ -872,7 +901,7 @@ pub(crate) fn reconstruct(
             .take(usize::try_from(maximum_items).ok()?)
             .map(|capability| json!({"capability_id": capability.as_str(), "state": "available"}))
             .collect::<Vec<_>>();
-        let binding = cursor_binding(call, &request)?;
+        let binding = cursor_binding(call, namespace, &request)?;
         // Try complete public replies, including cursor, warnings, caller identity,
         // and extensions. A payload-only sum cannot enforce the negotiated ceiling.
         let minimum_items = usize::from(offset < readiness.descriptor.capabilities.len());
@@ -919,7 +948,6 @@ pub(crate) fn reconstruct(
         return Some(());
     } else if call.operation == ProviderOperation::Inspection {
         let request: Value = serde_json::from_slice(&call.payload.bytes).ok()?;
-        let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let retained_locator = match request.get("target") {
             Some(raw_target) => {
                 let projected = target(call, raw_target, &namespace)?;
@@ -941,7 +969,7 @@ pub(crate) fn reconstruct(
                 if !items.is_empty() {
                     return None;
                 }
-                let item = maintenance_receipt_item(call, &request, row)?;
+                let item = maintenance_receipt_item(call, namespace, &request, row)?;
                 let item_bytes = serde_json::to_vec(&item).ok()?.len() as u64;
                 if bytes_used.saturating_add(item_bytes) > request["maximum_bytes"].as_u64()? {
                     partial = true;
@@ -972,6 +1000,7 @@ pub(crate) fn reconstruct(
             let original = &retained["original_source"];
             let source = retained_source(
                 call,
+                namespace,
                 &retained,
                 &row["provenance"],
                 row["source"].as_str()?,
@@ -1011,7 +1040,7 @@ pub(crate) fn reconstruct(
             }
             let mut item = if request["view"] == "delivery_receipt" {
                 let delivery = decode_receipt_capsule(&row["delivery_capsule"])?;
-                fields(&delivery, &["operation_id", "idempotency_key"])?;
+                validate_delivery_caller(call, namespace, &delivery)?;
                 let operation_id = string(&delivery["operation_id"])?;
                 let idempotency_key = string(&delivery["idempotency_key"])?;
                 let receipt = string(&row["provider_receipt_digest"])?;
@@ -1130,7 +1159,7 @@ pub(crate) fn reconstruct(
         let cursor = match payload["cursor_after"].as_u64() {
             Some(after) => json!(format!(
                 "ncm-cursor:{after}:{}",
-                cursor_binding(call, &request)?
+                cursor_binding(call, namespace, &request)?
             )),
             None => Value::Null,
         };
@@ -1191,7 +1220,7 @@ mod legacy_trace_tests {
 
     #[test]
     fn legacy_trace_requires_exact_namespace_record_and_unknown_attribution() {
-        let namespace = NcmNamespace("ab".repeat(32));
+        let namespace = NcmNamespace("ab".repeat(32), NcmNamespaceBinding::ExactSessionV1);
         let row = json!({"legacy_record_id":1,"legacy_namespace_sha256":hex_digest(&Sha256::digest(namespace.as_str().as_bytes())),"stable_memory_ref":"1",
             "content":"retained 🦀", "content_sha256":hex_digest(&Sha256::digest("retained 🦀".as_bytes())),"original_source":null});
         assert!(legacy_trace_item(&namespace, "1", &row).is_some());

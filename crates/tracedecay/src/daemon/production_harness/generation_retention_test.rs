@@ -7,9 +7,9 @@ use tracedecay_contracts::doctor::DoctorStorageFamilyReadV1;
 use tracedecay_contracts::storage::compaction::CompactionThresholdConfig;
 use tracedecay_domain::{CodeGenerationId, canonical_text::sha256_hex};
 
-use super::journey_test_support::git;
 use super::*;
 use crate::daemon::maintenance::project_store_maintenance_lease;
+use crate::test_support::git::git;
 use tracedecay_code_index_retention::code_index_generations::{
     CodeGenerationRetentionErrorV1, MAX_CODE_GENERATION_RETENTION_BATCH_V1,
     code_generation_segments_root, prepare_next_code_generation_retention_cancellable,
@@ -238,15 +238,27 @@ async fn mounted_code_generation_retention_continues_capped_segment_reclamation(
             path
         })
         .collect::<Vec<_>>();
-    let outcome = tracedecay_maintenance::generation::run_project_generation_maintenance(
-        &project_store_maintenance_lease(graph.as_ref()),
-        schedulers,
-        &observations,
-        &cancellation,
-        Some(&compaction),
-        None,
-    )
-    .await;
+    // The mounted scheduler can still move the active generation or hold the
+    // generation store; such a pass defers as `Retry` before it sweeps.
+    let outcome = loop {
+        let outcome = tracedecay_maintenance::generation::run_project_generation_maintenance(
+            &project_store_maintenance_lease(graph.as_ref()),
+            schedulers,
+            &observations,
+            &cancellation,
+            Some(&compaction),
+            None,
+        )
+        .await;
+        if outcome != MaintenanceTickOutcome::Retry {
+            break outcome;
+        }
+        assert!(
+            orphan_segments.iter().all(|path| path.exists()),
+            "a deferred pass must not sweep segments"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     assert_eq!(
         outcome,
         MaintenanceTickOutcome::Continue(MaintenanceContinuation::CodeGenerationRetention),

@@ -217,7 +217,8 @@ async fn assert_health_route(handle: &StoreRuntimeClientLease, writer_expected: 
 
     let (request, probe) = health_request(handle.binding());
     let outcome = handle
-        .dispatch_read(request, &probe)
+        .dispatch_read(request, Arc::new(probe))
+        .await
         .expect("health data port must be mounted");
     assert!(matches!(
         outcome.value(),
@@ -225,7 +226,7 @@ async fn assert_health_route(handle: &StoreRuntimeClientLease, writer_expected: 
     ));
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn lifecycle_publisher_mounts_profile_project_and_session_health_routes() {
     let root = TempDir::new().unwrap();
     let resolver = Arc::new(FileResolver::default());
@@ -234,6 +235,7 @@ async fn lifecycle_publisher_mounts_profile_project_and_session_health_routes() 
     resolver.push(seed_db(&root, "sessions.db"));
 
     let registry = StoreRuntimeRegistry::with_config(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
         resolver,
         Arc::new(LifecycleShardRuntimePublisher),
         StoreRuntimeRegistryConfig::new(2).unwrap(),
@@ -257,13 +259,18 @@ async fn lifecycle_publisher_mounts_profile_project_and_session_health_routes() 
     assert_health_route(&sessions, true).await;
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn read_only_open_mounts_readers_without_acquiring_a_writer() {
     let root = TempDir::new().unwrap();
     let resolver = Arc::new(FileResolver::default());
     resolver.push(seed_final_graph_db(&root, "profile.db").await);
     resolver.push(seed_final_graph_db(&root, "project.db").await);
-    let registry = StoreRuntimeRegistry::new(resolver, Arc::new(LifecycleShardRuntimePublisher));
+    let registry = StoreRuntimeRegistry::new(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        resolver,
+        Arc::new(LifecycleShardRuntimePublisher),
+    )
+    .unwrap();
     let _profile = open_published(
         &registry,
         StoreRuntimeOpenRequest::new(profile_shard(), incarnation(), None),
@@ -293,20 +300,27 @@ async fn read_only_open_mounts_readers_without_acquiring_a_writer() {
     assert_health_route(&project, false).await;
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn read_only_open_refuses_nonfinal_schema_as_reset_required_before_publication() {
     let root = TempDir::new().unwrap();
     let profile_path = seed_final_graph_db(&root, "profile.db").await;
     let project_path = seed_final_graph_db(&root, "project.db").await;
     Connection::open(&project_path)
         .unwrap()
-        .execute_batch("PRAGMA user_version = 31;")
+        .execute_batch(
+            "UPDATE tracedecay_schema_version SET version = 31 WHERE component = 'graph';",
+        )
         .unwrap();
 
     let resolver = Arc::new(FileResolver::default());
     resolver.push(profile_path);
     resolver.push(project_path);
-    let registry = StoreRuntimeRegistry::new(resolver, Arc::new(LifecycleShardRuntimePublisher));
+    let registry = StoreRuntimeRegistry::new(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        resolver,
+        Arc::new(LifecycleShardRuntimePublisher),
+    )
+    .unwrap();
     let _profile = open_published(
         &registry,
         StoreRuntimeOpenRequest::new(profile_shard(), incarnation(), None),
@@ -346,7 +360,7 @@ async fn read_only_open_refuses_nonfinal_schema_as_reset_required_before_publica
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn writable_existing_open_refuses_tampered_final_shape_before_publication() {
     let root = TempDir::new().unwrap();
     let profile_path = seed_db(&root, "profile.db");
@@ -359,7 +373,12 @@ async fn writable_existing_open_refuses_tampered_final_shape_before_publication(
     let resolver = Arc::new(FileResolver::default());
     resolver.push(profile_path);
     resolver.push(project_path.clone());
-    let registry = StoreRuntimeRegistry::new(resolver, Arc::new(LifecycleShardRuntimePublisher));
+    let registry = StoreRuntimeRegistry::new(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        resolver,
+        Arc::new(LifecycleShardRuntimePublisher),
+    )
+    .unwrap();
     let _profile = open_published(
         &registry,
         StoreRuntimeOpenRequest::new(profile_shard(), incarnation(), None),
@@ -406,7 +425,7 @@ async fn writable_existing_open_refuses_tampered_final_shape_before_publication(
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn remote_node_initialization_installs_only_the_final_registered_schema() {
     let root = TempDir::new().unwrap();
     let profile_path = root.path().join("profile.db");
@@ -414,7 +433,12 @@ async fn remote_node_initialization_installs_only_the_final_registered_schema() 
     let resolver = Arc::new(InitializingFileResolver::default());
     resolver.push(profile_path.clone());
     resolver.push(remote_path.clone());
-    let registry = StoreRuntimeRegistry::new(resolver, Arc::new(LifecycleShardRuntimePublisher));
+    let registry = StoreRuntimeRegistry::new(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        resolver,
+        Arc::new(LifecycleShardRuntimePublisher),
+    )
+    .unwrap();
 
     let profile_authority =
         crate::db::DatabaseAuthority::acquire_test(&profile_path, "initialize profile").unwrap();
@@ -476,14 +500,19 @@ async fn remote_node_initialization_installs_only_the_final_registered_schema() 
     );
 }
 
-#[tokio::test]
+#[asupersync::test]
 async fn distinct_logical_shards_cannot_publish_two_writers_for_one_database() {
     let root = TempDir::new().unwrap();
     let resolver = Arc::new(FileResolver::default());
     resolver.push(seed_db(&root, "profile.db"));
     let shared_path = seed_final_graph_db(&root, "shared-project.db").await;
     resolver.push(shared_path.clone());
-    let registry = StoreRuntimeRegistry::new(resolver, Arc::new(LifecycleShardRuntimePublisher));
+    let registry = StoreRuntimeRegistry::new(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        resolver,
+        Arc::new(LifecycleShardRuntimePublisher),
+    )
+    .unwrap();
     let _profile = open_published(
         &registry,
         StoreRuntimeOpenRequest::new(profile_shard(), incarnation(), None),
@@ -545,23 +574,27 @@ async fn rewind_to_pre_digest_shape(path: &Path) {
              DROP TRIGGER memory_v2_assertion_payload_digests_no_update;
              DROP INDEX memory_v2_assertion_payload_digests_lookup;
              DROP TABLE memory_v2_assertion_payload_digests;
-             PRAGMA user_version = 34;",
+             UPDATE tracedecay_schema_version SET version = 34 WHERE component = 'graph';",
         )
         .await
         .expect("rewind graph store to the pre-digest shape");
 }
 
 fn user_version(path: &Path) -> u32 {
-    Connection::open(path)
-        .unwrap()
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap()
+    let connection = Connection::open(path).unwrap();
+    let version = crate::db::schema_version::read_version_sync(
+        &connection,
+        crate::db::schema_version::GRAPH_COMPONENT,
+    )
+    .unwrap()
+    .unwrap_or(0);
+    u32::try_from(version).unwrap()
 }
 
 /// A store at an older released schema is never upgraded in place, even by a
 /// write-authorized open: admission fails with the typed fresh-start refusal
 /// and leaves the stamp untouched.
-#[tokio::test]
+#[asupersync::test]
 async fn existing_store_at_an_older_schema_is_refused_even_with_write_authority() {
     let root = TempDir::new().unwrap();
     let resolver = Arc::new(FileResolver::default());
@@ -569,7 +602,12 @@ async fn existing_store_at_an_older_schema_is_refused_even_with_write_authority(
     let project_path = seed_final_graph_db(&root, "project.db").await;
     rewind_to_pre_digest_shape(&project_path).await;
     resolver.push(project_path.clone());
-    let registry = StoreRuntimeRegistry::new(resolver, Arc::new(LifecycleShardRuntimePublisher));
+    let registry = StoreRuntimeRegistry::new(
+        asupersync::runtime::Runtime::current_handle().unwrap(),
+        resolver,
+        Arc::new(LifecycleShardRuntimePublisher),
+    )
+    .unwrap();
     let _profile = open_published(
         &registry,
         StoreRuntimeOpenRequest::new(profile_shard(), incarnation(), None),

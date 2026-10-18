@@ -84,7 +84,7 @@ fn payload(evidence: &Value) -> &Value {
 }
 
 /// Four conversational Claude records (two user, two assistant) whose text all
-/// contains [`SHARED_TERM`]; the third additionally contains [`UNIQUE_TERM`].
+/// contains [`SHARED_TERM`]; the third also contains [`UNIQUE_TERM`].
 fn write_claude_transcript(home: &std::path::Path, project: &std::path::Path) {
     let dir = home.join(".claude/projects/-claude-recall");
     std::fs::create_dir_all(&dir).expect("transcript directory");
@@ -208,13 +208,12 @@ async fn ingested_server() -> (Arc<McpServer>, TempDir, TempDir, TempDir) {
 fn omission_reasons(evidence: &Value) -> Vec<String> {
     evidence["omissions"]
         .as_array()
-        .map(|omissions| {
+        .map_or_default(|omissions| {
             omissions
                 .iter()
                 .map(|omission| omission["reason"].as_str().unwrap_or("").to_string())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[tokio::test]

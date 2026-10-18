@@ -4,13 +4,14 @@
 //! deliberately absent from these serializable payloads.
 
 use std::collections::BTreeSet;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tracedecay_domain::{
     BrainId, BrainNodeId, CurrentRemoteAuthorityStateV1, EnrollmentCredentialRecordV1, EntityId,
-    ProjectionGenerationId, RemoteAuthorityUnavailableReasonV1, RemoteCapabilityV1,
-    RemotePlacementRevisionV1, RemoteRepositoryScopeV1, RemoteWriterFenceV1, ShardId, UtcMicros,
+    RemoteAuthorityUnavailableReasonV1, RemoteCapabilityV1, RemoteRepositoryScopeV1,
+    RemoteWriterFenceV1, UtcMicros,
 };
 use tracedecay_tool_catalog::SchemaId;
 
@@ -71,17 +72,25 @@ pub trait RemoteProtocolPortV1<Request> {
         &self,
         request: RemoteProtocolRequestV1<Request>,
         credential: OpaqueRemoteCredential,
-    ) -> Result<RemoteProtocolResponseV1<Self::Output>, ApplicationContractError>;
+    ) -> RemoteProtocolFutureV1<'_, Self::Output>;
 
     fn execute_controlled(
         &self,
         request: RemoteProtocolRequestV1<Request>,
         credential: OpaqueRemoteCredential,
         _control: RemoteProtocolExecutionControlV1,
-    ) -> Result<RemoteProtocolResponseV1<Self::Output>, ApplicationContractError> {
+    ) -> RemoteProtocolFutureV1<'_, Self::Output> {
         self.execute(request, credential)
     }
 }
+
+pub type RemoteProtocolFutureV1<'a, T> = Pin<
+    Box<
+        dyn Future<Output = Result<RemoteProtocolResponseV1<T>, ApplicationContractError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 #[derive(Clone, Debug)]
 pub struct RemoteProtocolExecutionControlV1 {
@@ -112,7 +121,7 @@ impl<Port: ?Sized> RemoteProtocolServiceV1<Port> {
         Self { port }
     }
 
-    pub fn execute<Request>(
+    pub async fn execute<Request>(
         &self,
         request: RemoteProtocolRequestV1<Request>,
         credential: OpaqueRemoteCredential,
@@ -125,10 +134,10 @@ impl<Port: ?Sized> RemoteProtocolServiceV1<Port> {
         request
             .body
             .validate_remote_protocol_body(request.sent_at)?;
-        self.port.execute(request, credential)
+        self.port.execute(request, credential).await
     }
 
-    pub fn execute_controlled<Request>(
+    pub async fn execute_controlled<Request>(
         &self,
         request: RemoteProtocolRequestV1<Request>,
         credential: OpaqueRemoteCredential,
@@ -142,7 +151,9 @@ impl<Port: ?Sized> RemoteProtocolServiceV1<Port> {
         request
             .body
             .validate_remote_protocol_body(request.sent_at)?;
-        self.port.execute_controlled(request, credential, control)
+        self.port
+            .execute_controlled(request, credential, control)
+            .await
     }
 
     pub fn execute_enrollment(
@@ -331,24 +342,13 @@ impl<T> RemoteProtocolResponseV1<T> {
     }
 }
 
-/// Exact shard placement requested during current-authority discovery.
+/// Current-authority discovery for the caller's own enrolled repository
+/// scope. The authority answers from its durable rows only to the enrolled
+/// holder of the presented credential.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CurrentAuthorityRequestV1 {
-    pub brain_id: BrainId,
-    pub shard_id: ShardId,
-    pub generation_id: ProjectionGenerationId,
-    pub placement_revision: RemotePlacementRevisionV1,
-}
-
-impl CurrentAuthorityRequestV1 {
-    pub fn validate(&self) -> Result<(), ApplicationContractError> {
-        self.brain_id.validate()?;
-        self.shard_id.validate()?;
-        self.generation_id.validate()?;
-        self.placement_revision.validate()?;
-        Ok(())
-    }
+    pub scope: RemoteRepositoryScopeV1,
 }
 
 impl RemoteProtocolBodyV1 for CurrentAuthorityRequestV1 {
@@ -356,35 +356,12 @@ impl RemoteProtocolBodyV1 for CurrentAuthorityRequestV1 {
         &self,
         _sent_at: UtcMicros,
     ) -> Result<(), ApplicationContractError> {
-        self.validate()
+        self.scope
+            .validate()
+            .map_err(|_| ApplicationContractError::InvalidIdentifier {
+                field: "remote authority discovery scope",
+            })
     }
-}
-
-/// Ensure discovered authority evidence addresses exactly the requested
-/// Brain/shard/generation/placement. A response for a nearby shard or stale
-/// placement is never accepted as current.
-pub fn validate_current_authority_state(
-    request: &CurrentAuthorityRequestV1,
-    state: &CurrentRemoteAuthorityStateV1,
-) -> Result<(), ApplicationContractError> {
-    request.validate()?;
-    state.validate()?;
-    let fence = match state {
-        CurrentRemoteAuthorityStateV1::Available(authority) => Some(&authority.fence),
-        CurrentRemoteAuthorityStateV1::Partial { known_fence, .. } => known_fence.as_ref(),
-        CurrentRemoteAuthorityStateV1::Unavailable { .. } => None,
-    };
-    if fence.is_some_and(|fence| {
-        fence.brain_id != request.brain_id
-            || fence.shard_id != request.shard_id
-            || fence.generation_id != request.generation_id
-            || fence.placement_revision != request.placement_revision
-    }) {
-        return Err(ApplicationContractError::Inconsistent {
-            field: "current remote authority identity",
-        });
-    }
-    Ok(())
 }
 
 /// Public enrollment metadata. The opaque enrollment credential is accepted
@@ -615,8 +592,8 @@ mod tests {
 
     use super::*;
     use tracedecay_domain::{
-        AuthorityEpoch, CurrentRemoteAuthorityV1, ProjectId, RemotePlacementRevisionV1,
-        RepositoryId, RepositoryStateSnapshotId, WorktreeId,
+        AuthorityEpoch, ProjectId, ProjectionGenerationId, RemotePlacementRevisionV1, RepositoryId,
+        RepositoryStateSnapshotId, ShardId, WorktreeId,
     };
     use tracedecay_tool_catalog::SchemaId;
 
@@ -653,10 +630,10 @@ mod tests {
             &self,
             request: RemoteProtocolRequestV1<EmptyTestBody>,
             _credential: OpaqueRemoteCredential,
-        ) -> Result<RemoteProtocolResponseV1<Self::Output>, ApplicationContractError> {
+        ) -> RemoteProtocolFutureV1<'_, Self::Output> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let request_id = request.request_id;
-            RemoteProtocolResponseV1::new(
+            Box::pin(std::future::ready(RemoteProtocolResponseV1::new(
                 request_id.clone(),
                 CurrentRemoteAuthorityStateV1::Unavailable {
                     reason:
@@ -669,12 +646,12 @@ mod tests {
                     RemoteProtocolFailureV1::AuthorityUnavailable,
                 )
                 .unwrap()),
-            )
+            )))
         }
     }
 
-    #[test]
-    fn generic_protocol_service_delegates_once_to_application_port() {
+    #[asupersync::test]
+    async fn generic_protocol_service_delegates_once_to_application_port() {
         let calls = Arc::new(AtomicUsize::new(0));
         let service = RemoteProtocolServiceV1::new(Arc::new(FakeProtocolPort {
             calls: Arc::clone(&calls),
@@ -700,6 +677,7 @@ mod tests {
                 )
                 .unwrap(),
             )
+            .await
             .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -758,57 +736,6 @@ mod tests {
             .unwrap_err()
             .to_string(),
             "remote request authority Brain identity is inconsistent with the application contract"
-        );
-    }
-
-    #[test]
-    fn authority_discovery_requires_the_exact_typed_placement_revision() {
-        let request = CurrentAuthorityRequestV1 {
-            brain_id: BrainId::new("brain.remote").unwrap(),
-            shard_id: ShardId::new("shard.remote").unwrap(),
-            generation_id: ProjectionGenerationId::new("generation.remote").unwrap(),
-            placement_revision: RemotePlacementRevisionV1::new(2).unwrap(),
-        };
-        let state = CurrentRemoteAuthorityStateV1::Available(CurrentRemoteAuthorityV1 {
-            fence: fence(),
-            credential_revision: 1,
-            observed_at: UtcMicros(10),
-        });
-        assert_eq!(
-            validate_current_authority_state(&request, &state)
-                .unwrap_err()
-                .to_string(),
-            "current remote authority identity is inconsistent with the application contract"
-        );
-
-        let exact = CurrentAuthorityRequestV1 {
-            placement_revision: RemotePlacementRevisionV1::new(1).unwrap(),
-            ..request
-        };
-        assert!(validate_current_authority_state(&exact, &state).is_ok());
-    }
-
-    #[test]
-    fn authority_discovery_rejects_zero_placement_on_the_wire() {
-        let invalid = serde_json::json!({
-            "brain_id": "brain.remote",
-            "shard_id": "shard.remote",
-            "generation_id": "generation.remote",
-            "placement_revision": 0,
-        });
-        assert!(serde_json::from_value::<CurrentAuthorityRequestV1>(invalid).is_err());
-
-        let valid = CurrentAuthorityRequestV1 {
-            brain_id: BrainId::new("brain.remote").unwrap(),
-            shard_id: ShardId::new("shard.remote").unwrap(),
-            generation_id: ProjectionGenerationId::new("generation.remote").unwrap(),
-            placement_revision: RemotePlacementRevisionV1::new(9).unwrap(),
-        };
-        let encoded = serde_json::to_value(&valid).unwrap();
-        assert_eq!(encoded["placement_revision"], 9);
-        assert_eq!(
-            serde_json::from_value::<CurrentAuthorityRequestV1>(encoded).unwrap(),
-            valid
         );
     }
 

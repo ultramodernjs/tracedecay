@@ -155,6 +155,38 @@ pub fn incomplete_code_index_query_lanes(search: &Value) -> Vec<&'static str> {
         .collect()
 }
 
+/// The code-index freshness a status read reports, tracked across one wait.
+///
+/// A starved daemon indexes slowly but keeps moving; a stuck one stops. A
+/// wait built on this fails only once `window` passes with no change in the
+/// reported freshness (phase, progress counters, lane states), instead of
+/// once a fixed total elapses.
+pub struct IndexProgress {
+    last: Value,
+    changed_at: Instant,
+    window: Duration,
+}
+
+impl IndexProgress {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            last: Value::Null,
+            changed_at: Instant::now(),
+            window,
+        }
+    }
+
+    /// Records `status` and reports whether the index is still moving.
+    pub fn moving(&mut self, status: &Value) -> bool {
+        let freshness = &status["code_index_freshness"];
+        if *freshness != self.last {
+            self.last = freshness.clone();
+            self.changed_at = Instant::now();
+        }
+        self.changed_at.elapsed() < self.window
+    }
+}
+
 /// A throwaway user home holding one TraceDecay profile, handed explicitly to
 /// every API a fixture drives.
 ///
@@ -223,12 +255,8 @@ impl IsolatedHome {
         TraceDecayOpenOptions::for_profile(&self.profile)
     }
 
-    /// Reuses the installed toolchain in a child whose `HOME` is this
-    /// isolated home: rustup and cargo would otherwise resolve their state
-    /// under the empty throwaway home. The child's hermetic `PATH` prefers
-    /// the declared compiler toolchain, then the installed rust-analyzer
-    /// proxy directory retained by the test launcher. Cargo state stays in
-    /// the launcher's isolated `CARGO_HOME`.
+    /// Keeps the declared compiler and analyzer available inside an isolated
+    /// child home. Cargo and rustup state stay in the launcher's scratch tree.
     pub fn apply_toolchain_env(&self, command: &mut Command) {
         for (key, value) in &self.toolchain_environment {
             match value {
@@ -238,12 +266,13 @@ impl IsolatedHome {
                             .map(PathBuf::from)
                             .expect("Bazel must provide the fixture compiler");
                         let compiler_bin = compiler.parent().expect("compiler directory");
-                        let rustup_bin = std::env::var_os("TRACEDECAY_TEST_RUSTUP_BIN")
+                        let analyzer = std::env::var_os("RUST_ANALYZER")
                             .map(PathBuf::from)
-                            .expect("Bazel must provide the installed analyzer proxy directory");
+                            .expect("Bazel must provide the declared analyzer");
+                        let analyzer_bin = analyzer.parent().expect("analyzer directory");
                         command.env(
                             "PATH",
-                            hermetic_path(&[compiler_bin.to_owned(), rustup_bin]),
+                            hermetic_path(&[compiler_bin.to_owned(), analyzer_bin.to_owned()]),
                         );
                     }
                     command.env(key, value);
@@ -304,30 +333,10 @@ pub fn rerun_test_in_child(test_path: &str, env: &[(&str, Option<&OsStr>)]) {
 }
 
 fn toolchain_environment() -> [(&'static str, Option<OsString>); 3] {
-    let real_home =
-        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     [
-        (
-            "RUSTUP_HOME",
-            std::env::var_os("RUSTUP_HOME").or_else(|| {
-                real_home
-                    .as_ref()
-                    .map(|home| home.join(".rustup").into_os_string())
-            }),
-        ),
-        (
-            "CARGO_HOME",
-            std::env::var_os("CARGO_HOME").or_else(|| {
-                real_home
-                    .as_ref()
-                    .map(|home| home.join(".cargo").into_os_string())
-            }),
-        ),
-        (
-            "RUSTUP_TOOLCHAIN",
-            std::env::var_os("RUSTUP_TOOLCHAIN")
-                .or_else(|| option_env!("RUSTUP_TOOLCHAIN").map(OsString::from)),
-        ),
+        ("RUSTUP_HOME", std::env::var_os("RUSTUP_HOME")),
+        ("CARGO_HOME", std::env::var_os("CARGO_HOME")),
+        ("RUSTUP_TOOLCHAIN", std::env::var_os("RUSTUP_TOOLCHAIN")),
     ]
 }
 
@@ -835,9 +844,8 @@ pub fn search_eval_bin(name: &str) -> PathBuf {
         "tracedecay-search-eval-direct" => "TRACEDECAY_SEARCH_EVAL_DIRECT_TEST_BIN",
         _ => "TRACEDECAY_SEARCH_EVAL_TEST_BIN",
     };
-    let binary = std::env::var_os(override_env)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let binary = std::env::var_os(override_env).map_or_else(
+        || {
             let test_executable =
                 std::env::current_exe().expect("test executable path should resolve");
             let profile_dir = test_executable
@@ -845,7 +853,9 @@ pub fn search_eval_bin(name: &str) -> PathBuf {
                 .and_then(Path::parent)
                 .expect("integration test should run from a Cargo profile directory");
             profile_dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-        });
+        },
+        PathBuf::from,
+    );
     assert!(
         binary.is_file(),
         "search-eval binary `{name}` is missing at {}; build it with `cargo build --workspace --bins --locked --features tracedecay/test-helpers` or set {override_env}.          A `-p tracedecay-search-eval` build resolves `tracedecay-code-index` without its default language tiers and yields an evaluator that cannot parse Rust, so the package selection must match the test lane's.",
@@ -1550,11 +1560,14 @@ impl LcmTestRuntime {
         self.runtime.lcm_load_session_for_test(request).await
     }
 
-    pub async fn lcm_grep(
+    pub async fn lcm_raw_message_search_fields(
         &self,
-        request: tracedecay_lcm::LcmGrepRequest,
-    ) -> Result<tracedecay_lcm::LcmGrepOutcome, tracedecay_lcm::LcmError> {
-        self.runtime.lcm_grep_for_test(request).await
+        provider: &str,
+        message_id: &str,
+    ) -> Result<Option<(String, String)>, tracedecay_lcm::LcmError> {
+        self.runtime
+            .lcm_raw_message_search_fields_for_test(provider, message_id)
+            .await
     }
 
     pub async fn lcm_expand(

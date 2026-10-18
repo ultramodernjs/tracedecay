@@ -5,14 +5,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use asupersync::channel::watch;
 use futures_util::future::select_all;
-use tokio::sync::watch;
 use tracedecay_runtime_core::config::ProfileRoot;
 
 use tracedecay_contracts::ProfileIdentityReadPort;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
-use tracedecay_sessions::host_ports::session_review::SessionReviewPort;
 use tracedecay_sessions::observation::ObservationCancellation;
 
 pub type SessionHistoricalIngestPass<'a> =
@@ -69,14 +68,19 @@ impl SessionHistoricalCapacityRelease {
         Self { signals }
     }
 
-    /// Resolves once any signal advances. A closed signal never releases.
+    /// Resolves once any signal advances. A closed signal never releases, and
+    /// neither does any signal while the native runtime is unavailable.
     pub async fn released(&mut self) {
         if self.signals.is_empty() {
             return std::future::pending().await;
         }
+        let Some(cx) = tracedecay_runtime_core::native_runtime::cx() else {
+            return std::future::pending().await;
+        };
+        let cx = &cx;
         let changes = self.signals.iter_mut().map(|signal| {
             Box::pin(async move {
-                if signal.changed().await.is_err() {
+                if signal.changed(cx).await.is_err() {
                     std::future::pending::<()>().await;
                 }
             })
@@ -155,7 +159,14 @@ impl SessionHistoricalIngestor for ProjectSessionHistoricalIngestor {
             let authority =
                 tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(self.database.clone())
                     .with_background_cpu(Arc::clone(&self.background_cpu));
-            let pass = Box::pin(
+            let pass: Pin<
+                Box<
+                    dyn Future<
+                            Output = tracedecay_sessions::runtime::TranscriptIngestOutcome,
+                        > + Send
+                        + '_,
+                >,
+            > = Box::pin(
                 tracedecay_sessions::runtime::ingest_project_sources_for_provider_with_cancellation_and_codex_state(
                     self.profile_identity.brain_id(),
                     self.profile_identity.profile_id(),
@@ -204,7 +215,6 @@ pub struct ProfileSessionHistoricalIngestor {
     cancellation: ObservationCancellation,
     codex_discovery: Arc<tracedecay_sessions::runtime::hosts::codex::CodexDiscoveryHub>,
     background_cpu: Arc<ProcessBackgroundCpuV1>,
-    session_review: SessionReviewPort,
     codex_consumer: String,
     codex_registered: AtomicBool,
 }
@@ -217,7 +227,6 @@ impl ProfileSessionHistoricalIngestor {
         transcript_source_profile: ProfileRoot,
         codex_discovery: Arc<tracedecay_sessions::runtime::hosts::codex::CodexDiscoveryHub>,
         background_cpu: Arc<ProcessBackgroundCpuV1>,
-        session_review: SessionReviewPort,
     ) -> Self {
         let source_home = transcript_source_profile
             .home()
@@ -238,7 +247,6 @@ impl ProfileSessionHistoricalIngestor {
             cancellation: ObservationCancellation::default(),
             codex_discovery,
             background_cpu,
-            session_review,
             codex_consumer,
             codex_registered: AtomicBool::new(true),
         }
@@ -274,12 +282,18 @@ impl SessionHistoricalIngestor for ProfileSessionHistoricalIngestor {
         Box::pin(async move {
             let authority =
                 tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(self.database.clone())
-                    .with_background_cpu(Arc::clone(&self.background_cpu))
-                    .with_session_review(self.session_review);
+                    .with_background_cpu(Arc::clone(&self.background_cpu));
             let registry_authority =
                 tracedecay_host_admission::session_ingest_authority::GlobalDbSessionIngestAuthority::new(self.registry_database.clone())
                     .with_background_cpu(Arc::clone(&self.background_cpu));
-            let pass = Box::pin(
+            let pass: Pin<
+                Box<
+                    dyn Future<
+                            Output = tracedecay_sessions::runtime::TranscriptIngestOutcome,
+                        > + Send
+                        + '_,
+                >,
+            > = Box::pin(
                 tracedecay_sessions::runtime::ingest_user_global_sources_for_startup_with_db_and_codex_state(
                     self.profile_identity.brain_id(),
                     self.profile_identity.profile_id(),

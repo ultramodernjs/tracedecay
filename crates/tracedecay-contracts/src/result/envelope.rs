@@ -98,7 +98,19 @@ pub enum ApplicationOutcome<T> {
 impl<T> ApplicationOutcome<T> {
     /// The same outcome and receipts carrying `map(payload)`.
     pub fn map_payload<U>(self, map: impl FnOnce(T) -> U) -> ApplicationOutcome<U> {
-        match self {
+        match self.try_map_payload(|payload| Ok::<_, std::convert::Infallible>(map(payload))) {
+            Ok(outcome) => outcome,
+            Err(error) => match error {},
+        }
+    }
+
+    /// Fallibly transform only the payload, preserving every receipt and
+    /// control field even when the outcome carries no payload.
+    pub fn try_map_payload<U, E>(
+        self,
+        map: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<ApplicationOutcome<U>, E> {
+        Ok(match self {
             Self::Evidence(packet) => ApplicationOutcome::Evidence(crate::EvidencePacket {
                 temporal: packet.temporal,
                 authority: packet.authority,
@@ -109,7 +121,7 @@ impl<T> ApplicationOutcome<T> {
                 contributions: packet.contributions,
                 page: packet.page,
                 execution: packet.execution,
-                payload: packet.payload.map(map),
+                payload: packet.payload.map(map).transpose()?,
             }),
             Self::Preview(preview) => ApplicationOutcome::Preview(crate::PreviewResult {
                 preview_id: preview.preview_id,
@@ -118,7 +130,7 @@ impl<T> ApplicationOutcome<T> {
                 authority: preview.authority,
                 expected_state: preview.expected_state,
                 execution: preview.execution,
-                payload: preview.payload.map(map),
+                payload: preview.payload.map(map).transpose()?,
             }),
             Self::Effect(effect) => ApplicationOutcome::Effect(crate::EffectResult {
                 effect_id: effect.effect_id,
@@ -129,10 +141,10 @@ impl<T> ApplicationOutcome<T> {
                 execution: effect.execution,
                 reconciliation: effect.reconciliation,
                 receipt: effect.receipt,
-                payload: effect.payload.map(map),
+                payload: effect.payload.map(map).transpose()?,
             }),
-            Self::Result(result) => ApplicationOutcome::Result(map(result)),
-        }
+            Self::Result(result) => ApplicationOutcome::Result(map(result)?),
+        })
     }
 
     pub fn payload(&self) -> Option<&T> {
@@ -267,6 +279,15 @@ pub struct ApplicationProblemRecord {
 }
 
 impl ApplicationProblemRecord {
+    /// The wire record of `problem`, for a result that carries a refusal as a
+    /// value rather than as the response's own problem envelope.
+    pub fn from_problem(
+        request_id: RequestId,
+        problem: ApplicationProblem,
+    ) -> Result<Self, ApplicationContractError> {
+        Self::new(request_id, problem)
+    }
+
     /// `code: message`, the single line adapters print for a refusal.
     pub fn summary(&self) -> String {
         format!("{}: {}", self.code, self.message)
@@ -563,10 +584,10 @@ impl ApplicationProblemRecord {
             .as_ref()
             .and_then(ApplicationProblemDetailV1::retry_after_millis);
         let committed_receipt = source.committed_receipt().cloned();
-        let code = diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.code.clone())
-            .unwrap_or_else(|| source.canonical_code().to_owned());
+        let code = diagnostic.as_ref().map_or_else(
+            || source.canonical_code().to_owned(),
+            |diagnostic| diagnostic.code.clone(),
+        );
         let record = Self {
             revision: APPLICATION_PROBLEM_REVISION,
             kind,
@@ -628,11 +649,10 @@ impl ApplicationProblemRecord {
         }
 
         if self.code
-            != self
-                .source
-                .diagnostic()
-                .map(|diagnostic| diagnostic.code.as_str())
-                .unwrap_or_else(|| self.source.canonical_code())
+            != self.source.diagnostic().map_or_else(
+                || self.source.canonical_code(),
+                |diagnostic| diagnostic.code.as_str(),
+            )
             || self.message != self.source.safe_message()
             || self.diagnostic.as_ref() != self.source.diagnostic()
             || self.detail.as_ref() != self.source.detail()

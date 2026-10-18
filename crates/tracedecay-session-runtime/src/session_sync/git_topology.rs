@@ -94,7 +94,7 @@ impl SessionSyncProjectContext {
         let worktree = scope.worktree_id;
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        let worker = tokio::task::spawn_blocking(move || {
+        let worker = tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             publish_native_topology(
                 runtime,
                 project_root,
@@ -335,8 +335,7 @@ pub(super) fn validate_retained_declared_topology(
 
 fn topology_read_failure(error: GitTopologyProjectionError) -> GitTopologySyncFailure {
     match error {
-        GitTopologyProjectionError::Stale { .. }
-        | GitTopologyProjectionError::StaleBinding { .. } => GitTopologySyncFailure::Stale,
+        GitTopologyProjectionError::StaleBinding { .. } => GitTopologySyncFailure::Stale,
         GitTopologyProjectionError::RepositoryMismatch => GitTopologySyncFailure::Denied,
         _ => GitTopologySyncFailure::Unavailable,
     }

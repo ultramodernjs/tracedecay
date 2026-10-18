@@ -1,8 +1,11 @@
+use std::future::Future;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 use tracedecay_maintenance::retention::orphan_stores::dir_size_bytes;
-use tracedecay_runtime_core::config::ProfileRoot;
+use tracedecay_runtime_core::config::{GLOBAL_DB_FILENAME, ProfileRoot};
+use tracedecay_runtime_core::storage::{USER_MEMORY_DB_FILENAME, USER_SESSIONS_DB_FILENAME};
 
 use tracedecay_global_db::profile_registry_maintenance::{
     ProfileRegistryMaintenanceRuntime, remove_store_directory, verify_store_path_absent,
@@ -14,7 +17,7 @@ use tracedecay_contracts::retrieval::{
     AdminCliRegistryContextV1, AdminCliResultV1, AdminCliSurfaceRequestV1,
 };
 
-use super::daemon::{admin_cli_result, admin_cli_result_mismatch};
+use super::daemon::{admin_cli_result, admin_cli_result_mismatch, registry_context};
 
 /// Bounds the wait for the profile lifecycle lease after the managed daemon
 /// service is stopped. The stop itself is separately bounded by the service
@@ -23,7 +26,11 @@ use super::daemon::{admin_cli_result, admin_cli_result_mismatch};
 /// shared holders such as hooks and doctor runs.
 const PROFILE_OFFLINE_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-const PROFILE_SQLITE_DATABASES: [&str; 3] = ["global.db", "user-sessions.db", "user-memory.db"];
+const PROFILE_SQLITE_DATABASES: [&str; 3] = [
+    GLOBAL_DB_FILENAME,
+    USER_SESSIONS_DB_FILENAME,
+    USER_MEMORY_DB_FILENAME,
+];
 const PROFILE_DATABASE_PATHS: [&str; 15] = [
     "projects",
     "stores",
@@ -213,7 +220,7 @@ pub(crate) async fn try_admit_profile_registry(
         }
     })?;
     if !profile_root
-        .join("global.db")
+        .join(GLOBAL_DB_FILENAME)
         .try_exists()
         .map_err(
             |error| tracedecay_domain::errors::TraceDecayError::Database {
@@ -225,8 +232,27 @@ pub(crate) async fn try_admit_profile_registry(
         return Ok(None);
     }
     let identity = tracedecay_daemon_identity::profile_identity::load_existing(&profile_root)?;
-    let registry = tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity).await?;
-    let profile_database = registry.profile_database().await?;
+    let registry: Pin<
+        Box<
+            dyn Future<
+                    Output = tracedecay_domain::errors::Result<
+                        tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1,
+                    >,
+                > + Send,
+        >,
+    > = Box::pin(tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1::open(identity));
+    let registry = registry.await?;
+    let profile_database: Pin<
+        Box<
+            dyn Future<
+                    Output = tracedecay_domain::errors::Result<
+                        tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > = Box::pin(registry.profile_database());
+    let profile_database = profile_database.await?;
     Ok(Some(
         ProfileRegistryMaintenanceRuntime::from_admitted_lease(profile_database),
     ))
@@ -319,171 +345,6 @@ fn wipe_complete_profile_database_state(
     Ok(removed)
 }
 
-#[cfg(test)]
-#[allow(clippy::expect_used)]
-mod wipe_safety_tests {
-    use super::*;
-
-    #[test]
-    fn reset_refusals_name_the_authority_and_the_exact_reset_command() {
-        let profile = annotate_reset_required(
-            tracedecay_domain::errors::TraceDecayError::reset_required(
-                "session temporal",
-                "persisted session temporal schema is the published v3 shape",
-            ),
-            None,
-        )
-        .to_string();
-        assert!(profile.contains("session temporal persisted shape requires reset"));
-        assert!(profile.contains("refused authority: session temporal"));
-        assert!(
-            profile.contains("\n  tracedecay wipe --stale --yes"),
-            "{profile}"
-        );
-
-        let project = annotate_reset_required(
-            tracedecay_domain::errors::TraceDecayError::reset_required(
-                "project store",
-                "schema v26 is incompatible",
-            ),
-            Some(Path::new("/repo/example")),
-        )
-        .to_string();
-        assert!(
-            project.contains("reset-project-store --project-root /repo/example --yes"),
-            "{project}"
-        );
-
-        let untouched = annotate_reset_required(
-            tracedecay_domain::errors::TraceDecayError::Config {
-                message: "unrelated".to_owned(),
-            },
-            None,
-        );
-        assert_eq!(untouched.to_string(), "config error: unrelated");
-    }
-
-    #[test]
-    fn nonterminal_wipe_without_yes_does_not_wait_on_stdin() {
-        assert!(wipe_must_not_wait_for_stdin(false, false));
-        assert!(!wipe_must_not_wait_for_stdin(true, false));
-        assert!(!wipe_must_not_wait_for_stdin(false, true));
-    }
-
-    #[test]
-    fn default_list_omits_recursive_store_size() {
-        let missing = Path::new("/definitely/missing-tracedecay-store");
-        assert_eq!(list_store_size_bytes(false, true, missing), None);
-        assert_eq!(list_store_size_bytes(true, false, missing), Some(0));
-    }
-
-    #[test]
-    fn complete_wipe_accepts_an_exact_canonical_profile_directory() {
-        let profile = tempfile::TempDir::new().expect("create temporary profile");
-        let profile = profile
-            .path()
-            .canonicalize()
-            .expect("canonicalize temporary profile");
-        let home = profile
-            .parent()
-            .expect("temporary profile has a parent")
-            .to_path_buf();
-
-        validate_complete_wipe_profile_root(&profile, Some(&home))
-            .expect("exact private profile root is safe to wipe");
-    }
-
-    #[test]
-    fn complete_wipe_rejects_relative_user_home_and_filesystem_roots() {
-        let profile = tempfile::TempDir::new().expect("create temporary profile");
-        let profile = profile
-            .path()
-            .canonicalize()
-            .expect("canonicalize temporary profile");
-        let filesystem_root = profile
-            .ancestors()
-            .last()
-            .expect("absolute path has a filesystem root");
-
-        let parent = profile.parent().expect("temporary profile has a parent");
-        for (candidate, home, expected) in [
-            (
-                Path::new("relative-profile"),
-                None,
-                "config error: complete profile wipe requires an absolute profile root, got \
-                 'relative-profile'"
-                    .to_owned(),
-            ),
-            (
-                profile.as_path(),
-                Some(profile.as_path()),
-                format!(
-                    "config error: complete profile wipe root '{}' must not be the user home or \
-                     one of its ancestors",
-                    profile.display()
-                ),
-            ),
-            (
-                parent,
-                Some(profile.as_path()),
-                format!(
-                    "config error: complete profile wipe root '{}' must not be the user home or \
-                     one of its ancestors",
-                    parent.display()
-                ),
-            ),
-            (
-                filesystem_root,
-                None,
-                format!(
-                    "config error: complete profile wipe root '{}' must be an exact canonical \
-                     non-filesystem-root directory",
-                    filesystem_root.display()
-                ),
-            ),
-        ] {
-            let error = validate_complete_wipe_profile_root(candidate, home).unwrap_err();
-            assert_eq!(error.to_string(), expected);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn complete_wipe_rejects_a_leaf_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let parent = tempfile::TempDir::new().expect("create temporary parent");
-        let parent_path = parent.path().canonicalize().expect("canonical parent");
-        let profile = parent_path.join("profile");
-        let profile_link = parent_path.join("profile-link");
-        let dangling = parent_path.join("dangling");
-        std::fs::create_dir(&profile).expect("create real profile");
-        symlink(&profile, &profile_link).expect("create profile symlink");
-        symlink(parent_path.join("missing"), &dangling).expect("create dangling symlink");
-
-        assert_eq!(
-            validate_complete_wipe_profile_root(&profile_link, None)
-                .unwrap_err()
-                .to_string(),
-            format!(
-                "config error: complete profile wipe root '{}' must be a regular directory, not a \
-                 symlink",
-                profile_link.display()
-            )
-        );
-        validate_complete_wipe_profile_root(&profile, None)
-            .expect("the symlink target is a real root");
-        assert_eq!(
-            verify_store_path_absent(&dangling).unwrap_err().to_string(),
-            format!(
-                "config error: store removal did not remove expected namespace entry '{}'",
-                dangling.display()
-            ),
-            "a dangling symlink remains a namespace entry"
-        );
-    }
-}
-
 /// Handles the `wipe` and `wipe --all` commands.
 ///
 /// `assume_yes` carries the global `--yes` confirmation flag. It is the same
@@ -538,7 +399,7 @@ fn handle_wipe_inner(
         )
         .await;
         let restore = profile_offline.finish();
-        join_outcome_and_restore("wipe", outcome, restore)
+        join_outcome_and_restore(RestoreWording::ManagedService, "wipe", outcome, restore)
     })
 }
 
@@ -581,31 +442,41 @@ pub(crate) fn process_error_text(error: tracedecay_domain::errors::TraceDecayErr
     annotate_reset_required(error, None).to_string()
 }
 
-/// Combines a destructive command's outcome with the daemon-restore outcome
-/// so neither failure can shadow the other.
-pub(crate) fn join_outcome_and_restore(
+/// How [`join_outcome_and_restore`] words a failed daemon restore.
+#[derive(Clone, Copy)]
+pub(crate) enum RestoreWording {
+    /// Destructive profile commands: always name the managed service state.
+    ManagedService,
+    /// Update and restart: a lone restore error passes through unchanged.
+    DaemonState,
+}
+
+/// Combines a command's outcome with the daemon-restore outcome so neither
+/// failure can shadow the other.
+pub(crate) fn join_outcome_and_restore<T>(
+    wording: RestoreWording,
     operation: &str,
-    outcome: tracedecay_domain::errors::Result<()>,
+    outcome: tracedecay_domain::errors::Result<T>,
     restore: tracedecay_domain::errors::Result<()>,
-) -> tracedecay_domain::errors::Result<()> {
-    match (outcome, restore) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(restore_error)) => Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: format!(
-                "{operation} completed, but the managed daemon service state could not be \
-                 restored: {restore_error}"
-            ),
-        }),
-        (Err(error), Ok(())) => Err(error),
-        (Err(error), Err(restore_error)) => {
-            Err(tracedecay_domain::errors::TraceDecayError::Config {
-                message: format!(
-                    "{error}; additionally the managed daemon service state could not be \
-                     restored: {restore_error}"
-                ),
-            })
-        }
-    }
+) -> tracedecay_domain::errors::Result<T> {
+    let Err(restore_error) = restore else {
+        return outcome;
+    };
+    let message = match (wording, outcome) {
+        (RestoreWording::ManagedService, Ok(_)) => format!(
+            "{operation} completed, but the managed daemon service state could not be \
+             restored: {restore_error}"
+        ),
+        (RestoreWording::ManagedService, Err(error)) => format!(
+            "{error}; additionally the managed daemon service state could not be \
+             restored: {restore_error}"
+        ),
+        (RestoreWording::DaemonState, Ok(_)) => return Err(restore_error),
+        (RestoreWording::DaemonState, Err(operation_error)) => format!(
+            "{operation} failed: {operation_error}; daemon state restoration also failed: {restore_error}"
+        ),
+    };
+    Err(tracedecay_domain::errors::TraceDecayError::Config { message })
 }
 
 /// Non-terminal wipe must not read stdin. Irreversible deletion still requires
@@ -793,21 +664,9 @@ fn handle_list_inner(
             if location.status == global::ProjectStorageStatus::Stale
                 && let Some(profile_root) = home_tracedecay.as_deref()
             {
-                let stores = match admin_cli_result(
-                    profile,
-                    None,
-                    AdminCliSurfaceRequestV1::RegistryContext {
-                        project_arg: Some(path.clone()),
-                    },
-                )
-                .await?
-                {
-                    AdminCliResultV1::RegistryContext(AdminCliRegistryContextV1::Ok {
-                        stores,
-                        ..
-                    }) => stores,
-                    AdminCliResultV1::RegistryContext(_) => Vec::new(),
-                    _ => return Err(admin_cli_result_mismatch("registry_context")),
+                let stores = match registry_context(profile, path.clone()).await? {
+                    AdminCliRegistryContextV1::Ok { stores, .. } => stores,
+                    _ => Vec::new(),
                 };
                 if let Some(store) =
                     stores
@@ -818,7 +677,11 @@ fn handle_list_inner(
                                 == Some("code_project")
                         })
                     && let Some(registry_location) =
-                        global::classify_registry_storage_value(path, profile_root, store)
+                        tracedecay_runtime_core::storage::classify_registry_storage_value(
+                            path,
+                            profile_root,
+                            store,
+                        )
                 {
                     location = registry_location;
                 }
@@ -909,9 +772,10 @@ fn handle_list_inner(
         };
         println!(
             "Total: {} on disk · {} tokens saved{}",
-            total_size
-                .map(tracedecay_runtime_core::text::format_bytes)
-                .unwrap_or_else(|| "—".to_string()),
+            total_size.map_or_else(
+                || "—".to_string(),
+                tracedecay_runtime_core::text::format_bytes
+            ),
             total_tokens_str,
             total_suffix
         );
@@ -989,5 +853,211 @@ fn append_orphan_manifest_rows(
             size,
             tokens: Some(0),
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod wipe_safety_tests {
+    use super::*;
+
+    #[test]
+    fn reset_refusals_name_the_authority_and_the_exact_reset_command() {
+        let profile = annotate_reset_required(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
+                "session temporal",
+                "persisted session temporal schema is the published v3 shape",
+            ),
+            None,
+        )
+        .to_string();
+        assert!(profile.contains("session temporal persisted shape requires reset"));
+        assert!(profile.contains("refused authority: session temporal"));
+        assert!(
+            profile.contains("\n  tracedecay wipe --stale --yes"),
+            "{profile}"
+        );
+
+        let project = annotate_reset_required(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
+                "project store",
+                "schema v26 is incompatible",
+            ),
+            Some(Path::new("/repo/example")),
+        )
+        .to_string();
+        assert!(
+            project.contains("reset-project-store --project-root /repo/example --yes"),
+            "{project}"
+        );
+
+        let untouched = annotate_reset_required(
+            tracedecay_domain::errors::TraceDecayError::Config {
+                message: "unrelated".to_owned(),
+            },
+            None,
+        );
+        assert_eq!(untouched.to_string(), "config error: unrelated");
+    }
+
+    #[test]
+    fn nonterminal_wipe_without_yes_does_not_wait_on_stdin() {
+        assert!(wipe_must_not_wait_for_stdin(false, false));
+        assert!(!wipe_must_not_wait_for_stdin(true, false));
+        assert!(!wipe_must_not_wait_for_stdin(false, true));
+    }
+
+    #[test]
+    fn default_list_omits_recursive_store_size() {
+        let missing = Path::new("/definitely/missing-tracedecay-store");
+        assert_eq!(list_store_size_bytes(false, true, missing), None);
+        assert_eq!(list_store_size_bytes(true, false, missing), Some(0));
+    }
+
+    #[test]
+    fn complete_wipe_accepts_an_exact_canonical_profile_directory() {
+        let profile = tempfile::TempDir::new().expect("create temporary profile");
+        let profile = profile
+            .path()
+            .canonicalize()
+            .expect("canonicalize temporary profile");
+        let home = profile
+            .parent()
+            .expect("temporary profile has a parent")
+            .to_path_buf();
+
+        validate_complete_wipe_profile_root(&profile, Some(&home))
+            .expect("exact private profile root is safe to wipe");
+    }
+
+    #[test]
+    fn complete_wipe_rejects_relative_user_home_and_filesystem_roots() {
+        let profile = tempfile::TempDir::new().expect("create temporary profile");
+        let profile = profile
+            .path()
+            .canonicalize()
+            .expect("canonicalize temporary profile");
+        let filesystem_root = profile
+            .ancestors()
+            .last()
+            .expect("absolute path has a filesystem root");
+
+        let parent = profile.parent().expect("temporary profile has a parent");
+        for (candidate, home, expected) in [
+            (
+                Path::new("relative-profile"),
+                None,
+                "config error: complete profile wipe requires an absolute profile root, got \
+                 'relative-profile'"
+                    .to_owned(),
+            ),
+            (
+                profile.as_path(),
+                Some(profile.as_path()),
+                format!(
+                    "config error: complete profile wipe root '{}' must not be the user home or \
+                     one of its ancestors",
+                    profile.display()
+                ),
+            ),
+            (
+                parent,
+                Some(profile.as_path()),
+                format!(
+                    "config error: complete profile wipe root '{}' must not be the user home or \
+                     one of its ancestors",
+                    parent.display()
+                ),
+            ),
+            (
+                filesystem_root,
+                None,
+                format!(
+                    "config error: complete profile wipe root '{}' must be an exact canonical \
+                     non-filesystem-root directory",
+                    filesystem_root.display()
+                ),
+            ),
+        ] {
+            let error = validate_complete_wipe_profile_root(candidate, home).unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn restore_failures_keep_each_wording() {
+        let failed = |message: &str| -> tracedecay_domain::errors::Result<()> {
+            Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: message.to_owned(),
+            })
+        };
+        let joined = |wording, outcome| {
+            join_outcome_and_restore(wording, "op", outcome, failed("restore"))
+                .unwrap_err()
+                .to_string()
+        };
+        for (wording, outcome, expected) in [
+            (
+                RestoreWording::ManagedService,
+                Ok(()),
+                "config error: op completed, but the managed daemon service state could not be \
+                 restored: config error: restore",
+            ),
+            (
+                RestoreWording::ManagedService,
+                failed("boom"),
+                "config error: config error: boom; additionally the managed daemon service state \
+                 could not be restored: config error: restore",
+            ),
+            (RestoreWording::DaemonState, Ok(()), "config error: restore"),
+            (
+                RestoreWording::DaemonState,
+                failed("boom"),
+                "config error: op failed: config error: boom; daemon state restoration also \
+                 failed: config error: restore",
+            ),
+        ] {
+            assert_eq!(joined(wording, outcome), expected);
+        }
+        assert_eq!(
+            join_outcome_and_restore(RestoreWording::DaemonState, "op", Ok(7), Ok(())).unwrap(),
+            7
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_wipe_rejects_a_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().expect("create temporary parent");
+        let parent_path = parent.path().canonicalize().expect("canonical parent");
+        let profile = parent_path.join("profile");
+        let profile_link = parent_path.join("profile-link");
+        let dangling = parent_path.join("dangling");
+        std::fs::create_dir(&profile).expect("create real profile");
+        symlink(&profile, &profile_link).expect("create profile symlink");
+        symlink(parent_path.join("missing"), &dangling).expect("create dangling symlink");
+
+        assert_eq!(
+            validate_complete_wipe_profile_root(&profile_link, None)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "config error: complete profile wipe root '{}' must be a regular directory, not a \
+                 symlink",
+                profile_link.display()
+            )
+        );
+        validate_complete_wipe_profile_root(&profile, None)
+            .expect("the symlink target is a real root");
+        assert_eq!(
+            verify_store_path_absent(&dangling).unwrap_err().to_string(),
+            format!(
+                "config error: store removal did not remove expected namespace entry '{}'",
+                dangling.display()
+            ),
+            "a dangling symlink remains a namespace entry"
+        );
     }
 }

@@ -1,5 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+
+use tracing::Instrument;
 
 use std::fmt::Write as _;
 
@@ -36,7 +40,7 @@ pub(super) const PROJECT_REGISTRY_PERFORMANCE_INDEX_SQL: &str = "
 ";
 
 /// Which registry table a reap candidate belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReapEntryKind {
     /// A `projects` row: the cross-project savings ledger, which despite the
@@ -60,7 +64,7 @@ impl ReapEntryKind {
 }
 
 /// One registry row whose referenced path is gone from disk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RegistryReapEntry {
     pub kind: ReapEntryKind,
     /// Primary key of the row: ledger path, alias key, or project id.
@@ -270,6 +274,155 @@ impl ProjectIdentityAliasKind {
             Self::GitCommonDir => "git-common-dir:",
         }
     }
+}
+
+/// The `project_aliases` keys through which a checkout no path names may
+/// adopt an enrolled project.
+///
+/// History alone would merge forks, re-pointed templates and subtree-merged
+/// libraries into one project, so a shared root commit adopts only beside
+/// agreement on the remote: the same normalized `origin` as an enrolled
+/// checkout, or a local `origin` that is itself an enrolled checkout. A
+/// shallow clone, which cannot walk to its roots, adopts on its remote alone;
+/// so does a full clone when the enrolled project has no history anchors yet.
+struct AnchorProbe {
+    history: Vec<String>,
+    remote: Option<String>,
+    local_origin: Option<String>,
+}
+
+impl AnchorProbe {
+    fn new(
+        anchors: &[tracedecay_runtime_core::storage::IdentityAnchor],
+        origin: Option<&str>,
+    ) -> Self {
+        let (history, remote): (Vec<_>, Vec<_>) =
+            anchors.iter().partition(|anchor| anchor.is_history());
+        Self {
+            history: history.iter().map(|anchor| anchor.alias_key()).collect(),
+            remote: remote.first().map(|anchor| anchor.alias_key()),
+            local_origin: origin
+                .and_then(tracedecay_runtime_core::git::local_remote_path)
+                .map(|path| project_path_alias_key(&path)),
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.history
+            .iter()
+            .chain(&self.remote)
+            .chain(&self.local_origin)
+            .map(String::as_str)
+    }
+
+    /// The one project the anchors agree on; anchors naming two projects adopt
+    /// nothing.
+    async fn adopted(
+        &self,
+        named: &std::collections::HashMap<String, String>,
+        read: &impl QueryExecutor,
+    ) -> tracedecay_domain::errors::Result<Option<String>> {
+        let remote = self.remote.as_ref().and_then(|key| named.get(key));
+        if self.history.is_empty() {
+            return Ok(remote.cloned());
+        }
+        let named_by_history = self
+            .history
+            .iter()
+            .filter_map(|key| named.get(key))
+            .collect::<BTreeSet<_>>();
+        let projects = named_by_history.into_iter().collect::<Vec<_>>();
+        if projects.is_empty() {
+            if let Some(project_id) = remote
+                && !has_history_anchor_in(read, project_id).await?
+            {
+                return Ok(Some(project_id.clone()));
+            }
+            return Ok(None);
+        }
+        let [project_id] = projects[..] else {
+            return Ok(None);
+        };
+        let local_origin = self.local_origin.as_ref().and_then(|key| named.get(key));
+        Ok(
+            (remote == Some(project_id) || local_origin == Some(project_id))
+                .then(|| project_id.clone()),
+        )
+    }
+}
+
+async fn has_history_anchor_in(
+    read: &impl QueryExecutor,
+    project_id: &str,
+) -> tracedecay_domain::errors::Result<bool> {
+    const OPERATION: &str = "resolve project history anchor";
+    let mut rows = read
+        .query(
+            "SELECT 1 FROM project_aliases
+             WHERE project_id = ?1
+               AND (alias_path LIKE 'git-root-commit:%' OR alias_path LIKE 'git-subproject:%')
+             LIMIT 1",
+            params![project_id],
+        )
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    Ok(rows
+        .next()
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?
+        .is_some())
+}
+
+async fn alias_project_id(
+    read: &impl QueryExecutor,
+    alias: &str,
+) -> tracedecay_domain::errors::Result<Option<String>> {
+    const OPERATION: &str = "resolve project alias";
+    let mut rows = read
+        .query(
+            "SELECT project_id FROM project_aliases WHERE alias_path = ?1",
+            params![alias],
+        )
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?
+    else {
+        return Ok(None);
+    };
+    row.get::<String>(0)
+        .map(Some)
+        .map_err(|error| global_db_operation_error(OPERATION, error))
+}
+
+/// The registered `(canonical_root, git_common_dir)` of `project_id`.
+async fn registered_root(
+    transaction: &super::RegisteredGlobalDbWriteTransaction<'_>,
+    project_id: &str,
+) -> tracedecay_domain::errors::Result<Option<(String, Option<String>)>> {
+    const OPERATION: &str = "upsert code project";
+    let mut rows = transaction
+        .query(
+            "SELECT canonical_root, git_common_dir FROM code_projects WHERE project_id = ?1",
+            params![project_id],
+        )
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.get::<String>(0)
+            .map_err(|error| global_db_operation_error(OPERATION, error))?,
+        row.get::<Option<String>>(1)
+            .map_err(|error| global_db_operation_error(OPERATION, error))?,
+    )))
 }
 
 /// Canonical identity key for a project path, including paths that no longer
@@ -524,7 +677,7 @@ async fn list_code_project_paths_from(
              FROM recent_projects
              LEFT JOIN project_aliases
                ON project_aliases.project_id = recent_projects.project_id
-              AND project_aliases.last_seen_at = recent_projects.last_seen_at
+              AND project_aliases.last_seen_at = recent_projects.primary_root_last_seen_at
              ORDER BY recent_projects.last_seen_at DESC,
                       recent_projects.project_id,
                       project_aliases.alias_path",
@@ -618,7 +771,10 @@ async fn list_code_project_paths_from(
                     }
                 };
                 let display_evidence = path.to_string_lossy();
-                if primary_last_seen != last_seen_at
+                // Clone activity advances project recency without verifying
+                // the primary root again. Its own alias must still agree with
+                // the primary-root evidence from the last root verification.
+                if primary_last_seen > last_seen_at
                     || (display_evidence != canonical_root && display_evidence != display_root)
                     || !current_aliases.contains(&project_path_alias_key(&path))
                 {
@@ -653,52 +809,53 @@ pub(super) async fn list_registered_lossless_paths(
     list_lossless_paths_from(ProjectRegistryDatabase(db), sql, operation).await
 }
 
-#[tracing::instrument(
-    name = "global_db.registry.query.list_paths",
-    level = "trace",
-    skip_all
-)]
-async fn list_lossless_paths_from(
-    db: ProjectRegistryDatabase<'_>,
-    sql: &str,
+fn list_lossless_paths_from<'a>(
+    db: ProjectRegistryDatabase<'a>,
+    sql: &'a str,
     operation: &'static str,
-) -> tracedecay_domain::errors::Result<Vec<PathBuf>> {
-    let read = db.read_snapshot(operation).await?;
-    let mut rows = read
-        .query(sql, ())
-        .await
-        .map_err(|error| global_db_operation_error(operation, error))?;
-    let mut paths = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| global_db_operation_error(operation, error))?
-    {
-        let encoded = row
-            .get::<String>(0)
-            .map_err(|error| global_db_operation_error(operation, error))?;
-        let path = match decode_native_project_path_alias(&encoded) {
-            Ok(Some(path)) => Some(path),
-            Ok(None) if Path::new(&encoded).is_absolute() => Some(PathBuf::from(encoded)),
-            Ok(None) => None,
-            Err(error) => {
-                return Err(global_db_operation_message(
-                    operation,
-                    format!("invalid native project path alias: {error}"),
-                ));
+) -> Pin<Box<dyn Future<Output = tracedecay_domain::errors::Result<Vec<PathBuf>>> + Send + 'a>> {
+    let span = tracing::trace_span!("global_db.registry.query.list_paths");
+    Box::pin(
+        async move {
+            let read = db.read_snapshot(operation).await?;
+            let mut rows = read
+                .query(sql, ())
+                .await
+                .map_err(|error| global_db_operation_error(operation, error))?;
+            let mut paths = Vec::new();
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| global_db_operation_error(operation, error))?
+            {
+                let encoded = row
+                    .get::<String>(0)
+                    .map_err(|error| global_db_operation_error(operation, error))?;
+                let path = match decode_native_project_path_alias(&encoded) {
+                    Ok(Some(path)) => Some(path),
+                    Ok(None) if Path::new(&encoded).is_absolute() => Some(PathBuf::from(encoded)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        return Err(global_db_operation_message(
+                            operation,
+                            format!("invalid native project path alias: {error}"),
+                        ));
+                    }
+                };
+                if let Some(path) = path {
+                    if !path.is_absolute() {
+                        return Err(global_db_operation_message(
+                            operation,
+                            "native project path alias is not absolute",
+                        ));
+                    }
+                    paths.push(path);
+                }
             }
-        };
-        if let Some(path) = path {
-            if !path.is_absolute() {
-                return Err(global_db_operation_message(
-                    operation,
-                    "native project path alias is not absolute",
-                ));
-            }
-            paths.push(path);
+            Ok(paths)
         }
-    }
-    Ok(paths)
+        .instrument(span),
+    )
 }
 
 impl RegisteredGlobalDb {
@@ -742,115 +899,187 @@ impl RegisteredGlobalDb {
     /// [`TraceDecayError::ProjectRoute`]: tracedecay_domain::errors::TraceDecayError::ProjectRoute
     /// [`TraceDecayError::ResetRequired`]: tracedecay_domain::errors::TraceDecayError::ResetRequired
     /// [`TraceDecayError::Database`]: tracedecay_domain::errors::TraceDecayError::Database
-    #[tracing::instrument(name = "global_db.registry.persist.upsert", level = "trace", skip_all)]
-    pub async fn upsert_code_project(
-        &self,
-        project_id: &str,
-        project_root: &Path,
-        git_common_dir: Option<&Path>,
-        git_remote_url: Option<&str>,
-        default_branch: Option<&str>,
-    ) -> tracedecay_domain::errors::Result<CodeProjectRecord> {
-        const OPERATION: &str = "upsert code project";
-        // The one door through which a project authority is minted. Enforcing
-        // admission here rather than at each caller means an ephemeral root
-        // cannot become a durable authority even from a call site that has
-        // never heard of the policy.
-        if let Some(reason) = self.ephemeral_root_rejection(project_root) {
-            return Err(tracedecay_domain::errors::TraceDecayError::project_route(
-                EPHEMERAL_PROJECT_ROOT_REASON_CODE,
-                false,
-                reason,
-            ));
-        }
-        let now = tracedecay_runtime_core::tracedecay::current_timestamp();
-        let canonical_project_root = canonical_project_path(project_root);
-        let canonical_root = canonical_project_root.to_string_lossy().into_owned();
-        let current_root_alias = project_path_alias_key(&canonical_project_root);
-        let canonical_git_common_dir = git_common_dir.map(canonical_project_path);
-        let git_common_dir_text = canonical_git_common_dir
-            .as_deref()
-            .map(|path| path.to_string_lossy().into_owned());
-        let git_common_dir_alias =
-            super::repo_identity_aliases(canonical_git_common_dir.as_deref())
-                .into_iter()
-                .next();
-        let transaction = self
-            .begin_write_transaction()
-            .await
-            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    pub fn upsert_code_project<'a>(
+        &'a self,
+        project_id: &'a str,
+        project_root: &'a Path,
+        git_common_dir: Option<&'a Path>,
+        git_remote_url: Option<&'a str>,
+        default_branch: Option<&'a str>,
+    ) -> Pin<
+        Box<dyn Future<Output = tracedecay_domain::errors::Result<CodeProjectRecord>> + Send + 'a>,
+    > {
+        Box::pin(
+            async move {
+                const OPERATION: &str = "upsert code project";
+                // The one door through which a project authority is minted. Enforcing
+                // admission here rather than at each caller means an ephemeral root
+                // cannot become a durable authority even from a call site that has
+                // never heard of the policy.
+                if let Some(reason) = self.ephemeral_root_rejection(project_root) {
+                    return Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                        EPHEMERAL_PROJECT_ROOT_REASON_CODE,
+                        false,
+                        reason,
+                    ));
+                }
+                let now = tracedecay_runtime_core::tracedecay::current_timestamp();
+                let canonical_project_root = canonical_project_path(project_root);
+                let canonical_root = canonical_project_root.to_string_lossy().into_owned();
+                let current_root_alias = project_path_alias_key(&canonical_project_root);
+                let canonical_git_common_dir = git_common_dir.map(canonical_project_path);
+                let git_common_dir_text = canonical_git_common_dir
+                    .as_deref()
+                    .map(|path| path.to_string_lossy().into_owned());
+                let git_common_dir_alias =
+                    super::repo_identity_aliases(canonical_git_common_dir.as_deref())
+                        .into_iter()
+                        .next();
+                // Resolved in the lifecycle's order: a marker naming a store this
+                // profile holds, then path and common-dir aliases, then anchors.
+                let held_marker =
+                    match tracedecay_runtime_core::storage::read_repository_identity_marker(
+                        project_root,
+                    ) {
+                        Ok(Some(marker)) if self.has_store_instance(&marker.project_id).await? => {
+                            Some(marker.project_id)
+                        }
+                        _ => None,
+                    };
+                let named = match held_marker.clone() {
+                    Some(project_id) => Some(project_id),
+                    None => match self
+                        .project_id_by_path_alias(
+                            project_root,
+                            ProjectIdentityAliasKind::ProjectRoot,
+                        )
+                        .await?
+                    {
+                        Some(project_id) => Some(project_id),
+                        None => match git_common_dir {
+                            Some(git_common_dir) => {
+                                self.project_id_by_path_alias(
+                                    git_common_dir,
+                                    ProjectIdentityAliasKind::GitCommonDir,
+                                )
+                                .await?
+                            }
+                            None => None,
+                        },
+                    },
+                };
+                // A named checkout walks only until its project records a
+                // history anchor, so a profile enrolled before anchors existed
+                // records them once. After that it records what a lookup of
+                // this process already walked, such as a fresh clone's roots.
+                let anchors = match named.as_deref() {
+                    Some(project_id) if self.has_history_anchor(project_id).await? => {
+                        tracedecay_runtime_core::storage::walked_repository_identity_anchors(
+                            project_root,
+                            git_remote_url,
+                        )
+                    }
+                    _ => {
+                        tracedecay_runtime_core::storage::repository_identity_anchors_off_executor(
+                            project_root,
+                            git_remote_url,
+                        )
+                        .await
+                    }
+                };
+                let probe = AnchorProbe::new(&anchors, git_remote_url);
+                let anchor_aliases = anchors
+                    .iter()
+                    .map(tracedecay_runtime_core::storage::IdentityAnchor::alias_key)
+                    .collect::<Vec<_>>();
+                let transaction = self
+                    .begin_write_transaction()
+                    .await
+                    .map_err(|error| global_db_operation_error(OPERATION, error))?;
 
-        let mut existing_authorities = BTreeSet::new();
-        for alias in [
-            Some(current_root_alias.as_str()),
-            git_common_dir_alias.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let mut rows = transaction
-                .query(
-                    "SELECT project_id FROM project_aliases WHERE alias_path = ?1",
-                    params![alias],
-                )
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            if let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?
-            {
-                existing_authorities.insert(
-                    row.get::<String>(0)
-                        .map_err(|error| global_db_operation_error(OPERATION, error))?,
-                );
-            }
-        }
-        if let Some(git_common_dir_text) = git_common_dir_text.as_deref() {
-            let mut rows = transaction
-                .query(
-                    "SELECT project_id FROM code_projects WHERE git_common_dir = ?1",
-                    params![git_common_dir_text],
-                )
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?
-            {
-                existing_authorities.insert(
-                    row.get::<String>(0)
-                        .map_err(|error| global_db_operation_error(OPERATION, error))?,
-                );
-            }
-        }
-        if existing_authorities.len() > 1 {
-            // Two ids already claim this root or its repository. Picking one
-            // would fabricate a consolidation the caller never asked for, so
-            // the conflict is surfaced with the ids that produced it.
-            return Err(tracedecay_domain::errors::TraceDecayError::reset_required(
-                PROJECT_REGISTRY_AUTHORITY,
-                format!(
-                    "conflicting project authorities [{}] already claim '{}'",
+                let mut existing_authorities = BTreeSet::new();
+                let path_aliases = [
+                    Some(current_root_alias.as_str()),
+                    git_common_dir_alias.as_deref(),
+                ];
+                for alias in path_aliases.into_iter().flatten() {
+                    if held_marker.is_none() {
+                        existing_authorities.extend(alias_project_id(&transaction, alias).await?);
+                    }
+                }
+                if held_marker.is_none()
+                    && let Some(git_common_dir_text) = git_common_dir_text.as_deref()
+                {
+                    let mut rows = transaction
+                        .query(
+                            "SELECT project_id FROM code_projects WHERE git_common_dir = ?1",
+                            params![git_common_dir_text],
+                        )
+                        .await
+                        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+                    while let Some(row) = rows
+                        .next()
+                        .await
+                        .map_err(|error| global_db_operation_error(OPERATION, error))?
+                    {
+                        existing_authorities.insert(
+                            row.get::<String>(0)
+                                .map_err(|error| global_db_operation_error(OPERATION, error))?,
+                        );
+                    }
+                }
+                existing_authorities.extend(held_marker);
+                // Anchors adopt only a clone no path names yet. Consulting them
+                // otherwise would put two clones enrolled separately before
+                // anchors existed into a reset-required conflict.
+                if existing_authorities.is_empty() {
+                    let mut named_by_anchor = std::collections::HashMap::new();
+                    for key in probe.keys() {
+                        if let Some(project_id) = alias_project_id(&transaction, key).await? {
+                            named_by_anchor.insert(key.to_owned(), project_id);
+                        }
+                    }
                     existing_authorities
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    canonical_project_root.display()
-                ),
-            ));
-        }
-        let authority_project_id = existing_authorities
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| project_id.to_string());
+                        .extend(probe.adopted(&named_by_anchor, &transaction).await?);
+                }
+                if existing_authorities.len() > 1 {
+                    // Two ids already claim this root or its repository. Picking one
+                    // would fabricate a consolidation the caller never asked for, so
+                    // the conflict is surfaced with the ids that produced it.
+                    return Err(tracedecay_domain::errors::TraceDecayError::reset_required(
+                        PROJECT_REGISTRY_AUTHORITY,
+                        format!(
+                            "conflicting project authorities [{}] already claim '{}'",
+                            existing_authorities
+                                .iter()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            canonical_project_root.display()
+                        ),
+                    ));
+                }
+                let authority_project_id = existing_authorities
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| project_id.to_string());
 
-        if authority_project_id == project_id {
-            transaction
-                .execute(
-                    "INSERT INTO code_projects
+                let rewrite_registered_root = authority_project_id == project_id
+                    && match registered_root(&transaction, project_id).await? {
+                        None => true,
+                        // The first enrolled checkout stays the registered root
+                        // while it exists; a linked worktree of it may repair it.
+                        Some((registered_root, registered_common_dir)) => {
+                            registered_root == canonical_root
+                                || !Path::new(&registered_root).exists()
+                                || (registered_common_dir.is_some()
+                                    && registered_common_dir == git_common_dir_text)
+                        }
+                    };
+                if rewrite_registered_root {
+                    transaction
+                        .execute(
+                            "INSERT INTO code_projects
                  (project_id, canonical_root, display_root, primary_root_platform,
                   primary_root_bytes, primary_root_last_seen_at, git_common_dir,
                   git_remote_url, default_branch, created_at, last_seen_at)
@@ -865,64 +1094,91 @@ impl RegisteredGlobalDb {
                     git_remote_url = excluded.git_remote_url,
                     default_branch = excluded.default_branch,
                     last_seen_at = excluded.last_seen_at",
-                    params![
-                        authority_project_id.as_str(),
-                        canonical_root,
-                        native_project_path_platform(),
-                        encode_native_project_path(&canonical_project_root),
-                        now,
-                        git_common_dir_text,
-                        git_remote_url,
-                        default_branch
-                    ],
-                )
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?;
-        } else {
-            transaction
-                .execute(
-                    "UPDATE code_projects SET last_seen_at = ?2 WHERE project_id = ?1",
-                    params![authority_project_id.as_str(), now],
-                )
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?;
-        }
-        let mut aliases = vec![current_root_alias];
-        aliases.extend(git_common_dir_alias);
-        if let Some(alias) = super::git_remote_search_alias(git_remote_url) {
-            aliases.push(alias);
-        }
-        for alias in aliases {
-            transaction
-                .execute(
-                    "INSERT INTO project_aliases (alias_path, project_id, last_seen_at)
+                            params![
+                                authority_project_id.as_str(),
+                                canonical_root,
+                                native_project_path_platform(),
+                                encode_native_project_path(&canonical_project_root),
+                                now,
+                                git_common_dir_text,
+                                git_remote_url,
+                                default_branch
+                            ],
+                        )
+                        .await
+                        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+                } else {
+                    // Only the registered root speaks for the project's remote and
+                    // default branch; another clone may track a local origin.
+                    transaction
+                        .execute(
+                            "UPDATE code_projects SET last_seen_at = ?2 WHERE project_id = ?1",
+                            params![authority_project_id.as_str(), now],
+                        )
+                        .await
+                        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+                }
+                let mut aliases = vec![current_root_alias];
+                aliases.extend(git_common_dir_alias);
+                if let Some(alias) = super::git_remote_search_alias(git_remote_url) {
+                    aliases.push(alias);
+                }
+                for alias in aliases {
+                    transaction
+                        .execute(
+                            "INSERT INTO project_aliases (alias_path, project_id, last_seen_at)
                      VALUES (?1, ?2, ?3)
                      ON CONFLICT(alias_path) DO UPDATE SET
                         project_id = excluded.project_id,
                         last_seen_at = excluded.last_seen_at",
-                    params![alias, authority_project_id.as_str(), now],
-                )
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?;
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|error| global_db_operation_error(OPERATION, error))?;
-        // A committed authority that cannot be read back is a registry
-        // inconsistency, not an "unregistered project", say so rather than
-        // handing the caller an absence it would read as a clean refusal.
-        self.get_code_project(&authority_project_id)
-            .await?
-            .ok_or_else(|| {
-                global_db_operation_message(
-                    OPERATION,
-                    format!(
-                        "project '{authority_project_id}' is not readable after its \
-                         registration committed"
-                    ),
-                )
-            })
+                            params![alias, authority_project_id.as_str(), now],
+                        )
+                        .await
+                        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+                }
+                // An anchor keeps the project that first recorded it, so a
+                // history later grafted into another repository cannot move it.
+                for alias in anchor_aliases {
+                    transaction
+                        .execute(
+                            "INSERT INTO project_aliases (alias_path, project_id, last_seen_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(alias_path) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at",
+                            params![alias, authority_project_id.as_str(), now],
+                        )
+                        .await
+                        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| global_db_operation_error(OPERATION, error))?;
+                // A committed authority that cannot be read back is a registry
+                // inconsistency, not an "unregistered project", say so rather than
+                // handing the caller an absence it would read as a clean refusal.
+                let recorded: Pin<
+                    Box<
+                        dyn Future<
+                                Output = tracedecay_domain::errors::Result<
+                                    Option<CodeProjectRecord>,
+                                >,
+                            > + Send
+                            + '_,
+                    >,
+                > = Box::pin(self.get_code_project(&authority_project_id));
+                recorded.await?.ok_or_else(|| {
+                    global_db_operation_message(
+                        OPERATION,
+                        format!(
+                            "project '{authority_project_id}' is not readable after its \
+                     registration committed"
+                        ),
+                    )
+                })
+            }
+            .instrument(tracing::trace_span!("global_db.registry.persist.upsert")),
+        )
     }
 
     /// Mints or refreshes a `project_aliases` row.
@@ -1570,13 +1826,21 @@ impl RegisteredGlobalDb {
         project_root: &Path,
         git_common_dir: Option<&Path>,
     ) -> tracedecay_domain::errors::Result<Option<ProjectStoreResolution>> {
-        let Some(project_id) = self
-            .project_id_by_identity(project_root, git_common_dir)
-            .await?
-        else {
+        let identified: Pin<
+            Box<dyn Future<Output = tracedecay_domain::errors::Result<Option<String>>> + Send + '_>,
+        > = Box::pin(self.project_id_by_identity(project_root, git_common_dir));
+        let Some(project_id) = identified.await? else {
             return Ok(None);
         };
-        let Some(context) = self.project_registry_context_by_id(&project_id).await? else {
+        let context_read: Pin<
+            Box<
+                dyn Future<
+                        Output = tracedecay_domain::errors::Result<Option<ProjectRegistryContext>>,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(self.project_registry_context_by_id(&project_id));
+        let Some(context) = context_read.await? else {
             return Ok(None);
         };
         if context.stores.len() > 1 {
@@ -1650,13 +1914,21 @@ impl RegisteredGlobalDb {
         project_root: &Path,
         git_common_dir: Option<&Path>,
     ) -> tracedecay_domain::errors::Result<Option<ProjectRegistryContext>> {
-        let Some(project_id) = self
-            .project_id_by_identity(project_root, git_common_dir)
-            .await?
-        else {
+        let identified: Pin<
+            Box<dyn Future<Output = tracedecay_domain::errors::Result<Option<String>>> + Send + '_>,
+        > = Box::pin(self.project_id_by_identity(project_root, git_common_dir));
+        let Some(project_id) = identified.await? else {
             return Ok(None);
         };
-        self.project_registry_context_by_id(&project_id).await
+        let context: Pin<
+            Box<
+                dyn Future<
+                        Output = tracedecay_domain::errors::Result<Option<ProjectRegistryContext>>,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(self.project_registry_context_by_id(&project_id));
+        context.await
     }
 
     async fn project_id_by_identity(
@@ -1693,8 +1965,11 @@ impl RegisteredGlobalDb {
         git_common_dir: Option<&Path>,
     ) -> tracedecay_domain::errors::Result<Vec<String>> {
         let mut project_ids = BTreeSet::new();
+        // Every profile reads the same `.git/` marker; only the profile that
+        // registered a store for its id may treat it as an identity.
         if let Some(marker) =
             tracedecay_runtime_core::storage::read_repository_identity_marker(project_root)?
+            && self.has_store_instance(&marker.project_id).await?
         {
             project_ids.insert(marker.project_id);
         }
@@ -1711,7 +1986,73 @@ impl RegisteredGlobalDb {
         {
             project_ids.insert(project_id);
         }
+        if project_ids.is_empty()
+            && let Some(project_id) = self.project_id_by_anchors(project_root).await?
+        {
+            project_ids.insert(project_id);
+        }
         Ok(project_ids.into_iter().collect())
+    }
+
+    async fn project_id_by_anchors(
+        &self,
+        project_root: &Path,
+    ) -> tracedecay_domain::errors::Result<Option<String>> {
+        let Some(origin) = tracedecay_runtime_core::git::git_remote_url(project_root) else {
+            return Ok(None);
+        };
+        let anchors = tracedecay_runtime_core::storage::repository_identity_anchors_off_executor(
+            project_root,
+            Some(&origin),
+        )
+        .await;
+        let probe = AnchorProbe::new(&anchors, Some(&origin));
+        let snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| global_db_operation_error("resolve project history anchor", error))?;
+        let mut named = std::collections::HashMap::new();
+        for key in probe.keys() {
+            if let Some(project_id) = alias_project_id(&snapshot, key).await? {
+                named.insert(key.to_owned(), project_id);
+            }
+        }
+        probe.adopted(&named, &snapshot).await
+    }
+
+    async fn has_history_anchor(
+        &self,
+        project_id: &str,
+    ) -> tracedecay_domain::errors::Result<bool> {
+        const OPERATION: &str = "resolve project history anchor";
+        let snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        has_history_anchor_in(&snapshot, project_id).await
+    }
+
+    async fn has_store_instance(
+        &self,
+        project_id: &str,
+    ) -> tracedecay_domain::errors::Result<bool> {
+        const OPERATION: &str = "resolve project store instance";
+        let snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        let mut rows = snapshot
+            .query(
+                "SELECT 1 FROM store_instances WHERE project_id = ?1 LIMIT 1",
+                params![project_id],
+            )
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        Ok(rows
+            .next()
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?
+            .is_some())
     }
 
     pub(super) async fn project_id_by_path_alias(
@@ -1719,37 +2060,37 @@ impl RegisteredGlobalDb {
         path: &Path,
         kind: ProjectIdentityAliasKind,
     ) -> tracedecay_domain::errors::Result<Option<String>> {
-        #[tracing::instrument(name = "global_db.registry.query.alias", level = "trace", skip_all)]
-        async fn project_id_by_alias_key(
-            db: &RegisteredGlobalDb,
-            alias: &str,
-        ) -> tracedecay_domain::errors::Result<Option<String>> {
-            const OPERATION: &str = "resolve project identity alias";
-            let snapshot = db
-                .read_snapshot()
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            let mut rows = snapshot
-                .query(
-                    "SELECT project_id FROM project_aliases WHERE alias_path = ?1",
-                    params![alias],
-                )
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            let Some(row) = rows
-                .next()
-                .await
-                .map_err(|error| global_db_operation_error(OPERATION, error))?
-            else {
-                return Ok(None);
-            };
-            row.get(0)
-                .map(Some)
-                .map_err(|error| global_db_operation_error(OPERATION, error))
-        }
-
         let alias = format!("{}{}", kind.prefix(), project_path_alias_key(path));
-        project_id_by_alias_key(self, &alias).await
+        self.project_id_by_alias_key(&alias).await
+    }
+
+    #[tracing::instrument(name = "global_db.registry.query.alias", level = "trace", skip_all)]
+    async fn project_id_by_alias_key(
+        &self,
+        alias: &str,
+    ) -> tracedecay_domain::errors::Result<Option<String>> {
+        const OPERATION: &str = "resolve project identity alias";
+        let snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        let mut rows = snapshot
+            .query(
+                "SELECT project_id FROM project_aliases WHERE alias_path = ?1",
+                params![alias],
+            )
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?
+        else {
+            return Ok(None);
+        };
+        row.get(0)
+            .map(Some)
+            .map_err(|error| global_db_operation_error(OPERATION, error))
     }
 
     /// Deletes registry authority rows, returning the committed row count.
@@ -1899,6 +2240,18 @@ impl RegisteredGlobalDb {
     #[tracing::instrument(name = "global_db.registry.query.reap_plan", level = "trace", skip_all)]
     pub async fn plan_registry_reap(&self) -> tracedecay_domain::errors::Result<RegistryReapPlan> {
         const OPERATION: &str = "plan registry reap";
+        let snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        self.classify_registry_reap(&snapshot).await
+    }
+
+    async fn classify_registry_reap(
+        &self,
+        snapshot: &impl QueryExecutor,
+    ) -> tracedecay_domain::errors::Result<RegistryReapPlan> {
+        const OPERATION: &str = "classify registry reap";
         let profile_root = self
             .db_path()
             .parent()
@@ -1906,10 +2259,6 @@ impl RegisteredGlobalDb {
                 global_db_operation_message(OPERATION, "global database has no profile directory")
             })?
             .to_path_buf();
-        let snapshot = self
-            .read_snapshot()
-            .await
-            .map_err(|error| global_db_operation_error(OPERATION, error))?;
         let mut plan = RegistryReapPlan::default();
 
         let mut rows = snapshot
@@ -1935,6 +2284,7 @@ impl RegisteredGlobalDb {
         }
 
         let mut live_roots_by_project: BTreeMap<String, usize> = BTreeMap::new();
+        let mut native_path_projects = BTreeSet::new();
         let mut dead_aliases = Vec::new();
         let mut rows = snapshot
             .query(
@@ -1954,14 +2304,21 @@ impl RegisteredGlobalDb {
             let project_id: String = row
                 .get(1)
                 .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            // A non-path alias (a remote-name search key) can never be judged
-            // dead by consulting the filesystem, so it is never a candidate.
+            // Anchors remain lookup data while the project exists, but are
+            // not evidence that any checkout still exists.
             let missing_path = match self::alias_key_path(&alias) {
                 Some(path) if !path.exists() => path.to_string_lossy().into_owned(),
-                // Either a non-path alias, which the filesystem can never
-                // judge dead, or a path that is still there.
-                _ => {
+                Some(_) => {
                     *live_roots_by_project.entry(project_id).or_default() += 1;
+                    continue;
+                }
+                None => {
+                    let key = alias
+                        .strip_prefix(GIT_COMMON_DIR_ALIAS_PREFIX)
+                        .unwrap_or(&alias);
+                    if key.starts_with(NATIVE_PROJECT_PATH_ALIAS_PREFIX) {
+                        native_path_projects.insert(project_id);
+                    }
                     continue;
                 }
             };
@@ -1993,7 +2350,9 @@ impl RegisteredGlobalDb {
             let canonical_root: String = row
                 .get(1)
                 .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            let git_common_dir: Option<String> = row.get(2).ok();
+            let git_common_dir: Option<String> = row
+                .get(2)
+                .map_err(|error| global_db_operation_error(OPERATION, error))?;
             if Path::new(&canonical_root).exists()
                 || git_common_dir
                     .as_deref()
@@ -2012,7 +2371,14 @@ impl RegisteredGlobalDb {
                 &profile_root,
                 &project_id,
             );
-            if store_root.exists() {
+            if native_path_projects.contains(&project_id) {
+                // The reap receipt carries a display string, so it cannot
+                // safely recheck a native path that does not round-trip as UTF-8.
+                plan.retained.push(RetainedRegistryEntry {
+                    entry,
+                    reason: "native path aliases require lossless reap evidence".to_owned(),
+                });
+            } else if store_root.exists() {
                 plan.retained.push(RetainedRegistryEntry {
                     entry,
                     reason: format!(
@@ -2031,10 +2397,10 @@ impl RegisteredGlobalDb {
 
     /// Removes the rows in `plan.reapable`, and only those rows.
     ///
-    /// Every path is re-checked here rather than trusted from planning time,
-    /// so a checkout that reappeared between the two calls is skipped instead
-    /// of unregistered. Returns the number of rows actually removed. No
-    /// filesystem path is deleted, moved, or opened for writing.
+    /// Candidates are reclassified under the write transaction: new live aliases,
+    /// stores, or changed row identities invalidate stale entries. Each path is
+    /// checked again before deletion, and each matching row is counted once.
+    /// No filesystem path is deleted, moved, or opened for writing.
     #[tracing::instrument(name = "global_db.registry.persist.reap", level = "trace", skip_all)]
     pub async fn apply_registry_reap(
         &self,
@@ -2045,9 +2411,15 @@ impl RegisteredGlobalDb {
             .begin_write_transaction()
             .await
             .map_err(|error| global_db_operation_error(OPERATION, error))?;
+        let mut eligible: HashSet<_> = self
+            .classify_registry_reap(&transaction)
+            .await?
+            .reapable
+            .into_iter()
+            .collect();
         let mut removed = 0;
         for entry in &plan.reapable {
-            if Path::new(&entry.missing_path).exists() {
+            if !eligible.remove(entry) || Path::new(&entry.missing_path).exists() {
                 continue;
             }
             let statement = match entry.kind {
@@ -2055,11 +2427,11 @@ impl RegisteredGlobalDb {
                 ReapEntryKind::ProjectAlias => "DELETE FROM project_aliases WHERE alias_path = ?1",
                 ReapEntryKind::CodeProject => "DELETE FROM code_projects WHERE project_id = ?1",
             };
-            transaction
+            let changed_rows = transaction
                 .execute(statement, params![entry.key.as_str()])
                 .await
                 .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            removed += 1;
+            removed += usize::from(changed_rows != 0);
         }
         transaction
             .commit()
@@ -2088,20 +2460,35 @@ pub async fn registered_enrollment_roots(
         candidates.extend(super::registry_context_candidate_roots(&context));
     }
 
-    let mut roots =
-        tracedecay_runtime_core::storage::enrolled_project_roots(candidates, project_id)?;
     let enrollment_root = tracedecay_runtime_core::worktree::repository_identity_root(project_root)
         .unwrap_or_else(|| project_root.to_path_buf());
-    match enrollment_root.canonicalize() {
-        Ok(canonical) => {
-            if tracedecay_runtime_core::storage::read_repository_identity_marker(&canonical)?
-                .is_none()
-            {
+    let canonical_enrollment_root = enrollment_root.canonicalize();
+    if let Ok(canonical) = &canonical_enrollment_root {
+        let marker = tracedecay_runtime_core::storage::read_repository_identity_marker(canonical)?;
+        match tracedecay_runtime_core::storage::profile_root_of_sharded_data_root(
+            &store_layout.data_root,
+            project_id.as_str(),
+        ) {
+            Some(profile_root) => {
+                tracedecay_runtime_core::storage::claim_repository_identity_marker(
+                    canonical,
+                    project_id.as_str(),
+                    profile_root,
+                )?;
+            }
+            None if marker.is_none() => {
                 tracedecay_runtime_core::storage::write_repository_identity_marker(
-                    &canonical,
+                    canonical,
                     project_id.as_str(),
                 )?;
             }
+            None => {}
+        }
+    }
+    let mut roots =
+        tracedecay_runtime_core::storage::enrolled_project_roots(candidates, project_id)?;
+    match canonical_enrollment_root {
+        Ok(canonical) => {
             if roots.is_empty() {
                 roots.push(canonical);
             }

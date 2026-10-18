@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
 #[cfg(any(test, feature = "test-helpers"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{
@@ -27,7 +29,7 @@ use tracedecay_store::{
     GraphPublicationReplayRecordV1, GraphPublicationStoreV1, GraphReplayAppendOutcomeV1,
     GraphVerifiedHeadV1, ProjectId, RetainedGraphStoreLeaseV1, RuntimeCancellationIdV1,
     RuntimeCancellationIdentityV1, RuntimeDeadlineIdV1, RuntimeDeadlineV1, RuntimeInterruptionV1,
-    RuntimeRequestControlV1, RuntimeRequestProbeV1, StoreShardIdV1,
+    RuntimeRequestControlV1, RuntimeRequestProbeV1, StoreShardIdV1, StoreShardScopeV1,
 };
 
 use super::{DaemonSessionRuntimeRegistryV1, Result, session_registry_error};
@@ -47,6 +49,8 @@ mod layered_refresh_tests;
 #[cfg(test)]
 mod sealed_publication_tests;
 mod seals;
+#[cfg(test)]
+mod shard_owner_retirement_tests;
 use seals::{
     finalize_project_graph_replay_unlink, lock_project_graph_replay_pool,
     prove_stable_sealed_source, revalidate_stable_sealed_source,
@@ -688,7 +692,6 @@ pub(crate) struct RetainedCodeGraphRuntimeV1 {
     sealed_state_digest: tracedecay_graph_db::SealedGraphStateDigest,
     lifecycle_cancelled: Arc<AtomicBool>,
     operation_task_owner: Arc<RuntimeOperationTaskOwnerV1>,
-    operation_runtime: tokio::runtime::Handle,
     /// Registry-owned per-project-publication-shard locks; see
     /// `DaemonSessionRuntimeRegistryV1::code_graph_publication_gates`.
     publication_locks: Arc<CodeGraphShardPublicationLocksV1>,
@@ -1794,21 +1797,11 @@ impl RetainedCodeGraphRuntimeV1 {
             }
             let _ = release_process_allocator_memory_v1();
         };
-        // Publication also runs on plain measurement threads. Enter the
-        // runtime captured at mount so those calls use the same task owner.
-        let _entered = self.operation_runtime.enter();
-        if !self.operation_task_owner.retain(async move {
-            if let Err(error) = tokio::task::spawn_blocking(sweep).await {
-                tracing::warn!(
-                    event = "graph_staging_release_failed",
-                    error = %error,
-                    "staging release worker failed; maintenance will retry the release"
-                );
-            }
-        }) {
+        if let Err(error) = self.operation_task_owner.retain_blocking(sweep) {
             tracing::warn!(
                 event = "graph_staging_release_failed",
-                "staging release admission closed; maintenance will retry the release"
+                error = %error,
+                "staging release admission failed; maintenance will retry the release"
             );
             let _ = release_process_allocator_memory_v1();
         }
@@ -2504,6 +2497,13 @@ impl DaemonSessionRuntimeRegistryV1 {
     /// to a concurrent attacher (or any other failure here) is swallowed:
     /// the ordinary lease path still runs and surfaces its own, more precise
     /// error if the shard is genuinely unavailable.
+    ///
+    /// A shard whose project runtime is mounted here belongs to that mount
+    /// alone: this waits for the mount's own background graph open instead.
+    /// An unretained attachment there would make the mount's open fail with
+    /// `GraphOwnerAttachmentAlreadyRegistered` and leave a map owner that no
+    /// project retirement target covers, so the idle project could never be
+    /// retired for capacity reuse.
     #[tracing::instrument(
         name = "daemon.session_registry.ensure_graph_shard_attached",
         level = "trace",
@@ -2523,15 +2523,40 @@ impl DaemonSessionRuntimeRegistryV1 {
                 return;
             }
         }
-        match graph_attachment::open_session_relation_owner(
-            &self.registry,
-            &self.graph_registry,
-            &self.graph_lifecycle_cancelled,
-            self.incarnation,
-            project_shard.clone(),
-        )
-        .await
+        if let StoreShardScopeV1::Project { project_id } = &project_shard.scope
+            && project_shard.brain_id == *self.identity.brain_id()
+            && project_shard.profile_id == *self.identity.profile_id()
         {
+            let waited: Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> =
+                Box::pin(self.project_owners.wait_for_memory_graph(project_id));
+            match waited.await {
+                Ok(false) => {}
+                Ok(true) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        event = "code_graph_shard_owner_wait_failed",
+                        shard = ?project_shard,
+                        error = %error,
+                        "could not await the mounted project graph owner"
+                    );
+                    return;
+                }
+            }
+        }
+        let opened = tracedecay_runtime_core::erase_send!(
+            graph_attachment::open_session_relation_owner(
+                &self.registry,
+                &self.graph_registry,
+                &self.graph_lifecycle_cancelled,
+                self.incarnation,
+                project_shard.clone(),
+            ),
+            Result<(
+                GraphDbOwnerAttachmentV1,
+                CanonicalGraphStoreOwnerRetirementTargetV1,
+            )>
+        );
+        match opened.await {
             Ok((attachment, target)) => {
                 tracing::info!(
                     event = "code_graph_shard_reattached",
@@ -2592,7 +2617,11 @@ impl DaemonSessionRuntimeRegistryV1 {
             self.identity.profile_id().clone(),
             project_id.clone(),
         );
-        self.ensure_code_graph_shard_attached(&project_shard).await;
+        {
+            let attached: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                Box::pin(self.ensure_code_graph_shard_attached(&project_shard));
+            attached.await;
+        }
         let code_scope = match reference {
             Some(ref_id) => CodeShardScopeV1::Branch {
                 worktree_id,
@@ -2607,17 +2636,24 @@ impl DaemonSessionRuntimeRegistryV1 {
             repository_id.clone(),
             code_scope,
         );
-        let authority = self
-            .registry
-            .retain_code_graph_store(
-                StoreRuntimeKey::new(project_shard.clone(), self.incarnation),
-                code_shard.clone(),
-                generation_id.clone(),
-            )
-            .await
-            .map_err(|failure| {
-                session_registry_error("retain exact code graph authority", format!("{failure:?}"))
-            })?;
+        let retained_store: Pin<
+            Box<
+                dyn Future<
+                        Output = std::result::Result<
+                            Arc<tracedecay_runtime_core::shard_runtime::registry::CanonicalCodeGraphStoreLeaseV1>,
+                            tracedecay_runtime_core::shard_runtime::registry::StoreRuntimeRegistryFailure,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > = Box::pin(self.registry.retain_code_graph_store(
+            StoreRuntimeKey::new(project_shard.clone(), self.incarnation),
+            code_shard.clone(),
+            generation_id.clone(),
+        ));
+        let authority = retained_store.await.map_err(|failure| {
+            session_registry_error("retain exact code graph authority", format!("{failure:?}"))
+        })?;
         // The pre-retain heal above keys the freshly reconstructed project
         // shard, but every later publish/recover lease keys the registry by
         // this lease's binding (`registered_database` uses
@@ -2633,7 +2669,11 @@ impl DaemonSessionRuntimeRegistryV1 {
                 bound = ?bound_shard,
                 "code graph lease binding names a different shard than the reconstructed project shard"
             );
-            self.ensure_code_graph_shard_attached(&bound_shard).await;
+            {
+                let attached: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                    Box::pin(self.ensure_code_graph_shard_attached(&bound_shard));
+                attached.await;
+            }
         }
         let replay_root = project_database
             .database_path()
@@ -2661,9 +2701,6 @@ impl DaemonSessionRuntimeRegistryV1 {
             .map_err(|error| {
                 session_registry_error("bind code graph replay route", error.to_string())
             })?;
-        let operation_runtime = tokio::runtime::Handle::try_current().map_err(|error| {
-            session_registry_error("retain code graph operation runtime", error.to_string())
-        })?;
         let publication_locks = self.retain_project_publication_locks(&project_shard);
         Ok(RetainedCodeGraphRuntimeV1 {
             graph_registry: self.graph_registry.clone(),
@@ -2680,7 +2717,6 @@ impl DaemonSessionRuntimeRegistryV1 {
             sealed_state_digest: replay_binding.sealed_state_digest,
             lifecycle_cancelled: Arc::clone(&self.graph_lifecycle_cancelled),
             operation_task_owner: Arc::clone(&self.operation_task_owner),
-            operation_runtime,
             publication_locks,
         })
     }
@@ -2697,7 +2733,11 @@ impl DaemonSessionRuntimeRegistryV1 {
             self.identity.profile_id().clone(),
             project_id.clone(),
         );
-        self.ensure_code_graph_shard_attached(&project_shard).await;
+        {
+            let attached: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                Box::pin(self.ensure_code_graph_shard_attached(&project_shard));
+            attached.await;
+        }
         let authority = self
             .registry
             .retain_graph_store(StoreRuntimeKey::new(
@@ -2708,7 +2748,11 @@ impl DaemonSessionRuntimeRegistryV1 {
             .map_err(|error| GraphDbError::unavailable(format!("{error:?}")))?;
         let bound_shard = authority.binding().shard_id.clone();
         if bound_shard != project_shard {
-            self.ensure_code_graph_shard_attached(&bound_shard).await;
+            {
+                let attached: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                    Box::pin(self.ensure_code_graph_shard_attached(&bound_shard));
+                attached.await;
+            }
         }
         let authority_lease: Arc<dyn RetainedGraphStoreLeaseV1> = authority;
         let mut storage = project_database
@@ -2717,7 +2761,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         let graph_registry = self.graph_registry.clone();
         let graph_lifecycle_cancelled = Arc::clone(&self.graph_lifecycle_cancelled);
         let cancellation = cancellation.clone();
-        tokio::task::spawn_blocking(move || {
+        tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             let deadline_at = Instant::now() + GRAPH_OPERATION_DEADLINE;
             let request_cancellation: Arc<dyn GraphCancellation> =
                 Arc::new(MaintenanceGraphCancellationV1(cancellation));
@@ -2823,7 +2867,11 @@ impl DaemonSessionRuntimeRegistryV1 {
         // That exact failure surfaced on every retention tick as
         // `graph_replay_release_failed`, which blocked the code-generation
         // pass and let superseded sealed generations accumulate without bound.
-        self.ensure_code_graph_shard_attached(&project_shard).await;
+        {
+            let attached: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                Box::pin(self.ensure_code_graph_shard_attached(&project_shard));
+            attached.await;
+        }
         let authority = self
             .registry
             .retain_graph_store(StoreRuntimeKey::new(
@@ -2843,7 +2891,11 @@ impl DaemonSessionRuntimeRegistryV1 {
                 bound = ?bound_shard,
                 "graph replay reconcile lease binding names a different shard than the reconstructed project shard"
             );
-            self.ensure_code_graph_shard_attached(&bound_shard).await;
+            {
+                let attached: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+                    Box::pin(self.ensure_code_graph_shard_attached(&bound_shard));
+                attached.await;
+            }
         }
         let authority_lease: Arc<dyn RetainedGraphStoreLeaseV1> = authority;
         let mut storage = project_database
@@ -2859,7 +2911,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         let graph_lifecycle_cancelled = Arc::clone(&self.graph_lifecycle_cancelled);
         let cancellation = cancellation.clone();
         let generation = generation.clone();
-        tokio::task::spawn_blocking(move || {
+        tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             let pool_deadline = Instant::now() + GRAPH_OPERATION_DEADLINE;
             let pool_check = || {
                 if cancellation.is_cancelled() {

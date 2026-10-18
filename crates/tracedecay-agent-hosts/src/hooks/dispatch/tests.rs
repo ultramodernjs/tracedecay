@@ -950,7 +950,6 @@ async fn events_spooled_before_a_binding_republication_replay_after_it() {
             stop,
             native_capture_material(source, stop, observed_at).unwrap(),
             observed_at,
-            tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET,
         ),
         tracedecay_hooks::NativeHookCaptureOutcomeV1::Captured,
     );
@@ -1023,8 +1022,8 @@ fn bound_hook_excludes_maintenance_until_dispatch_is_released() {
     let maintenance = acquire_exclusive_for_profile(profile.data_dir(), "wipe").unwrap();
     let spool = tracedecay_hooks::hook_v2_spool_root(&layout.data_root, host);
     std::fs::remove_dir_all(&spool).unwrap();
-    assert!(prepare().is_none());
+    assert!(matches!(prepare(), Err(Unprepared::Unavailable)));
     assert!(!spool.exists());
     drop(maintenance);
-    assert!(prepare().is_some());
+    assert!(prepare().is_ok());
 }

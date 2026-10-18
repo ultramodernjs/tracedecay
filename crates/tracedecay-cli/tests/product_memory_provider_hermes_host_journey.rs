@@ -336,6 +336,7 @@ impl HermesJourney {
             canonical_text_setting(&MemoryProviderNcmObserverV1::Enabled {
                 worker_binary: worker.canonicalize().expect("canonical NCM worker"),
                 state_root: state_root.canonicalize().expect("canonical NCM state root"),
+                namespace_binding: Default::default(),
             }),
             "configuration.idempotency.hermes-cli-project-journey.ncm",
         );

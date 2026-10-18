@@ -446,6 +446,11 @@ pub fn required_string_list(
 fn partition_index_patterns(
     patterns: Vec<String>,
 ) -> (Vec<String>, Vec<ConfigurationSettingFindingV1>) {
+    // One set compiles when every member does; only a failing list needs the
+    // per-pattern compiles that name its invalid members.
+    if validate_index_path_patterns(&patterns).is_ok() {
+        return (patterns, Vec::new());
+    }
     let mut applied = Vec::with_capacity(patterns.len());
     let mut findings = Vec::new();
     for pattern in patterns {
@@ -583,6 +588,7 @@ mod memory_provider_snapshot_tests {
         let observer = MemoryProviderNcmObserverV1::Enabled {
             worker_binary: root.join("opt/tracedecay/tracedecay-ncm-worker"),
             state_root: root.join("var/lib/tracedecay/ncm"),
+            namespace_binding: Default::default(),
         };
         let value = ConfigurationValueV1::Text(serde_json::to_string(&observer).unwrap());
         let selected = runtime_config_from_snapshot(&snapshot_with(
@@ -631,6 +637,7 @@ mod memory_provider_snapshot_tests {
         let ncm = MemoryProviderNcmObserverV1::Enabled {
             worker_binary: root.join("worker"),
             state_root: root.join("state"),
+            namespace_binding: Default::default(),
         };
         values.insert(
             setting_key(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY),

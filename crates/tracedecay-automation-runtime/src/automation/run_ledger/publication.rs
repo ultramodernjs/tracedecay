@@ -163,7 +163,7 @@ pub async fn read_published_artifact_chain(
         .parent()
         .ok_or_else(|| config_error("artifact publication is missing its run directory"))?
         .to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         sync_directory(&run_directory)?;
         let artifacts_root = run_directory
             .parent()
@@ -195,7 +195,7 @@ pub(crate) async fn publish_run_artifact_chain(
     let publication = prepare_run_artifact_publication(run_id, identity, &artifact_descriptors)?;
     let dashboard_root = dashboard_root.to_path_buf();
     let run_id = run_id.to_string();
-    tokio::task::spawn_blocking(move || {
+    tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
         publish_run_artifact_chain_blocking(&dashboard_root, &run_id, &artifacts, &publication)
     })
     .await

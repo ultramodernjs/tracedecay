@@ -2703,7 +2703,7 @@ mod failed_handshake_generation_tests {
     fn refusal_preserves_only_observed_generation_and_never_readiness() {
         let request = NcmSurfaceHandshakeRequest {
             registration_revision: 1,
-            namespace: NcmNamespace("a1".repeat(32)),
+            namespace: NcmNamespace("a1".repeat(32), crate::NcmNamespaceBinding::ExactSessionV1),
             request_id: "request".into(),
             required_capabilities: BTreeSet::new(),
             host_limits: ProviderLimits {

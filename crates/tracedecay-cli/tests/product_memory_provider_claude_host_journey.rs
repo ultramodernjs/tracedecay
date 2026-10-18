@@ -1053,6 +1053,7 @@ impl ClaudeHostJourney {
                 state_root: state_root
                     .canonicalize()
                     .expect("canonical isolated state root"),
+                namespace_binding: Default::default(),
             }),
             "configuration.idempotency.cli-journey-ncm-observer",
         );

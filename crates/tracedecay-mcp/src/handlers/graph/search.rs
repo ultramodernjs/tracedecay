@@ -473,8 +473,7 @@ pub(super) fn append_coverage_md(md: &mut Md, value: &Value) {
 fn display_unavailable_suffix(row: &Value) -> String {
     row.get("display_unavailable")
         .and_then(Value::as_str)
-        .map(|reason| format!(" · display unavailable: {reason}"))
-        .unwrap_or_default()
+        .map_or_default(|reason| format!(" · display unavailable: {reason}"))
 }
 
 /// One result row with its rendered markdown.
@@ -515,7 +514,7 @@ fn ranked_search_row(it: &Value) -> RankedRow {
     }
     RankedRow {
         rank,
-        utility_micros: utility,
+        utility_micros: Some(utility),
         name: name.to_owned(),
         anchored: lexical_routing::ranked_by_anchor(it),
         markdown: md.render(),
@@ -528,7 +527,7 @@ fn render_search_md(response_handle_root: Option<&Path>, query: &str, value: &Va
     match value.get("results").and_then(Value::as_array) {
         Some(items) if !items.is_empty() => {
             let rows = items.iter().map(ranked_search_row).collect::<Vec<_>>();
-            md.raw(&ranked_rows_md(response_handle_root, query, &rows));
+            md.raw(&ranked_rows_md(response_handle_root, query, &rows).0);
         }
         _ => {
             md.empty_note("No matching symbols.");

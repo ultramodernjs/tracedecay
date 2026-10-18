@@ -2841,7 +2841,7 @@ mod tests {
                 RetainedSurfaceOperation::from_operation_name(name),
                 Some(operation)
             );
-            assert!(RetainedSurfaceOperation::SDK_EXECUTABLE.contains(&operation));
+            assert!(RetainedSurfaceOperation::CALLABLE.contains(&operation));
             let capability = tracedecay_tool_catalog::CapabilityId::new(format!(
                 "capability.application.retained.{}",
                 name.replace('_', "-")

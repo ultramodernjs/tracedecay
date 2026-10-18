@@ -42,8 +42,8 @@ use super::{
     languages::{LanguageRegistry, StaticLanguageRegistry},
     lineage::{GenerationSymbolIndexV1, LineageResolutionErrorV1, SymbolLineageResolver},
     projection::{
-        CodeChunkProjectionSink, ProjectionPublicationErrorV1, ProjectionPublicationHandoffV1,
-        expected_request_digest, project_for_publication,
+        ProjectionPublicationErrorV1, ProjectionPublicationHandoffV1, expected_request_digest,
+        project_for_publication,
     },
     provider::{
         GenerationProviderCoverageV1, GenerationProviderReadV1,
@@ -1868,29 +1868,25 @@ struct ActiveGenerationLookupV1 {
 }
 
 /// Production owner for one repository and one atomic publication authority.
-pub struct CodeIndexProductionOwnerV1<P, S> {
+pub struct CodeIndexProductionOwnerV1<P> {
     config: CodeIndexProductionConfigV1,
     publication: P,
-    projection: S,
     physical_artifacts: SharedPhysicalCodeArtifactPoolV1,
     retained_parses: SharedRetainedParsePool,
 }
 
-impl<P, S> CodeIndexProductionOwnerV1<P, S>
+impl<P> CodeIndexProductionOwnerV1<P>
 where
     P: CodeIndexAtomicPublicationPort,
-    S: CodeChunkProjectionSink,
 {
     pub fn new(
         config: CodeIndexProductionConfigV1,
         publication: P,
-        projection: S,
     ) -> Result<Self, CodeIndexProductionOpenErrorV1> {
         config.validate()?;
         Ok(Self {
             config,
             publication,
-            projection,
             physical_artifacts: SharedPhysicalCodeArtifactPoolV1::default(),
             retained_parses: SharedRetainedParsePool::default(),
         })
@@ -2124,13 +2120,7 @@ where
                     target_projection_key: &request.target_projection_key,
                     control,
                 }
-                .build(
-                    &mut self.projection,
-                    parent,
-                    plan,
-                    manifest.clone(),
-                    &validated.snapshot,
-                )?;
+                .build(parent, plan, manifest.clone(), &validated.snapshot)?;
                 match sparse {
                     Ok(sparse) => {
                         crate::observe::record_rebuild_state("increment");
@@ -2215,10 +2205,11 @@ where
                         .map_err(CodeIndexProductionErrorV1::Capability)
                     }
                 }?;
-                let projection = project_for_publication(
-                    &mut self.projection,
-                    projection_request(None, target_projection_key, changes)?,
-                )
+                let projection = project_for_publication(projection_request(
+                    None,
+                    target_projection_key,
+                    changes,
+                )?)
                 .map_err(CodeIndexProductionErrorV1::Projection)?;
                 lexical_page_source::checkpoint(control)?;
                 let imports = {
@@ -2379,9 +2370,43 @@ where
             physical_artifacts.insert(reuse_key, &artifact);
             files.push(artifact);
         }
+        #[cfg(any(test, feature = "test-helpers"))]
+        hold_after_cold_extraction_for_test(control)?;
         lexical_page_source::checkpoint(control)?;
         staged_generation(manifest.generation_id.clone(), files)
     }
+}
+
+/// Park a cold build after it extracted every present file and before it
+/// assembles and publishes the generation, while the file
+/// `TRACEDECAY_TEST_HOLD_AFTER_COLD_EXTRACTION` names exists and the build is
+/// not cancelled. Records `<hold>.entered` on arrival. Builds that run before
+/// the test creates the file pass straight through.
+///
+/// Compiled only under `test-helpers`, so a default or `production` build
+/// does not read the variable.
+#[cfg(any(test, feature = "test-helpers"))]
+fn hold_after_cold_extraction_for_test(
+    control: &dyn CodeIndexExecutionControlV1,
+) -> Result<(), CodeIndexProductionErrorV1> {
+    let Some(hold) = std::env::var_os("TRACEDECAY_TEST_HOLD_AFTER_COLD_EXTRACTION") else {
+        return Ok(());
+    };
+    let hold = std::path::PathBuf::from(hold);
+    if !hold.exists() {
+        return Ok(());
+    }
+    let entered = std::path::PathBuf::from(format!("{}.entered", hold.display()));
+    std::fs::write(&entered, b"cold-extraction").map_err(|error| {
+        CodeIndexProductionErrorV1::Contract(format!(
+            "could not record the test hold at {}: {error}",
+            entered.display()
+        ))
+    })?;
+    while hold.exists() && !control.is_cancelled() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 fn interruption_error(control: &dyn CodeIndexExecutionControlV1) -> CodeIndexProductionErrorV1 {
@@ -2464,8 +2489,7 @@ fn materialize_present_file(
         .chunks
         .chunks
         .first()
-        .map(|chunk| chunk.sensitivity.level)
-        .unwrap_or(SensitivityLevelV1::Public);
+        .map_or(SensitivityLevelV1::Public, |chunk| chunk.sensitivity.level);
     let physical_reuse_key = physical_reuse_key(config, file, descriptor, sensitivity)?;
     let reused = u64::try_from(carried.artifacts.clone_bodies.len()).unwrap_or(u64::MAX);
     physical_artifacts.record_clone_payloads(reused, 0);

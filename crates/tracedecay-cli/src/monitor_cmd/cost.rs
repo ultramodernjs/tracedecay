@@ -212,10 +212,10 @@ async fn fetch_cost_snapshot(profile: &ProfileRoot) -> Result<Option<CostSnapsho
         )?;
         map_cost_payloads(week, today).map_err(|message| TraceDecayError::Config { message })
     };
-    tokio::time::timeout(FETCH_TIMEOUT, fetch)
+    tracedecay_runtime_core::native_runtime::timeout(FETCH_TIMEOUT, fetch)
         .await
-        .map_err(|_| TraceDecayError::Config {
-            message: "daemon cost refresh timed out after 5 seconds".to_string(),
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("daemon cost refresh did not answer within 5 seconds: {error}"),
         })?
 }
 
@@ -240,12 +240,7 @@ async fn cost_summary(
 }
 
 fn fetch_cost_snapshot_blocking(profile: &ProfileRoot) -> RefreshResult {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("could not start cost refresh runtime: {error}"))?;
-    runtime
-        .block_on(fetch_cost_snapshot(profile))
+    tracedecay_runtime_core::native_runtime::block_on(fetch_cost_snapshot(profile))?
         .map_err(|error| error.to_string())
 }
 
@@ -390,16 +385,31 @@ mod tests {
         );
     }
 
+    /// The refresh worker is a plain thread, so the daemon client it drives
+    /// must settle with no Tokio runtime entered.
+    #[test]
+    fn cost_refresh_settles_without_an_entered_tokio_runtime() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = ProfileRoot::under_home(home.path());
+        assert!(tokio::runtime::Handle::try_current().is_err());
+
+        let refreshed = fetch_cost_snapshot_blocking(&profile);
+
+        assert!(
+            refreshed.is_err(),
+            "no daemon serves this profile: {refreshed:?}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_worker_is_nonblocking_and_runtime_context_safe() {
         let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
         let receiver = spawn_refresh_worker(move || {
             release_receiver.recv().unwrap();
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            assert_eq!(runtime.block_on(async { 42 }), 42);
+            assert_eq!(
+                tracedecay_runtime_core::native_runtime::block_on(async { 42 }),
+                Ok(42)
+            );
             Ok(None)
         })
         .unwrap();
