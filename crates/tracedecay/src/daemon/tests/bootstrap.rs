@@ -1733,6 +1733,8 @@ async fn linked_worktree_root_is_admitted_for_explicit_first_touch_init() {
 #[cfg(unix)]
 #[tokio::test]
 async fn linked_route_reuses_primary_authority_while_shadow_writer_is_held() {
+    use futures_util::FutureExt;
+
     let home = TempDir::new().expect("isolated home");
     let root = home.path().canonicalize().expect("canonical home");
     let primary = root.join("primary");
@@ -1789,47 +1791,63 @@ async fn linked_route_reuses_primary_authority_while_shadow_writer_is_held() {
     });
     writer_held.notified().await;
 
-    let linked_server = tokio::time::timeout(
+    let linked_open = std::panic::AssertUnwindSafe(tokio::time::timeout(
         std::time::Duration::from_secs(5),
         engine.project_server(&linked_handshake),
-    )
-    .await
-    .expect("linked worktree must not wait on shadow writer administration")
-    .expect("linked worktree must reuse the primary authority without shadow admission");
-    release_writer.send(()).expect("release shadow writer");
-    blocker.await.expect("shadow writer blocker joins");
+    ))
+    .catch_unwind()
+    .await;
+    // Release and join the blocker before reporting any request failure.
+    // The assertion scope drops its linked server even when an assertion panics.
+    let writer_released = release_writer.send(());
+    let blocker_joined = blocker.await;
+    let assertions = std::panic::AssertUnwindSafe(async {
+        let linked_server = match linked_open {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+        .expect("linked worktree must not wait on shadow writer administration")
+        .expect("linked worktree must reuse the primary authority without shadow admission");
+        writer_released.expect("release shadow writer");
+        blocker_joined.expect("shadow writer blocker joins");
 
-    let servers = engine.store_administration.project_servers().lock().await;
-    let server_keys = servers.servers.keys().cloned().collect::<Vec<_>>();
-    let route_aliases = servers
-        .aliases
-        .iter()
-        .map(|(route, key)| (route.project_path.clone(), key.project_root.clone()))
-        .collect::<Vec<_>>();
-    drop(servers);
-    assert!(
-        Arc::ptr_eq(&primary_server, &linked_server),
-        "both routes must resolve one retained project server; \
-         server keys: {server_keys:?}; route aliases: {route_aliases:?}"
-    );
-    let servers = engine.store_administration.project_servers().lock().await;
-    assert_eq!(
-        servers.servers.len(),
-        1,
-        "one physical project server key: {server_keys:?}"
-    );
-    assert_eq!(
-        servers.aliases.len(),
-        2,
-        "primary and linked route aliases: {route_aliases:?}"
-    );
-    drop(servers);
-    assert!(
-        !linked.join(".tracedecay").exists(),
-        "linked route must not acquire working-tree project state"
-    );
-    drop((primary_server, linked_server));
+        let servers = engine.store_administration.project_servers().lock().await;
+        let server_keys = servers.servers.keys().cloned().collect::<Vec<_>>();
+        let route_aliases = servers
+            .aliases
+            .iter()
+            .map(|(route, key)| (route.project_path.clone(), key.project_root.clone()))
+            .collect::<Vec<_>>();
+        drop(servers);
+        assert!(
+            Arc::ptr_eq(&primary_server, &linked_server),
+            "both routes must resolve one retained project server; \
+             server keys: {server_keys:?}; route aliases: {route_aliases:?}"
+        );
+        let servers = engine.store_administration.project_servers().lock().await;
+        assert_eq!(
+            servers.servers.len(),
+            1,
+            "one physical project server key: {server_keys:?}"
+        );
+        assert_eq!(
+            servers.aliases.len(),
+            2,
+            "primary and linked route aliases: {route_aliases:?}"
+        );
+        drop(servers);
+        assert!(
+            !linked.join(".tracedecay").exists(),
+            "linked route must not acquire working-tree project state"
+        );
+    })
+    .catch_unwind()
+    .await;
+    drop(primary_server);
     engine.shutdown_all().await;
+    if let Err(panic) = assertions {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 /// A checkout build that resolved an installed profile must not enroll its
