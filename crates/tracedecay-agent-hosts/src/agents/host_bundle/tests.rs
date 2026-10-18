@@ -829,6 +829,27 @@ fn feedback_switch_apply_restore_and_aggregate_receipt_share_one_writer() {
 }
 
 #[test]
+fn artifact_content_bound_admits_exact_limit_and_rejects_one_byte_more() {
+    for (size, admitted) in [
+        (MAX_ARTIFACT_CONTENT_BYTES, true),
+        (MAX_ARTIFACT_CONTENT_BYTES + 1, false),
+    ] {
+        let bytes = vec![b'x'; size];
+        let bundle = manifest(HostKindV1::Codex, &bytes);
+        let result = super::planner::validate_artifact_contents_for_operation(
+            &bundle,
+            HostBundleLifecycleOpV1::Install,
+            &content(&bytes),
+        );
+        if admitted {
+            assert_eq!(result.unwrap()["plugins/tracedecay.json"], bytes);
+        } else {
+            assert_eq!(result, Err(HostBundleError::ArtifactContentMismatch));
+        }
+    }
+}
+
+#[test]
 fn corruption_and_external_bundle_paths_are_rejected() {
     let root = tempfile::tempdir().unwrap();
     let bundle = manifest(HostKindV1::OpenCode, b"expected");
