@@ -297,7 +297,7 @@ pub(crate) fn project_recall(
     let object = value.as_object()?;
     if object
         .keys()
-        .any(|name| !names.contains(&name.as_str()) && name != "history_grant")
+        .any(|name| !names.contains(&name.as_str()))
         || names.iter().any(|name| !object.contains_key(*name))
     {
         return None;
@@ -399,18 +399,18 @@ pub(crate) fn project_attribution(
     call: &ProviderCall,
     value: &Value,
     namespace: &NcmNamespace,
-    admission: Option<&CurrentAdvisoryAdmission>,
 ) -> Option<Option<Value>> {
     let Some(original) = value.pointer("/source_identity/original_source") else {
         return Some(None);
     };
     let admitted = attribution(original)?;
-    if let OriginScopeEvidence::Recorded { scope, .. } = &admitted.origin_scope {
-        // A claim in history_grant is not host authorization. Cross-session
-        // records arrive through the explicit replay admission path.
-        if scope != &call.exact_scope && !history_source_admitted(&admitted, admission) {
-            return None;
-        }
+    // The host delivers each canonical record under the exact scope of its own
+    // session. An attribution recorded anywhere else is refused, never
+    // relabelled into this delivery.
+    if let OriginScopeEvidence::Recorded { scope, .. } = &admitted.origin_scope
+        && scope != &call.exact_scope
+    {
+        return None;
     }
     let canonical = value.get("canonical_payload")?;
     let source_ref = format!(
@@ -458,22 +458,6 @@ pub(crate) fn project_attribution(
     })))
 }
 
-fn history_source_admitted(
-    source: &SourceAttribution,
-    admission: Option<&CurrentAdvisoryAdmission>,
-) -> bool {
-    admission.is_some_and(|admission| {
-        admission.history_sources.iter().any(|entry| {
-            entry.attribution == *source
-                && matches!(
-                    entry.current_disposition.state,
-                    tracedecay_memory_provider_api::contract::SourceDisposition::Available
-                        | tracedecay_memory_provider_api::contract::SourceDisposition::Superseded
-                        | tracedecay_memory_provider_api::contract::SourceDisposition::Revoked
-                )
-        })
-    })
-}
 
 pub(crate) fn evidence_text(kind: &str, canonical: &Value) -> Option<(String, String)> {
     let payload = canonical.get("payload").unwrap_or(canonical);
@@ -573,6 +557,27 @@ fn evidence_field(payload: &Value, names: &[&str]) -> Option<String> {
             .filter(|text| text.len() <= 8_192)
             .map(str::to_owned)
     })
+}
+
+/// Whether two exact scopes name the same checkout. Every agent session of a
+/// checkout shares NCM's memory; the session binding and resolved-scope
+/// digest are per-delivery evidence, not a partition.
+fn same_checkout(left: &OwnedExactScope, right: &OwnedExactScope) -> bool {
+    left.profile_id == right.profile_id
+        && left.project_id == right.project_id
+        && left.repository_identity == right.repository_identity
+        && left.worktree_identity == right.worktree_identity
+        && left.branch_identity == right.branch_identity
+}
+
+/// A recall candidate's `checkout_observations` identity: the five checkout
+/// fields of the admitted call, with the session and resolved-scope digest the
+/// binding forbids left empty.
+fn checkout_scope_value(scope: &OwnedExactScope) -> Value {
+    json!({"scope_binding": "checkout_observations", "profile_id": scope.profile_id,
+        "project_id": scope.project_id, "repository_identity": scope.repository_identity,
+        "worktree_identity": scope.worktree_identity, "branch_identity": scope.branch_identity,
+        "agent_session_id": "", "resolved_scope_digest": ""})
 }
 
 fn scope_value(scope: &OwnedExactScope) -> Value {
@@ -713,21 +718,19 @@ pub(crate) fn reconstruct_observation(
     Some(())
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn reconstruct_recall(
     call: &ProviderCall,
     instance: &str,
     reply: &mut ProviderReply,
-    admission: Option<&CurrentAdvisoryAdmission>,
 ) -> Option<()> {
-    reconstruct_recall_with_diagnostics(call, instance, reply, admission, None, None)
+    reconstruct_recall_with_diagnostics(call, instance, reply, None, None)
 }
 
 pub(crate) fn reconstruct_recall_with_diagnostics(
     call: &ProviderCall,
     instance: &str,
     reply: &mut ProviderReply,
-    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
     diagnostic_key: Option<&[u8; 32]>,
 ) -> Option<()> {
@@ -735,7 +738,6 @@ pub(crate) fn reconstruct_recall_with_diagnostics(
         call,
         instance,
         reply,
-        admission,
         diagnostic_sink,
         diagnostic_key,
     );
@@ -748,7 +750,6 @@ pub(crate) fn reconstruct_recall_with_diagnostics(
                 call,
                 instance,
                 reply.state_generation,
-                admission,
                 diagnostic_key,
             ),
         );
@@ -760,7 +761,6 @@ fn reconstruct_recall_inner(
     call: &ProviderCall,
     instance: &str,
     reply: &mut ProviderReply,
-    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
     diagnostic_key: Option<&[u8; 32]>,
 ) -> Option<()> {
@@ -785,7 +785,6 @@ fn reconstruct_recall_inner(
                 rows,
                 max_candidates,
                 max_total,
-                admission,
                 reply.state_generation,
                 diagnostic_key,
             ),
@@ -801,7 +800,7 @@ fn reconstruct_recall_inner(
         let retained = decode_capsule(&row["provenance"])?;
         let original = &retained["original_source"];
         let source = attribution(original)?;
-        if scope(&retained["delivery_scope"])? != call.exact_scope {
+        if !same_checkout(&scope(&retained["delivery_scope"])?, &call.exact_scope) {
             return None;
         }
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
@@ -816,10 +815,10 @@ fn reconstruct_recall_inner(
         {
             return None;
         }
-        if let OriginScopeEvidence::Recorded { scope, .. } = &source.origin_scope {
-            if scope != &call.exact_scope && !history_source_admitted(&source, admission) {
-                return None;
-            }
+        if let OriginScopeEvidence::Recorded { scope, .. } = &source.origin_scope
+            && !same_checkout(scope, &call.exact_scope)
+        {
+            return None;
         }
         let content = row["value_text"].as_str()?;
         let digest = hex_digest(&Sha256::digest(content.as_bytes()));
@@ -923,8 +922,7 @@ fn reconstruct_recall_inner(
         } else {
             Vec::new()
         };
-        let mut candidate_scope = scope_value(&call.exact_scope);
-        candidate_scope["scope_binding"] = json!("exact_coding_scope");
+        let candidate_scope = checkout_scope_value(&call.exact_scope);
         total += emitted_content.len() as u64;
         // The validated stable reference is also the existing retained trace
         // inspection selector. It does not attest a kernel activation trace.
@@ -1008,7 +1006,6 @@ fn reconstruct_recall_inner(
                 &value,
                 max_candidates,
                 max_total,
-                admission,
                 worker["common_recall"]["scanned_items"]
                     .as_u64()
                     .unwrap_or(0),
@@ -1059,7 +1056,6 @@ const RECALL_DIAGNOSTIC_EXACT_SCOPE_DOMAIN: &[u8] =
 const RECALL_DIAGNOSTIC_INSTANCE_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic.instance.v1\0";
 
 struct RecallDiagnosticAccumulator {
-    history_source_count: u64,
     scanned_items: u64,
     candidate_count: u64,
     admitted_candidate_count: u64,
@@ -1075,7 +1071,6 @@ struct RecallDiagnosticAccumulator {
 impl RecallDiagnosticAccumulator {
     fn new() -> Self {
         Self {
-            history_source_count: 0,
             scanned_items: 0,
             candidate_count: 0,
             admitted_candidate_count: 0,
@@ -1179,7 +1174,6 @@ impl RecallDiagnosticAccumulator {
                 instance.as_bytes(),
             ),
             state_generation,
-            history_source_count: self.history_source_count,
             scanned_items: self.scanned_items,
             candidate_count: self.candidate_count,
             candidate_ranks: self.candidate_ranks,
@@ -1277,7 +1271,6 @@ fn worker_budgeted_content_bytes(
     max_candidates: usize,
     max_content: u64,
     max_total: u64,
-    admission: Option<&CurrentAdvisoryAdmission>,
     accepted_candidates: usize,
     accepted_content_bytes: u64,
 ) -> Option<usize> {
@@ -1286,7 +1279,7 @@ fn worker_budgeted_content_bytes(
     }
     validated_worker_activation(row)?;
     let content = row["value_text"].as_str()?;
-    let (retained, source) = authorized_worker_row(call, row, admission)?;
+    let (retained, source) = authorized_worker_row(call, row)?;
     if row["key_text"] != retained["projection"]["key_text"]
         || row["value_text"] != retained["projection"]["value_text"]
     {
@@ -1357,11 +1350,6 @@ fn worker_budgeted_content_bytes(
     Some(boundary)
 }
 
-fn diagnostic_history_source_count(admission: Option<&CurrentAdvisoryAdmission>) -> u64 {
-    admission.map_or(0, |admission| {
-        u64::try_from(admission.history_sources.len()).unwrap_or(u64::MAX)
-    })
-}
 
 fn diagnostic_for_worker(
     call: &ProviderCall,
@@ -1371,12 +1359,10 @@ fn diagnostic_for_worker(
     rows: &[Value],
     max_candidates: usize,
     max_total: u64,
-    admission: Option<&CurrentAdvisoryAdmission>,
     state_generation: u64,
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let mut summary = RecallDiagnosticAccumulator::new();
-    summary.history_source_count = diagnostic_history_source_count(admission);
     summary.scanned_items = worker["common_recall"]["scanned_items"]
         .as_u64()
         .unwrap_or(0);
@@ -1402,7 +1388,6 @@ fn diagnostic_for_worker(
                 max_candidates,
                 max_content,
                 max_total,
-                admission,
                 budgeted_candidates,
                 budgeted_total,
             )
@@ -1457,7 +1442,6 @@ fn diagnostic_for_reconstructed(
     value: &Value,
     max_candidates: usize,
     max_total: u64,
-    admission: Option<&CurrentAdvisoryAdmission>,
     scanned_items: u64,
     state_generation: u64,
     stage: NcmRecallDiagnosticStage,
@@ -1467,7 +1451,6 @@ fn diagnostic_for_reconstructed(
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let mut summary = RecallDiagnosticAccumulator::new();
-    summary.history_source_count = diagnostic_history_source_count(admission);
     summary.scanned_items = scanned_items;
     if let Some(candidates) = value["candidates"].as_array() {
         for (index, candidate) in candidates.iter().enumerate() {
@@ -1500,7 +1483,6 @@ fn diagnostic_for_reconstruction_failure(
     call: &ProviderCall,
     instance: &str,
     state_generation: u64,
-    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let request = serde_json::from_slice::<Value>(&call.payload.bytes).unwrap_or(Value::Null);
@@ -1511,9 +1493,7 @@ fn diagnostic_for_reconstruction_failure(
     let max_total = request["budgets"]["maximum_total_content_bytes"]
         .as_u64()
         .unwrap_or(0);
-    let mut summary = RecallDiagnosticAccumulator::new();
-    summary.history_source_count = diagnostic_history_source_count(admission);
-    summary.finish(
+    RecallDiagnosticAccumulator::new().finish(
         call,
         instance,
         &request,
@@ -1535,7 +1515,6 @@ pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
     instance: &str,
     reply: &ProviderReply,
     code: TerminalCode,
-    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
     diagnostic_key: Option<&[u8; 32]>,
 ) {
@@ -1554,7 +1533,6 @@ pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
             instance,
             reply.state_generation,
             stage,
-            admission,
             diagnostic_key,
         ),
     );
@@ -1565,7 +1543,6 @@ fn diagnostic_for_control_terminal(
     instance: &str,
     state_generation: u64,
     stage: NcmRecallDiagnosticStage,
-    admission: Option<&CurrentAdvisoryAdmission>,
     diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let request = serde_json::from_slice::<Value>(&call.payload.bytes).unwrap_or(Value::Null);
@@ -1576,9 +1553,7 @@ fn diagnostic_for_control_terminal(
     let max_total = request["budgets"]["maximum_total_content_bytes"]
         .as_u64()
         .unwrap_or(0);
-    let mut summary = RecallDiagnosticAccumulator::new();
-    summary.history_source_count = diagnostic_history_source_count(admission);
-    summary.finish(
+    RecallDiagnosticAccumulator::new().finish(
         call,
         instance,
         &request,
@@ -1593,14 +1568,10 @@ fn diagnostic_for_control_terminal(
     )
 }
 
-fn authorized_worker_row(
-    call: &ProviderCall,
-    row: &Value,
-    admission: Option<&CurrentAdvisoryAdmission>,
-) -> Option<(Value, SourceAttribution)> {
+fn authorized_worker_row(call: &ProviderCall, row: &Value) -> Option<(Value, SourceAttribution)> {
     let retained = decode_capsule_bounded(&row["provenance"], RECALL_DIAGNOSTIC_MAX_CAPSULE_BYTES)?;
     let source = attribution(&retained["original_source"])?;
-    if scope(&retained["delivery_scope"])? != call.exact_scope {
+    if !same_checkout(&scope(&retained["delivery_scope"])?, &call.exact_scope) {
         return None;
     }
     let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
@@ -1611,8 +1582,7 @@ fn authorized_worker_row(
         row["source"].as_str()?,
     )?;
     if let OriginScopeEvidence::Recorded { scope, .. } = &source.origin_scope
-        && scope != &call.exact_scope
-        && !history_source_admitted(&source, admission)
+        && !same_checkout(scope, &call.exact_scope)
     {
         return None;
     }
@@ -1637,7 +1607,7 @@ mod recall_diagnostic_tests {
     // Independent Python hashlib/hmac computation for DIAGNOSTIC_KEY, the
     // diagnostic-session namespace, and the query domain/value below.
     const EXPECTED_QUERY_HMAC: &str =
-        "e29bafe7d4f7c2f22380f931bc8e3381989c5d46b53178dee215ba7cc5d661e1";
+        "a3d33c05e33d4b614723953e4fd22d9b9cb9ace09eac999ea3ef9bd4b7191aa5";
 
     impl NcmRecallDiagnosticSink for RecordingSink {
         fn record(&self, event: NcmRecallDiagnosticEvent) {
@@ -1693,6 +1663,10 @@ mod recall_diagnostic_tests {
     }
 
     fn original_source(call: &ProviderCall, sequence: u64) -> Value {
+        original_source_in(&call.exact_scope, sequence)
+    }
+
+    fn original_source_in(origin: &OwnedExactScope, sequence: u64) -> Value {
         json!({
             "source": {
                 "canonical_provider_id": "claude",
@@ -1705,7 +1679,7 @@ mod recall_diagnostic_tests {
             },
             "origin_scope": {
                 "state": "recorded",
-                "exact_scope_identity": scope_value(&call.exact_scope),
+                "exact_scope_identity": scope_value(origin),
                 "authority_ref": "private-authority"
             },
             "source_sequence": sequence,
@@ -1722,13 +1696,25 @@ mod recall_diagnostic_tests {
     }
 
     fn worker_row(call: &ProviderCall, sequence: u64, content: &str, activation: f64) -> Value {
-        let original = original_source(call, sequence);
+        worker_row_delivered(call, &call.exact_scope, sequence, content, activation)
+    }
+
+    /// A row the worker retained from a delivery under `delivery`, returned
+    /// to a recall issued by `call`.
+    fn worker_row_delivered(
+        call: &ProviderCall,
+        delivery: &OwnedExactScope,
+        sequence: u64,
+        content: &str,
+        activation: f64,
+    ) -> Value {
+        let original = original_source_in(delivery, sequence);
         let source = attribution(&original).unwrap();
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let binding = source_binding(&namespace, &source).unwrap();
         let retained = json!({
             "original_source": original,
-            "delivery_scope": scope_value(&call.exact_scope),
+            "delivery_scope": scope_value(delivery),
             "projection": {"key_text": content, "value_text": content},
             "source_refs": [format!("private-ref-{sequence}")]
         });
@@ -2053,7 +2039,7 @@ mod recall_diagnostic_tests {
             }
         });
         let mut reply = worker_reply(&call, &worker);
-        reconstruct_recall(&call, "ncm.instance.contract", &mut reply, None)
+        reconstruct_recall(&call, "ncm.instance.contract", &mut reply)
             .expect("reconstruction");
         assert_eq!(
             reply.payload.as_ref().unwrap().contract_id.as_str(),
@@ -2083,6 +2069,75 @@ mod recall_diagnostic_tests {
             json!(["private-ref-42"])
         );
         assert_eq!(candidate["trace_refs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recall_answers_any_session_of_the_checkout_and_refuses_another_checkout() {
+        let request = canonical_request(
+            canonical_temporal("current"),
+            canonical_budgets(),
+            canonical_exclusions(),
+            60_000,
+        );
+        let call = canonical_call(&request, 60_000);
+        let earlier_session = exact_scope_with_session("earlier-session");
+        let worker = |row: Value| {
+            json!({
+                "common_recall": {
+                    "candidates": [row],
+                    "truncated": false,
+                    "unknown_items": 0,
+                    "excluded_items": 0,
+                    "scanned_items": 1,
+                    "score_upper_bound": 1.0
+                }
+            })
+        };
+        let mut reply = worker_reply(
+            &call,
+            &worker(worker_row_delivered(
+                &call,
+                &earlier_session,
+                7,
+                "earlier session evidence",
+                0.9,
+            )),
+        );
+        reconstruct_recall(&call, "ncm.instance.contract", &mut reply)
+            .expect("another session of this checkout is recallable");
+        let output: Value = serde_json::from_slice(&reply.payload.as_ref().unwrap().bytes).unwrap();
+        let candidate = &output["candidates"][0];
+        assert_eq!(candidate["content"], json!("earlier session evidence"));
+        assert_eq!(
+            candidate["exact_scope_identity"],
+            checkout_scope_value(&call.exact_scope)
+        );
+        assert_eq!(
+            candidate["exact_scope_identity"]["scope_binding"],
+            json!("checkout_observations")
+        );
+        assert_eq!(
+            candidate["provenance"]["original_sources"][0],
+            original_source_in(&earlier_session, 7),
+            "the original session's attribution is preserved, never relabelled"
+        );
+
+        let mut other_checkout = earlier_session.clone();
+        other_checkout.branch_identity = "refs/heads/another-checkout".to_owned();
+        let mut foreign = worker_reply(
+            &call,
+            &worker(worker_row_delivered(
+                &call,
+                &other_checkout,
+                8,
+                "another checkout's evidence",
+                0.9,
+            )),
+        );
+        assert!(
+            reconstruct_recall(&call, "ncm.instance.contract", &mut foreign).is_none(),
+            "a row delivered for another checkout is never re-scoped into this one"
+        );
     }
 
     #[test]
@@ -2122,7 +2177,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             4,
             8192,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2139,7 +2193,6 @@ mod recall_diagnostic_tests {
             &reconstructed,
             4,
             8192,
-            None,
             0,
             7,
             NcmRecallDiagnosticStage::Reconstructed,
@@ -2192,7 +2245,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             4,
             8192,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2230,9 +2282,17 @@ mod recall_diagnostic_tests {
     }
 
     #[test]
-    fn diagnostic_identity_is_unlinkable_across_scopes() {
+    fn diagnostic_identity_is_unlinkable_across_checkouts() {
         let call_a = call_for_scope(exact_scope_with_session("diagnostic-session-a"));
-        let call_b = call_for_scope(exact_scope_with_session("diagnostic-session-b"));
+        // Sessions of one checkout share NCM's memory and its namespace.
+        let same_checkout = call_for_scope(exact_scope_with_session("diagnostic-session-b"));
+        assert_eq!(
+            NcmNamespace::from_exact_scope(&call_a.exact_scope),
+            NcmNamespace::from_exact_scope(&same_checkout.exact_scope)
+        );
+        let mut other_checkout = exact_scope_with_session("diagnostic-session-b");
+        other_checkout.branch_identity = "refs/heads/diagnostic-other-checkout".to_owned();
+        let call_b = call_for_scope(other_checkout);
         let request = json!({
             "query": "private query marker",
             "budgets": {
@@ -2260,7 +2320,6 @@ mod recall_diagnostic_tests {
             worker_a["common_recall"]["candidates"].as_array().unwrap(),
             4,
             8192,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2272,7 +2331,6 @@ mod recall_diagnostic_tests {
             worker_b["common_recall"]["candidates"].as_array().unwrap(),
             4,
             8192,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2313,7 +2371,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             4,
             8192,
-            None,
             7,
             None,
         );
@@ -2368,7 +2425,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             4,
             8192,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2430,7 +2486,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             4,
             2,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2504,7 +2559,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             4,
             64,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2543,7 +2597,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             1,
             64,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2585,7 +2638,6 @@ mod recall_diagnostic_tests {
             worker["common_recall"]["candidates"].as_array().unwrap(),
             1,
             64,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2609,7 +2661,6 @@ mod recall_diagnostic_tests {
                 .unwrap(),
             1,
             64,
-            None,
             7,
             Some(&DIAGNOSTIC_KEY),
         );
@@ -2631,7 +2682,7 @@ mod recall_diagnostic_tests {
             "canonical_payload": canonical,
             "source_identity": {"original_source": original_source(&call, 1)}
         });
-        assert!(project_attribution(&call, &observation, &namespace, None).is_none());
+        assert!(project_attribution(&call, &observation, &namespace).is_none());
     }
 
     #[test]

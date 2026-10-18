@@ -450,7 +450,7 @@ fn provider_behind_the_acknowledged_watermark_requires_a_snapshot_restore() -> T
     let plan = runtime.assess(&checkpoint(SCHEMA_V1, 4, reported(1))?, &control(now), now)?;
     assert_eq!(
         plan.repair_action(),
-        Some(RepairActionV1::RestoreProviderSnapshot)
+        Some(RepairActionV1::ResetProviderState)
     );
     match &plan {
         RecoveryPlanV1::StateIncompatible {
@@ -538,7 +538,7 @@ fn a_provider_that_abandons_its_replay_position_is_typed_and_refused() -> TestRe
             ..
         } => {
             assert_eq!(*host_acknowledged, Some(SourceSequenceV1(1)));
-            assert_eq!(*repair, RepairActionV1::RestoreProviderSnapshot);
+            assert_eq!(*repair, RepairActionV1::ResetProviderState);
         }
         other => return Err(format!("expected an abandoned position, got {other:?}").into()),
     }

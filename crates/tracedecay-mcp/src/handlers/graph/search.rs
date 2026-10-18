@@ -995,7 +995,6 @@ where
         coverage,
         memory_matches,
         memory_graph_coverage,
-        memory_temporal_coverage: None,
         memory_matches_error,
         verified_graph_evidence,
         plan,

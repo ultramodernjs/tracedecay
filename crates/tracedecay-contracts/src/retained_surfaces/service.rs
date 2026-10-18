@@ -282,7 +282,7 @@ impl<'a> RetainedSurfaceServiceV1<'a> {
                 }
             }
             RetainedSurfaceDispatch::ProviderControl(request) => {
-                if request.validate_at(observed_at).is_err() {
+                if request.validate().is_err() {
                     Err(RetainedSurfaceExecutionErrorV1::InvalidRequest)
                 } else {
                     match self.ports.provider_control.as_ref() {
@@ -461,10 +461,7 @@ pub(super) fn outcome_matches_operation(
         ApplicationOutcome::Preview(_) | ApplicationOutcome::Result(_) => None,
     };
     if let Some(RetainedSurfaceResultV1::ProviderControl(result)) = result {
-        return operation == result.operation()
-            && class_matches
-            && result.validate().is_ok()
-            && provider_control_intent_matches_outcome(result, outcome);
+        return operation == result.operation() && class_matches && result.validate().is_ok();
     }
     if let Some(RetainedSurfaceResultV1::FactStoreCurate(result)) = result {
         return operation == RetainedSurfaceOperation::FactStoreCurate
@@ -568,17 +565,6 @@ fn provider_control_outcome_matches_request(
     matches!(result, Some(RetainedSurfaceResultV1::ProviderControl(result)) if result.validate_for(request).is_ok())
 }
 
-fn provider_control_intent_matches_outcome(
-    result: &super::ProviderControlResultV1,
-    outcome: &ApplicationOutcome<RetainedSurfaceResultV1>,
-) -> bool {
-    let super::ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = &result.result
-    else {
-        return true;
-    };
-    matches!(outcome, ApplicationOutcome::Effect(effect) if effect.receipt == deletion.intent.host_receipt)
-}
-
 /// Whether a retained operation can cross its durable effect boundary.
 pub const fn retained_surface_operation_is_effect(operation: RetainedSurfaceOperation) -> bool {
     matches!(
@@ -589,12 +575,7 @@ pub const fn retained_surface_operation_is_effect(operation: RetainedSurfaceOper
             | RetainedSurfaceOperation::FactStoreRemove
             | RetainedSurfaceOperation::FactStoreSupersede
             | RetainedSurfaceOperation::FactFeedback
-            | RetainedSurfaceOperation::ProviderFeedback
-            | RetainedSurfaceOperation::ProviderCorrection
-            | RetainedSurfaceOperation::ProviderDeleteBySource
             | RetainedSurfaceOperation::ProviderMaintenance
-            | RetainedSurfaceOperation::ProviderSnapshotRestore
-            | RetainedSurfaceOperation::ProviderReplay
             | RetainedSurfaceOperation::SessionRefreshCancel
             | RetainedSurfaceOperation::SessionRefreshBegin
     )

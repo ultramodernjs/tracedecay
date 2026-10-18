@@ -590,22 +590,7 @@ impl ProjectCognitiveRecallPortV1 {
         request: CognitiveRecallRequest,
         cancellation: &CancellationSignal,
     ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
-        self.recall_admitted_with_history(request, cancellation, None)
-            .await
-    }
-
-    /// Recalls with the canonical JSON produced by the host's freshly
-    /// revalidated typed history grant. The mounted authority still admits it
-    /// at dispatch; carrying this claim never grants source access by itself.
-    pub async fn recall_admitted_with_history(
-        &self,
-        request: CognitiveRecallRequest,
-        cancellation: &CancellationSignal,
-        history_grant: Option<serde_json::Value>,
-    ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
-        let outcome = self
-            .recall_uncounted(request, cancellation, history_grant)
-            .await?;
+        let outcome = self.recall_uncounted(request, cancellation).await?;
         if let Some(report) = &outcome.report {
             self.admission_observer
                 .observe_admission(report)
@@ -630,7 +615,6 @@ impl ProjectCognitiveRecallPortV1 {
         &self,
         request: CognitiveRecallRequest,
         cancellation: &CancellationSignal,
-        history_grant: Option<serde_json::Value>,
     ) -> Result<CognitiveRecallAdmittedOutcomeV1, CognitiveRecallPortError> {
         request
             .validate()
@@ -717,7 +701,6 @@ impl ProjectCognitiveRecallPortV1 {
             request_id: request.request_id().as_str().to_owned(),
             query: request.query().to_owned(),
             exclusions: request.exclusions().cloned(),
-            history_grant,
             temporal: temporal.clone(),
             budgets,
             policy_revision: self.policy_revision,
@@ -966,7 +949,7 @@ impl ProjectCognitiveRecallPortV1 {
                     .with_explanation(summary)
                     .map_err(CognitiveRecallPortError::Application)?;
             }
-            if let Some(sources) = admitted.observation_history_sources() {
+            if let Some(sources) = admitted.observation_sources() {
                 original_sources.insert(candidate.candidate_id.clone(), sources.to_vec());
             }
             candidates.push(application_candidate);
@@ -1170,7 +1153,6 @@ struct RecallCallPlan {
     request_id: String,
     query: String,
     exclusions: Option<CognitiveRecallExclusions>,
-    history_grant: Option<serde_json::Value>,
     temporal: AdmittedTemporalQuery,
     budgets: RecallBudgetsV1,
     policy_revision: u64,
@@ -1279,7 +1261,6 @@ impl ActiveCallPlan for RecallCallPlan {
                 remaining_millis: call_control.remaining_millis(),
             },
             self.exclusions.as_ref(),
-            self.history_grant.as_ref(),
             &required_capabilities,
         )
         .map_err(RecallRoutePlanError::Admission)?;

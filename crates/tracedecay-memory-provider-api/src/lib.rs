@@ -1080,11 +1080,11 @@ impl ProviderDescriptor {
         for capability in &self.capabilities {
             CapabilityId::new(capability.as_str()).map_err(ApiError::InvalidVersionedId)?;
         }
-        for mandatory in [
-            "provider.health.v1",
-            "observation.accept.v1",
-            "recall.query.v1",
-        ] {
+        // Observation is not universal: a provider that observes nothing (the
+        // host's own Native memory) is complete with health and recall. Every
+        // observation delivery still requires `observation.accept.v1` at its
+        // own call and readiness boundary.
+        for mandatory in ["provider.health.v1", "recall.query.v1"] {
             if !self.supports(mandatory) {
                 return Err(ApiError::MandatoryCapabilityMissing(mandatory));
             }

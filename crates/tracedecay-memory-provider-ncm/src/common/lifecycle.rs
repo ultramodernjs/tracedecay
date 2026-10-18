@@ -597,7 +597,7 @@ pub(crate) fn project(
                     control["transition_time"] = json!(replacement.validity.valid_from_utc_nanos?);
                     control["transition_wire"] = original["validity"]["valid_from"].clone();
                     let provenance =
-                        project_attribution(call, &value["replacement"], namespace, admission)??;
+                        project_attribution(call, &value["replacement"], namespace)??;
                     let kind = value["replacement"]["observation_kind"].as_str()?;
                     let (key_text, value_text) =
                         evidence_text(kind, &value["replacement"]["canonical_payload"])?;

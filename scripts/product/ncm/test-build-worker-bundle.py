@@ -9,7 +9,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import stat
 import sys
 import tempfile
@@ -178,11 +178,97 @@ class BuildWorkerBundleTest(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(
                 captured.getvalue().strip(),
-                f"TRACEDECAY_NCM_WORKER_MANIFEST={output}",
+                f"TRACEDECAY_NCM_WORKER_MANIFEST={output.as_posix()}",
             )
             merged = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(len(merged["targets"]), 2)
             self.assertEqual(MODULE.main(["--merge", inputs[0], inputs[0], "-o", str(output)]), 2)
+
+    def test_printed_paths_use_forward_slashes_on_windows(self) -> None:
+        bundle = PureWindowsPath(r"D:\a\repo\target\ncm-bundle\x86_64-pc-windows-msvc")
+        self.assertEqual(
+            MODULE.assignment(
+                "TRACEDECAY_NCM_WORKER",
+                bundle / MODULE.worker_executable_name("x86_64-pc-windows-msvc"),
+            ),
+            "TRACEDECAY_NCM_WORKER="
+            "D:/a/repo/target/ncm-bundle/x86_64-pc-windows-msvc/tracedecay-ncm-worker.exe",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "the fake cargo is a POSIX script")
+    def test_build_cli_bundles_the_target_worker_and_prints_both_assignments(self) -> None:
+        triple = "aarch64-pc-windows-msvc"
+        with tempfile.TemporaryDirectory(prefix="ncm-build-") as directory:
+            root = Path(directory)
+            target_directory = root / "target"
+            record = root / "cargo-calls.json"
+            cargo = root / "fake-cargo"
+            cargo.write_text(
+                f"""#!{sys.executable}
+import json, os, pathlib, sys
+arguments = sys.argv[1:]
+record = pathlib.Path({str(record)!r})
+calls = json.loads(record.read_text()) if record.exists() else []
+calls.append({{
+    "arguments": arguments,
+    "manifest_env": os.environ.get("TRACEDECAY_NCM_WORKER_MANIFEST"),
+    "ort_lib_location": os.environ.get("ORT_LIB_LOCATION"),
+}})
+record.write_text(json.dumps(calls))
+target_directory = pathlib.Path({str(target_directory)!r})
+if arguments[0] == "build":
+    triple = arguments[arguments.index("--target") + 1]
+    release = target_directory / triple / "release"
+    release.mkdir(parents=True, exist_ok=True)
+    (release / "tracedecay-ncm-worker.exe").write_bytes(b"MZ fixture worker")
+elif arguments[0] == "metadata":
+    print(json.dumps({{"target_directory": str(target_directory)}}))
+""",
+                encoding="utf-8",
+            )
+            cargo.chmod(0o755)
+            output = root / "bundle"
+            captured = io.StringIO()
+            environment = {
+                "TRACEDECAY_NCM_WORKER_MANIFEST": "/stale/worker-manifest.json",
+                "ORT_LIB_LOCATION": "/opt/onnxruntime/lib",
+            }
+            saved = {key: os.environ.get(key) for key in environment}
+            os.environ.update(environment)
+            try:
+                with redirect_stdout(captured):
+                    status = MODULE.main(
+                        ["--target", triple, "--output", str(output), "--cargo", str(cargo)]
+                    )
+            finally:
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+            self.assertEqual(status, 0)
+            self.assertEqual(
+                captured.getvalue().splitlines(),
+                [
+                    f"TRACEDECAY_NCM_WORKER={(output / 'tracedecay-ncm-worker.exe').as_posix()}",
+                    f"TRACEDECAY_NCM_WORKER_MANIFEST={(output / 'worker-manifest.json').as_posix()}",
+                ],
+            )
+            self.assertEqual(
+                (output / "tracedecay-ncm-worker.exe").read_bytes(), b"MZ fixture worker"
+            )
+            manifest = json.loads((output / "worker-manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest, per_target_manifest(triple, b"MZ fixture worker"))
+            calls = json.loads(record.read_text(encoding="utf-8"))
+            build = calls[0]
+            self.assertEqual(build["arguments"][0], "build")
+            self.assertEqual(
+                build["arguments"][build["arguments"].index("--target") + 1], triple
+            )
+            self.assertIn("--locked", build["arguments"])
+            # A stale pin never reaches the worker build; ORT linkage does.
+            self.assertTrue(all(call["manifest_env"] is None for call in calls))
+            self.assertEqual(build["ort_lib_location"], "/opt/onnxruntime/lib")
 
 
 if __name__ == "__main__":

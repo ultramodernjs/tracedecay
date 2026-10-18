@@ -64,15 +64,9 @@ fn provider_control_tools_project_the_canonical_mcp_and_result_schemas() {
     let registry =
         tracedecay_contracts::mcp_executable_binding_registry().expect("MCP executable registry");
     for operation in [
-        RetainedSurfaceOperation::ProviderFeedback,
-        RetainedSurfaceOperation::ProviderCorrection,
-        RetainedSurfaceOperation::ProviderDeleteBySource,
         RetainedSurfaceOperation::ProviderHealth,
         RetainedSurfaceOperation::ProviderInspection,
         RetainedSurfaceOperation::ProviderMaintenance,
-        RetainedSurfaceOperation::ProviderSnapshotExport,
-        RetainedSurfaceOperation::ProviderSnapshotRestore,
-        RetainedSurfaceOperation::ProviderReplay,
     ] {
         let name = format!("tracedecay_{}", operation.as_str());
         let definition = definitions

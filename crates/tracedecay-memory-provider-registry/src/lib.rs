@@ -417,7 +417,7 @@ pub struct ProviderRegistrationMetadataV1 {
     /// Admitted participation mode.
     pub mode: EnabledProviderMode,
     /// Host composition's common-profile requirement, independent of provider
-    /// identity, descriptor claims and payload-carried history grants.
+    /// identity and descriptor claims.
     pub requires_common_advisory_profile: bool,
     /// Actual validated descriptor limits.
     pub limits: ProviderLimits,

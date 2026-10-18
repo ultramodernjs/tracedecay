@@ -1,0 +1,276 @@
+name: Memory providers real world
+
+# Real-world acceptance for the pluggable memory-provider host on hosted
+# machines: build a pinned NCM worker bundle for the runner's own target, embed
+# its trust root in the host binaries, install the pinned model, and drive the
+# shipped CLI, daemon, and host hooks through Native, NCM observer, NCM active,
+# and NCM-to-Native rollback journeys with the real encoder.
+#
+# arm64 macOS is the authoritative lane. The other targets run the same NCM
+# runtime acceptance; Unix targets also run the host journeys (the real-NCM
+# journeys are `cfg(unix)`), and Windows runs the NCM lifecycle CLI suite plus
+# a smoke of the shipped host binary instead. Entries marked `experimental`
+# are allowed to fail without failing the run.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/pluggable-memory-providers-v2]
+    paths:
+      - "crates/**"
+      - "product/ncm/**"
+      - "scripts/product/ncm/**"
+      - "Cargo.lock"
+      - ".github/workflows/memory-providers-real-world.yml"
+
+concurrency:
+  group: memory-providers-real-world-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  journeys:
+    name: Journeys ${{ matrix.target }}${{ matrix.experimental && ' (experimental)' || '' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Authoritative signal; keep first.
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            experimental: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            experimental: false
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            experimental: false
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            experimental: false
+          # ort-sys ships only a DirectML build for arm64 Windows, and the
+          # partner image is younger than the x64 one.
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            experimental: true
+          # ort-sys 2.0.0-rc.13 ships no x86_64-apple-darwin prebuilt, so this
+          # lane links Homebrew's ONNX Runtime dynamically (see below). The
+          # macos-13 image was retired in December 2025; macos-15-intel is the
+          # remaining hosted x86_64 macOS image.
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            experimental: true
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # Same Defender exclusions and fast-drive TMP/TEMP as the upstream
+      # Windows test partitions; the journeys create many temp profiles.
+      - name: Tune Windows runner for build and test I/O
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/tune-windows-runner
+        with:
+          redirect-temp: "true"
+
+      # Only the toolchain rust-toolchain.toml pins, as upstream's Windows and
+      # analyzer lanes install it. Bootstraps rustup where an image lacks it.
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/rustup-init.exe" \
+                "https://static.rust-lang.org/rustup/dist/${{ matrix.target }}/rustup-init.exe"
+              "$RUNNER_TEMP/rustup-init.exe" -y --default-toolchain none --profile minimal
+              cargo_bin="$(cygpath -u "$USERPROFILE")/.cargo/bin"
+              github_path="$(cygpath -w "$cargo_bin")"
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain none --profile minimal
+              cargo_bin="$HOME/.cargo/bin"
+              github_path="$cargo_bin"
+            fi
+            export PATH="$cargo_bin:$PATH"
+            echo "$github_path" >> "$GITHUB_PATH"
+          fi
+          # An emulated x64 rustup on an arm64 image would otherwise install a
+          # foreign-host toolchain.
+          rustup set default-host "${{ matrix.target }}"
+          rustup toolchain install
+          rustup target add "${{ matrix.target }}"
+          rustup show active-toolchain
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [[ "$host" != "${{ matrix.target }}" ]]; then
+            echo "::error::runner host $host does not match matrix target ${{ matrix.target }}"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: ./.github/actions/setup-pnpm
+
+      # `python` (not `python3`) below: setup-python provides it on every OS.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: ./.github/actions/setup-linux-mold
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: memory-providers-real-world-${{ matrix.target }}
+          cache-on-failure: true
+
+      # The macOS product is re-signed after strip; keep the same wrapper the
+      # upstream macOS lanes use. Cargo has no per-target wrapper, so only
+      # macOS runners set it.
+      - name: Select the macOS rustc wrapper
+        if: runner.os == 'macOS'
+        run: echo "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER=$GITHUB_WORKSPACE/scripts/macos-rustc-wrapper.sh" >> "$GITHUB_ENV"
+
+      # ort-sys 2.0.0-rc.13 has no pyke prebuilt for x86_64-apple-darwin.
+      # Its build script reads ORT_LIB_LOCATION (alias ORT_LIB_PATH) and, with
+      # ORT_PREFER_DYNAMIC_LINK=1, links `-lonnxruntime` from that directory
+      # instead of attempting a static link. fastembed 6.0.3 enables ort's
+      # `api-24`, so the runtime must be ONNX Runtime 1.24 or newer. The
+      # worker then depends on Homebrew's dylib by absolute install name,
+      # so this bundle is NOT self-contained; the linkage is recorded below.
+      - name: Link Homebrew ONNX Runtime (x86_64 macOS)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          set -euo pipefail
+          brew install onnxruntime
+          version=$(brew list --versions onnxruntime | awk '{print $NF}')
+          python - "$version" <<'PY'
+          import sys
+          version = tuple(int(part) for part in sys.argv[1].split("_")[0].split(".")[:2])
+          if version < (1, 24):
+              sys.exit(f"Homebrew onnxruntime {sys.argv[1]} is older than 1.24 (ort api-24)")
+          PY
+          lib="$(brew --prefix onnxruntime)/lib"
+          ls -l "$lib"/libonnxruntime*.dylib
+          {
+            echo "ORT_LIB_LOCATION=$lib"
+            echo "ORT_PREFER_DYNAMIC_LINK=1"
+          } >> "$GITHUB_ENV"
+          echo "Linked ONNX Runtime: Homebrew onnxruntime $version at $lib" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the pinned NCM worker bundle
+        run: |
+          set -euo pipefail
+          python scripts/product/ncm/build-worker-bundle.py --target "${{ matrix.target }}" | tee "$RUNNER_TEMP/bundle.out"
+          manifest=$(sed -n 's/^TRACEDECAY_NCM_WORKER_MANIFEST=//p' "$RUNNER_TEMP/bundle.out" | tail -1)
+          worker=$(sed -n 's/^TRACEDECAY_NCM_WORKER=//p' "$RUNNER_TEMP/bundle.out" | tail -1)
+          test -f "$manifest"
+          test -f "$worker"
+          bundle=$(dirname "$manifest")
+          expected="$bundle/tracedecay-ncm-worker"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            expected="$expected.exe"
+          fi
+          if [[ "$worker" != "$expected" ]]; then
+            echo "::error::bundle worker $worker is not $expected"
+            exit 1
+          fi
+          {
+            echo "TRACEDECAY_NCM_WORKER_MANIFEST=$manifest"
+            echo "TRACEDECAY_NCM_WORKER=$worker"
+            echo "NCM_BUNDLE=$bundle"
+          } >> "$GITHUB_ENV"
+
+      - name: Record the worker's native linkage
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          linkage="$RUNNER_TEMP/ncm-worker-linkage.txt"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            otool -L "$TRACEDECAY_NCM_WORKER" | tee "$linkage"
+          else
+            ldd "$TRACEDECAY_NCM_WORKER" | tee "$linkage"
+          fi
+          if [[ "${{ matrix.target }}" == "x86_64-apple-darwin" ]]; then
+            grep -q 'libonnxruntime' "$linkage" || {
+              echo "::error::x86_64 macOS worker does not link Homebrew libonnxruntime"
+              exit 1
+            }
+          fi
+          {
+            echo '### NCM worker linkage (${{ matrix.target }})'
+            echo '```'
+            cat "$linkage"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the pinned NCM model
+        run: |
+          set -euo pipefail
+          temp="$RUNNER_TEMP"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            temp=$(cygpath -m "$RUNNER_TEMP")
+          fi
+          root="$temp/ncm-model-root"
+          mkdir -p "$root"
+          python scripts/product/ncm/verify-installed.py \
+            --manifest product/ncm/release/model-acquisition-manifest.json \
+            --revision-receipt product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json \
+            --model-root "$root" \
+            --operation install
+          echo "TRACEDECAY_NCM_REAL_MODEL_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: NCM runtime with the real encoder
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-memory-ncm-runtime --test real_embeddings --test model_lifecycle
+          cargo test --locked -p tracedecay-memory-ncm-runtime --features test-transport --test worker
+
+      # The always-on lifecycle cases run on every target; the pinned-worker
+      # lifecycle case exists only on arm64 macOS and reads
+      # TRACEDECAY_NCM_WORKER.
+      - name: NCM lifecycle through the shipped CLI
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport \
+            --test host_journeys_suite -- ncm_lifecycle_cli_acceptance:: --include-ignored
+
+      - name: Provider host journeys
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          cargo test --locked -p tracedecay-cli --features memory-provider-host,test-transport \
+            --test product_memory_provider_claude_host_journey -- \
+            --include-ignored --skip host_comparison_fixture_entry --test-threads 2
+
+      # The real-NCM host journeys are Unix-only; on Windows prove the shipped
+      # host shape (no test transport) builds and starts.
+      - name: Smoke the memory-provider host binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          cargo build --locked -p tracedecay-cli --bin tracedecay --features memory-provider-host
+          binary="target/debug/tracedecay.exe"
+          test -f "$binary"
+          "$binary" --version
+          "$binary" ncm --help >/dev/null
+
+      - name: Upload the worker bundle manifests and linkage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ncm-bundle-${{ matrix.target }}
+          path: |
+            ${{ env.NCM_BUNDLE }}/*.json
+            ${{ runner.temp }}/ncm-worker-linkage.txt
+          if-no-files-found: ignore

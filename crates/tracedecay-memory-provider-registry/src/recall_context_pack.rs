@@ -980,38 +980,6 @@ pub struct ContextPackReceiptV1 {
     pub excluded_metadata_not_contained: u64,
 }
 
-/// Exact canonical history already settled in the original provider journal.
-///
-/// The host artifact producer supplies these fields only after retaining and
-/// reading back every referenced batch. The compiler budgets this whole lane
-/// value; it never derives batches from an enqueue count or recall candidates.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CanonicalHistoryReplayV1 {
-    /// Original provider whose journal settled these observations.
-    pub provider_id: String,
-    /// Original registration under which they settled.
-    pub registration_revision: u64,
-    /// Complete destination namespace of the original admissions.
-    pub delivery_scope: crate::RecallOutcomeScopeV1,
-    /// Increasing contiguous runs of the actual settled source sequences.
-    pub batches: Vec<CanonicalHistoryReplayBatchV1>,
-}
-
-/// One durably retained contiguous run from the actual settled history page.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CanonicalHistoryReplayBatchV1 {
-    /// Opaque host artifact reference, resolved by the durable artifact owner.
-    pub observation_batch_ref: String,
-    /// First actual source sequence in this contiguous run, inclusive.
-    pub first_source_sequence: u64,
-    /// Last actual source sequence in this contiguous run, inclusive.
-    pub last_source_sequence: u64,
-    /// Actual observations in this run; gaps belong in separate batches.
-    pub observation_count: u64,
-}
-
 /// Actual retained recall correlation, independent of whether any candidate survived.
 /// The host publishes this value only after the final trace is retained.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1025,12 +993,6 @@ pub struct ContextRecallTraceV1 {
 
 struct PreparedContextRecallTraceV1<'a> {
     metadata: &'a ContextRecallTraceV1,
-    json: String,
-}
-
-/// One bounded serialization shared by framing, final rendering, and hashing.
-struct PreparedCanonicalHistoryReplayV1<'a> {
-    metadata: &'a CanonicalHistoryReplayV1,
     json: String,
 }
 
@@ -1059,10 +1021,6 @@ pub struct ContextPackV1 {
     pub total_token_budget: u64,
     /// Advisory quota that bounded the provider section.
     pub advisory_token_quota: u64,
-    /// Retained canonical history admitted with the lane, including zero-result
-    /// lanes. Absent when the lane's complete framing did not fit its budget.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_history_replay: Option<CanonicalHistoryReplayV1>,
     /// Retained trace correlation admitted with the complete advisory framing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall_trace: Option<ContextRecallTraceV1>,
@@ -1208,7 +1166,6 @@ pub fn compile_context_pack_with_control_refs(
         lane,
         control_refs,
         None,
-        None,
     )
 }
 
@@ -1221,13 +1178,10 @@ pub fn compile_context_pack_with_control_metadata(
     host_items: &[HostContextItemV1],
     lane: &AdvisoryLaneV1,
     control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
-    canonical_history_replay: Option<&CanonicalHistoryReplayV1>,
     recall_trace: Option<&ContextRecallTraceV1>,
 ) -> Result<ContextPackV1, ContextPackError> {
     validate_control_refs(lane, control_refs)?;
     let recall_trace = prepare_context_recall_trace(lane, recall_trace)?;
-    let canonical_history_replay =
-        prepare_canonical_history_replay(lane, canonical_history_replay)?;
     if tokenizer.tokenizer_id() != CANONICAL_CONTEXT_TOKENIZER_ID
         || tokenizer.tokenizer_revision() != CANONICAL_CONTEXT_TOKENIZER_REVISION
     {
@@ -1280,12 +1234,7 @@ pub fn compile_context_pack_with_control_metadata(
     // competes for the budget: a header, an identity line, and a bounded
     // receipt are agent-visible tokens exactly like content is.
     let host_framing_tokens = tokenizer.count_tokens(&host_framing_probe(form, lane));
-    let lane_framing_text = lane_framing_text(
-        form,
-        lane,
-        canonical_history_replay.as_ref(),
-        recall_trace.as_ref(),
-    );
+    let lane_framing_text = lane_framing_text(form, lane, recall_trace.as_ref());
     let lane_framing_tokens = tokenizer.count_tokens(&lane_framing_text);
     let lane_fits_quota = lane_framing_tokens <= policy.advisory_token_quota;
     let framing_tokens = host_framing_tokens.saturating_add(if lane_fits_quota {
@@ -1435,7 +1384,6 @@ pub fn compile_context_pack_with_control_metadata(
             tokenizer,
             host_items,
             lane,
-            canonical_history_replay.as_ref(),
             recall_trace.as_ref(),
             lane_fits_quota,
             &required_sections,
@@ -1464,7 +1412,6 @@ pub fn compile_context_pack_with_control_metadata(
                 tokenizer,
                 host_items,
                 lane,
-                canonical_history_replay.as_ref(),
                 recall_trace.as_ref(),
                 false,
                 &required_sections,
@@ -1511,7 +1458,6 @@ fn finish_pack(
     tokenizer: &dyn ContextTokenizer,
     host_items: &[HostContextItemV1],
     lane: &AdvisoryLaneV1,
-    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
     recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
     lane_rendered: bool,
     required_sections: &[ContextPackSectionV1],
@@ -1531,19 +1477,8 @@ fn finish_pack(
             items: advisory_items.to_vec(),
         });
     }
-    let canonical_history_replay = if lane_rendered {
-        canonical_history_replay
-    } else {
-        None
-    };
     let recall_trace = if lane_rendered { recall_trace } else { None };
-    let pack_hash = pack_hash(
-        policy,
-        tokenizer,
-        &sections,
-        canonical_history_replay,
-        recall_trace,
-    );
+    let pack_hash = pack_hash(policy, tokenizer, &sections, recall_trace);
     let receipt = ContextPackReceiptV1 {
         state: "compiled".to_owned(),
         pack_hash: pack_hash.clone(),
@@ -1592,7 +1527,6 @@ fn finish_pack(
         policy.render_form,
         host_items,
         lane,
-        canonical_history_replay,
         recall_trace,
         lane_rendered,
         advisory_items,
@@ -1609,7 +1543,6 @@ fn finish_pack(
             render_form: policy.render_form,
             total_token_budget: policy.total_token_budget,
             advisory_token_quota: policy.advisory_token_quota,
-            canonical_history_replay: canonical_history_replay.map(|value| value.metadata.clone()),
             recall_trace: recall_trace.map(|value| value.metadata.clone()),
             sections,
             excluded_provider_items: excluded_provider_items.to_vec(),
@@ -1747,102 +1680,6 @@ fn prepare_context_recall_trace<'a>(
     }
     let json = serde_json::to_string(metadata).map_err(|_| invalid())?;
     Ok(Some(PreparedContextRecallTraceV1 { metadata, json }))
-}
-
-/// Validate only bounded projection shape here. Current authorization, actual
-/// journal settlement, artifact identity, and durable retention stay with the
-/// host producer; the compiler cannot manufacture any of those facts.
-fn prepare_canonical_history_replay<'a>(
-    lane: &AdvisoryLaneV1,
-    metadata: Option<&'a CanonicalHistoryReplayV1>,
-) -> Result<Option<PreparedCanonicalHistoryReplayV1<'a>>, ContextPackError> {
-    let Some(metadata) = metadata else {
-        return Ok(None);
-    };
-    let invalid = || ContextPackError::ProviderAttributionInvalid {
-        field: "canonical_history_replay",
-    };
-    let Some(contribution) = lane.contribution() else {
-        return Err(invalid());
-    };
-    if metadata.provider_id != contribution.provider_id
-        || metadata.registration_revision != contribution.registration_revision
-        || metadata.registration_revision == 0
-        || metadata.registration_revision > i64::MAX as u64
-        || metadata.batches.len() > 256
-    {
-        return Err(invalid());
-    }
-    let scope = &metadata.delivery_scope;
-    for value in [
-        metadata.provider_id.as_str(),
-        scope.profile_id.as_str(),
-        scope.project_id.as_str(),
-        scope.repository_identity.as_str(),
-        scope.worktree_identity.as_str(),
-        scope.branch_identity.as_str(),
-        scope.agent_session_id.as_str(),
-        scope.resolved_scope_digest.as_str(),
-    ] {
-        if value.is_empty()
-            || value.len() > 1_024
-            || value.trim() != value
-            || !is_contained_provider_label(value)
-        {
-            return Err(invalid());
-        }
-    }
-    crate::OwnedProviderId::new(metadata.provider_id.clone()).map_err(|_| invalid())?;
-    crate::OwnedExactScope::new(
-        scope.profile_id.clone(),
-        scope.project_id.clone(),
-        scope.repository_identity.clone(),
-        scope.worktree_identity.clone(),
-        scope.branch_identity.clone(),
-        scope.agent_session_id.clone(),
-        scope.resolved_scope_digest.clone(),
-    )
-    .map_err(|_| invalid())?;
-    let mut previous_last = None;
-    let mut total_observations = 0_u64;
-    let mut references = BTreeSet::new();
-    for batch in &metadata.batches {
-        let Some(digest) = batch
-            .observation_batch_ref
-            .strip_prefix("host-observation-batch-v1:")
-        else {
-            return Err(invalid());
-        };
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || !references.insert(batch.observation_batch_ref.as_str())
-            || batch.first_source_sequence == 0
-            || previous_last.is_some_and(|last| batch.first_source_sequence <= last)
-            || batch.observation_count == 0
-            || batch.observation_count > 256
-            || batch
-                .last_source_sequence
-                .checked_sub(batch.first_source_sequence)
-                .and_then(|difference| difference.checked_add(1))
-                != Some(batch.observation_count)
-        {
-            return Err(invalid());
-        }
-        total_observations = total_observations
-            .checked_add(batch.observation_count)
-            .ok_or_else(invalid)?;
-        if total_observations > 256 {
-            return Err(invalid());
-        }
-        previous_last = Some(batch.last_source_sequence);
-    }
-    let json = serde_json::to_string(metadata).map_err(|_| invalid())?;
-    if json.len() > 131_072 {
-        return Err(invalid());
-    }
-    Ok(Some(PreparedCanonicalHistoryReplayV1 { metadata, json }))
 }
 
 /// The first provider-controlled string of one item that fails containment.
@@ -2071,20 +1908,19 @@ fn json_candidate(
 fn lane_framing_text(
     form: ContextPackRenderFormV1,
     lane: &AdvisoryLaneV1,
-    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
     recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
 ) -> String {
     match (form, lane) {
         (_, AdvisoryLaneV1::Absent) => String::new(),
         (ContextPackRenderFormV1::Markdown, lane) => {
-            let mut framing = lane_head_markdown(lane, canonical_history_replay, recall_trace);
+            let mut framing = lane_head_markdown(lane, recall_trace);
             if lane.contribution().is_some() {
                 framing.push_str(ADVISORY_MARKDOWN_EMPTY_LINE);
             }
             framing
         }
         (ContextPackRenderFormV1::Json, lane) => {
-            let scaffold = json_lane_head(lane, canonical_history_replay, recall_trace);
+            let scaffold = json_lane_head(lane, recall_trace);
             format!(",\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{scaffold}\"candidates\":[]}}",)
         }
     }
@@ -2093,7 +1929,6 @@ fn lane_framing_text(
 /// The JSON lane's leading members, up to but excluding `candidates`.
 fn json_lane_head(
     lane: &AdvisoryLaneV1,
-    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
     recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
 ) -> String {
     let mut head = match lane {
@@ -2121,9 +1956,6 @@ fn json_lane_head(
             )
         }
     };
-    if let Some(replay) = canonical_history_replay {
-        let _ = write!(head, "\"canonical_history_replay\":{},", replay.json);
-    }
     if let Some(trace) = recall_trace {
         let _ = write!(head, "\"recall_trace\":{},", trace.json);
     }
@@ -2201,7 +2033,6 @@ fn render_pack(
     form: ContextPackRenderFormV1,
     host_items: &[HostContextItemV1],
     lane: &AdvisoryLaneV1,
-    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
     recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
     lane_rendered: bool,
     advisory_items: &[ContextPackItemV1],
@@ -2217,11 +2048,7 @@ fn render_pack(
             }
             let mut advisory_block = String::new();
             if lane_rendered && !matches!(lane, AdvisoryLaneV1::Absent) {
-                advisory_block.push_str(&lane_head_markdown(
-                    lane,
-                    canonical_history_replay,
-                    recall_trace,
-                ));
+                advisory_block.push_str(&lane_head_markdown(lane, recall_trace));
                 if lane.contribution().is_some() {
                     if advisory_items.is_empty() {
                         advisory_block.push_str(ADVISORY_MARKDOWN_EMPTY_LINE);
@@ -2251,12 +2078,12 @@ fn render_pack(
                     .join(",");
                 advisory_block = format!(
                     ",\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{}\"candidates\":[{candidates}]}}",
-                    json_lane_head(lane, canonical_history_replay, recall_trace)
+                    json_lane_head(lane, recall_trace)
                 );
                 members.push(format!(
                     "\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{}\"candidates\":[{candidates}],\
                      \"context_pack\":{}}}",
-                    json_lane_head(lane, canonical_history_replay, recall_trace),
+                    json_lane_head(lane, recall_trace),
                     serde_json::to_string(receipt).unwrap_or_default()
                 ));
             }
@@ -2271,7 +2098,6 @@ fn render_pack(
 /// The advisory lane's markdown head: heading plus identity or notice.
 fn lane_head_markdown(
     lane: &AdvisoryLaneV1,
-    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
     recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
 ) -> String {
     let mut head = match lane {
@@ -2296,9 +2122,6 @@ fn lane_head_markdown(
             head
         }
     };
-    if let Some(replay) = canonical_history_replay {
-        let _ = writeln!(head, "canonical_history_replay={}", replay.json);
-    }
     if let Some(trace) = recall_trace {
         let _ = writeln!(head, "recall_trace={}", trace.json);
     }
@@ -2368,7 +2191,6 @@ fn pack_hash(
     policy: &ContextPackPolicyV1,
     tokenizer: &dyn ContextTokenizer,
     sections: &[ContextPackSectionV1],
-    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
     recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
 ) -> String {
     let mut hasher = Sha256::new();
@@ -2379,10 +2201,6 @@ fn pack_hash(
     absorb(&mut hasher, policy.render_form.label().as_bytes());
     absorb(&mut hasher, &policy.total_token_budget.to_be_bytes());
     absorb(&mut hasher, &policy.advisory_token_quota.to_be_bytes());
-    if let Some(replay) = canonical_history_replay {
-        absorb(&mut hasher, b"canonical_history_replay");
-        absorb(&mut hasher, replay.json.as_bytes());
-    }
     if let Some(trace) = recall_trace {
         absorb(&mut hasher, b"recall_trace");
         absorb(&mut hasher, trace.json.as_bytes());

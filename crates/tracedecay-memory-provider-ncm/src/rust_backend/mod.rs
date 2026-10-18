@@ -2688,6 +2688,7 @@ mod source_revocation_tests {
 #[allow(clippy::unwrap_used)]
 mod failed_handshake_generation_tests {
     use super::*;
+    use crate::NcmNamespace;
     use tracedecay_memory_provider_api::CancellationToken;
 
     #[test]

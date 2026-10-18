@@ -35,25 +35,21 @@ pub(crate) mod native_authority;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod native_provider;
 #[cfg(feature = "memory-provider-host")]
+mod observation_attribution;
+#[cfg(feature = "memory-provider-host")]
 pub(crate) mod observation_journey;
 #[cfg(feature = "memory-provider-host")]
 pub(crate) mod provider_control;
 #[cfg(feature = "memory-provider-host")]
-pub(crate) mod provider_history;
-#[cfg(feature = "memory-provider-host")]
 mod provider_host;
-#[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
-pub(crate) use provider_host::declared_project_provider_registration_revision_for_test;
-#[cfg(all(feature = "memory-provider-host", test))]
-pub(crate) use provider_host::native_observation_mount;
 #[cfg(feature = "memory-provider-host")]
 pub use provider_host::{
-    NativeApplicationPortInterpositionV1, NcmRegistrationFactoryV1, ProjectAdvisoryRecallCallV1,
-    ProjectCognitiveRecallMountV1, ProjectMemoryProviderFullMountInputsV1,
-    ProjectMemoryProviderFullMountV1, ProjectMemoryProviderHostInputsV1,
-    ProjectMemoryProviderHostMountV1, ProjectObservationJourneyMountV1,
-    mount_project_memory_provider_full, mount_project_memory_provider_host,
-    project_advisory_context_call, project_advisory_memory_context_for_call,
+    NcmRegistrationFactoryV1, ProjectAdvisoryRecallCallV1, ProjectCognitiveRecallMountV1,
+    ProjectMemoryProviderFullMountInputsV1, ProjectMemoryProviderFullMountV1,
+    ProjectMemoryProviderHostInputsV1, ProjectMemoryProviderHostMountV1,
+    ProjectObservationJourneyMountV1, mount_project_memory_provider_full,
+    mount_project_memory_provider_host, project_advisory_context_call,
+    project_advisory_memory_context_for_call,
 };
 
 #[cfg(feature = "memory-provider-host")]

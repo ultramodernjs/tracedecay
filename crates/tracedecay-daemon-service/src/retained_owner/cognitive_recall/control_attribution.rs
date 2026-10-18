@@ -49,7 +49,7 @@ impl RecallLocatorKeyV1 {
         Ok(Self(Arc::new(Zeroizing::new(material))))
     }
 
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self::from_material(vec![0xA5; 32]).expect("fixed recall locator test key")
     }
@@ -121,14 +121,6 @@ impl RecallControlTraceRefV1 {
     pub(crate) fn as_str(&self) -> &str {
         &self.wire
     }
-
-    /// The scope digest is part of the retained trace key and is also the
-    /// context input to every opaque source locator derived from that trace.
-    /// Callers resolving a retained source must prove that the trace and the
-    /// freshly mounted destination are the same scope before using it.
-    pub(crate) fn is_bound_to_scope(&self, scope: &OwnedExactScope) -> bool {
-        self.exact_scope_sha256 == scope.exact_scope_sha256()
-    }
 }
 
 /// Original provider rank in the final trace, never a normalization-list rank.
@@ -139,25 +131,6 @@ pub(crate) struct RecallControlItemRefV1 {
 }
 
 impl RecallControlItemRefV1 {
-    pub(crate) fn parse(value: &str) -> Result<Self> {
-        if value.len() > ITEM_PREFIX.len() + 20 {
-            return Err(invalid("item reference length"));
-        }
-        let rank = value
-            .strip_prefix(ITEM_PREFIX)
-            .ok_or_else(|| invalid("item reference version"))?;
-        let provider_rank = rank
-            .parse::<usize>()
-            .map_err(|_| invalid("item reference rank"))?;
-        if rank != provider_rank.to_string() || !valid_rank(provider_rank) {
-            return Err(invalid("item reference rank"));
-        }
-        Ok(Self {
-            wire: value.to_owned(),
-            provider_rank,
-        })
-    }
-
     pub(crate) fn as_str(&self) -> &str {
         &self.wire
     }
@@ -545,19 +518,6 @@ pub(crate) struct RetainedRecallControlScopeV1 {
     pub(crate) delivery_scope: OwnedExactScope,
 }
 
-/// Exact retained member selected by observation identity, including multi-source items.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RetainedRecallControlSourceV1 {
-    /// In-memory context for re-redacting the persisted source locator. The
-    /// trace itself is never serialized into the control tables.
-    pub(crate) trace: RecallControlTraceRefV1,
-    pub(crate) scope: RetainedRecallControlScopeV1,
-    pub(crate) candidate_id: String,
-    pub(crate) provider_rank: usize,
-    pub(crate) stable_memory_ref: String,
-    pub(crate) original_source: RecallSourceAttributionV1,
-}
-
 impl RecallAdmissionLedgerV1 {
     /// Execute on the caller's existing blocking pool with its original control.
     pub(crate) fn read_retained_control_scope(
@@ -568,65 +528,6 @@ impl RecallAdmissionLedgerV1 {
         self.with_control_connection(control, |connection| {
             validate_retained_trace_identity_on_connection(connection, trace, &self.locator_key)?;
             read_retained_control_scope_on_connection(connection, trace, control, &self.locator_key)
-        })
-    }
-
-    /// One composite-key JOIN reads a single item; siblings are never fetched.
-    pub(crate) fn read_retained_control_source(
-        &self,
-        trace: &RecallControlTraceRefV1,
-        item: &RecallControlItemRefV1,
-        observation_id: &str,
-        control: &OperationControl,
-    ) -> Result<RetainedRecallControlSourceV1> {
-        control
-            .snapshot()
-            .map_err(RecallControlAttributionErrorV1::Control)?;
-        require_id(observation_id)?;
-        let locator_key = self.locator_key.clone();
-        self.with_control_connection(control, |connection| {
-            validate_retained_trace_identity_on_connection(connection, trace, &locator_key)?;
-            let result = connection
-                .query_row(
-                    "SELECT substr(CAST(t.exact_scope_sha256 AS BLOB),1,65),
-                        substr(CAST(t.trace_id AS BLOB),1,65),
-                        substr(CAST(t.provider_id AS BLOB),1,1025), t.registration_revision,
-                        substr(CAST(t.delivery_scope_json AS BLOB),1,16385),
-                        substr(CAST(t.control_metadata_sha256 AS BLOB),1,65),
-                        substr(CAST(t.scope_binding_mac AS BLOB),1,65),
-                        i.provider_rank, substr(CAST(i.candidate_id AS BLOB),1,1025),
-                        substr(CAST(i.stage AS BLOB),1,65),
-                        substr(CAST(i.host_reason_code AS BLOB),1,1025),
-                        substr(CAST(i.host_reason_detail AS BLOB),1,16385),
-                        substr(CAST(i.host_decision_json AS BLOB),1,16385),
-                        substr(CAST(i.stable_memory_ref AS BLOB),1,1025),
-                        substr(CAST(i.original_sources_json AS BLOB),1,1048577),
-                        substr(CAST(i.control_binding_mac AS BLOB),1,65),
-                        substr(CAST(i.provider_explanation_json AS BLOB),1,16385),
-                        substr(CAST(i.section AS BLOB),1,1025), i.tokens,
-                        substr(CAST(i.item_mac AS BLOB),1,65)
-                 FROM recall_explain_traces t
-                 JOIN recall_explain_trace_items i
-                   ON i.exact_scope_sha256=t.exact_scope_sha256 AND i.trace_id=t.trace_id
-                 WHERE t.exact_scope_sha256=?1 AND t.trace_id=?2 AND i.provider_rank=?3 LIMIT 1",
-                    params![
-                        trace.exact_scope_sha256,
-                        trace.trace_id,
-                        item.provider_rank as i64
-                    ],
-                    |row| {
-                        Ok(decode_source(
-                            row,
-                            trace,
-                            item,
-                            observation_id,
-                            control,
-                            &locator_key,
-                        ))
-                    },
-                )
-                .optional()?;
-            result.ok_or(RecallControlAttributionErrorV1::NotFound)?
         })
     }
 
@@ -1024,132 +925,7 @@ fn decode_scope(
     })
 }
 
-fn decode_source(
-    row: &Row<'_>,
-    trace: &RecallControlTraceRefV1,
-    item: &RecallControlItemRefV1,
-    observation_id: &str,
-    control: &OperationControl,
-    locator_key: &RecallLocatorKeyV1,
-) -> Result<RetainedRecallControlSourceV1> {
-    let scope = decode_scope(row, trace, locator_key)?;
-    let rank: i64 = row.get(7)?;
-    if usize::try_from(rank).ok() != Some(item.provider_rank) || !valid_rank(item.provider_rank) {
-        return Err(invalid("retained provider rank"));
-    }
-    let candidate_id = required_text(row, 8, MAX_ID_BYTES)?;
-    validate_retained_trace_candidate_id(&candidate_id)?;
-    let stage = required_text(row, 9, 64)?;
-    let host_reason_code = required_text(row, 10, MAX_ID_BYTES)?;
-    let host_reason_detail = optional_text(row, 11, MAX_DETAIL_BYTES)?;
-    let decision: RecallExplainHostDecisionV1 =
-        serde_json::from_str(&required_text(row, 12, MAX_DECISION_BYTES)?)?;
-    if !eligible_stage(decision.stage()) || decision.stage().label() != stage {
-        return Err(invalid("retained item was not selected or injected"));
-    }
-    if host_reason_code != decision.code() || host_reason_detail != decision.detail() {
-        return Err(invalid("retained item decision projection"));
-    }
-    let stable_memory_ref = optional_text(row, 13, MAX_ID_BYTES)?
-        .ok_or(RecallControlAttributionErrorV1::MissingAuthority)?;
-    if !is_opaque_locator(&stable_memory_ref, RETAINED_MEMORY_REF_PREFIX) {
-        return Err(invalid("retained stable reference is not opaque"));
-    }
-    let sources_json = optional_text(row, 14, MAX_SOURCES_BYTES)?
-        .ok_or(RecallControlAttributionErrorV1::MissingAuthority)?;
-    let retained_binding_mac =
-        optional_text(row, 15, 64)?.ok_or(RecallControlAttributionErrorV1::MissingAuthority)?;
-    require_sha256(&retained_binding_mac)?;
-    let provider_explanation_json = required_text(row, 16, MAX_DECISION_BYTES)?;
-    let provider_explanation: tracedecay_memory_provider_registry::RecallExplainProviderExplanationV1 =
-        serde_json::from_str(&provider_explanation_json)?;
-    let section = optional_text(row, 17, MAX_ID_BYTES)?;
-    let tokens: Option<i64> = row.get(18)?;
-    let item_mac =
-        optional_text(row, 19, 64)?.ok_or(RecallControlAttributionErrorV1::MissingAuthority)?;
-    require_sha256(&item_mac)?;
-    let provider_rank = item.provider_rank;
-    let item_value = tracedecay_memory_provider_registry::RecallExplainItemV1 {
-        candidate_id: candidate_id.clone(),
-        provider_rank,
-        stage: decision.stage(),
-        host_reason_code,
-        host_reason_detail,
-        host_decision: decision.clone(),
-        provider_explanation,
-        section,
-        tokens: tokens
-            .map(|value| u64::try_from(value).map_err(|_| invalid("retained tokens")))
-            .transpose()?,
-    };
-    let expected_item_mac = retained_item_bytes_mac(
-        locator_key,
-        trace.exact_scope_sha256(),
-        trace.trace_id(),
-        scope.provider_id.as_str(),
-        scope.registration_revision,
-        provider_rank,
-        &candidate_id,
-        &serde_json::to_vec(&item_value)?,
-    );
-    if expected_item_mac != item_mac {
-        return Err(invalid("retained item mac"));
-    }
-    let binding = RetainedRecallControlBindingV1 {
-        stable_memory_ref,
-        original_sources: serde_json::from_str::<BoundedSourcesV1>(&sources_json)?.0,
-    };
-    for source in &binding.original_sources {
-        validate_opaque_retained_source(source)?;
-    }
-    let binding = binding.validated(Some(control))?;
-    if retained_binding_mac
-        != binding_mac(
-            locator_key,
-            scope.provider_id.as_str(),
-            scope.registration_revision,
-            &scope.delivery_scope.exact_scope_sha256(),
-            item.provider_rank,
-            &candidate_id,
-            &binding,
-        )?
-    {
-        return Err(invalid("retained source binding mac"));
-    }
-    control
-        .snapshot()
-        .map_err(RecallControlAttributionErrorV1::Control)?;
-    let retained_observation_id = opaque_control_locator(
-        locator_key,
-        scope.provider_id.as_str(),
-        RETAINED_SOURCE_LOCATOR_PREFIX,
-        trace,
-        scope.registration_revision,
-        item.provider_rank,
-        &candidate_id,
-        "observation_id",
-        observation_id,
-    )?;
-    let original_source = binding
-        .original_sources
-        .into_iter()
-        .find(|source| source.source.observation_id == retained_observation_id)
-        .ok_or_else(|| invalid("observation identity outside retained item"))?;
-    Ok(RetainedRecallControlSourceV1 {
-        trace: trace.clone(),
-        scope,
-        candidate_id,
-        provider_rank: item.provider_rank,
-        stable_memory_ref: binding.stable_memory_ref,
-        original_source,
-    })
-}
-
-fn optional_text(
-    row: &Row<'_>,
-    column: usize,
-    maximum: usize,
-) -> Result<Option<String>> {
+fn optional_text(row: &Row<'_>, column: usize, maximum: usize) -> Result<Option<String>> {
     let bytes: Option<Vec<u8>> = row.get(column)?;
     bytes
         .map(|bytes| {
@@ -1239,25 +1015,6 @@ fn redact_control_binding(
         stable_memory_ref,
         original_sources,
     })
-}
-
-#[cfg(test)]
-pub(crate) fn redact_retained_source_attribution(
-    trace: &RecallControlTraceRefV1,
-    registration_revision: u64,
-    provider_rank: usize,
-    candidate_id: &str,
-    source: &RecallSourceAttributionV1,
-) -> Result<RecallSourceAttributionV1> {
-    redact_retained_source_attribution_with_key(
-        &RecallLocatorKeyV1::for_test(),
-        "tracedecay.native",
-        trace,
-        registration_revision,
-        provider_rank,
-        candidate_id,
-        source,
-    )
 }
 
 pub(crate) fn redact_retained_source_attribution_with_key(
@@ -1804,10 +1561,6 @@ fn require_id(value: &str) -> Result<()> {
     require_size(value, MAX_ID_BYTES)
 }
 
-pub(crate) fn validate_retained_candidate_identity(value: &str) -> Result<()> {
-    validate_retained_trace_candidate_id(value)
-}
-
 /// Projects the trace identity into the same durable host-owned namespace as
 /// its candidate and source locators. The registry's deterministic trace id
 /// is useful while reconciling an in-memory result, but the retained trace
@@ -1957,14 +1710,6 @@ pub(crate) fn validate_retained_trace_candidate_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_retained_provider_rank(rank: usize) -> Result<()> {
-    if valid_rank(rank) {
-        Ok(())
-    } else {
-        Err(invalid("retained provider rank"))
-    }
-}
-
 fn require_size(value: &str, maximum: usize) -> Result<()> {
     if value.len() > maximum {
         return Err(invalid("metadata byte bound"));
@@ -1974,7 +1719,7 @@ fn require_size(value: &str, maximum: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{RecallAdmissionLedgerError, RecallAdmissionLedgerWriteV1};
+    use super::super::RecallAdmissionLedgerWriteV1;
     use super::*;
     use std::sync::Mutex;
     use std::time::Instant;
@@ -2124,63 +1869,6 @@ mod tests {
     }
 
     #[test]
-    fn control_locators_and_final_rank_metadata_are_strict_and_deterministic() {
-        let metadata = prepared();
-        assert_eq!(
-            RecallControlTraceRefV1::parse(metadata.trace_ref().as_str()).unwrap(),
-            *metadata.trace_ref()
-        );
-        assert_eq!(metadata.item_ref(2).unwrap().as_str(), "recall-item-v1:2");
-        assert!(metadata.item_ref(1).is_none());
-        for invalid in [
-            "recall-item-v1:+1",
-            "recall-item-v1:01",
-            "recall-item-v1:-1",
-            "recall-item-v2:1",
-            "recall-item-v1:8",
-        ] {
-            assert!(RecallControlItemRefV1::parse(invalid).is_err(), "{invalid}");
-        }
-        for invalid in [
-            metadata.trace_ref().as_str().to_uppercase(),
-            format!("{}:extra", metadata.trace_ref().as_str()),
-            "a".repeat(64),
-        ] {
-            assert!(RecallControlTraceRefV1::parse(&invalid).is_err());
-        }
-        let mut same_bindings = bindings();
-        same_bindings
-            .get_mut(&candidate_alias("candidate.2"))
-            .unwrap()
-            .original_sources
-            .reverse();
-        assert_eq!(
-            PreparedRecallControlMetadataV1::prepare(&trace(), &scope(), &same_bindings).unwrap(),
-            metadata
-        );
-        same_bindings
-            .get_mut(&candidate_alias("candidate.2"))
-            .unwrap()
-            .stable_memory_ref = "memory.changed".to_owned();
-        assert_ne!(
-            PreparedRecallControlMetadataV1::prepare(&trace(), &scope(), &same_bindings)
-                .unwrap()
-                .metadata_sha256(),
-            metadata.metadata_sha256()
-        );
-        let mut malformed = trace();
-        malformed.items[2].provider_rank = 1;
-        assert!(
-            PreparedRecallControlMetadataV1::prepare(&malformed, &scope(), &bindings()).is_err()
-        );
-        assert!(!metadata.matches_trace(
-            &"f".repeat(64),
-            &trace(),
-            &RecallLocatorKeyV1::for_test(),
-        ));
-    }
-
-    #[test]
     fn retained_trace_identity_is_keyed_and_context_bound() {
         let key = RecallLocatorKeyV1::for_test();
         let scope = "b".repeat(64);
@@ -2221,86 +1909,6 @@ mod tests {
                 7,
             )
         );
-    }
-
-    #[test]
-    fn control_reads_reopen_exact_multisource_member_without_reading_siblings() {
-        let (temporary, ledger, metadata) = retained();
-        assert_eq!(
-            ledger
-                .retain_explain_trace_with_control(
-                    &scope().exact_scope_sha256(),
-                    &trace(),
-                    Some(&metadata),
-                )
-                .unwrap(),
-            RecallAdmissionLedgerWriteV1::AlreadyRecorded
-        );
-        drop(ledger);
-        let ledger =
-            RecallAdmissionLedgerV1::open(temporary.path().join("ledger.sqlite3")).unwrap();
-        let item = metadata.item_ref(2).unwrap();
-        let read = ledger
-            .read_retained_control_source(
-                metadata.trace_ref(),
-                &item,
-                "observation.3",
-                &control(1_000),
-            )
-            .unwrap();
-        assert_eq!(read.scope.provider_id.as_str(), "tracedecay.native");
-        assert_eq!(read.scope.registration_revision, 7);
-        assert_eq!(read.scope.delivery_scope, scope());
-        assert_eq!(read.provider_rank, 2);
-        assert_eq!(read.candidate_id, candidate_alias("candidate.2"));
-        assert!(
-            read.stable_memory_ref
-                .starts_with(RETAINED_MEMORY_REF_PREFIX)
-        );
-        assert_ne!(read.original_source, source("observation.3", 3));
-        assert_eq!(
-            read.original_source.source.canonical_provider_id.as_str(),
-            "recall.opaque"
-        );
-        assert_eq!(
-            ledger
-                .read_retained_control_scope(metadata.trace_ref(), &control(1_000))
-                .unwrap(),
-            read.scope
-        );
-        assert!(
-            ledger
-                .read_retained_control_source(
-                    metadata.trace_ref(),
-                    &item,
-                    "observation.1",
-                    &control(1_000)
-                )
-                .is_err()
-        );
-        ledger.connection.lock().unwrap().execute(
-            "UPDATE recall_explain_trace_items SET original_sources_json='broken' WHERE provider_rank=0", [],
-        ).unwrap();
-        assert!(
-            ledger
-                .read_retained_control_source(
-                    metadata.trace_ref(),
-                    &item,
-                    "observation.3",
-                    &control(1_000)
-                )
-                .is_ok()
-        );
-        let missing = RecallControlTraceRefV1::parse(&format!(
-            "{TRACE_PREFIX}{}:{}",
-            scope().exact_scope_sha256(),
-            "d".repeat(64)
-        ))
-        .unwrap();
-        assert!(matches!(
-            ledger.read_retained_control_scope(&missing, &control(1_000)),
-            Err(RecallControlAttributionErrorV1::NotFound)
-        ));
     }
 
     #[test]
@@ -2366,263 +1974,6 @@ mod tests {
     }
 
     #[test]
-    fn forged_opaque_locator_bytes_cannot_authorize_a_reopened_source() {
-        let (_temporary, ledger, metadata) = retained();
-        let item = metadata.item_ref(2).unwrap();
-        let control = control(1_000);
-        {
-            let connection = ledger.connection.lock().unwrap();
-            connection
-                .execute(
-                    "UPDATE recall_explain_trace_items
-                     SET stable_memory_ref=?1 WHERE provider_rank=2",
-                    [format!("{RETAINED_MEMORY_REF_PREFIX}{}", "0".repeat(64))],
-                )
-                .unwrap();
-        }
-        assert!(
-            ledger
-                .read_retained_control_source(
-                    metadata.trace_ref(),
-                    &item,
-                    "observation.3",
-                    &control,
-                )
-                .is_err()
-        );
-
-        let (_temporary, ledger, metadata) = retained();
-        let item = metadata.item_ref(2).unwrap();
-        let connection = ledger.connection.lock().unwrap();
-        let existing: String = connection
-            .query_row(
-                "SELECT original_sources_json FROM recall_explain_trace_items
-                 WHERE provider_rank=2",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let mut forged: serde_json::Value = serde_json::from_str(&existing).unwrap();
-        forged[0]["source"]["observation_id"] = serde_json::json!(format!(
-            "{RETAINED_SOURCE_LOCATOR_PREFIX}{}",
-            "1".repeat(64)
-        ));
-        connection
-            .execute(
-                "UPDATE recall_explain_trace_items
-                 SET original_sources_json=?1 WHERE provider_rank=2",
-                [serde_json::to_string(&forged).unwrap()],
-            )
-            .unwrap();
-        drop(connection);
-        assert!(
-            ledger
-                .read_retained_control_source(
-                    metadata.trace_ref(),
-                    &item,
-                    "observation.3",
-                    &control,
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn control_binding_hash_refuses_changed_stable_ref_source_and_producer() {
-        for changed in [
-            "stable",
-            "source",
-            "provider",
-            "revision",
-            "scope",
-            "rank",
-            "state",
-            "missing_hash",
-        ] {
-            let (_temporary, ledger, metadata) = retained();
-            {
-                let connection = ledger.connection.lock().unwrap();
-                match changed {
-                    "stable" => {
-                        connection.execute("UPDATE recall_explain_trace_items SET stable_memory_ref='memory.changed' WHERE provider_rank=2", []).unwrap();
-                    }
-                    "source" => {
-                        let mut sources = bindings()
-                            .remove(&candidate_alias("candidate.2"))
-                            .unwrap()
-                            .original_sources;
-                        sources[0].source.content_sha256 = "e".repeat(64);
-                        connection.execute("UPDATE recall_explain_trace_items SET original_sources_json=?1 WHERE provider_rank=2", [serde_json::to_string(&sources).unwrap()]).unwrap();
-                    }
-                    "provider" => {
-                        connection
-                            .execute(
-                                "UPDATE recall_explain_traces SET provider_id='another.provider'",
-                                [],
-                            )
-                            .unwrap();
-                    }
-                    "revision" => {
-                        connection
-                            .execute(
-                                "UPDATE recall_explain_traces SET registration_revision=8",
-                                [],
-                            )
-                            .unwrap();
-                    }
-                    "scope" => {
-                        let mut changed = scope();
-                        changed.agent_session_id = "session.changed".to_owned();
-                        connection
-                            .execute(
-                                "UPDATE recall_explain_traces SET delivery_scope_json=?1",
-                                [serde_json::to_string(&scope_wire(&changed)).unwrap()],
-                            )
-                            .unwrap();
-                    }
-                    "rank" => {
-                        connection.execute("UPDATE recall_explain_trace_items SET candidate_id='candidate.changed' WHERE provider_rank=2", []).unwrap();
-                    }
-                    "state" => {
-                        connection.execute("UPDATE recall_explain_trace_items SET stage='denied' WHERE provider_rank=2", []).unwrap();
-                    }
-                    "missing_hash" => {
-                        connection.execute("UPDATE recall_explain_trace_items SET control_binding_mac=NULL WHERE provider_rank=2", []).unwrap();
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            let result = ledger.read_retained_control_source(
-                metadata.trace_ref(),
-                &metadata.item_ref(2).unwrap(),
-                "observation.3",
-                &control(1_000),
-            );
-            assert!(result.is_err(), "{changed}");
-            if changed == "missing_hash" {
-                assert!(matches!(
-                    result,
-                    Err(RecallControlAttributionErrorV1::MissingAuthority)
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn control_metadata_conflicts_are_atomic_and_legacy_nulls_do_not_gain_authority() {
-        let (_temporary, ledger, metadata) = retained();
-        let mut changed = bindings();
-        changed
-            .get_mut(&candidate_alias("candidate.2"))
-            .unwrap()
-            .stable_memory_ref = "memory.changed".to_owned();
-        let changed =
-            PreparedRecallControlMetadataV1::prepare(&trace(), &scope(), &changed).unwrap();
-        assert!(matches!(
-            ledger.retain_explain_trace_with_control(
-                &scope().exact_scope_sha256(),
-                &trace(),
-                Some(&changed)
-            ),
-            Err(RecallAdmissionLedgerError::ConflictingTrace { .. })
-        ));
-        assert!(
-            ledger
-                .read_retained_control_source(
-                    metadata.trace_ref(),
-                    &metadata.item_ref(2).unwrap(),
-                    "observation.3",
-                    &control(1_000)
-                )
-                .unwrap()
-                .stable_memory_ref
-                .starts_with(RETAINED_MEMORY_REF_PREFIX)
-        );
-        let mut legacy = trace();
-        legacy.request_id = "request.legacy".to_owned();
-        legacy.trace_id = retained_trace_id_with_key(
-            &RecallLocatorKeyV1::for_test(),
-            &scope().exact_scope_sha256(),
-            &legacy.request_id,
-            &legacy.provider_id,
-            legacy.registration_revision,
-        );
-        ledger
-            .retain_explain_trace(&scope().exact_scope_sha256(), &legacy)
-            .unwrap();
-        let metadata =
-            PreparedRecallControlMetadataV1::prepare(&legacy, &scope(), &bindings()).unwrap();
-        assert!(matches!(
-            ledger.read_retained_control_scope(metadata.trace_ref(), &control(1_000)),
-            Err(RecallControlAttributionErrorV1::MissingAuthority)
-        ));
-        assert!(matches!(
-            ledger.retain_explain_trace_with_control(
-                &scope().exact_scope_sha256(),
-                &legacy,
-                Some(&metadata)
-            ),
-            Err(RecallAdmissionLedgerError::ConflictingTrace { .. })
-        ));
-        assert!(matches!(
-            ledger.read_retained_control_source(
-                metadata.trace_ref(),
-                &metadata.item_ref(2).unwrap(),
-                "observation.3",
-                &control(1_000)
-            ),
-            Err(RecallControlAttributionErrorV1::MissingAuthority)
-        ));
-    }
-
-    #[test]
-    fn legacy_raw_control_rows_are_withheld_after_reopen() {
-        let (temporary, ledger, metadata) = retained();
-        let raw_candidate = "provider-secret:/private/legacy-control-candidate";
-        let raw_stable_ref = "memory:/private/legacy-control-ref";
-        let raw_source = source("observation.3", 3);
-        let trace_id = metadata.trace_ref().trace_id().to_owned();
-        ledger
-            .connection
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE recall_explain_trace_items
-                 SET candidate_id=?1, stable_memory_ref=?2, original_sources_json=?3
-                 WHERE exact_scope_sha256=?4 AND trace_id=?5 AND provider_rank=2",
-                params![
-                    raw_candidate,
-                    raw_stable_ref,
-                    serde_json::to_string(&vec![raw_source]).unwrap(),
-                    metadata.trace_ref().exact_scope_sha256(),
-                    trace_id,
-                ],
-            )
-            .unwrap();
-        drop(ledger);
-
-        let reopened =
-            RecallAdmissionLedgerV1::open(temporary.path().join("ledger.sqlite3")).unwrap();
-        assert!(matches!(
-            reopened.read_retained_control_scope(metadata.trace_ref(), &control(1_000)),
-            Err(RecallControlAttributionErrorV1::Invalid(_))
-        ));
-        assert!(matches!(
-            reopened.read_retained_control_source(
-                metadata.trace_ref(),
-                &metadata.item_ref(2).unwrap(),
-                "observation.3",
-                &control(1_000),
-            ),
-            Err(RecallControlAttributionErrorV1::Invalid(_))
-        ));
-        assert!(matches!(
-            reopened.explain_trace(metadata.trace_ref()),
-            Err(RecallAdmissionLedgerError::InvalidControlMetadata)
-        ));
-    }
-
-    #[test]
     fn control_scope_read_checks_producer_revision_scope_and_envelope_digest() {
         for changed in ["provider", "revision", "scope", "hash", "version"] {
             let (_temporary, ledger, metadata) = retained();
@@ -2684,37 +2035,6 @@ mod tests {
                 "{changed}"
             );
         }
-    }
-
-    #[test]
-    fn control_reads_refuse_source_count_and_field_byte_overflow() {
-        let (_temporary, ledger, metadata) = retained();
-        let sources: Vec<_> = (1..=65)
-            .map(|sequence| source(&format!("observation.{sequence}"), sequence))
-            .collect();
-        ledger.connection.lock().unwrap().execute("UPDATE recall_explain_trace_items SET original_sources_json=?1 WHERE provider_rank=2", [serde_json::to_string(&sources).unwrap()]).unwrap();
-        assert!(
-            ledger
-                .read_retained_control_source(
-                    metadata.trace_ref(),
-                    &metadata.item_ref(2).unwrap(),
-                    "observation.3",
-                    &control(1_000)
-                )
-                .is_err()
-        );
-        ledger.connection.lock().unwrap().execute("UPDATE recall_explain_trace_items SET original_sources_json=?1 WHERE provider_rank=2", ["x".repeat(MAX_SOURCES_BYTES + 1)]).unwrap();
-        assert!(matches!(
-            ledger.read_retained_control_source(
-                metadata.trace_ref(),
-                &metadata.item_ref(2).unwrap(),
-                "observation.3",
-                &control(1_000)
-            ),
-            Err(RecallControlAttributionErrorV1::Invalid(
-                "retained field byte bound"
-            ))
-        ));
     }
 
     #[test]

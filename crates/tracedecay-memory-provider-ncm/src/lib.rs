@@ -52,14 +52,13 @@ pub const NCM_PROVIDER_ID: &str = "ncm";
 
 /// Recall candidate scope bindings the host authorizes NCM to attest, in the
 /// wire vocabulary of `tracedecay.memory.provider.recall.v1`
-/// `candidate_scope_binding.bindings`. NCM memories are bound to the exact
-/// coding scope namespace the adapter derives from the admitted call, so
-/// every candidate the adapter re-asserts must carry
-/// `scope_binding: "exact_coding_scope"`; the registry records this
-/// declaration at registration and passes it to admission with the admitted
-/// call, never from a reply.
-pub const NCM_RECALL_SCOPE_BINDINGS: &[&str] = &["exact_coding_scope"];
-const NAMESPACE_DOMAIN: &[u8] = b"tracedecay.ncm.scope.v1\0";
+/// `candidate_scope_binding.bindings`. NCM memories are staged observations
+/// of one checkout, shared by every session of it, so every candidate the
+/// adapter re-asserts carries `scope_binding: "checkout_observations"`; the
+/// registry records this declaration at registration and passes it to
+/// admission with the admitted call, never from a reply.
+pub const NCM_RECALL_SCOPE_BINDINGS: &[&str] = &["checkout_observations"];
+const NAMESPACE_DOMAIN: &[u8] = b"tracedecay.ncm.checkout.v1\0";
 const CHALLENGE_DOMAIN: &[u8] = b"tracedecay.ncm.handshake-proof.v1\0";
 const CHALLENGE_DOMAIN_V2: &[u8] = b"tracedecay.ncm.handshake-proof.v2\0";
 const OPAQUE_ID_DOMAIN: &[u8] = b"tracedecay.ncm.opaque-id.v1\0";
@@ -98,14 +97,20 @@ impl fmt::Display for NcmAdapterError {
 
 impl Error for NcmAdapterError {}
 
-/// Opaque provider-local namespace derived from a complete TraceDecay coding
-/// scope.
+/// Opaque provider-local namespace derived from the checkout a TraceDecay
+/// coding scope names.
+///
+/// NCM keeps one memory per checkout: every agent session of the same
+/// profile, project, repository, worktree and branch shares it, so a later
+/// session recalls what an earlier one observed from NCM's own state. The
+/// agent-session binding and the resolved-scope digest stay on each delivery
+/// and are checked at recall; they never partition the memory.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NcmNamespace(String);
 
 impl NcmNamespace {
     /// Derives a stable namespace without exposing raw profile, project,
-    /// repository, worktree, branch, or agent-session identifiers to NCM.
+    /// repository, worktree, or branch identifiers to NCM.
     #[must_use]
     pub fn from_exact_scope(scope: &OwnedExactScope) -> Self {
         let mut digest = Sha256::new();
@@ -116,8 +121,6 @@ impl NcmNamespace {
             scope.repository_identity.as_bytes(),
             scope.worktree_identity.as_bytes(),
             scope.branch_identity.as_bytes(),
-            scope.agent_session_id.as_bytes(),
-            scope.resolved_scope_digest.as_bytes(),
         ] {
             digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
             digest.update(value);
@@ -342,9 +345,6 @@ pub struct NcmRecallDiagnosticEvent {
     pub provider_instance_sha256: Option<String>,
     /// Provider state generation observed at capture.
     pub state_generation: u64,
-    /// Number of history sources in the fresh host admission, or zero when no
-    /// admission authority was installed.
-    pub history_source_count: u64,
     /// Number of items the worker scanned for this recall.
     pub scanned_items: u64,
     /// Number of candidates reported at this stage.
@@ -623,7 +623,7 @@ impl NcmProviderAdapter {
             value = common::project_recall(call, &value, &namespace)?;
         }
         let retained = if call.operation == ProviderOperation::Observe {
-            common::project_attribution(call, &value, &namespace, admission)?
+            common::project_attribution(call, &value, &namespace)?
         } else {
             None
         };
@@ -1625,7 +1625,6 @@ impl MemoryProvider for NcmProviderAdapter {
                     &readiness.provider_instance_id,
                     &reply,
                     code,
-                    current_admission.as_ref(),
                     self.recall_diagnostic_sink.as_deref(),
                     self.recall_diagnostic_key
                         .as_ref()
@@ -1704,7 +1703,6 @@ impl MemoryProvider for NcmProviderAdapter {
                     call,
                     &readiness.provider_instance_id,
                     &mut reply,
-                    current_admission.as_ref(),
                     self.recall_diagnostic_sink.as_deref(),
                     self.recall_diagnostic_key
                         .as_ref()

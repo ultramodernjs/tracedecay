@@ -3312,16 +3312,15 @@ fn tracedecay_cli_configuration_receipt(receipt: Option<&tracedecay_contracts::E
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_SCHEMA_VERSION, ControlPaths, MODEL_ACQUISITION_MANIFEST_NAME, NcmControlJournalV1,
-        NcmControlOperation, NcmControlReceiptV1, NcmJournalPhase, NcmScopeArgs,
-        RECEIPT_FILE_PREFIX, RECEIPT_FILE_SUFFIX, TRUSTED_MODEL_ACQUISITION_MANIFEST,
-        WORKER_MANIFEST_NAME, WORKER_NAME, before_observer_bundle_is_available,
-        cleanup_previous_control_worker,
-        control_paths_for_profile, daemon_endpoint_is_reachable, daemon_profile_has_live_owner,
-        latest_receipt, new_operation_id, now_unix, operation_id_for_identity, publish_worker,
+        ControlPaths, MODEL_ACQUISITION_MANIFEST_NAME, NcmControlJournalV1, NcmControlOperation,
+        NcmJournalPhase, NcmScopeArgs, RECEIPT_FILE_PREFIX, RECEIPT_FILE_SUFFIX,
+        TRUSTED_MODEL_ACQUISITION_MANIFEST, WORKER_MANIFEST_NAME, WORKER_NAME,
+        before_observer_bundle_is_available, cleanup_previous_control_worker,
+        daemon_endpoint_is_reachable, daemon_profile_has_live_owner, latest_receipt,
+        new_operation_id, now_unix, operation_id_for_identity, publish_worker,
         read_verified_model_acquisition_manifest, refuse_pending_journal,
         remove_control_worker_bundle, remove_guarded, require_absolute_path, sha256_hex,
-        validate_journal, write_receipt,
+        validate_journal,
     };
     use std::fs;
     use std::io::Write;

@@ -946,17 +946,6 @@ fn scoped_options(project: &Path, json: bool) -> Vec<String> {
     options
 }
 
-fn install_options(project: &Path, worker: &Path, state_root: &Path) -> Vec<String> {
-    let mut options = scoped_options(project, true);
-    options.extend(strings(&[
-        "--worker",
-        worker.to_str().expect("worker path is UTF-8"),
-        "--state-root",
-        state_root.to_str().expect("state root is UTF-8"),
-    ]));
-    options
-}
-
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }

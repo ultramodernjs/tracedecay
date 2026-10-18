@@ -10,56 +10,8 @@ use tracedecay_project::project::TraceDecay;
 
 use super::{
     AdvisoryMemoryContextV1, CognitiveRecallMountError, cognitive_recall, native_authority,
-    native_provider, observation_journey, provider_control, provider_history,
+    native_provider, observation_journey, provider_control,
 };
-
-/// Builds Native-identity observation mount metadata for journey fixtures.
-/// Production never mounts a Native observation journey: Native observes
-/// nothing, so this exists only for the journey tests' provider fixtures.
-#[cfg(test)]
-pub(crate) fn native_observation_mount(
-    data_root: &std::path::Path,
-    registration_revision: u64,
-) -> tracedecay_domain::errors::Result<
-    tracedecay_memory_provider_registry::ObservationProviderMountV1,
-> {
-    use tracedecay_domain::errors::TraceDecayError;
-    use tracedecay_memory_provider_registry::{
-        NATIVE_PROVIDER_ID, ObservationProviderMountV1, ObservationStateNamespacePolicyV1,
-        OwnedProviderId,
-    };
-
-    Ok(ObservationProviderMountV1 {
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).map_err(|error| {
-            TraceDecayError::Config {
-                message: format!("invalid Native observation identity: {error}"),
-            }
-        })?,
-        registration_revision,
-        provider_instance_id: Some(native_provider::PROVIDER_INSTANCE_ID.to_owned()),
-        instance_proof: None,
-        host_limits: native_provider::native_provider_limits(),
-        state_root: data_root.join(observation_journey::PROVIDER_STATE_DIR_NAME),
-        journal_file_name: "memory-observation-journal-v1.sqlite3",
-        state_namespace_policy: ObservationStateNamespacePolicyV1::Prefix(
-            NATIVE_PROVIDER_ID.to_owned(),
-        ),
-    })
-}
-
-/// Returns the registration revision declared by this daemon-service
-/// composition for a provider. Test evidence uses this declaration only to
-/// build a health request; the observed health reply remains authoritative.
-#[cfg(feature = "test-helpers")]
-pub(crate) fn declared_project_provider_registration_revision_for_test(
-    provider_id: &str,
-) -> Option<u64> {
-    match provider_id {
-        tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID => Some(1),
-        tracedecay_memory_provider_ncm::NCM_PROVIDER_ID => Some(1),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Project memory-provider host composition
@@ -78,7 +30,6 @@ pub type NcmRegistrationFactoryV1 = Arc<
             PathBuf,
             u64,
             tracedecay_memory_provider_registry::EnabledProviderMode,
-            Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
         ) -> std::result::Result<
             (
                 tracedecay_memory_provider_registry::ProviderRegistrationV1,
@@ -86,15 +37,6 @@ pub type NcmRegistrationFactoryV1 = Arc<
             ),
             String,
         > + Send
-        + Sync,
->;
-
-/// Test-only decoration of the production Native application port.
-pub type NativeApplicationPortInterpositionV1 = Arc<
-    dyn Fn(
-            Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
-        ) -> Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>
-        + Send
         + Sync,
 >;
 
@@ -121,17 +63,13 @@ pub struct ProjectMemoryProviderHostInputsV1 {
     /// NCM registration is supplied by the daemon composition root because it
     /// owns the worker-generation slot and the concrete worker topology.
     pub ncm_registration_factory: Option<NcmRegistrationFactoryV1>,
-    /// Optional test decoration of the real Native port.
-    pub native_port_interposition: Option<NativeApplicationPortInterpositionV1>,
 }
 
 /// Opaque provider host retained by one project-server generation.
 pub struct ProjectMemoryProviderHostMountV1 {
     composition: Arc<tracedecay_memory_provider_registry::ProjectMemoryProviderComposition>,
-    observation_provider_mounts: Vec<(
-        tracedecay_memory_provider_registry::ConfiguredObservationProviderMountV1,
-        Arc<provider_history::ProviderHistoryAuthorityMountV1>,
-    )>,
+    observation_provider_mounts:
+        Vec<tracedecay_memory_provider_registry::ConfiguredObservationProviderMountV1>,
     cognitive_recall_mount: Option<Arc<ProjectCognitiveRecallMountV1>>,
     native_session_retrieval_mount: Option<Arc<native_authority::NativeSessionRetrievalMountV1>>,
     locator_key: cognitive_recall::control_attribution::RecallLocatorKeyV1,
@@ -209,10 +147,6 @@ impl ProjectCognitiveRecallMountV1 {
     > {
         self.inner.port_for_session(canonical_session_id)
     }
-
-    pub(crate) fn inner(&self) -> Arc<cognitive_recall::ProjectCognitiveRecallMountV1> {
-        Arc::clone(&self.inner)
-    }
 }
 
 /// Opaque admission result for the MCP advisory recall lane.
@@ -259,15 +193,13 @@ pub async fn project_advisory_memory_context_for_call(
     >,
     mount: Option<&ProjectCognitiveRecallMountV1>,
     call: ProjectAdvisoryRecallCallV1,
-    context_memory_contribution: Option<
-        &tracedecay_contracts::retrieval::ContextMemoryContributionV1,
-    >,
+    host_answer: &str,
 ) -> Option<AdvisoryMemoryContextV1> {
     cognitive_recall::advisory_memory_context_for_call(
         port,
         mount.map(|mount| mount.inner.as_ref()),
         call.inner,
-        context_memory_contribution,
+        host_answer,
     )
     .await
 }
@@ -280,8 +212,6 @@ pub struct ProjectMemoryProviderFullMountInputsV1 {
     pub canonical_project_path: PathBuf,
     /// Profile identity bound to the route.
     pub profile_id: tracedecay_domain::UserProfileId,
-    /// Brain identity used by the existing hook admission ledger.
-    pub brain_id: tracedecay_domain::BrainId,
     /// Exact scope published by code-index admission.
     pub scope: tracedecay_contracts::ResolvedScope,
     /// Authoritative project identity checked against the scope.
@@ -416,10 +346,12 @@ pub async fn mount_project_memory_provider_host(
     // unselected Native has no provider-host consequence at all.
     if inputs.activation.native == MemoryProviderParticipationV1::Active {
         let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&inputs.graph)));
-        let session_retrieval = Arc::new(native_authority::NativeSessionRetrievalMountV1::for_project(
-            inputs.profile_id.clone(),
-            inputs.scope.clone(),
-        ));
+        let session_retrieval = Arc::new(
+            native_authority::NativeSessionRetrievalMountV1::for_project(
+                inputs.profile_id.clone(),
+                inputs.scope.clone(),
+            ),
+        );
         let port = native_provider::project_native_memory_application_port_off_runtime(
             graph_cell,
             inputs.canonical_project_path.clone(),
@@ -427,10 +359,6 @@ pub async fn mount_project_memory_provider_host(
         )
         .await
         .map_err(|error| format!("could not construct project Native application port: {error}"))?;
-        let port = match inputs.native_port_interposition.as_ref() {
-            Some(interpose) => interpose(port),
-            None => port,
-        };
         selected_native_port = Some(port);
         // The registration owns the port, while the host retains this handle
         // to bind the canonical session service after full admission.
@@ -448,10 +376,6 @@ pub async fn mount_project_memory_provider_host(
         } else {
             ObservationMountRequirementV1::Optional
         };
-        let history_mount = Arc::new(provider_history::ProviderHistoryAuthorityMountV1::default());
-        let admission_authority: Arc<
-            dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority,
-        > = history_mount.clone();
         let constructed: std::result::Result<
             (
                 tracedecay_memory_provider_registry::ProviderRegistrationV1,
@@ -472,14 +396,7 @@ pub async fn mount_project_memory_provider_host(
             };
             let profile_id = inputs.profile_id.clone();
             tokio::task::spawn_blocking(move || {
-                factory(
-                    profile_id,
-                    worker_binary,
-                    state_root,
-                    1,
-                    mode,
-                    Some(admission_authority),
-                )
+                factory(profile_id, worker_binary, state_root, 1, mode)
             })
             .await
             .map_err(|error| format!("NCM construction task unavailable: {error}"))?
@@ -492,14 +409,11 @@ pub async fn mount_project_memory_provider_host(
                 } else {
                     observers.push(registration);
                 }
-                observation_provider_mounts.push((
-                    ConfiguredObservationProviderMountV1 {
-                        mount,
-                        requirement,
-                        activation: ObservationMountActivationV1::AfterPublication,
-                    },
-                    history_mount,
-                ));
+                observation_provider_mounts.push(ConfiguredObservationProviderMountV1 {
+                    mount,
+                    requirement,
+                    activation: ObservationMountActivationV1::AfterPublication,
+                });
             }
             Err(error) if requirement == ObservationMountRequirementV1::Optional => {
                 tracing::warn!(
@@ -600,14 +514,8 @@ pub async fn mount_project_memory_provider_full(
 ) -> std::result::Result<Arc<ProjectMemoryProviderFullMountV1>, String> {
     use tracedecay_memory_provider_registry::ObservationMountRequirementV1;
 
-    let hook_origin_reader = Arc::new(provider_history::HookOriginReaderV1::new(
-        inputs.graph.hook_store_layout().data_root.clone(),
-        inputs.brain_id.clone(),
-        inputs.profile_id.clone(),
-    ));
     let mut journeys = Vec::with_capacity(host.observation_provider_mounts.len());
     let mut deferred = Vec::new();
-    let mut control_journals = Vec::new();
     macro_rules! fail_partial_provider_mount {
         ($error:expr) => {{
             let error = $error;
@@ -615,7 +523,7 @@ pub async fn mount_project_memory_provider_full(
             return Err(error);
         }};
     }
-    for (configured, history_mount) in &host.observation_provider_mounts {
+    for configured in &host.observation_provider_mounts {
         if cancellation.is_cancelled() {
             fail_partial_provider_mount!(
                 "project open was cancelled during provider observation mount".to_owned()
@@ -652,80 +560,12 @@ pub async fn mount_project_memory_provider_full(
                     continue;
                 }
             };
-        let original_authority = match provider_history::HistoryIdentityBridgeV1::admit(
-            &inputs.canonical_project_path,
-            &inputs.profile_id,
-            &inputs.scope,
-            &inputs.session_db.binding().shard_id,
-        ) {
-            Ok(bridge) => Some(Arc::new(
-                provider_history::MountedOriginalObservationAuthorityV1 {
-                    reader: Arc::clone(&hook_origin_reader),
-                    bridge: Arc::new(bridge),
-                },
-            )),
-            Err(error)
-                if matches!(
-                    &error,
-                    provider_history::ProviderHistoryErrorV1::Unavailable(
-                        "repository marker"
-                            | "current repository capture"
-                            | "canonical repository identity"
-                    )
-                ) =>
-            {
-                tracing::debug!(
-                    provider = provider.provider_id.as_str(),
-                    error = %error,
-                    "provider history unavailable without original repository evidence"
-                );
-                None
-            }
-            Err(error) => {
-                fail_partial_provider_mount!(format!("provider history mount refused: {error}"));
-            }
-        };
-        let journey_mount = Arc::new(ProjectObservationJourneyMountV1 {
+        // Keep the wrapper in `journeys` from the moment the worker-capable
+        // journey is mounted. Any later provider or control failure therefore
+        // shuts down every earlier and current journey before returning.
+        journeys.push(Arc::new(ProjectObservationJourneyMountV1 {
             inner: Arc::clone(&journey),
-        });
-        journeys.push(Arc::clone(&journey_mount));
-        let authority = Arc::new(provider_history::ProviderHistoryAuthorityV1 {
-            mounted_scope: inputs.scope.clone(),
-            profile_id: inputs.profile_id.clone(),
-            registered_shard: inputs.session_db.binding().shard_id.clone(),
-            observations: Arc::new(inputs.session_db.observation_store()),
-            dispositions: Arc::new(inputs.graph.db().clone()),
-            original_authority,
-            journal: journey.history_journal(),
-            provider_id: provider.provider_id.clone(),
-            policy_revision: 1,
-            runtime: tokio::runtime::Handle::current(),
-        });
-        if let Err(error) = authority.validate_mount() {
-            fail_partial_provider_mount!(format!("provider history mount refused: {error}"));
-        }
-        if let Err(error) = history_mount.bind(authority.clone()) {
-            fail_partial_provider_mount!(format!("provider history binding refused: {error}"));
-        }
-        if let Err(error) = journey.bind_history_authority(authority.clone()) {
-            fail_partial_provider_mount!(format!(
-                "provider journey history binding refused: {error}"
-            ));
-        }
-        if let Some(recall) = host
-            .cognitive_recall_mount
-            .as_ref()
-            .filter(|recall| recall.inner.routing().active_provider() == &provider.provider_id)
-        {
-            if let Err(error) = recall
-                .inner
-                .bind_selected_history(authority, Arc::clone(&journey))
-            {
-                fail_partial_provider_mount!(format!(
-                    "provider recall history binding refused: {error}"
-                ));
-            }
-        }
+        }));
         if configured.activation
             == tracedecay_memory_provider_registry::ObservationMountActivationV1::BeforePublication
         {
@@ -744,11 +584,18 @@ pub async fn mount_project_memory_provider_full(
         } else {
             deferred.push((Arc::clone(&journey), configured.requirement));
         }
-        control_journals.push((provider.provider_id.clone(), journey.history_journal()));
-        // Keep the wrapper in `journeys` from the moment the worker-capable
-        // journey is mounted. Any later provider or control failure therefore
-        // shuts down every earlier and current journey before returning.
-        let _ = journey_mount;
+    }
+
+    // The active recall route confirms observation-sourced candidates against
+    // this same canonical store; before this binding it confirms none.
+    if let Some(recall) = host.cognitive_recall_mount.as_ref()
+        && let Err(error) = recall
+            .inner
+            .bind_observation_store(inputs.session_db.observation_store())
+    {
+        fail_partial_provider_mount!(format!(
+            "memory recall observation store binding refused: {error}"
+        ));
     }
 
     let now = tracedecay_contracts::now_micros().0;
@@ -758,20 +605,15 @@ pub async fn mount_project_memory_provider_full(
         tracedecay_memory_provider_registry::CancellationToken::new(),
     );
     let control_inputs = provider_control::authority::ProviderControlAuthorityInputsV1 {
-        canonical_project_path: inputs.canonical_project_path.clone(),
         profile_id: inputs.profile_id.clone(),
         mounted_scope: inputs.scope.clone(),
         session_db: inputs.session_db.clone(),
-        dispositions: Arc::new(inputs.graph.db().clone()),
-        hook_origin_reader,
         store_data_root: inputs.graph.store_layout().data_root.clone(),
         live_ledger: host
             .cognitive_recall_mount
             .as_ref()
             .map(|mount| mount.inner.control_ledger()),
         locator_key: host.locator_key.clone(),
-        live_journals: control_journals,
-        runtime: tokio::runtime::Handle::current(),
     };
     let blocking_control = control.clone();
     let mut work = tokio::task::spawn_blocking(move || {
@@ -792,20 +634,17 @@ pub async fn mount_project_memory_provider_full(
         joined = &mut work => joined,
     };
     let authority = if control.snapshot().is_err() {
-        tracing::debug!(
-            cause = "admission_budget",
-            "provider source controls unavailable"
-        );
+        tracing::debug!(cause = "admission_budget", "provider controls unavailable");
         None
     } else {
         match joined {
             Ok(Ok(authority)) => Some(Arc::new(authority)),
             Ok(Err(error)) => {
-                tracing::debug!(cause = "retained_authority", error = %error, "provider source controls unavailable");
+                tracing::debug!(cause = "retained_authority", error = %error, "provider controls unavailable");
                 None
             }
             Err(error) => {
-                tracing::debug!(cause = "mount_task", error = %error, "provider source controls unavailable");
+                tracing::debug!(cause = "mount_task", error = %error, "provider controls unavailable");
                 None
             }
         }
@@ -813,7 +652,6 @@ pub async fn mount_project_memory_provider_full(
     let provider_control_mount = provider_control::project_provider_control_port(
         provider_control::ProviderControlMountInputsV1 {
             authority,
-            composition: Arc::clone(&host.composition),
             journeys: journeys
                 .iter()
                 .map(|journey| Arc::clone(&journey.inner))
@@ -821,10 +659,7 @@ pub async fn mount_project_memory_provider_full(
             profile_id: inputs.profile_id,
             mounted_scope: inputs.scope,
             authoritative_project_id: inputs.authoritative_project_id,
-            project_root: inputs.canonical_project_path,
             configuration_digest: inputs.configuration_digest,
-            canonical_session_db: inputs.session_db.clone(),
-            canonical_dispositions: Arc::new(inputs.graph.db().clone()),
         },
     );
     Ok(Arc::new(ProjectMemoryProviderFullMountV1 {

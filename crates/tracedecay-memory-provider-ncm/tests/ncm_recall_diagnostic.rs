@@ -15,13 +15,10 @@ use std::thread;
 use std::time::Duration;
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
-    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, CancellationToken, CanonicalPayload,
-    CommittedEffectEvidence, CurrentAdvisoryAdmission, CurrentSourceDisposition, FallbackDirective,
-    GrantedHistorySource, HandshakeRequest, HandshakeRequestParts, MemoryProvider,
-    OperationControl, OriginScopeEvidence, OriginalSourceIdentity, OwnedExactScope,
+    CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
+    HandshakeRequest, HandshakeRequestParts, MemoryProvider, OperationControl, OwnedExactScope,
     OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderDescriptor,
-    ProviderLimits, ProviderOperation, ProviderReply, RecordedValidity, SourceAttribution,
-    TerminalRecord,
+    ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_ncm::{
     NCM_PROVIDER_ID, NcmCognitiveSurface, NcmNamespace, NcmProviderAdapter,
@@ -171,52 +168,6 @@ impl NcmCognitiveSurface for DiagnosticSurface {
             extensions: Vec::new(),
             state_generation: call.expected_state_generation,
         }
-    }
-}
-
-struct DiagnosticHistoryAuthority {
-    source_count: usize,
-}
-
-impl AdvisoryAdmissionAuthority for DiagnosticHistoryAuthority {
-    fn admit(
-        &self,
-        request: &ProviderCall,
-    ) -> Result<CurrentAdvisoryAdmission, AdvisoryAdmissionError> {
-        let history_sources = (0..self.source_count)
-            .map(|index| GrantedHistorySource {
-                attribution: SourceAttribution {
-                    source: OriginalSourceIdentity {
-                        canonical_provider_id: OwnedProviderId::new("codex")
-                            .expect("diagnostic source provider"),
-                        canonical_session_id: format!("diagnostic-history-session-{index}"),
-                        source_key: format!("diagnostic-history-source-{index}"),
-                        stable_record_id: Some(format!("diagnostic-history-record-{index}")),
-                        observation_id: format!("diagnostic-history-observation-{index}"),
-                        source_revision: Some(format!("diagnostic-history-revision-{index}")),
-                        content_sha256: "ab".repeat(32),
-                    },
-                    origin_scope: OriginScopeEvidence::Recorded {
-                        scope: request.exact_scope.clone(),
-                        authority_ref: "diagnostic-history-authority".to_owned(),
-                    },
-                    source_sequence: u64::try_from(index).unwrap_or(u64::MAX),
-                    occurred_at_utc_nanos: Some(1),
-                    ingested_at_utc_nanos: 1,
-                    validity: RecordedValidity {
-                        valid_from_utc_nanos: Some(1),
-                        ..RecordedValidity::default()
-                    },
-                },
-                current_disposition: CurrentSourceDisposition {
-                    state: tracedecay_memory_provider_api::contract::SourceDisposition::Available,
-                    authority_ref: "diagnostic-history-authority".to_owned(),
-                    authority_revision: Some(1),
-                    checked_at_utc_nanos: 1,
-                },
-            })
-            .collect();
-        CurrentAdvisoryAdmission::new(request, history_sources, None)
     }
 }
 
@@ -531,40 +482,15 @@ fn adapter_invoke_traces_four_worker_rows_to_two_partial_candidates() {
         tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::Worker
     );
     assert_eq!(events[0].candidate_count, 4);
-    assert_eq!(events[0].history_source_count, 0);
     assert_eq!(events[0].scanned_items, 4);
     assert_eq!(
         events[1].stage,
         tracedecay_memory_provider_ncm::NcmRecallDiagnosticStage::PartialReply
     );
     assert_eq!(events[1].candidate_count, 2);
-    assert_eq!(events[1].history_source_count, 0);
     assert_eq!(events[1].scanned_items, 4);
     assert_eq!(events[0].request_id_sha256, events[1].request_id_sha256);
     assert_eq!(events[0].query_sha256, events[1].query_sha256);
-}
-
-#[test]
-fn diagnostic_history_count_comes_from_fresh_admission() {
-    let (adapter, ready_receipt) = adapter(SurfaceMode::FourRows);
-    let adapter =
-        adapter.with_admission_authority(Arc::new(DiagnosticHistoryAuthority { source_count: 3 }));
-    let sink = Arc::new(RecordingSink::default());
-    let adapter = adapter.with_recall_diagnostic_sink(sink.clone(), Some(diagnostic_key()));
-    let reply = adapter.invoke(&recall_call(
-        &ready_receipt,
-        "fresh-history-count",
-        2,
-        500,
-        CancellationToken::new(),
-    ));
-    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Partial);
-    let events = sink.snapshot();
-    assert_eq!(events.len(), 2, "{events:?}");
-    for event in events {
-        assert_eq!(event.history_source_count, 3);
-        assert_eq!(event.scanned_items, 4);
-    }
 }
 
 #[test]

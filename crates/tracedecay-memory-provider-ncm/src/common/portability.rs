@@ -250,7 +250,7 @@ fn project_replay(
         );
         let provenance = if eligible {
             let mut provenance =
-                project_attribution(call, observation, namespace, Some(admission))??;
+                project_attribution(call, observation, namespace)??;
             let delivery = serde_json::to_vec(&json!({"operation_id":call.operation_id,"idempotency_key":string(&observation["idempotency_key"])?})).ok()?;
             provenance["delivery_capsule"] = json!({"version":1,"sha256":hex_digest(&Sha256::digest(&delivery)),"bytes":delivery});
             provenance

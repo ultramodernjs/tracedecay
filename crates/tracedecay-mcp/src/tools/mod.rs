@@ -10,7 +10,6 @@ pub mod response_trailers;
 
 use serde_json::Value;
 use std::fmt::Write as _;
-use tracedecay_contracts::retrieval::ContextMemoryContributionV1;
 use tracedecay_mcp_catalog::ToolDefinition;
 
 /// The result of a tool call, including the JSON response and the file
@@ -24,9 +23,6 @@ pub struct ToolResult {
     /// Internal analytics metadata for the server runtime. This must never be
     /// serialized into the tool response payload.
     internal_analytics: Option<Value>,
-    /// Canonical context identities and validated request policy retained for
-    /// host recall. This sidecar is never serialized into the MCP payload.
-    context_memory_contribution: Option<ContextMemoryContributionV1>,
     /// Structural signal that the handler itself determined this call failed
     /// semantically (e.g. an edit whose `success` field is `false`), set by
     /// the handler rather than inferred later from rendered response text.
@@ -54,7 +50,6 @@ impl ToolResult {
             value,
             touched_files,
             internal_analytics: None,
-            context_memory_contribution: None,
             semantic_error: None,
             failure_message: None,
             token_accounting: None,
@@ -71,11 +66,6 @@ impl ToolResult {
     pub fn with_internal_analytics(mut self, internal_analytics: Value) -> Self {
         self.internal_analytics = Some(internal_analytics);
         self
-    }
-
-    /// Returns the internal canonical contribution, absent for ordinary tools.
-    pub fn context_memory_contribution(&self) -> Option<&ContextMemoryContributionV1> {
-        self.context_memory_contribution.as_ref()
     }
 
     pub fn internal_analytics(&self) -> Option<&Value> {

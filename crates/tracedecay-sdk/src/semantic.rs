@@ -30,15 +30,9 @@ pub(crate) fn response_matches(
                 return false;
             };
             let operation = match operation {
-                RetainedSurfaceOperation::ProviderFeedback => "feedback",
-                RetainedSurfaceOperation::ProviderCorrection => "correction",
-                RetainedSurfaceOperation::ProviderDeleteBySource => "delete_by_source",
                 RetainedSurfaceOperation::ProviderHealth => "health",
                 RetainedSurfaceOperation::ProviderInspection => "inspection",
                 RetainedSurfaceOperation::ProviderMaintenance => "maintenance",
-                RetainedSurfaceOperation::ProviderSnapshotExport => "snapshot_export",
-                RetainedSurfaceOperation::ProviderSnapshotRestore => "snapshot_restore",
-                RetainedSurfaceOperation::ProviderReplay => "replay",
                 _ => return false,
             };
             let Ok(request) = serde_json::from_value::<ProviderControlRequestV1>(
@@ -104,14 +98,14 @@ mod tests {
     }
 
     #[test]
-    fn provider_control_semantics_bind_generated_operation_source_and_terminal_effect() {
-        use crate::operations::{ProviderFeedback, ProviderHealth, TypedOperation};
+    fn provider_control_semantics_bind_generated_operation_request_and_terminal_effect() {
+        use crate::operations::{ProviderHealth, ProviderMaintenance, TypedOperation};
         use tracedecay_contracts::RequestId;
         use tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
 
-        let source = json!({"trace_ref":"trace.retained.1","item_ref":"item.1","observation_id":"observation.1"});
-        let request: <ProviderFeedback as TypedOperation>::Request =
-            serde_json::from_value(json!({"source":source,"signal":"helpful","weight":"1","evidence_refs":[],"occurred_at":1})).expect("concrete SDK request body");
+        let state = json!({"kind":"canonical_session","provider_id":"native","registration_revision":7,"canonical_provider_id":"claude","session_id":"session-1"});
+        let request: <ProviderMaintenance as TypedOperation>::Request =
+            serde_json::from_value(json!({"state":state,"task":"validate_state","maximum_items":20,"maximum_bytes":65536,"maximum_duration_millis":1000,"dry_run":false})).expect("concrete SDK request body");
         let request = serde_json::to_value(request).expect("SDK serialized request");
         assert!(request.get("operation").is_none());
         let expected_id = RequestId::new("request.sdk.provider").expect("request ID");
@@ -127,17 +121,15 @@ mod tests {
             "scope":{"profile_id":"profile-1","project_id":"project-1","repository_identity":"repo-1","worktree_identity":"worktree-1","branch_identity":"refs/heads/main","agent_session_id":"session-1","resolved_scope_digest":format!("sha256:{}","1".repeat(64))},
             "operation_id":"018f22c2-77cd-7000-8000-000000000001","idempotency_key":"d".repeat(64),
             "terminal":"success","diagnostic_id":null,"domain_detail":null,"effect":effect,"warnings":[],
-            "result":{"operation":"feedback","data":{
-                "source":source,
-                "target":{"stable_memory_ref":"provider.memory.1","source":{"canonical_provider_id":"native","canonical_session_id":"session-1","source_key":"source.1","stable_record_id":null,"observation_id":"observation.1","source_revision":"revision.1","content_sha256":"a".repeat(64)}},
-                "target_digest":"a".repeat(64),"signal":"helpful","applied_effect":"recorded",
+            "result":{"operation":"maintenance","data":{
+                "task":"validate_state","dry_run":false,"scanned_items":1,"changed_items":1,"removed_items":0,"partial":false,"resume_cursor":null,
                 "receipt":{"state_generation_before":3,"state_generation_after":4,"provider_receipt_digest":"b".repeat(64)}
             }}
         });
         let matches = |result: &serde_json::Value| {
             response_matches(
-                ProviderFeedback::RESULT_SEMANTICS,
-                ProviderFeedback::OPERATION_ID,
+                ProviderMaintenance::RESULT_SEMANTICS,
+                ProviderMaintenance::OPERATION_ID,
                 expected_id.as_str(),
                 Some(&expected_id),
                 &request,
@@ -146,7 +138,7 @@ mod tests {
         };
         assert!(
             matches(&result),
-            "actual typed request and committing feedback"
+            "actual typed request and committing maintenance"
         );
 
         let mut foreign_operation = result.clone();
@@ -164,7 +156,7 @@ mod tests {
         );
         assert!(
             !response_matches(
-                ProviderFeedback::RESULT_SEMANTICS,
+                ProviderMaintenance::RESULT_SEMANTICS,
                 ProviderHealth::OPERATION_ID,
                 expected_id.as_str(),
                 Some(&expected_id),
@@ -174,29 +166,27 @@ mod tests {
             "the response cannot choose its own operation"
         );
 
-        let mut foreign_source = result.clone();
-        foreign_source["result"]["data"]["source"]["observation_id"] = json!("observation.other");
-        foreign_source["result"]["data"]["target"]["source"]["observation_id"] =
-            json!("observation.other");
-        serde_json::from_value::<ProviderControlResultV1>(foreign_source.clone())
-            .expect("typed foreign source")
+        let mut foreign_task = result.clone();
+        foreign_task["result"]["data"]["task"] = json!("compact");
+        serde_json::from_value::<ProviderControlResultV1>(foreign_task.clone())
+            .expect("typed foreign task")
             .validate()
-            .expect("internally consistent foreign source result");
+            .expect("internally consistent foreign task result");
         assert!(
-            !matches(&foreign_source),
-            "the target must belong to the requested source"
+            !matches(&foreign_task),
+            "the result must answer the requested maintenance task"
         );
 
         let mut invalid_terminal = result.clone();
         invalid_terminal["terminal"] = json!("provider_unavailable");
         assert!(
             !matches(&invalid_terminal),
-            "unavailable cannot claim committed feedback"
+            "unavailable cannot claim committed maintenance"
         );
         assert!(
             !response_matches(
-                ProviderFeedback::RESULT_SEMANTICS,
-                ProviderFeedback::OPERATION_ID,
+                ProviderMaintenance::RESULT_SEMANTICS,
+                ProviderMaintenance::OPERATION_ID,
                 "request.foreign",
                 Some(&expected_id),
                 &request,
@@ -206,7 +196,7 @@ mod tests {
         );
         assert!(
             !response_matches(
-                ProviderFeedback::RESULT_SEMANTICS,
+                ProviderMaintenance::RESULT_SEMANTICS,
                 "operation.application.fact_store_curate",
                 expected_id.as_str(),
                 Some(&expected_id),

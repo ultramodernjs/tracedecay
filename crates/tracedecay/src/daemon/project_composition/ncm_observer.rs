@@ -21,33 +21,73 @@ use tracedecay_memory_provider_registry::{
 };
 
 /// Construction failed before an NCM registration could be mounted.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub(in crate::daemon) enum NcmObserverConstructionError {
     /// A daemon may not create another worker under conflicting profile/config authority.
-    #[error(
-        "NCM worker {field} conflicts with this daemon's admitted owner; restart with one profile/configuration"
-    )]
     OwnerBindingConflict { field: &'static str },
     /// Poisoned daemon ownership cannot be replaced with another process.
-    #[error("NCM worker owner slot is unavailable")]
     OwnerSlotUnavailable,
     /// Configured state root was not admitted.
-    #[error("NCM observer state root is invalid: {0}")]
     StateRoot(String),
     /// The real worker could not be constructed or report coherent identity.
-    #[error("NCM observer worker is unavailable: {0}")]
-    Worker(#[from] tracedecay_memory_provider_ncm::RustNcmError),
+    Worker(tracedecay_memory_provider_ncm::RustNcmError),
     /// Composition could not admit the adapter's declared scope bindings.
-    #[error("NCM registration is invalid: {0}")]
     Registration(String),
     /// The real surface declared an invalid adapter identity.
-    #[error("NCM observer adapter is invalid: {0}")]
-    Adapter(#[from] tracedecay_memory_provider_ncm::NcmAdapterError),
+    Adapter(tracedecay_memory_provider_ncm::NcmAdapterError),
     /// The opt-in diagnostic journey asked for keyed stage evidence, but the
     /// daemon could not obtain a fresh secret from the operating system.
     #[cfg(feature = "test-transport")]
-    #[error("NCM recall diagnostic entropy is unavailable: {0}")]
     DiagnosticEntropyUnavailable(String),
+}
+
+impl std::fmt::Display for NcmObserverConstructionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OwnerBindingConflict { field } => write!(
+                formatter,
+                "NCM worker {field} conflicts with this daemon's admitted owner; restart with one profile/configuration"
+            ),
+            Self::OwnerSlotUnavailable => {
+                formatter.write_str("NCM worker owner slot is unavailable")
+            }
+            Self::StateRoot(detail) => {
+                write!(formatter, "NCM observer state root is invalid: {detail}")
+            }
+            Self::Worker(error) => write!(formatter, "NCM observer worker is unavailable: {error}"),
+            Self::Registration(detail) => {
+                write!(formatter, "NCM registration is invalid: {detail}")
+            }
+            Self::Adapter(error) => write!(formatter, "NCM observer adapter is invalid: {error}"),
+            #[cfg(feature = "test-transport")]
+            Self::DiagnosticEntropyUnavailable(detail) => write!(
+                formatter,
+                "NCM recall diagnostic entropy is unavailable: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NcmObserverConstructionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Worker(error) => Some(error),
+            Self::Adapter(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<tracedecay_memory_provider_ncm::RustNcmError> for NcmObserverConstructionError {
+    fn from(error: tracedecay_memory_provider_ncm::RustNcmError) -> Self {
+        Self::Worker(error)
+    }
+}
+
+impl From<tracedecay_memory_provider_ncm::NcmAdapterError> for NcmObserverConstructionError {
+    fn from(error: tracedecay_memory_provider_ncm::NcmAdapterError) -> Self {
+        Self::Adapter(error)
+    }
 }
 
 /// Installs the opt-in recall-stage sink immediately after the adapter is
@@ -130,10 +170,6 @@ impl tracedecay_memory_provider_ncm::NcmRecallDiagnosticSink for NcmRecallDiagno
         let mut fields = vec![
             ("stage", stage.to_owned()),
             ("state_generation", event.state_generation.to_string()),
-            (
-                "history_source_count",
-                event.history_source_count.to_string(),
-            ),
             ("scanned_items", event.scanned_items.to_string()),
             ("candidate_count", event.candidate_count.to_string()),
             ("excluded_count", event.excluded_count.to_string()),
@@ -288,15 +324,14 @@ impl ProviderLifecycleOwnerV1 for NcmLifecycleOwner {
 }
 
 /// Builds one lazy registration over the existing NCM worker slot. The mode is
-/// passed by validated composition; Native advisory authority is optional.
-pub(in crate::daemon) fn construct_ncm_registration_with_authority(
+/// passed by validated composition.
+pub(in crate::daemon) fn construct_ncm_registration(
     owners: &NcmWorkerOwnerSlot,
     profile_id: &UserProfileId,
     worker_binary: PathBuf,
     state_root: PathBuf,
     registration_revision: u64,
     mode: EnabledProviderMode,
-    authority: Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
 ) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
     let worker = owners.acquire(profile_id, &worker_binary, &state_root)?;
     let lifecycle =
@@ -308,11 +343,7 @@ pub(in crate::daemon) fn construct_ncm_registration_with_authority(
         Arc::new(NcmInstanceProof(Arc::clone(&surface))) as Arc<dyn ObservationInstanceProofV1>
     );
     let provider = NcmProviderAdapter::new(surface)?;
-    let provider = attach_recall_diagnostic_sink(provider)?;
-    let provider = Arc::new(match authority {
-        Some(authority) => provider.with_admission_authority(authority),
-        None => provider,
-    });
+    let provider = Arc::new(attach_recall_diagnostic_sink(provider)?);
     let mount = ObservationProviderMountV1 {
         provider_id: descriptor.provider_id.clone(),
         registration_revision,
@@ -358,14 +389,13 @@ mod tests {
         worker_binary: PathBuf,
         state_root: PathBuf,
     ) -> Result<ObservationProviderMountV1, NcmObserverConstructionError> {
-        construct_ncm_registration_with_authority(
+        construct_ncm_registration(
             owners,
             profile_id,
             worker_binary,
             state_root,
             1,
             EnabledProviderMode::Observer,
-            None,
         )
         .map(|(_, mount)| mount)
     }

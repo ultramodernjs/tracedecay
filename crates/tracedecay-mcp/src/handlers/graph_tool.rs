@@ -313,7 +313,6 @@ mod tests {
             },
             memory_matches: Vec::new(),
             memory_graph_coverage: None,
-            memory_temporal_coverage: None,
             memory_matches_error: None,
             verified_graph_evidence: None,
             plan: Some(ContextPlanV1 {

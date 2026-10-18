@@ -199,10 +199,19 @@ mod tests {
             project_source_id(&namespace, &revision).unwrap(),
             expected.source_id
         );
-        let mut other_delivery = exact.clone();
-        other_delivery.agent_session_id = "another-delivery-session".to_owned();
+        // Another session of the same checkout shares the namespace, so the
+        // same original source keeps one identity there.
+        let mut other_session = exact.clone();
+        other_session.agent_session_id = "another-delivery-session".to_owned();
+        assert_eq!(
+            project_source_id(&NcmNamespace::from_exact_scope(&other_session), &original).unwrap(),
+            expected.source_id,
+        );
+        let mut other_checkout = exact.clone();
+        other_checkout.worktree_identity = "another-worktree".to_owned();
         assert_ne!(
-            project_source_id(&NcmNamespace::from_exact_scope(&other_delivery), &original).unwrap(),
+            project_source_id(&NcmNamespace::from_exact_scope(&other_checkout), &original)
+                .unwrap(),
             expected.source_id,
         );
     }
@@ -325,7 +334,7 @@ mod tests {
                 }
                 let observation = json!({"source_identity":{"original_source":item},
                     "observation_kind":"session.message_committed.v1", "canonical_payload":{"role":"assistant","content":content}});
-                let mut provenance = project_attribution(&call, &observation, &namespace, None)
+                let mut provenance = project_attribution(&call, &observation, &namespace)
                     .unwrap()
                     .unwrap();
                 let binding = source_binding(&namespace, &attribution(&item).unwrap()).unwrap();
@@ -358,7 +367,7 @@ mod tests {
                 payload: Some(CanonicalPayload::new(call.payload.contract_id.clone(), worker.clone(), hex_digest(&Sha256::digest(&worker))).unwrap()),
                 warnings: Vec::new(), extensions: Vec::new(), state_generation: 0,
             };
-            reconstruct_recall(&call, "ncm-instance", &mut reply, None).unwrap();
+            reconstruct_recall(&call, "ncm-instance", &mut reply).unwrap();
             let result: Value = serde_json::from_slice(&reply.payload.unwrap().bytes).unwrap();
             assert_eq!(result["candidates"].as_array().unwrap().len(), 1);
             assert_eq!(result["candidates"][0]["content"], "assistant: kept");
@@ -396,7 +405,7 @@ mod tests {
             let observation = json!({"source_identity":{"original_source":item},
                 "observation_kind":"session.message_committed.v1",
                 "canonical_payload":{"role":role,"content":content}});
-            let provenance = project_attribution(&call, &observation, &namespace, None)
+            let provenance = project_attribution(&call, &observation, &namespace)
                 .unwrap()
                 .unwrap();
             let source = source_binding(&namespace, &attribution(&item).unwrap())
@@ -434,7 +443,7 @@ mod tests {
             payload: Some(CanonicalPayload::new(call.payload.contract_id.clone(), worker.clone(), hex_digest(&Sha256::digest(&worker))).unwrap()),
             warnings: Vec::new(), extensions: Vec::new(), state_generation: 2,
         };
-        reconstruct_recall(call, "ncm-instance", &mut reply, None).unwrap();
+        reconstruct_recall(call, "ncm-instance", &mut reply).unwrap();
         serde_json::from_slice(&reply.payload.unwrap().bytes).unwrap()
     }
 

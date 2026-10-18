@@ -33,7 +33,7 @@ pub(crate) mod control_attribution;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -44,41 +44,37 @@ use tracedecay_memory_provider_registry::{
     CognitiveRecallPortInputsV1, ContextPackError, ContextPackPolicyError, ContextPackPolicyV1,
     ContextPackRenderFormV1, ContextPackV1, ContextSectionKind, ExactScopeBinding,
     ExactScopeBindingError, HostCanonicalRecordStore, HostContextItemV1, HostEvidenceControlV1,
-    HostEvidenceLookupErrorV1, HostEvidenceScopeV1, HostSessionEvidenceStore,
-    HostSourceEvidenceStore, MountedHostProvenanceAuthorityV1, O200kBaseContextTokenizer,
-    OwnedExactScope, OwnedProviderId, ProjectCognitiveRecallPortV1,
-    ProjectMemoryProviderComposition, ProvenanceHydrationPassV1, ProvenanceHydrationPolicyV1,
+    HostEvidenceLookupErrorV1, HostEvidenceScopeV1, HostProvenanceAuthority,
+    HostSessionEvidenceStore, HostSourceEvidenceStore, MountedHostProvenanceAuthorityV1,
+    O200kBaseContextTokenizer, OwnedExactScope, OwnedProviderId, ProjectCognitiveRecallPortV1,
+    ProjectMemoryProviderComposition, ProvenanceHydrationError, ProvenanceHydrationPassV1,
+    ProvenanceHydrationPolicyV1,
     ProviderContextItemV1, ProviderContributionV1, ProviderInvocationBoundaryV1,
     ProviderInvocationLimitsV1, ProviderItemProvenanceV1, ProviderLimits, ProviderWorkV1,
     ProviderWorkerHandleV1, ProviderWorkerIsolationV1, ProviderWorkerSpawnErrorV1,
     ProviderWorkerSpawnV1, ProviderWorkerTerminationV1, RecallAdmissionAuditError,
     RecallAdmissionObserver, RecallAdmissionReport, RecallBudgetsV1, RecallDenialReason,
-    RecallExplainHostDecisionV1, RecallExplainHostWithholdingV1, RecallExplainItemV1,
-    RecallExplainProviderExplanationV1, RecallExplainStageV1, RecallExplainTokenSummaryV1,
-    RecallExplainTraceInputsV1, RecallExplainTraceV1, RecallExplanationRedactorV1,
-    RecallNormalizationV1, RecallSelectionV1, build_recall_explain_trace,
-    explanation_source_sha256,
+    RecallExplainHostWithholdingV1, RecallExplainProviderExplanationV1, RecallExplainTraceInputsV1,
+    RecallExplainTraceV1, RecallExplanationRedactorV1, RecallNormalizationV1, RecallSelectionV1,
+    build_recall_explain_trace, explanation_source_sha256,
+};
+#[cfg(test)]
+use tracedecay_memory_provider_registry::{
+    RecallExplainHostDecisionV1, RecallExplainItemV1, RecallExplainStageV1,
+    RecallExplainTokenSummaryV1,
 };
 
 use super::observation_journey::{
-    ObservationJourneyError, ReplayBoundsV1, UntrustedRecallGateFaultV1, UntrustedRecallGateV1,
-    UntrustedRecallItemV1, UntrustedRecallMetadataFieldV1, UntrustedRecallTrustV1,
-    UntrustedRecallWithheldReasonV1, exact_scope_for_session, provider_agent_session_id,
+    UntrustedRecallGateFaultV1, UntrustedRecallGateV1, UntrustedRecallItemV1,
+    UntrustedRecallMetadataFieldV1, UntrustedRecallTrustV1, UntrustedRecallWithheldReasonV1,
+    provider_agent_session_id,
 };
-use super::provider_control::portability::{
-    PortabilityErrorV1, RetainedCanonicalHistoryReplayV1, retain_settled_replay_batches,
-};
-use super::provider_history::{ProviderHistoryErrorV1, history_grant_json};
 
 use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
 use tracedecay_memory_provider_registry::recall_context_pack::{
-    CanonicalHistoryReplayV1, ContextRecallControlRefV1, ContextRecallTraceV1,
-    compile_context_pack_with_control_metadata,
+    ContextRecallControlRefV1, ContextRecallTraceV1, compile_context_pack_with_control_metadata,
 };
-use tracedecay_memory_provider_registry::{
-    HistoryGrant, HostEvidenceRefV1, HostProvenanceAuthority, OperationControl,
-    ProvenanceHydrationError, UnknownValidityPolicy,
-};
+use tracedecay_memory_provider_registry::{HostEvidenceRefV1, UnknownValidityPolicy};
 
 /// File name of the project-owned recall admission ledger inside the
 /// canonical store layout. Placement only; never an identity input.
@@ -102,8 +98,6 @@ const CONTEXT_INDEX_COVERAGE_HINT_HEADING: &str = "### Index Coverage Hint";
 struct TestToolResult {
     value: Value,
     touched_files: Vec<String>,
-    context_memory_contribution:
-        Option<tracedecay_contracts::retrieval::ContextMemoryContributionV1>,
 }
 
 #[cfg(test)]
@@ -112,22 +106,7 @@ impl TestToolResult {
         Self {
             value,
             touched_files,
-            context_memory_contribution: None,
         }
-    }
-
-    fn with_context_memory_contribution(
-        mut self,
-        contribution: tracedecay_contracts::retrieval::ContextMemoryContributionV1,
-    ) -> Self {
-        self.context_memory_contribution = Some(contribution);
-        self
-    }
-
-    fn context_memory_contribution(
-        &self,
-    ) -> Option<&tracedecay_contracts::retrieval::ContextMemoryContributionV1> {
-        self.context_memory_contribution.as_ref()
     }
 }
 
@@ -143,20 +122,6 @@ const PROJECT_RECALL_BUDGETS: RecallBudgetsV1 = RecallBudgetsV1 {
     maximum_warnings: 8,
     maximum_extensions_per_candidate: 8,
 };
-
-/// Content-free diagnostics for the isolated CLI journey, never a product API.
-#[cfg(feature = "test-helpers")]
-pub(super) fn emit_host_history_recall_test_diagnostic(build: impl FnOnce() -> Value) {
-    if std::env::var_os("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS").as_deref()
-        != Some(std::ffi::OsStr::new("1"))
-    {
-        return;
-    }
-    let encoded = build().to_string();
-    if encoded.len() <= 4096 {
-        eprintln!("[tracedecay] event=host_history_recall_test_diagnostic {encoded}");
-    }
-}
 
 /// Typed failure of mounting the recall port or minting a session port.
 #[derive(Debug, thiserror::Error)]
@@ -208,6 +173,9 @@ pub enum CognitiveRecallMountError {
     /// The registry port refused the mount inputs.
     #[error("cognitive recall port refused the mount: {0}")]
     Port(#[source] CognitiveRecallPortError),
+    /// The canonical observation store binding is poisoned.
+    #[error("the canonical observation store binding of this recall route is unavailable")]
+    ObservationStoreUnavailable,
 }
 
 impl CognitiveRecallMountError {
@@ -226,6 +194,7 @@ impl CognitiveRecallMountError {
             Self::SessionIdentityInvalid => "recall_mount_session_identity_invalid",
             Self::LedgerOpen { .. } => "recall_mount_ledger_unopenable",
             Self::Port(error) => error.code(),
+            Self::ObservationStoreUnavailable => "recall_mount_observation_store_unavailable",
         }
     }
 }
@@ -234,6 +203,7 @@ impl CognitiveRecallMountError {
 #[derive(Debug, thiserror::Error)]
 pub enum RecallAdmissionLedgerError {
     /// A retained trace lookup must carry its complete scope-bound reference.
+    #[cfg(test)]
     #[error("retained recall explain trace reference is invalid or not scope-bound")]
     InvalidTraceReference,
     /// Control data differs from the final trace, or the sink cannot retain it.
@@ -274,6 +244,7 @@ pub enum RecallAdmissionLedgerError {
         exact_scope_sha256: String,
     },
     /// A retained row could not be decoded back into its typed value.
+    #[cfg(test)]
     #[error("retained recall explain trace row could not be decoded: {0}")]
     Decode(#[source] serde_json::Error),
     /// The SQLite ledger refused the write.
@@ -327,7 +298,9 @@ pub trait RecallExplainTraceSinkV1: Send + Sync + 'static {
     }
 }
 
-/// One retained explain trace as the project audit ledger holds it.
+/// One retained explain trace as the project audit ledger holds it, read back
+/// by the ledger's own retention tests.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetainedRecallExplainTraceV1 {
     /// Exact-scope digest the recall ran under.
@@ -360,13 +333,6 @@ impl std::fmt::Debug for RecallAdmissionLedgerV1 {
 }
 
 impl RecallAdmissionLedgerV1 {
-    #[cfg(test)]
-    pub(crate) fn open_for_control_test(
-        store_data_root: &Path,
-    ) -> Result<Self, CognitiveRecallMountError> {
-        Self::open(store_data_root.join(LEDGER_FILE_NAME))
-    }
-
     #[cfg(test)]
     fn open(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
         Self::open_with_key(path, control_attribution::RecallLocatorKeyV1::for_test())
@@ -505,6 +471,7 @@ impl RecallAdmissionLedgerV1 {
 
     /// Keyed projection context shared by explain, denial and control
     /// retention. The key itself never leaves this host module.
+    #[cfg(test)]
     pub(crate) fn locator_key(&self) -> &control_attribution::RecallLocatorKeyV1 {
         &self.locator_key
     }
@@ -661,16 +628,6 @@ impl RecallAdmissionLedgerV1 {
         transaction
             .commit()
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
-        #[cfg(feature = "test-helpers")]
-        emit_host_history_recall_test_diagnostic(|| {
-            let mut reasons = BTreeMap::<&str, usize>::new();
-            for denied in &report.denied {
-                *reasons.entry(denied.reason.label()).or_default() += 1;
-            }
-            json!({"phase":"admission", "received":report.received_count,
-                "admitted":report.admitted_count, "denied":report.denied.len(),
-                "degraded":report.degraded, "denial_reasons":reasons})
-        });
         Ok(RecallAdmissionLedgerWriteV1::Recorded)
     }
 
@@ -911,30 +868,6 @@ impl RecallAdmissionLedgerV1 {
         transaction
             .commit()
             .map_err(RecallAdmissionLedgerError::Sqlite)?;
-        #[cfg(feature = "test-helpers")]
-        emit_host_history_recall_test_diagnostic(|| {
-            let mut reasons = BTreeMap::<&str, usize>::new();
-            for item in &trace.items {
-                let code = match &item.host_decision {
-                    RecallExplainHostDecisionV1::HostWithheld { reason_code, .. } => {
-                        match reason_code.as_str() {
-                            "content_not_inline" => "content_not_inline",
-                            "provenance_claimed_unconfirmed" => "provenance_claimed_unconfirmed",
-                            "provenance_redacted" => "provenance_redacted",
-                            "provenance_unresolvable" => "provenance_unresolvable",
-                            "provenance_unknown" => "provenance_unknown",
-                            _ => "other_host_withheld",
-                        }
-                    }
-                    decision => decision.code(),
-                };
-                *reasons.entry(code).or_default() += 1;
-            }
-            let stages: BTreeMap<_, _> = trace.stage_counts().into_iter().collect();
-            json!({"phase":"trace", "received":trace.requested_count,
-                "items":trace.items.len(), "degraded":trace.degraded,
-                "stage_counts":stages, "reason_counts":reasons})
-        });
         Ok(RecallAdmissionLedgerWriteV1::Recorded)
     }
 
@@ -948,6 +881,7 @@ impl RecallAdmissionLedgerV1 {
     ///
     /// Returns [`RecallAdmissionLedgerError`] when SQLite refuses the read or
     /// a retained row cannot be decoded back into its typed value.
+    #[cfg(test)]
     pub fn explain_trace(
         &self,
         trace: &control_attribution::RecallControlTraceRefV1,
@@ -1169,6 +1103,7 @@ impl RecallAdmissionLedgerV1 {
     /// # Errors
     ///
     /// Returns [`RecallAdmissionLedgerError`] when SQLite refuses the read.
+    #[cfg(test)]
     pub fn explain_trace_ids_for_request(
         &self,
         exact_scope_sha256: &str,
@@ -1276,7 +1211,7 @@ impl RecallAdmissionLedgerV1 {
             let provider_claimed_temporal_state: String = row.get(5)?;
             let retained = match (reason, provider_claimed_scope_binding) {
                 (Some(reason), Some(provider_claimed_scope_binding))
-                    if control_attribution::validate_retained_candidate_identity(&candidate_id)
+                    if control_attribution::validate_retained_trace_candidate_id(&candidate_id)
                         .is_ok()
                         && stable_memory_ref
                             .as_deref()
@@ -1543,305 +1478,6 @@ pub(crate) struct CognitiveRecallMountInputsV1 {
     pub(crate) locator_key: control_attribution::RecallLocatorKeyV1,
 }
 
-/// Per-call ownership visible to the lane's outer timeout. This holds only
-/// the retention stage's original control, never a replacement token or budget.
-#[derive(Default)]
-struct RecallReplayRetentionActivityV1 {
-    active: Mutex<Option<OperationControl>>,
-}
-
-impl RecallReplayRetentionActivityV1 {
-    fn enter(&self, control: &OperationControl) -> RecallReplayRetentionGuardV1<'_> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        debug_assert!(
-            active.is_none(),
-            "one recall may own only one retention stage"
-        );
-        *active = Some(control.clone());
-        RecallReplayRetentionGuardV1 { activity: self }
-    }
-
-    fn cancel_active(&self) -> bool {
-        let active = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(control) = active.as_ref() else {
-            return false;
-        };
-        control.cancellation().cancel();
-        true
-    }
-
-    async fn within_lane_fuse<T>(
-        &self,
-        wall_clock_budget: std::time::Duration,
-        recall: impl std::future::Future<Output = T>,
-    ) -> Result<T, tokio::time::error::Elapsed> {
-        tokio::pin!(recall);
-        match tokio::time::timeout(wall_clock_budget, &mut recall).await {
-            Ok(context) => Ok(context),
-            Err(_) if self.cancel_active() => {
-                // Retention still owns work. Its original stop reaches it,
-                // and the same future remains joined until its actual result.
-                // The inner lane records host_stopped before any provider recall.
-                Ok(recall.await)
-            }
-            Err(elapsed) => Err(elapsed),
-        }
-    }
-}
-
-struct RecallReplayRetentionGuardV1<'a> {
-    activity: &'a RecallReplayRetentionActivityV1,
-}
-
-impl Drop for RecallReplayRetentionGuardV1<'_> {
-    fn drop(&mut self) {
-        self.activity
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-    }
-}
-
-/// One recall's linked controls. Dropping an outer timeout also cancels any
-/// already-issued history work; this owns no worker or provider lifecycle.
-struct RecallHistoryControlV1 {
-    operation: OperationControl,
-    cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
-    caller: tracedecay_contracts::CancellationSignal,
-    deadline: tokio::time::Instant,
-}
-
-impl RecallHistoryControlV1 {
-    fn new(
-        deadline: &tracedecay_contracts::Deadline,
-        caller: &tracedecay_contracts::CancellationSignal,
-    ) -> Result<Self, tracedecay_contracts::ClockError> {
-        let now = try_now_micros()?;
-        let remaining = u64::try_from(deadline.expires_at.0.saturating_sub(now.0)).unwrap_or(0);
-        Ok(Self {
-            operation: OperationControl::new(
-                deadline.expires_at.0,
-                remaining / 1_000,
-                tracedecay_memory_provider_registry::CancellationToken::new(),
-            ),
-            cancellation: tracedecay_runtime_core::cancellation::CancellationToken::new(),
-            caller: caller.clone(),
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_micros(remaining),
-        })
-    }
-
-    fn bounds(&self) -> ReplayBoundsV1<'_> {
-        ReplayBoundsV1 {
-            cancellation: &self.cancellation,
-            deadline: self.deadline,
-        }
-    }
-
-    async fn run<T>(
-        &self,
-        stage: impl std::future::Future<Output = Result<T, ObservationJourneyError>>,
-    ) -> Result<T, ObservationJourneyError> {
-        tokio::select! {
-            biased;
-            () = self.caller.cancelled() => {
-                self.operation.cancellation().cancel();
-                self.cancellation.cancel();
-                Err(ObservationJourneyError::Cancelled { admitted: 0 })
-            }
-            result = tokio::time::timeout_at(self.deadline, stage) => match result {
-                Ok(result) => result,
-                Err(_) => {
-                    self.operation.cancellation().cancel();
-                    self.cancellation.cancel();
-                    Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 })
-                }
-            },
-        }
-    }
-
-    /// Retention owns filesystem work which must remain joined after stop.
-    /// Forward the original controls, then await that same bounded stage so
-    /// an already committed artifact remains an actual result. Publication
-    /// separately observes whether the host lane was stopped.
-    async fn run_replay_retention<T, E>(
-        &self,
-        activity: Option<&RecallReplayRetentionActivityV1>,
-        stage: impl std::future::Future<Output = Result<T, E>>,
-    ) -> (Result<T, E>, bool) {
-        let _owned_retention = activity.map(|activity| activity.enter(&self.operation));
-        tokio::pin!(stage);
-        let already_stopped = self.caller.is_cancelled()
-            || self.operation.snapshot().is_err()
-            || tokio::time::Instant::now() >= self.deadline;
-        let result = if already_stopped {
-            self.operation.cancellation().cancel();
-            self.cancellation.cancel();
-            stage.await
-        } else {
-            tokio::select! {
-                biased;
-                result = &mut stage => result,
-                () = self.caller.cancelled() => {
-                    self.operation.cancellation().cancel();
-                    self.cancellation.cancel();
-                    stage.await
-                }
-                () = tokio::time::sleep_until(self.deadline) => {
-                    self.operation.cancellation().cancel();
-                    self.cancellation.cancel();
-                    stage.await
-                }
-            }
-        };
-        let host_stopped = already_stopped
-            || self.caller.is_cancelled()
-            || self.operation.snapshot().is_err()
-            || tokio::time::Instant::now() >= self.deadline;
-        if host_stopped {
-            self.operation.cancellation().cancel();
-            self.cancellation.cancel();
-        }
-        (result, host_stopped)
-    }
-}
-
-impl Drop for RecallHistoryControlV1 {
-    fn drop(&mut self) {
-        self.operation.cancellation().cancel();
-        self.cancellation.cancel();
-    }
-}
-
-#[derive(Default)]
-struct PreparedRecallHistoryV1 {
-    grant: Option<HistoryGrant>,
-    partial_coverage: bool,
-}
-
-/// Per-candidate evidence already re-read from canonical authority. The
-/// existing hydration pass still meters it and checks the caller's controls.
-struct ConfirmedObservationEvidenceV1<'a> {
-    scope: &'a HostEvidenceScopeV1,
-    claimed_source: String,
-    evidence: Result<HostEvidenceRefV1, &'static str>,
-}
-
-impl HostProvenanceAuthority for ConfirmedObservationEvidenceV1<'_> {
-    fn resolve(
-        &self,
-        source: &str,
-        scope: &HostEvidenceScopeV1,
-        control: &HostEvidenceControlV1<'_>,
-    ) -> Result<HostEvidenceRefV1, ProvenanceHydrationError> {
-        control.check(source)?;
-        if scope != self.scope || source != self.claimed_source {
-            return Err(ProvenanceHydrationError::Unresolvable {
-                claimed_source: source.to_owned(),
-                reason: "canonical observation claim or scope differs".to_owned(),
-            });
-        }
-        self.evidence
-            .clone()
-            .map_err(|reason| ProvenanceHydrationError::Unresolvable {
-                claimed_source: source.to_owned(),
-                reason: reason.to_owned(),
-            })
-    }
-}
-
-/// History can confirm only the provider's actual Available declaration.
-/// The registry supplies sources only after the observation class and full
-/// declared reference set agree with that attribution.
-fn observation_claim_authority<'a>(
-    scope: &'a HostEvidenceScopeV1,
-    claim: &ProviderItemProvenanceV1,
-    sources: Option<&[RecallSourceAttributionV1]>,
-    dispatched: Option<&HistoryGrant>,
-    refreshed: Option<&HistoryGrant>,
-) -> Option<ConfirmedObservationEvidenceV1<'a>> {
-    let ProviderItemProvenanceV1::Available { source } = claim else {
-        return None;
-    };
-    let sources = sources.filter(|sources| !sources.is_empty())?;
-    let evidence = if let Some(record_id) = source.strip_prefix("record:")
-        && !sources.iter().any(|attribution| {
-            attribution
-                .source
-                .stable_record_id
-                .as_deref()
-                .unwrap_or(&attribution.source.observation_id)
-                == record_id
-        }) {
-        Err("declared record contradicts canonical observation attribution")
-    } else {
-        confirmed_original_sources(sources, dispatched, refreshed)
-    };
-    Some(ConfirmedObservationEvidenceV1 {
-        scope,
-        claimed_source: source.clone(),
-        evidence,
-    })
-}
-
-/// Every claimed immutable attribution must match both the dispatch grant and
-/// the fresh canonical read; any intervening disposition change withholds it.
-fn confirmed_original_sources(
-    claimed: &[RecallSourceAttributionV1],
-    dispatched: Option<&HistoryGrant>,
-    refreshed: Option<&HistoryGrant>,
-) -> Result<HostEvidenceRefV1, &'static str> {
-    let (Some(dispatched), Some(refreshed)) = (dispatched, refreshed) else {
-        return Err("canonical observation history unavailable");
-    };
-    if claimed.is_empty() || claimed.len() > 64 {
-        return Err("canonical observation attribution bound");
-    }
-    for source in claimed {
-        let attribution = source
-            .to_owned_attribution()
-            .map_err(|_| "canonical observation attribution malformed")?;
-        let before = dispatched
-            .sources
-            .iter()
-            .find(|source| source.attribution == attribution)
-            .ok_or("canonical observation outside dispatched grant")?;
-        let after = refreshed
-            .sources
-            .iter()
-            .find(|source| source.attribution == attribution)
-            .ok_or("canonical observation attribution changed")?;
-        if before.current_disposition.state != after.current_disposition.state
-            || before.current_disposition.authority_ref != after.current_disposition.authority_ref
-            || before.current_disposition.authority_revision
-                != after.current_disposition.authority_revision
-        {
-            return Err("canonical observation disposition changed");
-        }
-    }
-    Ok(HostEvidenceRefV1::CanonicalObservations {
-        sources: claimed.to_vec(),
-    })
-}
-
-/// The selected provider's existing canonical authority and observation owner.
-/// Bound together once after full composition admits the canonical session store.
-struct SelectedProviderHistoryV1 {
-    authority: Arc<
-        super::provider_history::ProviderHistoryAuthorityV1<
-            tracedecay_global_db::GlobalDbObservationStore,
-            tracedecay_runtime_core::db::Database,
-        >,
-    >,
-    journey: Arc<super::observation_journey::ProjectObservationJourneyV1>,
-}
-
 /// One project's mounted cognitive-recall route.
 pub struct ProjectCognitiveRecallMountV1 {
     composition: Arc<ProjectMemoryProviderComposition>,
@@ -1856,8 +1492,11 @@ pub struct ProjectCognitiveRecallMountV1 {
     routing: ActiveRoutingPolicy,
     host_limits: ProviderLimits,
     locator_key: control_attribution::RecallLocatorKeyV1,
-    /// Composition-time binding only; provider selection stays in the registry.
-    selected_history: OnceLock<SelectedProviderHistoryV1>,
+    /// The project's canonical observation store, bound once the full
+    /// project server admits the session database. Observation-sourced
+    /// recall candidates are confirmed against it; before it is bound they
+    /// stay unconfirmed and are withheld.
+    observation_store: Mutex<Option<tracedecay_global_db::GlobalDbObservationStore>>,
 }
 
 impl std::fmt::Debug for ProjectCognitiveRecallMountV1 {
@@ -1872,136 +1511,8 @@ impl std::fmt::Debug for ProjectCognitiveRecallMountV1 {
 }
 
 impl ProjectCognitiveRecallMountV1 {
-    /// Retains the same authority already bound to the selected adapter and
-    /// journey. An observer, another checkout, or a second binding is refused.
-    pub(crate) fn bind_selected_history(
-        &self,
-        authority: Arc<
-            super::provider_history::ProviderHistoryAuthorityV1<
-                tracedecay_global_db::GlobalDbObservationStore,
-                tracedecay_runtime_core::db::Database,
-            >,
-        >,
-        journey: Arc<super::observation_journey::ProjectObservationJourneyV1>,
-    ) -> Result<(), super::observation_journey::ObservationJourneyError> {
-        use super::provider_history::ProviderHistoryErrorV1;
-        use tracedecay_memory_provider_registry::EnabledProviderMode;
-
-        let selected = self
-            .composition
-            .registry()
-            .and_then(|registry| registry.selected_registration())
-            .ok_or(ProviderHistoryErrorV1::ClaimMismatch(
-                "selected recall registration",
-            ))?;
-        if selected.mode != EnabledProviderMode::Active
-            || &selected.provider_id != self.routing.active_provider()
-            || selected.registration_revision != self.routing.registration_revision()
-            || authority.provider_id != selected.provider_id
-            || authority.profile_id != self.profile_id
-            || authority.mounted_scope != self.scope
-            || authority.policy_revision != PROJECT_RECALL_POLICY_REVISION
-        {
-            return Err(
-                ProviderHistoryErrorV1::ClaimMismatch("selected recall history mount").into(),
-            );
-        }
-        authority.validate_mount()?;
-        journey.validate_history_mount(
-            &selected.provider_id,
-            selected.registration_revision,
-            &self.profile_id,
-            &self.scope,
-        )?;
-        if !Arc::ptr_eq(&authority.journal, &journey.history_journal()) {
-            return Err(
-                ProviderHistoryErrorV1::ClaimMismatch("selected recall history journal").into(),
-            );
-        }
-        self.selected_history
-            .set(SelectedProviderHistoryV1 { authority, journey })
-            .map_err(|_| {
-                ProviderHistoryErrorV1::ClaimMismatch("selected recall history already bound")
-                    .into()
-            })
-    }
-
-    /// Selects recent canonical coverage for this actual destination session,
-    /// enqueues through the retained journey, and waits for exact durable
-    /// delivery. The enqueue watermark is never used to choose recall coverage.
-    async fn prepare_recall_history(
-        &self,
-        canonical_session_id: &str,
-        control: &RecallHistoryControlV1,
-    ) -> Result<PreparedRecallHistoryV1, ObservationJourneyError> {
-        let Some(selected) = self.selected_history.get() else {
-            return Ok(PreparedRecallHistoryV1::default());
-        };
-        selected.authority.validate_mount()?;
-        if selected.authority.original_authority.is_none() {
-            // Ordinary same-session admission remains available without Git
-            // evidence. No history grant or original repository identity is invented.
-            return Ok(PreparedRecallHistoryV1 {
-                grant: None,
-                partial_coverage: true,
-            });
-        }
-        let destination =
-            exact_scope_for_session(&self.profile_id, &self.scope, canonical_session_id)?;
-        let reader = selected.authority.reader()?;
-        let page = reader
-            .select_recent_page(&destination, 256, &control.operation)
-            .await?;
-        let partial_coverage =
-            page.has_more || page.has_older || page.withheld > 0 || page.unknown_revision > 0;
-        #[cfg(feature = "test-helpers")]
-        emit_host_history_recall_test_diagnostic(|| {
-            json!({"phase":"history_selection", "scanned":page.scanned,
-                "withheld":page.withheld, "unknown_revision":page.unknown_revision,
-                "has_older":page.has_older, "has_more":page.has_more,
-                "partial_coverage":partial_coverage})
-        });
-        tracing::debug!(
-            provider = selected.authority.provider_id.as_str(),
-            scanned = page.scanned,
-            withheld = page.withheld,
-            unknown_revision = page.unknown_revision,
-            has_older = page.has_older,
-            has_more = page.has_more,
-            "selected provider recall history coverage",
-        );
-        let grant = page.grant.clone();
-        let replay = selected
-            .journey
-            .replay_authorized_history_page(
-                page,
-                destination,
-                PROJECT_RECALL_POLICY_REVISION,
-                control.bounds(),
-            )
-            .await?;
-        if replay.halted.is_some() || replay.shed.is_some() {
-            return Err(
-                ProviderHistoryErrorV1::Unavailable("recall history delivery admission").into(),
-            );
-        }
-        let grant = match grant {
-            Some(grant) => {
-                selected
-                    .journey
-                    .await_history_delivery(&grant, control.bounds())
-                    .await?;
-                Some(reader.revalidate_grant(&grant, &control.operation).await?)
-            }
-            None => None,
-        };
-        Ok(PreparedRecallHistoryV1 {
-            grant,
-            partial_coverage,
-        })
-    }
-
     /// Storage placement of the admission ledger.
+    #[cfg(test)]
     #[must_use]
     pub fn ledger_path(&self) -> &Path {
         self.ledger.path()
@@ -2012,10 +1523,116 @@ impl ProjectCognitiveRecallMountV1 {
         Arc::clone(&self.ledger)
     }
 
-    /// The context-bound projection key shared with retained control
-    /// authorization. The key material never crosses this module boundary.
-    pub(crate) fn locator_key(&self) -> &control_attribution::RecallLocatorKeyV1 {
-        &self.locator_key
+    /// Binds the canonical observation store the full project server
+    /// admitted. A later full admission of the same route replaces it.
+    pub(crate) fn bind_observation_store(
+        &self,
+        store: tracedecay_global_db::GlobalDbObservationStore,
+    ) -> Result<(), CognitiveRecallMountError> {
+        let mut slot = self
+            .observation_store
+            .lock()
+            .map_err(|_| CognitiveRecallMountError::ObservationStoreUnavailable)?;
+        *slot = Some(store);
+        Ok(())
+    }
+
+    /// Confirms every observation-sourced candidate's original sources against
+    /// the canonical store, under the caller's deadline and cancellation.
+    ///
+    /// Each cited observation is re-read, its attribution derived again by
+    /// the same host function the observation journey delivered, and its
+    /// current anchor disposition checked. Only a byte-equal attribution of a
+    /// record still available in this project confirms; anything else names
+    /// why the candidate stays unconfirmed. `claimed` is in the order the
+    /// hydration pass will meet the candidates, already bounded by its
+    /// attempt budget.
+    async fn confirm_observation_sources(
+        &self,
+        claimed: &[(&str, &[RecallSourceAttributionV1])],
+        deadline: &tracedecay_contracts::Deadline,
+        cancellation: &tracedecay_contracts::CancellationSignal,
+    ) -> BTreeMap<String, Result<HostEvidenceRefV1, &'static str>> {
+        let store = self
+            .observation_store
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let mut confirmed = BTreeMap::new();
+        for (candidate_id, sources) in claimed {
+            let outcome = match store.as_ref() {
+                None => Err("canonical observation store is not mounted"),
+                Some(store) => {
+                    self.confirm_candidate_sources(store, sources, deadline, cancellation)
+                        .await
+                }
+            };
+            confirmed.insert((*candidate_id).to_owned(), outcome);
+        }
+        confirmed
+    }
+
+    async fn confirm_candidate_sources(
+        &self,
+        store: &tracedecay_global_db::GlobalDbObservationStore,
+        sources: &[RecallSourceAttributionV1],
+        deadline: &tracedecay_contracts::Deadline,
+        cancellation: &tracedecay_contracts::CancellationSignal,
+    ) -> Result<HostEvidenceRefV1, &'static str> {
+        use tracedecay_store::{
+            AnchorDispositionStateV1, ObservationAdmissionPort, RetrievalAnchorDispositionStore,
+        };
+
+        if sources.is_empty() || sources.len() > MAX_CONFIRMED_OBSERVATION_SOURCES {
+            return Err("canonical observation attribution is outside the confirmation bound");
+        }
+        let owner = tracedecay_domain::FactOwnerV1::Project {
+            project_id: self.scope.project_id.clone(),
+        };
+        for source in sources {
+            let claim = source
+                .to_owned_attribution()
+                .map_err(|_| "canonical observation attribution is malformed")?;
+            let id = tracedecay_domain::CanonicalObservationIdV1::new(
+                source.source.observation_id.clone(),
+            )
+            .map_err(|_| "canonical observation identity is malformed")?;
+            let stored = bounded_host_read(deadline, cancellation, store.read_admitted_observation(&id))
+                .await
+                .ok_or("canonical observation read was stopped by the caller's controls")?
+                .map_err(|_| "canonical observation store is unavailable")?
+                .ok_or("canonical observation no longer exists")?;
+            let derived = super::observation_attribution::canonical_observation_attribution(
+                &self.profile_id,
+                &self.scope,
+                &stored,
+            )
+            .and_then(|derived| super::observation_attribution::owned_attribution(&derived))
+            .map_err(|_| "canonical observation is not attributable in this checkout")?;
+            if derived != claim {
+                return Err("canonical observation attribution differs from the host record");
+            }
+            let disposition = bounded_host_read(
+                deadline,
+                cancellation,
+                self.graph
+                    .db()
+                    .current_disposition(stored.retrieval_anchor_id(), &owner),
+            )
+            .await
+            .ok_or("canonical observation disposition read was stopped by the caller's controls")?
+            .map_err(|_| "canonical observation disposition is unavailable")?;
+            if disposition.is_some_and(|record| {
+                record.owner() != &owner
+                    || record.anchor_id() != stored.retrieval_anchor_id()
+                    || record.state() != AnchorDispositionStateV1::Active
+            }) {
+                return Err("canonical observation is no longer available");
+            }
+        }
+        Ok(HostEvidenceRefV1::CanonicalObservations {
+            sources: sources.to_vec(),
+        })
     }
 
     /// The host-pinned routing policy every session port routes under.
@@ -2032,13 +1649,6 @@ impl ProjectCognitiveRecallMountV1 {
     #[must_use]
     pub fn authoritative_scope(&self) -> &ResolvedScope {
         &self.scope
-    }
-
-    /// Absolute canonical root of the mounted checkout. The only tree a
-    /// `source:` provenance claim may be confirmed against.
-    #[must_use]
-    pub fn canonical_project_path(&self) -> &Path {
-        &self.canonical_project_path
     }
 
     /// The authoritative scope one advisory recall resolves provenance
@@ -2174,6 +1784,7 @@ impl ProjectCognitiveRecallMountV1 {
     ///
     /// Returns the typed ledger failure when the read is refused or a
     /// retained row cannot be decoded.
+    #[cfg(test)]
     pub fn explain_trace(
         &self,
         trace_ref: &str,
@@ -2197,6 +1808,7 @@ impl ProjectCognitiveRecallMountV1 {
     /// # Errors
     ///
     /// Returns the typed ledger failure when the read is refused.
+    #[cfg(test)]
     pub fn explain_trace_ids_for_request(
         &self,
         request_id: &str,
@@ -2288,6 +1900,102 @@ impl HostSourceEvidenceStore for MountedWorktreeSourceStoreV1 {
         })?;
         Ok(u64::try_from(text.lines().count()).unwrap_or(u64::MAX))
     }
+}
+
+/// Bound on the original sources one candidate may cite for confirmation,
+/// matching the shared `original_sources` contract ceiling.
+const MAX_CONFIRMED_OBSERVATION_SOURCES: usize = 64;
+
+/// Runs one host store read under the caller's deadline and cancellation.
+/// `None` means the caller's controls stopped the read before it answered.
+async fn bounded_host_read<T>(
+    deadline: &tracedecay_contracts::Deadline,
+    cancellation: &tracedecay_contracts::CancellationSignal,
+    read: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let now = tracedecay_contracts::now_micros();
+    let remaining = u64::try_from(deadline.expires_at.0.saturating_sub(now.0)).unwrap_or(0);
+    if remaining == 0 || cancellation.is_cancelled() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        result = tokio::time::timeout(std::time::Duration::from_micros(remaining), read) => {
+            result.ok()
+        }
+    }
+}
+
+/// Per-candidate observation evidence the host already re-read from the
+/// canonical store. The hydration pass still meters it and checks the
+/// caller's controls; this authority only answers for the one claim it was
+/// built for.
+struct ConfirmedObservationEvidenceV1<'a> {
+    scope: &'a HostEvidenceScopeV1,
+    claimed_source: &'a str,
+    evidence: Result<HostEvidenceRefV1, &'static str>,
+}
+
+impl HostProvenanceAuthority for ConfirmedObservationEvidenceV1<'_> {
+    fn resolve(
+        &self,
+        source: &str,
+        scope: &HostEvidenceScopeV1,
+        control: &HostEvidenceControlV1<'_>,
+    ) -> Result<HostEvidenceRefV1, ProvenanceHydrationError> {
+        control.check(source)?;
+        if scope != self.scope || source != self.claimed_source {
+            return Err(ProvenanceHydrationError::Unresolvable {
+                claimed_source: source.to_owned(),
+                reason: "canonical observation claim or scope differs".to_owned(),
+            });
+        }
+        self.evidence
+            .clone()
+            .map_err(|reason| ProvenanceHydrationError::Unresolvable {
+                claimed_source: source.to_owned(),
+                reason: reason.to_owned(),
+            })
+    }
+}
+
+/// The observation evidence authority for one candidate, when the registry
+/// admitted it with typed original sources. The provider's declared `record:`
+/// claim must name one of those sources; the sources themselves must have been
+/// confirmed against the canonical store.
+fn observation_claim_authority<'a>(
+    scope: &'a HostEvidenceScopeV1,
+    claim: &'a ProviderItemProvenanceV1,
+    sources: Option<&[RecallSourceAttributionV1]>,
+    confirmed: Option<&Result<HostEvidenceRefV1, &'static str>>,
+) -> Option<ConfirmedObservationEvidenceV1<'a>> {
+    let ProviderItemProvenanceV1::Available { source } = claim else {
+        return None;
+    };
+    let sources = sources.filter(|sources| !sources.is_empty())?;
+    let names_a_source = source.strip_prefix("record:").is_none_or(|record_id| {
+        sources.iter().any(|attribution| {
+            attribution
+                .source
+                .stable_record_id
+                .as_deref()
+                .unwrap_or(&attribution.source.observation_id)
+                == record_id
+        })
+    });
+    let evidence = if !names_a_source {
+        Err("declared record contradicts canonical observation attribution")
+    } else {
+        confirmed
+            .cloned()
+            .unwrap_or(Err("canonical observation confirmation budget was spent"))
+    };
+    Some(ConfirmedObservationEvidenceV1 {
+        scope,
+        claimed_source: source,
+        evidence,
+    })
 }
 
 /// Host session-evidence store for the advisory lane.
@@ -2523,13 +2231,16 @@ pub(crate) fn advisory_context_call(
 /// `Unavailable`, attributed to the provider the mounted routing policy
 /// pinned, so a broken lane is visible -- and identified -- instead of
 /// looking empty.
+///
+/// `host_answer` is the context text the authoritative handler already
+/// rendered. Its canonical `memory_matches` fact identities are read back from
+/// it, so a provider candidate naming one of those facts is withheld rather
+/// than shown a second time.
 pub(crate) async fn advisory_memory_context_for_call(
     port: Result<ProjectCognitiveRecallPortV1, CognitiveRecallMountError>,
     mount: Option<&ProjectCognitiveRecallMountV1>,
     call: AdvisoryRecallCallV1,
-    context_memory_contribution: Option<
-        &tracedecay_contracts::retrieval::ContextMemoryContributionV1,
-    >,
+    host_answer: &str,
 ) -> Option<AdvisoryMemoryContextV1> {
     // No mounted route is no lane at all: a dormant composition and an
     // observer-only routing gate stay silent rather than announcing a
@@ -2628,21 +2339,20 @@ pub(crate) async fn advisory_memory_context_for_call(
         u64::try_from(deadline.expires_at.0.saturating_sub(now.0)).unwrap_or(0),
     )
     .saturating_add(ADVISORY_RECALL_LANE_GRACE);
-    let retention = RecallReplayRetentionActivityV1::default();
-    let recall = advisory_context_recall_with_retention(
+    let memory_match_fact_ids = context_memory_match_fact_ids(host_answer);
+    let recall = advisory_context_recall(
         &port,
         mount,
         AdvisoryRecallInputsV1 {
-            context_memory_contribution,
+            memory_match_fact_ids: &memory_match_fact_ids,
             canonical_session_id: session.canonical_session_id(),
             query: &call.query,
             maximum_candidates: ADVISORY_RECALL_MAXIMUM_CANDIDATES,
             deadline,
             cancellation,
         },
-        Some(&retention),
     );
-    match retention.within_lane_fuse(wall_clock_budget, recall).await {
+    match tokio::time::timeout(wall_clock_budget, recall).await {
         Ok(context) => Some(context),
         Err(_) => unavailable(
             AdvisoryRecallUnavailableV1::LaneDeadlineExceeded,
@@ -2683,11 +2393,10 @@ fn advisory_sub_deadline(
 /// The exact scope, the routing policy, the budgets, and the policy revision
 /// are *not* here: they are mount-owned and cannot be influenced by a call.
 pub(crate) struct AdvisoryRecallInputsV1<'inputs> {
-    /// Exact policy and canonical fact identity metadata from the completed
-    /// context handler. Fact owner/revision tuples remain typed; an anchor or
-    /// bare fact ID cannot become a provider exclusion or history authority.
-    pub(crate) context_memory_contribution:
-        Option<&'inputs tracedecay_contracts::retrieval::ContextMemoryContributionV1>,
+    /// Canonical fact identities the completed context handler already
+    /// rendered as `memory_matches`. A provider candidate naming one of them
+    /// is the same fact and is withheld, never shown twice.
+    pub(crate) memory_match_fact_ids: &'inputs std::collections::BTreeSet<String>,
     /// Canonical host session identity, exactly as the host supplied it --
     /// either the structural session identity the call was routed under, or
     /// the MCP connection scope the host minted this call's request identity
@@ -2705,27 +2414,6 @@ pub(crate) struct AdvisoryRecallInputsV1<'inputs> {
     pub(crate) cancellation: tracedecay_contracts::CancellationSignal,
 }
 
-/// Consumes only the already-admitted policy. The contribution's complete
-/// owner/fact/assertion/event identity remains on the original host result;
-/// provider stable references cannot stand in for host-confirmed revisions.
-fn apply_context_memory_policy(
-    mut request: tracedecay_contracts::memory::CognitiveRecallRequest,
-    contribution: Option<&tracedecay_contracts::retrieval::ContextMemoryContributionV1>,
-) -> Result<
-    tracedecay_contracts::memory::CognitiveRecallRequest,
-    tracedecay_contracts::ApplicationContractError,
-> {
-    if let Some(contribution) = contribution {
-        if let Some(temporal) = contribution.temporal_query() {
-            request = request.with_temporal_query(temporal.clone())?;
-        }
-        if let Some(exclusions) = contribution.exclusions() {
-            request = request.with_exclusions(exclusions.clone())?;
-        }
-    }
-    Ok(request)
-}
-
 /// Runs one bounded advisory recall over a mounted route and projects the
 /// admitted candidates into the tool-facing advisory value.
 ///
@@ -2735,20 +2423,10 @@ fn apply_context_memory_policy(
 /// and consume *only* admitted candidates, each carrying its provenance
 /// label. Denied candidates never appear here; they remain visible only in
 /// the mount's admission ledger.
-#[cfg(test)]
 pub(crate) async fn advisory_context_recall(
     port: &ProjectCognitiveRecallPortV1,
     mount: &ProjectCognitiveRecallMountV1,
     inputs: AdvisoryRecallInputsV1<'_>,
-) -> AdvisoryMemoryContextV1 {
-    advisory_context_recall_with_retention(port, mount, inputs, None).await
-}
-
-async fn advisory_context_recall_with_retention(
-    port: &ProjectCognitiveRecallPortV1,
-    mount: &ProjectCognitiveRecallMountV1,
-    inputs: AdvisoryRecallInputsV1<'_>,
-    retention: Option<&RecallReplayRetentionActivityV1>,
 ) -> AdvisoryMemoryContextV1 {
     use tracedecay_contracts::memory::CognitiveRecallProvenance;
 
@@ -2796,9 +2474,7 @@ async fn advisory_context_recall_with_retention(
         inputs.cancellation.context(),
         inputs.query,
         inputs.maximum_candidates,
-    )
-    .and_then(|request| apply_context_memory_policy(request, inputs.context_memory_contribution))
-    {
+    ) {
         Ok(request) => request,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
@@ -2809,107 +2485,7 @@ async fn advisory_context_recall_with_retention(
             );
         }
     };
-    let history_control = match RecallHistoryControlV1::new(&inputs.deadline, &inputs.cancellation)
-    {
-        Ok(control) => control,
-        Err(error) => {
-            return AdvisoryMemoryContextV1::unavailable(
-                routed_provider.clone(),
-                routed_registration_revision,
-                AdvisoryRecallUnavailableV1::HostClockUnavailable,
-                error.to_string(),
-            );
-        }
-    };
-    let prepared = match history_control
-        .run(mount.prepare_recall_history(inputs.canonical_session_id, &history_control))
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return AdvisoryMemoryContextV1::unavailable(
-                routed_provider.clone(),
-                routed_registration_revision,
-                match error {
-                    ObservationJourneyError::Cancelled { .. } => {
-                        AdvisoryRecallUnavailableV1::HistoryCancelled
-                    }
-                    ObservationJourneyError::DeadlineExceeded { .. } => {
-                        AdvisoryRecallUnavailableV1::HistoryDeadlineExceeded
-                    }
-                    _ => AdvisoryRecallUnavailableV1::HistoryUnavailable,
-                },
-                error.to_string(),
-            );
-        }
-    };
-    // Retain only the actual settled admission selected above. The producer
-    // reauthorizes it and resolves its original journal receipts; neither the
-    // enqueue watermark nor the recall candidate list can mint replay refs.
-    let retained_replay = match mount.selected_history.get() {
-        Some(selected) if selected.authority.original_authority.is_some() => {
-            let (retention, host_stopped) = history_control
-                .run_replay_retention(retention, async {
-                    let delivery_scope = exact_scope_for_session(
-                        &mount.profile_id,
-                        &mount.scope,
-                        inputs.canonical_session_id,
-                    )
-                    .map_err(|_| PortabilityErrorV1::Invalid("recall replay delivery scope"))?;
-                    let scope = control_attribution::RetainedRecallControlScopeV1 {
-                        provider_id: routed_provider.clone(),
-                        registration_revision: routed_registration_revision,
-                        delivery_scope,
-                    };
-                    retain_settled_replay_batches(
-                        &mount.ledger,
-                        &selected.authority,
-                        &scope,
-                        prepared.grant.as_ref(),
-                        &history_control.operation,
-                    )
-                    .await
-                })
-                .await;
-            match retention {
-                Ok(retained) if !host_stopped => Some(Arc::new(retained)),
-                Ok(_retained) => {
-                    // The durable carrier really completed. The caller's
-                    // ended lane cannot publish it, and no recall follows.
-                    return AdvisoryMemoryContextV1::unavailable(
-                        routed_provider.clone(),
-                        routed_registration_revision,
-                        AdvisoryRecallUnavailableV1::HistoryReplayPublicationWithheld,
-                        "canonical replay retained; stopped host lane withheld publication",
-                    );
-                }
-                Err(error) => {
-                    return AdvisoryMemoryContextV1::unavailable(
-                        routed_provider.clone(),
-                        routed_registration_revision,
-                        AdvisoryRecallUnavailableV1::HistoryReplayRetentionFailed,
-                        format!("canonical replay artifact retention failed: {error}"),
-                    );
-                }
-            }
-        }
-        _ => None,
-    };
-    let history_payload = match prepared.grant.as_ref().map(history_grant_json).transpose() {
-        Ok(payload) => payload,
-        Err(error) => {
-            return AdvisoryMemoryContextV1::unavailable(
-                routed_provider.clone(),
-                routed_registration_revision,
-                AdvisoryRecallUnavailableV1::HistoryUnavailable,
-                error.to_string(),
-            );
-        }
-    };
-    let outcome = match port
-        .recall_admitted_with_history(request, &inputs.cancellation, history_payload)
-        .await
-    {
+    let outcome = match port.recall_admitted(request, &inputs.cancellation).await {
         Ok(outcome) => outcome,
         Err(error) => {
             return AdvisoryMemoryContextV1::unavailable(
@@ -2944,46 +2520,6 @@ async fn advisory_context_recall_with_retention(
         })
         .collect();
     let original_sources = outcome.original_sources;
-    // Confirm the actual canonical records again after provider execution.
-    // A missing source or changed privacy disposition can never be rescued by
-    // a provider's record-shaped provenance string.
-    let refreshed_history = if original_sources.values().any(|sources| !sources.is_empty()) {
-        match (mount.selected_history.get(), prepared.grant.as_ref()) {
-            (Some(selected), Some(grant)) => {
-                match history_control
-                    .run(async {
-                        Ok(selected
-                            .authority
-                            .reader()?
-                            .revalidate_grant(grant, &history_control.operation)
-                            .await?)
-                    })
-                    .await
-                {
-                    Ok(grant) => Some(grant),
-                    Err(error) => {
-                        return AdvisoryMemoryContextV1::unavailable(
-                            routed_provider.clone(),
-                            routed_registration_revision,
-                            match error {
-                                ObservationJourneyError::Cancelled { .. } => {
-                                    AdvisoryRecallUnavailableV1::HistoryCancelled
-                                }
-                                ObservationJourneyError::DeadlineExceeded { .. } => {
-                                    AdvisoryRecallUnavailableV1::HistoryDeadlineExceeded
-                                }
-                                _ => AdvisoryRecallUnavailableV1::HistoryUnavailable,
-                            },
-                            error.to_string(),
-                        );
-                    }
-                }
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
     let result = outcome.result;
     // A provider's `Available { source }` is only ever a *claim* about where
     // its content came from; nothing upstream of this point independently
@@ -3022,6 +2558,26 @@ async fn advisory_context_recall_with_retention(
         .collect::<std::collections::BTreeSet<_>>();
     let record_store = mount
         .confirm_canonical_records(&claimed_record_ids, &inputs.deadline, &inputs.cancellation)
+        .await;
+    // Observation-sourced candidates cite canonical records the host
+    // delivered. Each cited record is re-read and its attribution derived
+    // again before the candidate can be shown as grounded.
+    let claimed_observation_sources = result
+        .candidates()
+        .iter()
+        .filter_map(|candidate| {
+            original_sources
+                .get(candidate.candidate_id())
+                .map(|sources| (candidate.candidate_id(), sources.as_slice()))
+        })
+        .take(hydration_policy.max_hydrations())
+        .collect::<Vec<_>>();
+    let confirmed_sources = mount
+        .confirm_observation_sources(
+            &claimed_observation_sources,
+            &inputs.deadline,
+            &inputs.cancellation,
+        )
         .await;
     let Some(hydration_scope) = mount.host_evidence_scope(inputs.canonical_session_id) else {
         return AdvisoryMemoryContextV1::unavailable(
@@ -3130,18 +2686,8 @@ async fn advisory_context_recall_with_retention(
     // The context handler already rendered these canonical facts as
     // `memory_matches`; a provider candidate naming one of them is the same
     // fact, not advisory memory, and is withheld rather than shown twice.
-    let memory_match_fact_ids = inputs
-        .context_memory_contribution
-        .map(|contribution| {
-            contribution
-                .facts()
-                .iter()
-                .map(|fact| fact.fact_id.as_str().to_owned())
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
     for candidate in result.candidates() {
-        if duplicates_memory_match(candidate, &memory_match_fact_ids) {
+        if duplicates_memory_match(candidate, inputs.memory_match_fact_ids) {
             host_withheld.push(RecallExplainHostWithholdingV1 {
                 candidate_id: candidate.candidate_id().to_owned(),
                 reason_code: "duplicate_of_memory_matches".to_owned(),
@@ -3180,29 +2726,26 @@ async fn advisory_context_recall_with_retention(
         // budget-starved claim comes back as an explicit `Unresolvable`
         // decision plus a recorded lane degradation, never as the raw
         // `Available` claim the provider supplied.
-        let typed_sources = original_sources
-            .get(candidate.candidate_id())
-            .map(Vec::as_slice);
-        let decision = if let Some(authority) = observation_claim_authority(
+        let decision = match observation_claim_authority(
             &hydration_scope,
             &claimed_provenance,
-            typed_sources,
-            prepared.grant.as_ref(),
-            refreshed_history.as_ref(),
+            original_sources
+                .get(candidate.candidate_id())
+                .map(Vec::as_slice),
+            confirmed_sources.get(candidate.candidate_id()),
         ) {
-            hydration.hydrate(
+            Some(authority) => hydration.hydrate(
                 &authority,
                 &hydration_scope,
                 &hydration_control,
                 &claimed_provenance,
-            )
-        } else {
-            hydration.hydrate(
+            ),
+            None => hydration.hydrate(
                 &hydration_authority,
                 &hydration_scope,
                 &hydration_control,
                 &claimed_provenance,
-            )
+            ),
         };
         let provenance = decision.provenance;
         if decision.excluded {
@@ -3304,21 +2847,51 @@ async fn advisory_context_recall_with_retention(
             control_delivery_scope,
             control_bindings,
             locator_key: mount.locator_key.clone(),
-            canonical_history_replay: retained_replay,
             sink: Arc::clone(&mount.ledger) as Arc<dyn RecallExplainTraceSinkV1>,
         })
     });
     AdvisoryMemoryContextV1::Answered {
         provider_id: result.provider().provider_id().to_owned(),
         registration_revision: result.provider().registration_revision(),
-        degradation: result.degradation().or_else(|| {
-            prepared
-                .partial_coverage
-                .then_some(tracedecay_contracts::memory::CognitiveRecallDegradation::Partial)
-        }),
+        degradation: result.degradation(),
         candidates,
         explain,
     }
+}
+
+/// Prefix of one canonical fact line in the rendered Markdown memory section.
+const CONTEXT_MEMORY_MATCH_LINE_PREFIX: &str = "- fact_id=";
+
+/// The canonical fact identities a rendered context answer carries in its
+/// `memory_matches`: the JSON member's `fact.fact_id` values, or the
+/// `- fact_id=` lines of the Markdown memory section. Nothing else in the
+/// answer names a fact, so nothing else is read.
+fn context_memory_match_fact_ids(host_answer: &str) -> std::collections::BTreeSet<String> {
+    if let Ok(Value::Object(members)) = serde_json::from_str::<Value>(host_answer) {
+        return members
+            .get("memory_matches")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|hit| hit.pointer("/fact/fact_id").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+    }
+    let mut in_memory_section = false;
+    let mut fact_ids = std::collections::BTreeSet::new();
+    for line in host_answer.lines() {
+        if line.starts_with("## ") || line.starts_with("### ") {
+            in_memory_section = line.trim_end() == CONTEXT_MEMORY_MATCHES_HEADING;
+            continue;
+        }
+        if in_memory_section
+            && let Some(rest) = line.strip_prefix(CONTEXT_MEMORY_MATCH_LINE_PREFIX)
+            && let Some(fact_id) = rest.split_whitespace().next()
+        {
+            fact_ids.insert(fact_id.to_owned());
+        }
+    }
+    fact_ids
 }
 
 /// Whether a provider candidate names a canonical fact the context handler
@@ -3586,7 +3159,7 @@ pub(crate) fn mount_project_cognitive_recall(
         routing: inputs.routing,
         host_limits: inputs.host_limits,
         locator_key: inputs.locator_key,
-        selected_history: OnceLock::new(),
+        observation_store: Mutex::new(None),
     }))
 }
 
@@ -3920,16 +3493,6 @@ pub enum AdvisoryRecallUnavailableV1 {
         /// Typed code of [`CognitiveRecallPortError`].
         port_code: &'static str,
     },
-    /// Canonical history could not establish bounded delivery/source evidence.
-    HistoryUnavailable,
-    /// The caller cancelled canonical history preparation.
-    HistoryCancelled,
-    /// The original recall deadline elapsed during canonical history work.
-    HistoryDeadlineExceeded,
-    /// Replay artifact retention failed; preserve the whole host result.
-    HistoryReplayRetentionFailed,
-    /// Replay retention completed, but the stopped host lane cannot publish it.
-    HistoryReplayPublicationWithheld,
     /// The untrusted-memory gate could not be built, so no provider text was
     /// classified. Provider recall is untrusted advisory data and is never
     /// delivered unclassified: the lane reports itself unavailable instead.
@@ -3955,13 +3518,6 @@ impl AdvisoryRecallUnavailableV1 {
             Self::RequestIdentityInvalid => "advisory_request_identity_invalid",
             Self::RequestInvalid => "advisory_request_invalid",
             Self::RecallRefused { port_code } => port_code,
-            Self::HistoryUnavailable => "advisory_history_unavailable",
-            Self::HistoryCancelled => "advisory_history_cancelled",
-            Self::HistoryDeadlineExceeded => "advisory_history_deadline_exceeded",
-            Self::HistoryReplayRetentionFailed => "advisory_history_replay_retention_failed",
-            Self::HistoryReplayPublicationWithheld => {
-                "advisory_history_replay_publication_withheld"
-            }
             Self::UntrustedGateUnavailable => "advisory_untrusted_gate_unavailable",
             Self::UntrustedGateFaulted => "advisory_untrusted_gate_faulted",
         }
@@ -4094,7 +3650,6 @@ pub struct AdvisoryRecallExplainV1 {
     control_delivery_scope: Option<OwnedExactScope>,
     control_bindings: BTreeMap<String, control_attribution::RetainedRecallControlBindingV1>,
     locator_key: control_attribution::RecallLocatorKeyV1,
-    canonical_history_replay: Option<Arc<RetainedCanonicalHistoryReplayV1>>,
     sink: Arc<dyn RecallExplainTraceSinkV1>,
 }
 
@@ -4133,14 +3688,6 @@ impl PartialEq for AdvisoryRecallExplainV1 {
         self.receipts() == other.receipts()
             && self.control_delivery_scope == other.control_delivery_scope
             && self.control_bindings == other.control_bindings
-            && self
-                .canonical_history_replay
-                .as_ref()
-                .map(|retained| retained.metadata())
-                == other
-                    .canonical_history_replay
-                    .as_ref()
-                    .map(|retained| retained.metadata())
             && Arc::ptr_eq(&self.sink, &other.sink)
     }
 }
@@ -4466,7 +4013,7 @@ impl AdvisoryMemoryContextV1 {
         host_items: &[HostContextItemV1],
         control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
     ) -> AdvisoryContextPackV1 {
-        self.context_pack_with_control_metadata(render_form, host_items, control_refs, None, None)
+        self.context_pack_with_control_metadata(render_form, host_items, control_refs, None)
     }
 
     fn context_pack_with_control_metadata(
@@ -4474,7 +4021,6 @@ impl AdvisoryMemoryContextV1 {
         render_form: ContextPackRenderFormV1,
         host_items: &[HostContextItemV1],
         control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
-        canonical_history_replay: Option<&CanonicalHistoryReplayV1>,
         recall_trace: Option<&ContextRecallTraceV1>,
     ) -> AdvisoryContextPackV1 {
         let policy = match ContextPackPolicyV1::new(
@@ -4493,7 +4039,6 @@ impl AdvisoryMemoryContextV1 {
             host_items,
             &self.advisory_lane(),
             control_refs,
-            canonical_history_replay,
             recall_trace,
         ) {
             Ok(pack) => AdvisoryContextPackV1::Compiled(pack),
@@ -4538,25 +4083,6 @@ impl AdvisoryMemoryContextV1 {
             emitted.request_id == explain.report.request_id
                 && emitted.trace_ref == metadata.trace_ref().as_str()
         })
-    }
-
-    fn retained_replay_metadata(&self) -> Option<&CanonicalHistoryReplayV1> {
-        match self {
-            Self::Answered {
-                explain: Some(explain),
-                ..
-            } => explain
-                .canonical_history_replay
-                .as_ref()
-                .map(|retained| retained.metadata()),
-            _ => None,
-        }
-    }
-
-    fn retained_replay_metadata_matches(&self, pack: &ContextPackV1) -> bool {
-        pack.canonical_history_replay
-            .as_ref()
-            .is_none_or(|emitted| self.retained_replay_metadata() == Some(emitted))
     }
 
     fn provisional_control_refs(&self) -> Option<BTreeMap<String, ContextRecallControlRefV1>> {
@@ -4640,16 +4166,6 @@ impl AdvisoryMemoryContextV1 {
     /// answer unchanged with a typed withheld notice.
     #[must_use]
     pub fn appended_text(&self, text: &str) -> String {
-        if matches!(
-            self,
-            Self::Unavailable {
-                outcome: AdvisoryRecallUnavailableV1::HistoryReplayRetentionFailed
-                    | AdvisoryRecallUnavailableV1::HistoryReplayPublicationWithheld,
-                ..
-            }
-        ) {
-            return text.to_owned();
-        }
         let (render_form, host_items) = host_evidence(text);
         let Some(control_refs) = self.provisional_control_refs() else {
             tracing::warn!(
@@ -4663,7 +4179,6 @@ impl AdvisoryMemoryContextV1 {
             render_form,
             &host_items,
             &control_refs,
-            self.retained_replay_metadata(),
             recall_trace.as_ref(),
         ) {
             AdvisoryContextPackV1::Compiled(pack) => {
@@ -4675,7 +4190,6 @@ impl AdvisoryMemoryContextV1 {
                         // final trace and source bindings are retained atomically.
                         let retained = self.retain_explain_trace(Some(&pack), None);
                         if !self.retained_control_refs_match(&pack, retained.as_ref())
-                            || !self.retained_replay_metadata_matches(&pack)
                             || !self.retained_recall_trace_matches(&pack, retained.as_ref())
                         {
                             tracing::warn!(
@@ -4863,6 +4377,23 @@ mod advisory_rendering_tests {
     /// The canonical tokenizer, used to measure what the agent actually
     /// receives.
     const CANONICAL: O200kBaseContextTokenizer = O200kBaseContextTokenizer;
+
+    fn harden_test_candidate_identity(
+        gate: &UntrustedRecallGateV1,
+        candidate_id: &str,
+    ) -> Result<String, UntrustedRecallGateFaultV1> {
+        gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
+        Ok(
+            control_attribution::retained_candidate_identity_alias_for_context(
+                &control_attribution::RecallLocatorKeyV1::for_test(),
+                &"b".repeat(64),
+                "request.test-identity",
+                "provider.native",
+                4,
+                candidate_id,
+            ),
+        )
+    }
 
     fn tool_result(text: &str) -> TestToolResult {
         TestToolResult::new(
@@ -5358,23 +4889,6 @@ mod advisory_rendering_tests {
     /// These are unit tests of the seam, not proof that production mounts it.
     /// The end-to-end proof lives in the mounted-journey suite below, which
     /// drives a real provider through `advisory_context_recall`.
-    fn harden_test_candidate_identity(
-        gate: &UntrustedRecallGateV1,
-        candidate_id: &str,
-    ) -> Result<String, UntrustedRecallGateFaultV1> {
-        gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
-        let key = control_attribution::RecallLocatorKeyV1::for_test();
-        Ok(
-            control_attribution::retained_candidate_identity_alias_for_context(
-                &key,
-                &"b".repeat(64),
-                "request.test-identity",
-                "provider.native",
-                4,
-                candidate_id,
-            ),
-        )
-    }
 
     fn hardened_lane(
         candidate_id: &str,
@@ -5757,6 +5271,7 @@ mod tests {
     /// One already-rendered host answer, in the exact result shape the
     /// tool layer produces, so the advisory lane is appended to a real result
     /// rather than to a string.
+
     pub(super) fn tool_result_for_test(text: &str) -> TestToolResult {
         TestToolResult::new(
             serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
@@ -5821,6 +5336,13 @@ mod tests {
         std::fs::create_dir_all(&ledger_root).expect("ledger root");
         tracedecay_runtime_core::storage::pin_fixture_repository_identity(&project_root, project)
             .expect("project enrollment");
+        // This fixture stands in for the composition root, which registers
+        // the runtime ports before any project opens; registration is
+        // process-global and idempotent.
+        tracedecay_project::runtime_ports::register_runtime_ports(
+            tracedecay_project::runtime_ports::fixture_daemon_client_ports(),
+        )
+        .expect("runtime port registration");
         let graph = Arc::new(
             TraceDecay::init_with_options(
                 &project_root,
@@ -6349,7 +5871,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: "session.cognitive-recall.advisory",
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -6441,7 +5963,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id,
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -6556,7 +6078,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id,
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -6652,7 +6174,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: "session.cognitive-recall.hostile",
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -6752,7 +6274,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: "session.cognitive-recall.ordinary",
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -6822,7 +6344,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: "session.cognitive-recall.foreign-evidence",
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -6873,7 +6395,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: "session.cognitive-recall.budget",
                 query: "cognitive recall ledger durable retrieval",
                 // The mount's own host ceiling, which is deliberately larger
@@ -6907,7 +6429,7 @@ mod tests {
     }
 
     /// A cancelled caller never receives advisory content: cancellation before
-    /// provider dispatch remains an attributed history-stage unavailable lane.
+    /// provider dispatch is an attributed, content-free cancelled degradation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn advisory_context_recall_reports_a_cancelled_lane_without_content() {
         let fixture = project_fixture().await;
@@ -6923,7 +6445,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: "session.cognitive-recall.cancelled",
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -6937,20 +6459,20 @@ mod tests {
         assert!(
             matches!(
                 &advisory,
-                AdvisoryMemoryContextV1::Unavailable {
+                AdvisoryMemoryContextV1::Answered {
                     provider_id,
                     registration_revision: 1,
-                    outcome: AdvisoryRecallUnavailableV1::HistoryCancelled,
+                    degradation: Some(tracedecay_contracts::memory::CognitiveRecallDegradation::Cancelled),
+                    candidates,
                     ..
-                } if provider_id.as_str() == NATIVE_PROVIDER_ID
+                } if provider_id.as_str() == NATIVE_PROVIDER_ID && candidates.is_empty()
             ),
-            "history cancellation must preserve the routed provider and revision: {advisory:?}"
+            "cancellation must preserve the routed provider and revision: {advisory:?}"
         );
 
         let host_answer = "## Code Context\nthe canonical answer body\n";
         let text = rendered_text_for_test(&advisory.appended_to(tool_result_for_test(host_answer)));
         assert!(text.starts_with(host_answer), "{text}");
-        assert!(text.contains("advisory_history_cancelled"), "{text}");
         assert!(text.contains(NATIVE_PROVIDER_ID), "{text}");
         assert!(!text.contains(SEEDED_CONTENT), "{text}");
         assert_eq!(mount.ledger.report_count(), 0);
@@ -7290,7 +6812,7 @@ mod tests {
             RecallAdmissionLedgerV1::open(temporary.path().join(LEDGER_FILE_NAME)).unwrap(),
         );
         let (lane, _scope, _source) =
-            history_recall_tests::control_output_fixture(ledger.clone(), "request.tampered");
+            control_output_tests::control_output_fixture(ledger.clone(), "request.tampered");
         let delivered = lane.appended_to(TestToolResult::new(
             json!({"content": [{"type": "text", "text": "{\"answer\":true}"}]}),
             Vec::new(),
@@ -7418,7 +6940,7 @@ mod tests {
             &port,
             &mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: "session.cognitive-recall.sections",
                 query: "cognitive recall ledger",
                 maximum_candidates: 5,
@@ -7464,7 +6986,6 @@ mod tests {
             form,
             &host_items,
             &control_refs,
-            advisory.retained_replay_metadata(),
             Some(&recall_trace),
         ) else {
             panic!("the mounted journey must compile its pack");
@@ -7543,10 +7064,15 @@ mod tests {
         let now = now_micros();
         let live = Deadline::new(UtcMicros(now.0.saturating_add(60_000_000))).expect("deadline");
         let elapsed = Deadline::new(UtcMicros(now.0.saturating_sub(1))).expect("elapsed deadline");
-        let connection = RequestId::new("request.mcp.instancedd-c1.0123456789abcdef0123456789abcdef")
-            .expect("request identity");
+        let connection =
+            RequestId::new("request.mcp.instancedd-c1.0123456789abcdef0123456789abcdef")
+                .expect("request identity");
         let calls = [
-            (Some(&connection), &live, serde_json::json!({ "task": SEEDED_CONTENT })),
+            (
+                Some(&connection),
+                &live,
+                serde_json::json!({ "task": SEEDED_CONTENT }),
+            ),
             (None, &live, serde_json::json!({ "task": SEEDED_CONTENT })),
             (
                 None,
@@ -7571,7 +7097,7 @@ mod tests {
                 mount.port_for_session(native_call.canonical_session_id()),
                 Some(mount.as_ref()),
                 native_call,
-                None,
+                "",
             )
             .await;
             let disabled_call = advisory_context_call(
@@ -7586,10 +7112,13 @@ mod tests {
                 Err(CognitiveRecallMountError::CompositionDisabled),
                 None,
                 disabled_call,
-                None,
+                "",
             )
             .await;
-            assert!(native.is_none(), "Native selected must add no lane: {native:?}");
+            assert!(
+                native.is_none(),
+                "Native selected must add no lane: {native:?}"
+            );
             assert!(disabled.is_none(), "{disabled:?}");
         }
         let pending_call = advisory_context_call(
@@ -7605,7 +7134,7 @@ mod tests {
                 Err(CognitiveRecallMountError::FullCompositionPending),
                 Some(mount.as_ref()),
                 pending_call,
-                None,
+                "",
             )
             .await
             .is_none()
@@ -7619,6 +7148,37 @@ mod tests {
         // the host answer, exactly as with the provider host disabled.
         let rendered = rendered_text_for_test(&tool_result_for_test(host_answer));
         assert_eq!(rendered, host_answer);
+    }
+
+    /// The memory-match identities are read from the host answer the context
+    /// handler actually rendered, in both of its forms, and only from its
+    /// canonical memory section.
+    #[test]
+    fn memory_match_fact_ids_are_read_from_the_rendered_host_answer() {
+        let json_answer = serde_json::json!({
+            "task": "fact_id=fact.not-a-match",
+            "memory_matches": [
+                {"fact": {"fact_id": "fact.json.one"}},
+                {"fact": {"fact_id": "fact.json.two"}}
+            ],
+            "symbols": [{"fact": {"fact_id": "fact.elsewhere"}}]
+        })
+        .to_string();
+        assert_eq!(
+            context_memory_match_fact_ids(&json_answer),
+            std::collections::BTreeSet::from(["fact.json.one".to_owned(), "fact.json.two".to_owned()])
+        );
+        let markdown_answer = format!(
+            "## Code Context\n- fact_id=fact.in-code body\n{CONTEXT_MEMORY_MATCHES_HEADING}\n\
+             - fact_id=fact.md.one category=convention trust=0.90 score=0.500: remembered\n\
+             - fact_id=fact.md.two category=decision trust=0.70 score=0.400: also\n\n\
+             ### Entry Points\n- fact_id=fact.after body\n"
+        );
+        assert_eq!(
+            context_memory_match_fact_ids(&markdown_answer),
+            std::collections::BTreeSet::from(["fact.md.one".to_owned(), "fact.md.two".to_owned()])
+        );
+        assert!(context_memory_match_fact_ids("## Code Context\nno memory\n").is_empty());
     }
 
     /// A provider candidate that names a canonical fact the context handler
@@ -7827,7 +7387,7 @@ mod tests {
                 Err(CognitiveRecallMountError::CompositionDisabled),
                 None,
                 call,
-                None,
+                "",
             )
             .await
             .is_none()
@@ -7862,7 +7422,7 @@ mod tests {
             &mount.port_for_session(session).expect("session port"),
             mount.as_ref(),
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: session,
                 query: "cognitive recall ledger",
                 maximum_candidates: ADVISORY_RECALL_MAXIMUM_CANDIDATES,
@@ -7940,7 +7500,7 @@ mod tests {
             &mount.port_for_session(&session).expect("session port"),
             mount,
             AdvisoryRecallInputsV1 {
-                context_memory_contribution: None,
+                memory_match_fact_ids: &std::collections::BTreeSet::new(),
                 canonical_session_id: &session,
                 query: "cognitive recall ledger",
                 maximum_candidates: ADVISORY_RECALL_MAXIMUM_CANDIDATES,
@@ -8140,16 +7700,13 @@ mod tests {
 }
 
 #[cfg(test)]
-mod history_recall_tests {
+mod control_output_tests {
     #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::control_attribution::RecallControlTraceRefV1;
     use super::*;
-    use tracedecay_memory_provider_registry::{
-        CurrentSourceDisposition, GrantedHistorySource, HistoryRelation,
-        RestoreDispositionCheckpoint, SourceDisposition,
-    };
+    use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
 
-    fn history() -> (Vec<RecallSourceAttributionV1>, HistoryGrant) {
+    fn canonical_sources() -> (Vec<RecallSourceAttributionV1>, OwnedExactScope) {
         let scope = OwnedExactScope::new(
             "profile",
             "project",
@@ -8173,289 +7730,7 @@ mod history_recall_tests {
                 "validity": {"valid_from": null, "valid_until": null, "superseded_at": null, "superseded_by": null, "revoked_at": null},
             })).unwrap()
         }).collect::<Vec<_>>();
-        let grant = HistoryGrant {
-            authorization_ref: "host-grant".to_owned(),
-            policy_revision: 1,
-            destination_scope: scope.clone(),
-            relation: HistoryRelation::ExactScope,
-            sources: sources
-                .iter()
-                .map(|source| GrantedHistorySource {
-                    attribution: source.to_owned_attribution().unwrap(),
-                    current_disposition: CurrentSourceDisposition {
-                        state: SourceDisposition::Available,
-                        authority_ref: "host-disposition".to_owned(),
-                        authority_revision: Some(1),
-                        checked_at_utc_nanos: 1,
-                    },
-                })
-                .collect(),
-            disposition_checkpoint: RestoreDispositionCheckpoint {
-                exact_scope: scope,
-                authority_ref: "host-checkpoint".to_owned(),
-                authority_revision: Some(1),
-                checked_at_utc_nanos: 1,
-            },
-        };
-        grant.validate_structure().unwrap();
-        (sources, grant)
-    }
-
-    #[test]
-    fn context_contribution_preserves_explicit_temporal_policy_and_every_exclusion() {
-        use tracedecay_contracts::memory::{
-            CognitiveRecallExclusions, CognitiveRecallRequest, CognitiveRecallTemporalQuery,
-            CognitiveRecallUnknownValidityPolicy,
-        };
-        use tracedecay_contracts::retrieval::{
-            ContextMemoryContributionV1, ContextSurfaceRequestV1,
-        };
-        use tracedecay_contracts::{CancellationContext, Deadline, RequestId};
-        use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
-        let now = try_now_micros().unwrap();
-        let scope = ResolvedScope::new(
-            ProjectId::new("project.sidecar").unwrap(),
-            RepositoryId::new("repository.sidecar").unwrap(),
-            WorktreeId::new("worktree.sidecar").unwrap(),
-            Some(RefId::new("refs/heads/sidecar").unwrap()),
-        )
-        .unwrap();
-        let base = CognitiveRecallRequest::new(
-            scope,
-            RequestId::new("request.sidecar").unwrap(),
-            Deadline::new(UtcMicros(now.0 + 60_000_000)).unwrap(),
-            CancellationContext::active("token.sidecar").unwrap(),
-            "sidecar policy",
-            8,
-        )
-        .unwrap();
-        assert!(
-            apply_context_memory_policy(base.clone(), None)
-                .unwrap()
-                .temporal_query()
-                .is_none()
-        );
-        assert!(
-            apply_context_memory_policy(base.clone(), None)
-                .unwrap()
-                .exclusions()
-                .is_none()
-        );
-        let exclusions = CognitiveRecallExclusions {
-            stable_memory_refs: vec!["memory:explicit".to_owned()],
-            candidate_ids: vec!["candidate:explicit".to_owned()],
-            source_refs: vec!["source:explicit".to_owned()],
-            trace_refs: vec!["trace:explicit".to_owned()],
-            observation_ids: vec!["observation:explicit".to_owned()],
-            content_sha256: vec!["a".repeat(64)],
-        };
-        let current = CognitiveRecallTemporalQuery::current(now);
-        let queries = [
-            current
-                .clone()
-                .with_policy(false, true, CognitiveRecallUnknownValidityPolicy::Exclude),
-            current
-                .clone()
-                .with_as_of(UtcMicros(now.0 - 3_000_000))
-                .unwrap()
-                .with_policy(true, false, CognitiveRecallUnknownValidityPolicy::Degrade),
-            current
-                .clone()
-                .with_interval(UtcMicros(now.0 - 3_000_000), UtcMicros(now.0 - 1_000_000))
-                .unwrap()
-                .with_policy(
-                    false,
-                    true,
-                    CognitiveRecallUnknownValidityPolicy::AllowWithWarning,
-                ),
-            current.with_history().with_policy(
-                true,
-                true,
-                CognitiveRecallUnknownValidityPolicy::Exclude,
-            ),
-        ];
-        for temporal in queries {
-            let context: ContextSurfaceRequestV1 = serde_json::from_value(json!({
-                "task": "sidecar policy", "include_memory": false,
-                "temporal_query": temporal, "exclusions": exclusions,
-            }))
-            .unwrap();
-            let contribution =
-                ContextMemoryContributionV1::from_matches(&context, &[], None, None, now).unwrap();
-            let retained = contribution.clone();
-            let request = apply_context_memory_policy(base.clone(), Some(&contribution)).unwrap();
-            assert_eq!(request.temporal_query(), Some(&temporal));
-            assert_eq!(request.exclusions(), Some(&exclusions));
-            assert_eq!(request.deadline(), base.deadline());
-            assert_eq!(request.cancellation(), base.cancellation());
-            assert_eq!(request.scope(), base.scope());
-            assert_eq!(contribution, retained);
-            assert!(contribution.facts().is_empty());
-        }
-    }
-
-    #[test]
-    fn observation_hydration_requires_every_immutable_source_and_unchanged_disposition() {
-        let (sources, grant) = history();
-        assert!(
-            matches!(confirmed_original_sources(&sources, Some(&grant), Some(&grant)), Ok(HostEvidenceRefV1::CanonicalObservations { sources: actual }) if actual == sources)
-        );
-        let mut forged = sources.clone();
-        forged[1].source.source_revision = Some("revision-2".to_owned());
-        assert!(confirmed_original_sources(&forged, Some(&grant), Some(&grant)).is_err());
-        let mut missing = grant.clone();
-        missing.sources.pop();
-        assert!(confirmed_original_sources(&sources, Some(&grant), Some(&missing)).is_err());
-        let mut revoked = grant.clone();
-        revoked.sources[1].current_disposition.state = SourceDisposition::Revoked;
-        assert!(confirmed_original_sources(&sources, Some(&grant), Some(&revoked)).is_err());
-        let mut changed_revision = grant.clone();
-        changed_revision.sources[1]
-            .current_disposition
-            .authority_revision = Some(2);
-        assert!(
-            confirmed_original_sources(&sources, Some(&grant), Some(&changed_revision)).is_err()
-        );
-        assert!(confirmed_original_sources(&sources, None, Some(&grant)).is_err());
-        assert!(confirmed_original_sources(&sources, Some(&grant), None).is_err());
-        assert!(HostEvidenceRefV1::parse("observations:first,second").is_err());
-    }
-
-    #[test]
-    fn typed_history_never_upgrades_unavailable_redacted_or_foreign_record_claims() {
-        let (sources, grant) = history();
-        let scope = HostEvidenceScopeV1::new(
-            "profile",
-            ResolvedScope::new(
-                tracedecay_domain::ProjectId::new("project").unwrap(),
-                tracedecay_domain::RepositoryId::new("repository").unwrap(),
-                tracedecay_domain::WorktreeId::new("worktree").unwrap(),
-                Some(tracedecay_domain::RefId::new("refs/heads/main").unwrap()),
-            )
-            .unwrap(),
-            "session",
-            std::env::current_dir().unwrap(),
-        )
-        .unwrap();
-        let signal =
-            tracedecay_contracts::CancellationSignal::active("history.provenance").unwrap();
-        let control = HostEvidenceControlV1::new(1, 2, &signal);
-        for claim in [
-            ProviderItemProvenanceV1::Unknown,
-            ProviderItemProvenanceV1::Redacted {
-                reason: "provider_redacted".to_owned(),
-            },
-        ] {
-            assert!(
-                observation_claim_authority(
-                    &scope,
-                    &claim,
-                    Some(&sources),
-                    Some(&grant),
-                    Some(&grant)
-                )
-                .is_none()
-            );
-        }
-        let claim = ProviderItemProvenanceV1::Available {
-            source: "record:foreign-fact".to_owned(),
-        };
-        let authority =
-            observation_claim_authority(&scope, &claim, Some(&sources), Some(&grant), Some(&grant))
-                .unwrap();
-        let mut pass = ProvenanceHydrationPassV1::new(ProvenanceHydrationPolicyV1::default());
-        let decision = pass.hydrate(&authority, &scope, &control, &claim);
-        assert!(decision.excluded);
-        assert!(
-            matches!(decision.provenance, ProviderItemProvenanceV1::Unresolvable { source, .. } if source == "record:foreign-fact")
-        );
-        let claim = ProviderItemProvenanceV1::Available {
-            source: "record:first".to_owned(),
-        };
-        let authority =
-            observation_claim_authority(&scope, &claim, Some(&sources), Some(&grant), Some(&grant))
-                .unwrap();
-        assert!(matches!(
-            pass.hydrate(&authority, &scope, &control, &claim)
-                .provenance,
-            ProviderItemProvenanceV1::Hydrated {
-                evidence: HostEvidenceRefV1::CanonicalObservations { .. }
-            }
-        ));
-        assert!(
-            authority
-                .resolve("record:foreign-fact", &scope, &control)
-                .is_err()
-        );
-        // Legacy fact claims arrive without an eligible observation sidecar.
-        assert!(
-            observation_claim_authority(&scope, &claim, None, Some(&grant), Some(&grant)).is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn history_control_preserves_original_deadline_and_cancels_on_drop() {
-        let now = try_now_micros().unwrap();
-        let signal = tracedecay_contracts::CancellationSignal::active("history.deadline").unwrap();
-        let deadline =
-            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 - 1)).unwrap();
-        let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
-        assert_eq!(
-            control.operation.deadline_utc_micros(),
-            deadline.expires_at.0
-        );
-        assert!(matches!(
-            control
-                .run(std::future::pending::<Result<(), ObservationJourneyError>>())
-                .await,
-            Err(ObservationJourneyError::DeadlineExceeded { .. })
-        ));
-        let deadline =
-            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 + 60_000_000))
-                .unwrap();
-        let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
-        let provider_cancel = control.operation.cancellation();
-        let journey_cancel = control.cancellation.clone();
-        drop(control);
-        assert!(provider_cancel.is_cancelled());
-        assert!(journey_cancel.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn caller_cancellation_stops_pending_history_without_a_detached_bridge() {
-        let now = try_now_micros().unwrap();
-        let signal = tracedecay_contracts::CancellationSignal::active("history.cancel").unwrap();
-        let deadline =
-            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 + 60_000_000))
-                .unwrap();
-        let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
-        let stage = async {
-            assert!(signal.cancel(try_now_micros().unwrap()));
-            std::future::pending::<Result<(), ObservationJourneyError>>().await
-        };
-        assert!(matches!(
-            control.run(stage).await,
-            Err(ObservationJourneyError::Cancelled { .. })
-        ));
-        assert!(control.operation.cancellation().is_cancelled());
-        assert!(control.cancellation.is_cancelled());
-    }
-
-    fn harden_test_candidate_identity(
-        gate: &UntrustedRecallGateV1,
-        candidate_id: &str,
-    ) -> Result<String, UntrustedRecallGateFaultV1> {
-        gate.harden_metadata(UntrustedRecallMetadataFieldV1::CandidateId, candidate_id)?;
-        Ok(
-            control_attribution::retained_candidate_identity_alias_for_context(
-                &control_attribution::RecallLocatorKeyV1::for_test(),
-                &"b".repeat(64),
-                "request.test-identity",
-                "provider.native",
-                4,
-                candidate_id,
-            ),
-        )
+        (sources, scope)
     }
 
     /// Drives real canonical admission, normalization, selection, source
@@ -8473,10 +7748,9 @@ mod history_recall_tests {
             RecallSelectionPolicyV1, ScopeBinding, admit_recall_candidates,
             normalize_admitted_candidates, select_recall_candidates,
         };
-        let (originals, grant) = history();
+        let (originals, scope) = canonical_sources();
         let source = originals[0].clone();
         let sources = vec![source.clone()];
-        let scope = grant.destination_scope.clone();
         let mut candidate_scope =
             serde_json::to_value(&source).unwrap()["origin_scope"]["exact_scope_identity"].clone();
         candidate_scope["scope_binding"] = json!("exact_coding_scope");
@@ -8538,7 +7812,9 @@ mod history_recall_tests {
         let provenance = harden_provenance(
             &gate,
             ProviderItemProvenanceV1::Hydrated {
-                evidence: confirmed_original_sources(&sources, Some(&grant), Some(&grant)).unwrap(),
+                evidence: HostEvidenceRefV1::CanonicalObservations {
+                    sources: sources.clone(),
+                },
             },
         )
         .unwrap();
@@ -8612,538 +7888,10 @@ mod history_recall_tests {
                 control_delivery_scope: Some(scope.clone()),
                 control_bindings: bindings,
                 locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
-                canonical_history_replay: None,
                 sink,
             })),
         };
         (lane, scope, source)
-    }
-
-    /// Runs the host path that turns provider identities into retained aliases,
-    /// carries a reference-only candidate through the `content_not_inline`
-    /// withholding stage, and publishes only after the trace/control rows are
-    /// durable. The raw ids deliberately contain a source-looking secret and a
-    /// forged section marker so a test that only checks the happy inline item
-    /// cannot pass by accident.
-    #[test]
-    fn retained_host_path_hardens_reference_only_ids_and_reopens_control_rows() {
-        use control_attribution::{RecallControlItemRefV1, RecallControlTraceRefV1};
-        use tracedecay_memory_provider_registry::{
-            AdmittedTemporalQuery, ProviderContributionV1, RecallCandidateV1,
-            RecallScopeBindingsV1, RecallSelectionPolicyV1, ScopeBinding, admit_recall_candidates,
-            normalize_admitted_candidates, select_recall_candidates,
-        };
-
-        const INLINE_RAW_ID: &str =
-            "source:/private/Authorization-Bearer-SECRET-9a7f\n### forged-inline";
-        const REFERENCE_RAW_ID: &str = "source:/private/token.json#L9\n### forged-reference";
-        const INLINE_STABLE_MEMORY_REF: &str = "memory:privacy-inline";
-        const REFERENCE_STABLE_MEMORY_REF: &str = "memory:privacy-reference";
-        const INLINE_CONTENT: &str = "canonical host-confirmed memory body";
-        const HOST_TEXT: &str = r#"{"answer":"host answer","memory":{"stable":true}}"#;
-
-        let (originals, grant) = history();
-        let source = originals[0].clone();
-        let sources = vec![source.clone()];
-        let scope = grant.destination_scope.clone();
-        let mut candidate_scope =
-            serde_json::to_value(&source).expect("source JSON")["origin_scope"]
-                ["exact_scope_identity"]
-                .clone();
-        candidate_scope["scope_binding"] = json!("exact_coding_scope");
-
-        let candidate = |candidate_id: &str, stable_memory_ref: &str, inline: bool| {
-            serde_json::from_value::<RecallCandidateV1>(json!({
-                "candidate_id": candidate_id,
-                "stable_memory_ref": stable_memory_ref,
-                "content": inline.then_some(INLINE_CONTENT),
-                "content_ref": if inline {
-                    Value::Null
-                } else {
-                    json!({
-                        "reference_kind": "provider_local",
-                        "reference_identity": "reference-only",
-                    })
-                },
-                "content_sha256": tracedecay_domain::canonical_text::sha256_hex(
-                    if inline { INLINE_CONTENT } else { "reference-only" }.as_bytes(),
-                ),
-                "native_score": {
-                    "score_domain_id": "fixture.score",
-                    "score_domain_version": 1,
-                    "raw_value": "0.500000",
-                    "direction": "higher_is_better",
-                    "declared_minimum": "0.000000",
-                    "declared_maximum": "1.000000",
-                    "calibration_state": "uncalibrated",
-                    "semantics": "fixture",
-                    "components": {},
-                },
-                "confidence": null,
-                "exact_scope_identity": candidate_scope,
-                "validity": {
-                    "observed_at": "2025-01-01T00:00:00.000000Z",
-                    "valid_from": "2025-01-01T00:00:00.000000Z",
-                    "valid_until": null,
-                    "superseded_at": null,
-                    "superseded_by": null,
-                    "revoked_at": null,
-                    "source_revision": "revision-1",
-                    "temporal_state": "current",
-                },
-                "provenance": {
-                    "state": "available",
-                    "origin_refs": ["record:first"],
-                    "observation_refs": ["first"],
-                    "source_refs": ["record:first"],
-                    "transform_chain": [],
-                    "provider_trace_refs": [],
-                    "redaction_reason": null,
-                    "original_sources": sources,
-                },
-                "explanation": {
-                    "summary": null,
-                    "matched_features": [],
-                    "activation_trace_refs": [],
-                    "limitations": [],
-                },
-                "source_refs": [],
-                "trace_refs": [],
-                "sensitivity": "unknown",
-                "memory_class": "session_observation",
-                "warnings": [],
-                "extensions": [],
-            }))
-            .expect("candidate fixture")
-        };
-        let admission = admit_recall_candidates(
-            &scope,
-            "recall.privacy.host-path",
-            &AdmittedTemporalQuery::current("2026-09-01T00:00:00.000000Z").expect("temporal query"),
-            &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
-            vec![
-                candidate(INLINE_RAW_ID, INLINE_STABLE_MEMORY_REF, true),
-                candidate(REFERENCE_RAW_ID, REFERENCE_STABLE_MEMORY_REF, false),
-            ],
-        )
-        .expect("admit candidate fixture");
-        let mut admission = admission;
-        admission.report.provider_id =
-            Some(tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned());
-        admission.report.registration_revision = Some(31);
-        assert_eq!(admission.report.admitted_count, 2, "{:?}", admission.report);
-        let normalization = normalize_admitted_candidates(Default::default(), &admission.admitted)
-            .expect("normalize candidate fixture");
-        let selection = select_recall_candidates(
-            RecallSelectionPolicyV1::new(2).expect("selection policy"),
-            &normalization,
-            &admission.admitted,
-        )
-        .expect("select candidate fixture");
-        assert_eq!(selection.selected.len(), 2, "{selection:?}");
-
-        // This is the exact contribution path that records a reference-only
-        // selection as a ContentNotInline exclusion. The final advisory lane
-        // carries only inline candidates, while the explain payload retains
-        // the host withholding row for the reference candidate.
-        let contribution = ProviderContributionV1::from_selection(
-            tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID,
-            31,
-            &selection,
-            &admission.admitted,
-        )
-        .expect("selection contribution");
-        assert_eq!(
-            contribution.reference_only_candidate_ids,
-            vec![REFERENCE_RAW_ID]
-        );
-
-        let gate = UntrustedRecallGateV1::open().expect("untrusted-memory gate");
-        let inline_hardened_identity = harden_test_candidate_identity(&gate, INLINE_RAW_ID)
-            .expect("inline identity hardening");
-        let reference_hardened_identity = harden_test_candidate_identity(&gate, REFERENCE_RAW_ID)
-            .expect("reference identity hardening");
-        let aliases = harden_candidate_identities(
-            &gate,
-            &admission.report,
-            &control_attribution::RecallLocatorKeyV1::for_test(),
-        )
-        .expect("complete identity aliases");
-        let inline_alias = aliases[INLINE_RAW_ID].clone();
-        let reference_alias = aliases[REFERENCE_RAW_ID].clone();
-        assert_ne!(aliases[INLINE_RAW_ID], INLINE_RAW_ID);
-        assert_ne!(aliases[REFERENCE_RAW_ID], REFERENCE_RAW_ID);
-        assert_ne!(inline_alias, inline_hardened_identity);
-        assert_ne!(reference_alias, reference_hardened_identity);
-        assert!(aliases[INLINE_RAW_ID].starts_with("advisory.retained-identity-v1."));
-        assert!(aliases[REFERENCE_RAW_ID].starts_with("advisory.retained-identity-v1."));
-        let alternate_key = control_attribution::RecallLocatorKeyV1::from_material(vec![0x5A; 32])
-            .expect("alternate locator key");
-        let alternate_aliases = control_attribution::retained_candidate_identity_aliases_for_report(
-            &admission.report,
-            &alternate_key,
-        );
-        assert_ne!(
-            alternate_aliases[INLINE_RAW_ID], aliases[INLINE_RAW_ID],
-            "a durable-key change must invalidate retained candidate aliases"
-        );
-        let mut alternate_scope_report = admission.report.clone();
-        alternate_scope_report.exact_scope_sha256 = "c".repeat(64);
-        let alternate_scope_aliases =
-            control_attribution::retained_candidate_identity_aliases_for_report(
-                &alternate_scope_report,
-                &control_attribution::RecallLocatorKeyV1::for_test(),
-            );
-        assert_ne!(
-            alternate_scope_aliases[INLINE_RAW_ID], aliases[INLINE_RAW_ID],
-            "candidate aliases must be bound to the mounted scope"
-        );
-
-        let provenance = harden_provenance(
-            &gate,
-            ProviderItemProvenanceV1::Hydrated {
-                evidence: confirmed_original_sources(&sources, Some(&grant), Some(&grant))
-                    .expect("canonical source evidence"),
-            },
-        )
-        .expect("provenance hardening");
-        let hardened = gate
-            .harden(INLINE_CONTENT, None, advisory_trust_tier(&provenance))
-            .expect("content hardening");
-        assert!(matches!(
-            AdvisoryCandidateDispositionV1::from_gate(&hardened),
-            AdvisoryCandidateDispositionV1::Admitted { .. }
-        ));
-
-        let temporary = tempfile::tempdir().expect("privacy ledger root");
-        let path = temporary.path().join("privacy-host-path.sqlite3");
-        let ledger = Arc::new(RecallAdmissionLedgerV1::open(path.clone()).expect("open ledger"));
-        let provider_id = tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned();
-        let lane = AdvisoryMemoryContextV1::Answered {
-            provider_id: provider_id.clone(),
-            registration_revision: 31,
-            degradation: None,
-            candidates: vec![AdvisoryMemoryCandidateV1 {
-                candidate_id: inline_alias.clone(),
-                content: hardened.rendered_content(),
-                explanation: hardened.rendered_explanation(),
-                disposition: AdvisoryCandidateDispositionV1::from_gate(&hardened),
-                provenance,
-            }],
-            explain: Some(Box::new(AdvisoryRecallExplainV1 {
-                exact_scope_sha256: scope.exact_scope_sha256(),
-                attributed_provider: provider_id,
-                registration_revision: 31,
-                report: admission.report,
-                normalization: Some(normalization),
-                selection: Some(selection),
-                host_withheld: vec![RecallExplainHostWithholdingV1 {
-                    candidate_id: REFERENCE_RAW_ID.to_owned(),
-                    reason_code: "content_not_inline".to_owned(),
-                    detail: Some("the host retained only the candidate reference".to_owned()),
-                }],
-                pack_identity_aliases: aliases,
-                explanations: BTreeMap::from([
-                    (
-                        INLINE_RAW_ID.to_owned(),
-                        RecallExplainProviderExplanationV1::NotProvided,
-                    ),
-                    (
-                        REFERENCE_RAW_ID.to_owned(),
-                        RecallExplainProviderExplanationV1::NotProvided,
-                    ),
-                ]),
-                control_delivery_scope: Some(scope.clone()),
-                control_bindings: BTreeMap::from([(
-                    inline_alias.clone(),
-                    control_attribution::RetainedRecallControlBindingV1 {
-                        stable_memory_ref: INLINE_STABLE_MEMORY_REF.to_owned(),
-                        original_sources: sources,
-                    },
-                )]),
-                locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
-                canonical_history_replay: None,
-                sink: ledger.clone(),
-            })),
-        };
-
-        let delivered = lane.appended_to(super::tests::tool_result_for_test(HOST_TEXT));
-        let rendered = super::tests::rendered_text_for_test(&delivered);
-        let rendered_json: Value = serde_json::from_str(&rendered).expect("rendered JSON");
-        let advisory = &rendered_json[ADVISORY_CONTEXT_PACK_JSON_KEY];
-        let rendered_candidate = advisory["candidates"]
-            .as_array()
-            .and_then(|candidates| candidates.first())
-            .expect("inline advisory candidate");
-        assert_eq!(rendered_candidate["candidate_id"], json!(inline_alias));
-        assert_eq!(
-            rendered_candidate["provenance_evidence"]["recall"]["item_ref"],
-            "recall-item-v1:0"
-        );
-        let trace_wire = advisory["recall_trace"]["trace_ref"]
-            .as_str()
-            .expect("retained trace reference")
-            .to_owned();
-        for raw_id in [INLINE_RAW_ID, REFERENCE_RAW_ID] {
-            assert!(
-                !rendered.contains(raw_id),
-                "raw id reached rendered JSON: {raw_id}"
-            );
-        }
-
-        drop(lane);
-        drop(ledger);
-        let reopened = RecallAdmissionLedgerV1::open(path).expect("reopen ledger");
-        let trace_ref = RecallControlTraceRefV1::parse(&trace_wire).expect("trace reference");
-        let retained = reopened
-            .explain_trace(&trace_ref)
-            .expect("read retained trace")
-            .expect("trace row");
-        let retained_json = serde_json::to_string(&retained.trace).expect("retained trace JSON");
-        for raw_id in [INLINE_RAW_ID, REFERENCE_RAW_ID] {
-            assert!(
-                !retained_json.contains(raw_id),
-                "raw id reached retained trace: {raw_id}"
-            );
-        }
-        assert_eq!(retained.trace.items.len(), 2);
-        assert_eq!(retained.trace.items[0].candidate_id, inline_alias);
-        assert_eq!(retained.trace.items[1].candidate_id, reference_alias);
-        assert_eq!(
-            retained.trace.items[1].stage,
-            RecallExplainStageV1::HostWithheld
-        );
-        assert_eq!(
-            retained.trace.items[1].host_reason_code,
-            "content_not_inline"
-        );
-        match &retained.trace.items[1].host_decision {
-            RecallExplainHostDecisionV1::HostWithheld { reason_code, .. } => {
-                assert_eq!(reason_code, "content_not_inline")
-            }
-            other => panic!("reference-only candidate was not host-withheld: {other:?}"),
-        }
-
-        let control = OperationControl::new(
-            i64::MAX,
-            60_000,
-            tracedecay_memory_provider_registry::CancellationToken::new(),
-        );
-        let item_ref = RecallControlItemRefV1::parse("recall-item-v1:0").expect("item reference");
-        let retained_source = reopened
-            .read_retained_control_source(
-                &trace_ref,
-                &item_ref,
-                &source.source.observation_id,
-                &control,
-            )
-            .expect("retained control source");
-        assert_eq!(retained_source.candidate_id, inline_alias);
-        assert!(
-            retained_source
-                .stable_memory_ref
-                .starts_with("recall-memory-ref-v1:")
-        );
-        assert_ne!(retained_source.stable_memory_ref, INLINE_STABLE_MEMORY_REF);
-        assert_eq!(retained_source.provider_rank, 0);
-        assert_ne!(retained_source.original_source, source);
-        let retained_source_json = serde_json::to_string(&retained_source.original_source)
-            .expect("opaque retained source JSON");
-        for raw in [
-            INLINE_RAW_ID,
-            REFERENCE_RAW_ID,
-            INLINE_STABLE_MEMORY_REF,
-            REFERENCE_STABLE_MEMORY_REF,
-            source.source.observation_id.as_str(),
-        ] {
-            assert!(
-                !retained_source_json.contains(raw),
-                "raw source locator reached reopened control value: {raw}: {retained_source_json}"
-            );
-        }
-        assert_eq!(
-            retained_source
-                .original_source
-                .source
-                .canonical_provider_id
-                .as_str(),
-            "recall.opaque"
-        );
-        let connection = reopened.connection();
-        let (retained_candidate, retained_ref, retained_sources, retained_decision): (
-            String,
-            String,
-            String,
-            String,
-        ) = connection
-            .query_row(
-                "SELECT candidate_id, stable_memory_ref, original_sources_json, host_decision_json
-                 FROM recall_explain_trace_items WHERE provider_rank=0 LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("inspect retained control row");
-        drop(connection);
-        assert_eq!(retained_candidate, inline_alias);
-        assert!(retained_ref.starts_with("recall-memory-ref-v1:"));
-        for raw in [
-            INLINE_RAW_ID,
-            REFERENCE_RAW_ID,
-            INLINE_STABLE_MEMORY_REF,
-            REFERENCE_STABLE_MEMORY_REF,
-        ] {
-            assert!(!retained_sources.contains(raw));
-            assert!(!retained_decision.contains(raw));
-        }
-        assert_eq!(
-            reopened
-                .read_retained_control_scope(&trace_ref, &control)
-                .expect("retained control scope")
-                .registration_revision,
-            31
-        );
-    }
-
-    #[test]
-    fn published_control_refs_resolve_durably_after_aliasing_and_budget_exclusion() {
-        use control_attribution::{RecallControlItemRefV1, RecallControlTraceRefV1};
-        for (name, text) in [
-            ("json", "{\"answer\":\"host evidence\"}"),
-            ("markdown", "## Code Context\nhost evidence\n"),
-        ] {
-            let temporary = tempfile::tempdir().unwrap();
-            let path = temporary.path().join("control-output.sqlite3");
-            let ledger = Arc::new(RecallAdmissionLedgerV1::open(path.clone()).unwrap());
-            let (lane, scope, source) =
-                control_output_fixture(ledger.clone(), &format!("control-output.{name}"));
-            let survivor_identity = match &lane {
-                AdvisoryMemoryContextV1::Answered {
-                    explain: Some(explain),
-                    ..
-                } => explain
-                    .pack_identity_aliases
-                    .get("aa-survivor")
-                    .cloned()
-                    .expect("survivor identity alias"),
-                other => panic!("controlled fixture: {other:?}"),
-            };
-            let (form, host_items) = host_evidence(text);
-            let ordinary = lane.context_pack(form, &host_items);
-            let AdvisoryContextPackV1::Compiled(ordinary) = ordinary else {
-                panic!("ordinary context pack");
-            };
-            assert!(!ordinary.rendered.contains("recall-trace-v1:"));
-            let provisional = lane.provisional_control_refs().unwrap();
-            assert_eq!(provisional.len(), 3);
-            assert_eq!(provisional[&survivor_identity].item_ref, "recall-item-v1:2");
-            let reference =
-                RecallControlTraceRefV1::parse(&provisional[&survivor_identity].trace_ref).unwrap();
-            let control = OperationControl::new(
-                i64::MAX,
-                60_000,
-                tracedecay_memory_provider_registry::CancellationToken::new(),
-            );
-            assert!(
-                ledger
-                    .read_retained_control_scope(&reference, &control)
-                    .is_err(),
-                "preparing locators must not retain them"
-            );
-            let result = lane.appended_to(TestToolResult::new(
-                json!({"content": [{"type": "text", "text": text}]}),
-                Vec::new(),
-            ));
-            let rendered = result.value["content"][0]["text"].as_str().unwrap();
-            let evidence: Vec<Value> = if name == "json" {
-                let json: Value = serde_json::from_str(rendered).unwrap();
-                json[ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|candidate| candidate["provenance_evidence"].clone())
-                    .collect()
-            } else {
-                rendered
-                    .lines()
-                    .filter_map(|line| {
-                        line.split_once("provenance_evidence=").map(|(_, object)| {
-                            serde_json::from_str(object.strip_suffix(']').unwrap()).unwrap()
-                        })
-                    })
-                    .collect()
-            };
-            assert_eq!(evidence.len(), 1, "{name}: {rendered}");
-            assert!(rendered.contains(&survivor_identity));
-            assert!(!rendered.contains("recall-item-v1:0"));
-            assert!(!rendered.contains("recall-item-v1:1"));
-            let evidence = &evidence[0];
-            assert_eq!(evidence["sources"], json!([source.clone()]));
-            assert_eq!(evidence["recall"]["item_ref"], "recall-item-v1:2");
-            let trace_wire = evidence["recall"]["trace_ref"].as_str().unwrap().to_owned();
-            let item_wire = evidence["recall"]["item_ref"].as_str().unwrap().to_owned();
-            drop(lane);
-            drop(ledger);
-            let reopened = RecallAdmissionLedgerV1::open(path).unwrap();
-            let trace_ref = RecallControlTraceRefV1::parse(&trace_wire).unwrap();
-            let item_ref = RecallControlItemRefV1::parse(&item_wire).unwrap();
-            let retained = reopened
-                .read_retained_control_source(
-                    &trace_ref,
-                    &item_ref,
-                    &source.source.observation_id,
-                    &control,
-                )
-                .unwrap();
-            assert_eq!(retained.scope.delivery_scope, scope);
-            assert_eq!(retained.scope.registration_revision, 31);
-            assert_eq!(retained.provider_rank, 2);
-            assert_eq!(retained.candidate_id, survivor_identity);
-            assert!(
-                retained
-                    .stable_memory_ref
-                    .starts_with("recall-memory-ref-v1:")
-            );
-            assert_ne!(retained.stable_memory_ref, "memory:aa-survivor");
-            assert_ne!(retained.original_source, source);
-            assert_eq!(
-                retained
-                    .original_source
-                    .source
-                    .canonical_provider_id
-                    .as_str(),
-                "recall.opaque"
-            );
-            assert_eq!(
-                reopened
-                    .read_retained_control_scope(&trace_ref, &control)
-                    .unwrap(),
-                retained.scope
-            );
-            let trace = reopened
-                .explain_trace(&RecallControlTraceRefV1::parse(&trace_wire).unwrap())
-                .unwrap()
-                .unwrap()
-                .trace;
-            assert_eq!(trace.items[2].stage, RecallExplainStageV1::Injected);
-            assert!(
-                trace.items[..2]
-                    .iter()
-                    .all(|item| item.stage != RecallExplainStageV1::Injected)
-            );
-            for rank in [0, 1] {
-                assert!(
-                    reopened
-                        .read_retained_control_source(
-                            &trace_ref,
-                            &RecallControlItemRefV1::parse(&format!("recall-item-v1:{rank}"))
-                                .unwrap(),
-                            "first",
-                            &control
-                        )
-                        .is_err()
-                );
-            }
-        }
     }
 
     fn empty_control_output_fixture(
@@ -9224,7 +7972,6 @@ mod history_recall_tests {
                     form,
                     &host_items,
                     &BTreeMap::new(),
-                    None,
                     Some(&provisional),
                 )
             else {
@@ -9286,33 +8033,14 @@ mod history_recall_tests {
 
     #[test]
     fn failed_control_retention_withholds_advisory_and_preserves_the_whole_host_result() {
-        use tracedecay_contracts::retrieval::{
-            ContextMemoryContributionV1, ContextSurfaceRequestV1,
-        };
         let sink = Arc::new(RefusingControlOutputSink(
             std::sync::atomic::AtomicUsize::new(0),
         ));
         let (lane, _, _) = control_output_fixture(sink.clone(), "control-output.refused");
-        let policy: ContextSurfaceRequestV1 = serde_json::from_value(
-            json!({"task": "retained host context", "include_memory": false}),
-        )
-        .unwrap();
-        let sidecar = ContextMemoryContributionV1::from_matches(
-            &policy,
-            &[],
-            None,
-            None,
-            try_now_micros().unwrap(),
-        )
-        .unwrap();
-        let host = TestToolResult::new(json!({"content": [{"type": "text", "text": "{\"answer\":\"unchanged host evidence\"}"}]}), vec!["host.rs".to_owned()]).with_context_memory_contribution(sidecar);
+        let host = TestToolResult::new(json!({"content": [{"type": "text", "text": "{\"answer\":\"unchanged host evidence\"}"}]}), vec!["host.rs".to_owned()]);
         let delivered = lane.appended_to(host.clone());
         assert_eq!(delivered.value, host.value);
         assert_eq!(delivered.touched_files, host.touched_files);
-        assert_eq!(
-            delivered.context_memory_contribution(),
-            host.context_memory_contribution()
-        );
         assert_eq!(
             sink.0.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -9321,238 +8049,106 @@ mod history_recall_tests {
         assert!(!delivered.value.to_string().contains("recall-trace-v1:"));
         assert!(!delivered.value.to_string().contains("provenance_evidence"));
     }
+}
 
-    #[tokio::test]
-    async fn replay_retention_forwards_stop_and_joins_the_same_stage_to_its_actual_result() {
-        use std::task::Poll;
-        for expired in [false, true] {
-            let now = try_now_micros().unwrap();
-            let signal =
-                tracedecay_contracts::CancellationSignal::active("replay.retention-stop").unwrap();
-            let deadline =
-                tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(if expired {
-                    now.0 - 1
-                } else {
-                    now.0 + 60_000_000
-                }))
-                .unwrap();
-            let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
-            let original = control.operation.clone();
-            let completed = std::sync::atomic::AtomicBool::new(false);
-            let stage = async {
-                if !expired {
-                    assert!(signal.cancel(try_now_micros().unwrap()));
-                }
-                std::future::poll_fn(|context| {
-                    if original.cancellation().is_cancelled() {
-                        // The joined stage can still return its known durable
-                        // result after the original stop was forwarded to it.
-                        completed.store(true, std::sync::atomic::Ordering::Release);
-                        Poll::Ready(Ok::<_, ()>(17_u64))
-                    } else {
-                        context.waker().wake_by_ref();
-                        Poll::Pending
-                    }
-                })
-                .await
-            };
-            let (actual, host_stopped) = control.run_replay_retention(None, stage).await;
-            assert_eq!(actual, Ok(17));
-            assert!(host_stopped);
-            assert!(completed.load(std::sync::atomic::Ordering::Acquire));
-            assert!(original.cancellation().is_cancelled());
-            assert!(control.cancellation.is_cancelled());
-            assert_eq!(
-                control.operation.deadline_utc_micros(),
-                original.deadline_utc_micros()
-            );
-            assert_eq!(
-                control.operation.remaining_millis(),
-                original.remaining_millis()
-            );
-        }
+#[cfg(test)]
+mod observation_claim_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    use super::*;
+    use tracedecay_domain::{RefId, RepositoryId, WorktreeId};
+
+    fn source(observation_id: &str) -> RecallSourceAttributionV1 {
+        serde_json::from_value(json!({
+            "source": {"canonical_provider_id": "claude", "canonical_session_id": "session-a",
+                "source_key": "source-a", "stable_record_id": null,
+                "observation_id": observation_id, "source_revision": null,
+                "content_sha256": "a".repeat(64)},
+            "origin_scope": {"state": "ingestion_only"},
+            "source_sequence": 1, "occurred_at": null,
+            "ingested_at": "2026-01-01T00:00:00.000000000Z",
+            "validity": {"valid_from": null, "valid_until": null, "superseded_at": null,
+                "superseded_by": null, "revoked_at": null},
+        }))
+        .expect("attribution fixture")
     }
 
-    #[test]
-    fn replay_retention_failure_and_stopped_publication_preserve_the_whole_host_result() {
-        use tracedecay_contracts::retrieval::{
-            ContextMemoryContributionV1, ContextSurfaceRequestV1,
-        };
-        let policy: ContextSurfaceRequestV1 = serde_json::from_value(
-            json!({"task": "retained host context", "include_memory": false}),
+    fn evidence_scope() -> HostEvidenceScopeV1 {
+        HostEvidenceScopeV1::new(
+            "profile.claim",
+            ResolvedScope::new(
+                ProjectId::new("project.claim").expect("project"),
+                RepositoryId::new("repository.claim").expect("repository"),
+                WorktreeId::new("worktree.claim").expect("worktree"),
+                Some(RefId::new("refs/heads/claim").expect("reference")),
+            )
+            .expect("resolved scope"),
+            "session-b",
+            std::env::temp_dir(),
         )
-        .unwrap();
-        let sidecar = ContextMemoryContributionV1::from_matches(
-            &policy,
-            &[],
-            None,
-            None,
-            try_now_micros().unwrap(),
-        )
-        .unwrap();
-        for outcome in [
-            AdvisoryRecallUnavailableV1::HistoryReplayRetentionFailed,
-            AdvisoryRecallUnavailableV1::HistoryReplayPublicationWithheld,
-        ] {
-            let lane = AdvisoryMemoryContextV1::unavailable(
-                OwnedProviderId::new("provider.replay").unwrap(),
-                7,
-                outcome,
-                "private replay retention status",
-            );
-            for text in [
-                "{\"answer\":\"original host evidence\"}",
-                "## Code Context\noriginal host evidence\n",
-            ] {
-                let original = TestToolResult::new(
-                    json!({"content": [{"type": "text", "text": text}]}),
-                    vec!["host.rs".to_owned()],
-                )
-                .with_context_memory_contribution(sidecar.clone());
-                let delivered = lane.appended_to(original.clone());
-                assert_eq!(delivered.value, original.value);
-                assert_eq!(delivered.touched_files, original.touched_files);
-                assert_eq!(
-                    delivered.context_memory_contribution(),
-                    original.context_memory_contribution()
-                );
-                assert!(
-                    !delivered
-                        .value
-                        .to_string()
-                        .contains("canonical_history_replay")
-                );
-                assert!(
-                    !delivered
-                        .value
-                        .to_string()
-                        .contains("host-observation-batch-v1:")
-                );
-            }
-        }
+        .expect("evidence scope")
     }
 
+    fn decide(
+        claim: &str,
+        sources: &[RecallSourceAttributionV1],
+        confirmed: Option<Result<HostEvidenceRefV1, &'static str>>,
+    ) -> ProviderItemProvenanceV1 {
+        let scope = evidence_scope();
+        let signal = tracedecay_contracts::CancellationSignal::active("token.claim").unwrap();
+        let control = HostEvidenceControlV1::new(0, i64::MAX, &signal);
+        let claimed = ProviderItemProvenanceV1::Available {
+            source: claim.to_owned(),
+        };
+        let authority =
+            observation_claim_authority(&scope, &claimed, Some(sources), confirmed.as_ref())
+                .expect("an observation-sourced claim selects the observation authority");
+        let mut pass = ProvenanceHydrationPassV1::new(
+            ProvenanceHydrationPolicyV1::new(true, 4).expect("policy"),
+        );
+        pass.hydrate(&authority, &scope, &control, &claimed).provenance
+    }
+
+    /// Only a store-confirmed source set grounds the candidate, and only
+    /// for the record the provider actually cited among those sources.
     #[test]
-    fn zero_candidate_lane_requires_the_actual_retained_carrier_before_replay_publication() {
-        use tracedecay_memory_provider_registry::recall_context_pack::CanonicalHistoryReplayBatchV1;
-        let lane = AdvisoryMemoryContextV1::Answered {
-            provider_id: "provider.replay".to_owned(),
-            registration_revision: 7,
-            degradation: None,
-            candidates: Vec::new(),
-            explain: None,
+    fn observation_claims_ground_only_through_confirmed_sources_they_name() {
+        let sources = vec![source("observation-a")];
+        let confirmed = HostEvidenceRefV1::CanonicalObservations {
+            sources: sources.clone(),
         };
-        let metadata = CanonicalHistoryReplayV1 {
-            provider_id: "provider.replay".to_owned(),
-            registration_revision: 7,
-            delivery_scope: tracedecay_memory_provider_registry::RecallOutcomeScopeV1 {
-                profile_id: "profile.replay".to_owned(),
-                project_id: "project.replay".to_owned(),
-                repository_identity: "repository.replay".to_owned(),
-                worktree_identity: "worktree.replay".to_owned(),
-                branch_identity: "refs/heads/replay".to_owned(),
-                agent_session_id: "session.replay".to_owned(),
-                resolved_scope_digest: format!("sha256:{}", "1".repeat(64)),
-            },
-            batches: vec![CanonicalHistoryReplayBatchV1 {
-                observation_batch_ref: format!("host-observation-batch-v1:{}", "a".repeat(64)),
-                first_source_sequence: 11,
-                last_source_sequence: 12,
-                observation_count: 2,
-            }],
-        };
-        let AdvisoryContextPackV1::Compiled(pack) = lane.context_pack_with_control_metadata(
-            ContextPackRenderFormV1::Json,
-            &[],
-            &BTreeMap::new(),
-            Some(&metadata),
-            None,
-        ) else {
-            panic!("bounded replay lane metadata");
-        };
-        assert!(pack.items().next().is_none());
-        assert_eq!(pack.canonical_history_replay, Some(metadata));
-        assert!(!lane.retained_replay_metadata_matches(&pack));
-    }
-
-    #[tokio::test]
-    async fn outer_lane_fuse_joins_active_retention_and_prevents_provider_continuation() {
-        use std::future::Future;
-        use std::task::Poll;
-        let now = try_now_micros().unwrap();
-        let signal = tracedecay_contracts::CancellationSignal::active("replay.outer-fuse").unwrap();
-        let deadline =
-            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 + 60_000_000))
-                .unwrap();
-        let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
-        let original = control.operation.clone();
-        let activity = RecallReplayRetentionActivityV1::default();
-        let completed = std::sync::atomic::AtomicBool::new(false);
-        let provider_continued = std::sync::atomic::AtomicBool::new(false);
-        let recall = async {
-            let stage = std::future::poll_fn(|context| {
-                if original.cancellation().is_cancelled() {
-                    completed.store(true, std::sync::atomic::Ordering::Release);
-                    Poll::Ready(Ok::<_, ()>(23_u64))
-                } else {
-                    context.waker().wake_by_ref();
-                    Poll::Pending
-                }
-            });
-            let (actual, host_stopped) = control.run_replay_retention(Some(&activity), stage).await;
-            if !host_stopped {
-                provider_continued.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            decide("record:observation-a", &sources, Some(Ok(confirmed.clone()))),
+            ProviderItemProvenanceV1::Hydrated {
+                evidence: confirmed.clone()
             }
-            (actual, host_stopped)
-        };
-        tokio::pin!(recall);
-        // Enter the real retention wrapper before firing the outer fuse.
-        // One explicit poll establishes ownership without a timing sleep.
-        std::future::poll_fn(|context| match recall.as_mut().poll(context) {
-            Poll::Pending => Poll::Ready(()),
-            Poll::Ready(_) => panic!("retention finished before the outer fuse"),
-        })
-        .await;
-        assert!(!original.cancellation().is_cancelled());
-        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
-        let actual = activity
-            .within_lane_fuse(std::time::Duration::ZERO, recall)
-            .await
-            .unwrap();
-        assert_eq!(actual, (Ok(23), true));
-        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!provider_continued.load(std::sync::atomic::Ordering::Acquire));
-        assert!(original.cancellation().is_cancelled());
-        assert_eq!(
-            control.operation.deadline_utc_micros(),
-            original.deadline_utc_micros()
         );
-        assert_eq!(
-            control.operation.remaining_millis(),
-            original.remaining_millis()
-        );
+        assert!(matches!(
+            decide("record:observation-other", &sources, Some(Ok(confirmed))),
+            ProviderItemProvenanceV1::Unresolvable { .. }
+        ));
+        assert!(matches!(
+            decide(
+                "record:observation-a",
+                &sources,
+                Some(Err("canonical observation attribution differs from the host record"))
+            ),
+            ProviderItemProvenanceV1::Unresolvable { .. }
+        ));
+        assert!(matches!(
+            decide("record:observation-a", &sources, None),
+            ProviderItemProvenanceV1::Unresolvable { .. }
+        ));
         assert!(
-            !activity.cancel_active(),
-            "completed retention must release its ownership slot"
+            observation_claim_authority(
+                &evidence_scope(),
+                &ProviderItemProvenanceV1::Available {
+                    source: "record:observation-a".to_owned()
+                },
+                None,
+                None
+            )
+            .is_none(),
+            "a candidate without typed sources keeps the ordinary host authorities"
         );
-    }
-
-    #[tokio::test]
-    async fn outer_lane_fuse_still_stops_when_no_retention_work_is_owned() {
-        let activity = RecallReplayRetentionActivityV1::default();
-        assert_eq!(
-            activity
-                .within_lane_fuse(std::time::Duration::from_secs(1), async { 7 })
-                .await
-                .unwrap(),
-            7,
-        );
-        assert!(
-            activity
-                .within_lane_fuse(std::time::Duration::ZERO, std::future::pending::<()>(),)
-                .await
-                .is_err()
-        );
-        assert!(!activity.cancel_active());
     }
 }

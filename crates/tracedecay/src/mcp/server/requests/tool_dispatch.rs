@@ -408,20 +408,29 @@ impl McpServer {
         #[cfg(feature = "memory-provider-host")]
         let dispatched = match (dispatched, advisory_call) {
             (Ok(mut result), Some(call)) => {
-                let advisory_routing_mount = self.advisory_routing_mount();
-                let advisory =
-                    tracedecay_daemon_service::retained_owner::project_advisory_memory_context_for_call(
-                        self.cognitive_recall_port_for_session(call.canonical_session_id()),
-                        advisory_routing_mount.as_deref(),
-                        call,
-                        result.context_memory_contribution(),
-                    )
-                    .await;
-                if let Some(advisory) = advisory
-                    && let Some(slot) = result.value.pointer_mut("/content/0/text")
-                    && let Some(text) = slot.as_str()
+                // The lane augments the rendered answer and reads its canonical
+                // memory matches from it; an answer without text has nothing
+                // to augment, so no provider is asked.
+                if let Some(host_answer) = result
+                    .value
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
                 {
-                    *slot = Value::String(advisory.appended_text(text));
+                    let advisory_routing_mount = self.advisory_routing_mount();
+                    let advisory =
+                        tracedecay_daemon_service::retained_owner::project_advisory_memory_context_for_call(
+                            self.cognitive_recall_port_for_session(call.canonical_session_id()),
+                            advisory_routing_mount.as_deref(),
+                            call,
+                            &host_answer,
+                        )
+                        .await;
+                    if let Some(advisory) = advisory
+                        && let Some(slot) = result.value.pointer_mut("/content/0/text")
+                    {
+                        *slot = Value::String(advisory.appended_text(&host_answer));
+                    }
                 }
                 Ok(result)
             }

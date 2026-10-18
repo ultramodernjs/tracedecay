@@ -800,21 +800,18 @@ pub struct RecallRequestParts {
 pub fn build_recall_request_payload(
     parts: &RecallRequestParts,
 ) -> Result<CanonicalPayload, RecallAdmissionError> {
-    build_recall_request_payload_with_context(parts, None, None)
+    build_recall_request_payload_with_context(parts, None)
 }
 
-/// Attaches only host-admitted exclusions and canonical history grant JSON.
-/// Source authorization remains with the mounted host authority at dispatch.
-/// The complete value is encoded and hashed once, after these fields are bound.
+/// Attaches only host-admitted exclusions. The complete value is encoded and
+/// hashed once, after these fields are bound.
 pub fn build_recall_request_payload_with_context(
     parts: &RecallRequestParts,
     exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
-    history_grant: Option<&Value>,
 ) -> Result<CanonicalPayload, RecallAdmissionError> {
     build_recall_request_payload_with_capabilities(
         parts,
         exclusions,
-        history_grant,
         &[OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID)?],
     )
 }
@@ -824,7 +821,6 @@ pub fn build_recall_request_payload_with_context(
 pub(crate) fn build_recall_request_payload_with_capabilities(
     parts: &RecallRequestParts,
     exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
-    history_grant: Option<&Value>,
     required_capabilities: &[OwnedVersionedId],
 ) -> Result<CanonicalPayload, RecallAdmissionError> {
     parts.exact_scope.validate()?;
@@ -836,17 +832,6 @@ pub(crate) fn build_recall_request_payload_with_capabilities(
                 field: "exclusions",
                 detail: "exclusions violate the admitted application bounds",
             })?;
-    }
-    if let Some(grant) = history_grant {
-        if !grant.is_object()
-            || grant.get("policy_revision").and_then(Value::as_u64) != Some(parts.policy_revision)
-            || grant.get("destination_scope") != Some(&scope_wire_value(&parts.exact_scope))
-        {
-            return Err(RecallAdmissionError::InvalidTemporalQuery {
-                field: "history_grant",
-                detail: "history grant must bind the request policy and exact destination",
-            });
-        }
     }
     if parts.policy_revision == 0 {
         return Err(RecallAdmissionError::InvalidTemporalQuery {
@@ -887,9 +872,6 @@ pub(crate) fn build_recall_request_payload_with_capabilities(
                 detail: bounded_detail(&error.to_string()),
             }
         })?;
-    }
-    if let Some(grant) = history_grant {
-        value["history_grant"] = grant.clone();
     }
     let bytes =
         serde_json::to_vec(&value).map_err(|error| RecallAdmissionError::RequestEncode {
@@ -1212,8 +1194,8 @@ pub struct AdmittedRecallCandidate {
 }
 
 impl AdmittedRecallCandidate {
-    /// Structurally validated original source claims. Source existence, history
-    /// relations and current disposition still require host revalidation.
+    /// Structurally validated original source claims. Source existence and
+    /// current disposition still require host confirmation.
     #[must_use]
     pub fn original_sources(&self) -> &[RecallSourceAttributionV1] {
         &self.original_sources
@@ -1222,8 +1204,8 @@ impl AdmittedRecallCandidate {
     /// Observation claims whose declared provenance passed the canonical
     /// binding checks. Host authority must still confirm every source.
     #[must_use]
-    pub fn observation_history_sources(&self) -> Option<&[RecallSourceAttributionV1]> {
-        observation_history_claim(&self.candidate, &self.original_sources)
+    pub fn observation_sources(&self) -> Option<&[RecallSourceAttributionV1]> {
+        observation_source_claim(&self.candidate, &self.original_sources)
             .then_some(self.original_sources.as_slice())
     }
     /// Returns the candidate as the provider returned it.
@@ -1447,8 +1429,6 @@ pub(crate) fn admit_recall_reply_with_profile(
     #[derive(Deserialize)]
     struct DispatchedRecallExclusions {
         exclusions: tracedecay_contracts::memory::CognitiveRecallExclusions,
-        policy_revision: u64,
-        history_grant: Option<Value>,
     }
     let context: DispatchedRecallExclusions =
         serde_json::from_slice(&call.payload.bytes).map_err(|error| {
@@ -1461,15 +1441,7 @@ pub(crate) fn admit_recall_reply_with_profile(
             detail: bounded_detail(&error.to_string()),
         }
     })?;
-    let common_profile = requires_common_profile
-        .then(|| {
-            CommonRecallProfileV1::from_dispatched_history(
-                call,
-                context.policy_revision,
-                context.history_grant.as_ref(),
-            )
-        })
-        .transpose()?;
+    let common_profile = requires_common_profile.then(|| CommonRecallProfileV1::for_call(call));
     let mut admission = admit_recall_candidates_with_context(
         &call.exact_scope,
         &call.request_id,
@@ -1659,54 +1631,20 @@ struct AdmitDecision {
     degrades_lane: bool,
 }
 
-/// Sources the host already selected and freshly revalidated before dispatch.
-/// Matching this snapshot is an admission prerequisite, not privacy authority:
-/// the root still re-reads canonical disposition before any source is hydrated.
+/// The common advisory profile: every candidate is a session observation
+/// carrying its typed original sources, each recorded inside the dispatched
+/// checkout. Any session of that checkout qualifies; another checkout never
+/// does. This is structural admission only: the host confirms every cited
+/// source against its canonical store before anything is shown as grounded.
 struct CommonRecallProfileV1 {
-    granted_sources: Vec<tracedecay_memory_provider_api::SourceAttribution>,
+    dispatched_scope: OwnedExactScope,
 }
 
 impl CommonRecallProfileV1 {
-    fn from_dispatched_history(
-        call: &ProviderCall,
-        policy_revision: u64,
-        grant: Option<&Value>,
-    ) -> Result<Self, RecallAdmissionError> {
-        let invalid = || RecallAdmissionError::InvalidTemporalQuery {
-            field: "history_grant",
-            detail: "common recall history must bind the dispatched scope and original sources",
-        };
-        let Some(grant) = grant else {
-            // A required common profile remains required when history is
-            // absent; its empty allowlist cannot admit a fabricated source.
-            return Ok(Self {
-                granted_sources: Vec::new(),
-            });
-        };
-        if grant.get("destination_scope") != Some(&scope_wire_value(&call.exact_scope))
-            || grant.get("policy_revision").and_then(Value::as_u64) != Some(policy_revision)
-        {
-            return Err(invalid());
+    fn for_call(call: &ProviderCall) -> Self {
+        Self {
+            dispatched_scope: call.exact_scope.clone(),
         }
-        let sources = grant
-            .get("sources")
-            .and_then(Value::as_array)
-            .ok_or_else(invalid)?;
-        if sources.is_empty()
-            || sources.len() > tracedecay_memory_provider_api::MAX_ADVISORY_ADMISSION_SOURCES
-        {
-            return Err(invalid());
-        }
-        let granted_sources = sources
-            .iter()
-            .map(|source| {
-                let attribution: RecallSourceAttributionV1 =
-                    serde_json::from_value(source.get("attribution").ok_or_else(invalid)?.clone())
-                        .map_err(|_| invalid())?;
-                attribution.to_owned_attribution().map_err(|_| invalid())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { granted_sources })
     }
 
     fn check_candidate(
@@ -1726,14 +1664,29 @@ impl CommonRecallProfileV1 {
         }
         for source in sources {
             let attribution = source.to_owned_attribution()?;
-            if !self.granted_sources.contains(&attribution) {
+            let origin = attribution
+                .origin_scope
+                .recorded_scope()
+                .map_err(|_| invalid("original observation has no recorded origin scope"))?;
+            if !same_checkout(origin, &self.dispatched_scope) {
                 return Err(invalid(
-                    "original observation is outside dispatched canonical history",
+                    "original observation was recorded outside the dispatched checkout",
                 ));
             }
         }
         Ok(())
     }
+}
+
+/// Whether two exact scopes name the same checkout: profile, project,
+/// repository, worktree and branch. Session and resolved-scope digest are the
+/// per-session binding and the resolution revision, not the checkout.
+fn same_checkout(left: &OwnedExactScope, right: &OwnedExactScope) -> bool {
+    left.profile_id == right.profile_id
+        && left.project_id == right.project_id
+        && left.repository_identity == right.repository_identity
+        && left.worktree_identity == right.worktree_identity
+        && left.branch_identity == right.branch_identity
 }
 
 struct AdmittedCandidateParts {
@@ -1814,7 +1767,7 @@ fn provenance_refs<'a>(
         .filter_map(Value::as_str)
 }
 
-fn observation_history_claim(
+fn observation_source_claim(
     candidate: &RecallCandidateV1,
     sources: &[RecallSourceAttributionV1],
 ) -> bool {
@@ -1841,7 +1794,7 @@ fn check_original_source_claims(
     candidate: &RecallCandidateV1,
     sources: &[RecallSourceAttributionV1],
 ) -> Result<(), RecallDenialReason> {
-    if !observation_history_claim(candidate, sources) {
+    if !observation_source_claim(candidate, sources) {
         return Ok(());
     }
     let invalid = |detail: &str| RecallDenialReason::InvalidSourceAttribution {
@@ -2404,7 +2357,7 @@ mod request_context_tests {
     }
 
     #[test]
-    fn exclusions_and_history_are_in_the_single_canonical_payload_hash() {
+    fn exclusions_and_capabilities_are_in_the_single_canonical_payload_hash() {
         let parts = parts();
         let exclusions = CognitiveRecallExclusions {
             stable_memory_refs: vec!["stable".to_owned()],
@@ -2414,40 +2367,31 @@ mod request_context_tests {
             observation_ids: vec!["observation".to_owned()],
             content_sha256: vec!["3".repeat(64)],
         };
-        // This fixture tests the envelope binding only; it is not a source grant.
-        let mut grant = serde_json::json!({"policy_revision": 3, "destination_scope": scope_wire_value(&parts.exact_scope), "authorization_ref": "host.first"});
-        let first =
-            build_recall_request_payload_with_context(&parts, Some(&exclusions), Some(&grant))
-                .unwrap();
+        let first = build_recall_request_payload_with_context(&parts, Some(&exclusions)).unwrap();
         let wire: Value = serde_json::from_slice(&first.bytes).unwrap();
         assert_eq!(
             wire["exclusions"],
             serde_json::to_value(&exclusions).unwrap()
         );
-        assert_eq!(wire["history_grant"], grant);
+        assert!(
+            wire.get("history_grant").is_none(),
+            "the host dispatches no provider history"
+        );
         assert_eq!(first.sha256, hex::encode(Sha256::digest(&first.bytes)));
         assert_eq!(
             wire["required_capabilities"],
             serde_json::json!([RECALL_QUERY_CAPABILITY_ID])
         );
         let mut capabilities = vec![OwnedVersionedId::new(RECALL_QUERY_CAPABILITY_ID).unwrap()];
-        let legacy = build_recall_request_payload_with_capabilities(
-            &parts,
-            Some(&exclusions),
-            Some(&grant),
-            &capabilities,
-        )
-        .unwrap();
+        let legacy =
+            build_recall_request_payload_with_capabilities(&parts, Some(&exclusions), &capabilities)
+                .unwrap();
         assert_eq!(legacy.bytes, first.bytes);
         assert_eq!(legacy.sha256, first.sha256);
         capabilities.push(OwnedVersionedId::new(crate::COMMON_ADVISORY_PROFILE_ID).unwrap());
-        let common = build_recall_request_payload_with_capabilities(
-            &parts,
-            Some(&exclusions),
-            Some(&grant),
-            &capabilities,
-        )
-        .unwrap();
+        let common =
+            build_recall_request_payload_with_capabilities(&parts, Some(&exclusions), &capabilities)
+                .unwrap();
         let mut common_wire: Value = serde_json::from_slice(&common.bytes).unwrap();
         assert_eq!(
             common_wire["required_capabilities"],
@@ -2460,45 +2404,10 @@ mod request_context_tests {
         assert_ne!(first.sha256, common.sha256);
         common_wire["required_capabilities"] = wire["required_capabilities"].clone();
         assert_eq!(common_wire, wire, "only the selected capabilities changed");
-        grant["authorization_ref"] = Value::String("host.second".to_owned());
-        let changed =
-            build_recall_request_payload_with_context(&parts, Some(&exclusions), Some(&grant))
-                .unwrap();
-        assert_ne!(first.sha256, changed.sha256);
         assert_ne!(
             first.sha256,
-            build_recall_request_payload(&parts).unwrap().sha256
+            build_recall_request_payload(&parts).unwrap().sha256,
+            "exclusions are bound into the hashed payload"
         );
-    }
-
-    #[test]
-    fn grant_envelope_refuses_nonobject_policy_and_every_foreign_destination_field() {
-        let parts = parts();
-        let valid = serde_json::json!({"policy_revision": 3, "destination_scope": scope_wire_value(&parts.exact_scope)});
-        for invalid in [
-            Value::Null,
-            serde_json::json!([]),
-            serde_json::json!({"policy_revision": 4, "destination_scope": scope_wire_value(&parts.exact_scope)}),
-        ] {
-            assert!(
-                build_recall_request_payload_with_context(&parts, None, Some(&invalid)).is_err()
-            );
-        }
-        for field in [
-            "profile_id",
-            "project_id",
-            "repository_identity",
-            "worktree_identity",
-            "branch_identity",
-            "agent_session_id",
-            "resolved_scope_digest",
-        ] {
-            let mut foreign = valid.clone();
-            foreign["destination_scope"][field] = Value::String("foreign".to_owned());
-            assert!(
-                build_recall_request_payload_with_context(&parts, None, Some(&foreign)).is_err(),
-                "{field}"
-            );
-        }
     }
 }

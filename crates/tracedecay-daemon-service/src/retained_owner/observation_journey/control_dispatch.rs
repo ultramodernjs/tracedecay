@@ -1,13 +1,13 @@
 //! Synchronous lifecycle control through the mounted journey's existing owners.
 //!
 //! The caller authorizes the original attribution and supplies its original
-//! request control. This seam owns only bounded dispatch; it neither authorizes
-//! history nor interprets a terminal as proof that source erasure completed.
+//! request control. This seam owns only bounded dispatch; it never interprets a
+//! terminal as proof that a provider-local effect completed.
 
 use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
-use tracedecay_memory_provider_registry::{HistoryGrant, ProviderReply};
+use tracedecay_memory_provider_registry::ProviderReply;
 
 use super::{
     ApiError, Arc, BoundedCallRefusalV1, CanonicalPayload, ObservationJourneyError,
@@ -29,14 +29,12 @@ pub(crate) struct JourneyControlDispatchRequestV1 {
     pub(crate) idempotency_key: Option<String>,
     /// Already-authorized operation fields, with no caller-supplied host header.
     pub(crate) operation_body: Value,
-    /// Untrusted in-process claim for current host admission, outside wire JSON.
-    pub(crate) history_grant: Option<HistoryGrant>,
     /// The host policy revision that authorized this control.
     pub(crate) policy_revision: u64,
     /// Cloning this preserves its running monotonic budget and live token.
     pub(crate) control: OperationControl,
-    /// A caller's explicit guard, including restore/replay, must remain intact.
-    /// Absence uses the generation from this dispatch's readiness evidence.
+    /// A caller's explicit guard must remain intact. Absence uses the
+    /// generation from this dispatch's readiness evidence.
     pub(crate) expected_state_generation: Option<u64>,
 }
 
@@ -65,7 +63,7 @@ pub(crate) enum JourneyControlNotDispatchedV1 {
     RegistrationRevisionMismatch,
     #[error("the original provider's observation journey is stopping")]
     Stopping,
-    #[error("operation is not a lifecycle control: {0:?}")]
+    #[error("operation is not a mounted provider control: {0:?}")]
     UnsupportedOperation(ProviderOperation),
     #[error("original request control refused dispatch: {0:?}")]
     Control(TerminalCode),
@@ -79,8 +77,6 @@ pub(crate) enum JourneyControlNotDispatchedV1 {
     SuppliedAuthorityHeader(&'static str),
     #[error("control policy revision must be positive")]
     InvalidPolicyRevision,
-    #[error("replay body generation does not match the original expected generation guard")]
-    ReplayGenerationMismatch,
 }
 
 /// Dispatch stages stay typed without claiming an absent reply means no effect.
@@ -157,11 +153,6 @@ impl JourneyControlDispatchRequestV1 {
             "cancellation",
             "extensions",
         ] {
-            // Replay canonically carries its own generation assertion. It is
-            // preserved and compared below, never replaced with ready state.
-            if field == "expected_state_generation" && self.operation == ProviderOperation::Replay {
-                continue;
-            }
             if body.contains_key(field) {
                 return Err(JourneyControlNotDispatchedV1::SuppliedAuthorityHeader(field).into());
             }
@@ -169,26 +160,22 @@ impl JourneyControlDispatchRequestV1 {
         Ok(())
     }
 
+    /// The host mounts exactly the three retained provider controls; every
+    /// other provider operation has no host route and is refused here.
     fn payload_contract_id(&self) -> Result<&'static str, JourneyControlDispatchErrorV1> {
         match self.operation {
             ProviderOperation::Health => Ok("tracedecay.memory.provider.health.v1"),
-            ProviderOperation::Feedback => Ok("tracedecay.memory.provider.feedback.v1"),
-            ProviderOperation::Correction => Ok("tracedecay.memory.provider.correction.v1"),
-            ProviderOperation::DeleteBySource => {
-                Ok("tracedecay.memory.provider.deletion-by-source.v1")
-            }
             ProviderOperation::Inspection => Ok("tracedecay.memory.provider.inspection.v1"),
             ProviderOperation::Maintenance => Ok("tracedecay.memory.provider.maintenance.v1"),
-            ProviderOperation::SnapshotExport => {
-                Ok("tracedecay.memory.provider.snapshot-export.v1")
-            }
-            ProviderOperation::SnapshotRestore => {
-                Ok("tracedecay.memory.provider.snapshot-restore.v1")
-            }
-            ProviderOperation::Replay => Ok("tracedecay.memory.provider.replay.v1"),
             ProviderOperation::Handshake
             | ProviderOperation::Observe
-            | ProviderOperation::Recall => {
+            | ProviderOperation::Recall
+            | ProviderOperation::Feedback
+            | ProviderOperation::Correction
+            | ProviderOperation::DeleteBySource
+            | ProviderOperation::SnapshotExport
+            | ProviderOperation::SnapshotRestore
+            | ProviderOperation::Replay => {
                 Err(JourneyControlNotDispatchedV1::UnsupportedOperation(self.operation).into())
             }
         }
@@ -220,12 +207,6 @@ impl JourneyControlDispatchRequestV1 {
         deadline_utc_micros: i64,
         remaining_millis: u64,
     ) -> Result<CanonicalPayload, JourneyControlDispatchErrorV1> {
-        if self.operation == ProviderOperation::Replay
-            && self.operation_body["expected_state_generation"].as_u64()
-                != Some(expected_state_generation)
-        {
-            return Err(JourneyControlNotDispatchedV1::ReplayGenerationMismatch.into());
-        }
         let mut payload = self.operation_body.clone();
         let body = payload
             .as_object_mut()
@@ -416,10 +397,6 @@ impl ProjectObservationJourneyV1 {
                         extensions: Vec::new(),
                     })
                     .map_err(JourneyControlDispatchErrorV1::Contract)?;
-                    let call = match request.history_grant {
-                        Some(grant) => call.with_history_grant(grant),
-                        None => call,
-                    };
                     let reply = registry
                         .invoke_control(&call)
                         .map_err(JourneyControlDispatchErrorV1::Fabric)?;
@@ -462,7 +439,6 @@ mod tests {
             operation_id: "control-operation".to_owned(),
             idempotency_key: Some("original-control-key".to_owned()),
             operation_body: json!({}),
-            history_grant: None,
             policy_revision: 1,
             control: OperationControl::new(
                 tracedecay_contracts::now_micros()
@@ -476,26 +452,26 @@ mod tests {
     }
 
     #[test]
-    fn preflight_admits_only_the_nine_lifecycle_controls() {
+    fn preflight_admits_only_the_three_mounted_provider_controls() {
         for operation in [
-            ProviderOperation::Feedback,
-            ProviderOperation::Correction,
-            ProviderOperation::DeleteBySource,
             ProviderOperation::Health,
             ProviderOperation::Inspection,
             ProviderOperation::Maintenance,
-            ProviderOperation::SnapshotExport,
-            ProviderOperation::SnapshotRestore,
-            ProviderOperation::Replay,
         ] {
             request(operation)
                 .validate_before_readiness("control.original", 7, false)
-                .expect("lifecycle control");
+                .expect("mounted provider control");
         }
         for operation in [
             ProviderOperation::Handshake,
             ProviderOperation::Observe,
             ProviderOperation::Recall,
+            ProviderOperation::Feedback,
+            ProviderOperation::Correction,
+            ProviderOperation::DeleteBySource,
+            ProviderOperation::SnapshotExport,
+            ProviderOperation::SnapshotRestore,
+            ProviderOperation::Replay,
         ] {
             assert!(matches!(
                 request(operation).validate_before_readiness("control.original", 7, false),
@@ -508,7 +484,7 @@ mod tests {
 
     #[test]
     fn preflight_refuses_another_provider_revision_stopping_or_incomplete_scope() {
-        let mut request = request(ProviderOperation::DeleteBySource);
+        let mut request = request(ProviderOperation::Maintenance);
         assert!(matches!(
             request.validate_before_readiness("control.selected-new", 7, false),
             Err(JourneyControlDispatchErrorV1::NotDispatched(
@@ -536,7 +512,7 @@ mod tests {
 
     #[test]
     fn preflight_keeps_the_original_live_cancellation_and_expired_deadline() {
-        let mut request = request(ProviderOperation::SnapshotRestore);
+        let mut request = request(ProviderOperation::Maintenance);
         let original_control = request.control.clone();
         original_control.cancellation().cancel();
         assert!(matches!(

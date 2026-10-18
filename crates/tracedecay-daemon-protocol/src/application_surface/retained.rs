@@ -8,9 +8,7 @@ use tracedecay_contracts::retained_surfaces::{
     FactStoreUpdateRequestV1, LcmDescribeRequestV1, LcmDoctorRequestV1, LcmExpandQueryRequestV1,
     LcmExpandRequestV1, LcmGrepRequestV1, LcmLoadSessionRequestV1, LcmStatusRequestV1,
     MemoryStatusRequestV1, MessageSearchRequestV1, ProviderControlRequestV1,
-    ProviderCorrectionRequestV1, ProviderDeleteBySourceRequestV1, ProviderFeedbackRequestV1,
     ProviderHealthRequestV1, ProviderInspectionRequestV1, ProviderMaintenanceRequestV1,
-    ProviderReplayRequestV1, ProviderSnapshotExportRequestV1, ProviderSnapshotRestoreRequestV1,
     RetainedSurfaceOperation, RetainedSurfaceRequestV1, SessionRefreshActionRequestV1,
     SessionRefreshActionV1, SessionRefreshRequestV1, SessionsForRequestV1, WorkflowsRequestV1,
 };
@@ -44,15 +42,6 @@ pub fn decode_retained_request(
         };
     }
     match operation {
-        RetainedSurfaceOperation::ProviderFeedback => {
-            decode_provider_control!(ProviderFeedbackRequestV1, Feedback)
-        }
-        RetainedSurfaceOperation::ProviderCorrection => {
-            decode_provider_control!(ProviderCorrectionRequestV1, Correction)
-        }
-        RetainedSurfaceOperation::ProviderDeleteBySource => {
-            decode_provider_control!(ProviderDeleteBySourceRequestV1, DeleteBySource)
-        }
         RetainedSurfaceOperation::ProviderHealth => {
             decode_provider_control!(ProviderHealthRequestV1, Health)
         }
@@ -61,15 +50,6 @@ pub fn decode_retained_request(
         }
         RetainedSurfaceOperation::ProviderMaintenance => {
             decode_provider_control!(ProviderMaintenanceRequestV1, Maintenance)
-        }
-        RetainedSurfaceOperation::ProviderSnapshotExport => {
-            decode_provider_control!(ProviderSnapshotExportRequestV1, SnapshotExport)
-        }
-        RetainedSurfaceOperation::ProviderSnapshotRestore => {
-            decode_provider_control!(ProviderSnapshotRestoreRequestV1, SnapshotRestore)
-        }
-        RetainedSurfaceOperation::ProviderReplay => {
-            decode_provider_control!(ProviderReplayRequestV1, Replay)
         }
         RetainedSurfaceOperation::FactStoreCurate => {
             decode!(FactStoreCurateRequestV1, FactStoreCurate)
@@ -167,21 +147,8 @@ mod tests {
 
     #[test]
     fn all_provider_bodies_enter_the_unified_typed_control_request() {
-        let source = json!({"trace_ref":"trace.retained.1","item_ref":"item.1","observation_id":"observation.1"});
         let state = json!({"kind":"canonical_session","provider_id":"native","registration_revision":7,"canonical_provider_id":"codex","session_id":"session.1"});
         let cases = [
-            (
-                RetainedSurfaceOperation::ProviderFeedback,
-                json!({"source":source,"signal":"helpful","weight":"1","evidence_refs":[],"occurred_at":1}),
-            ),
-            (
-                RetainedSurfaceOperation::ProviderCorrection,
-                json!({"source":source,"expected_source_revision":"revision.1","correction":{"kind":"mark_incorrect","revoked_at":1},"reason":"canonical correction","evidence_refs":[]}),
-            ),
-            (
-                RetainedSurfaceOperation::ProviderDeleteBySource,
-                json!({"source":source,"mode":"remove_influence","expected_fence_revision":0,"include_snapshots":true}),
-            ),
             (
                 RetainedSurfaceOperation::ProviderHealth,
                 json!({"state":state,"requested_checks":["state"]}),
@@ -193,18 +160,6 @@ mod tests {
             (
                 RetainedSurfaceOperation::ProviderMaintenance,
                 json!({"state":state,"task":"validate_state","maximum_items":1,"maximum_bytes":4096,"maximum_duration_millis":1000,"dry_run":true}),
-            ),
-            (
-                RetainedSurfaceOperation::ProviderSnapshotExport,
-                json!({"state":state,"maximum_bytes":4096}),
-            ),
-            (
-                RetainedSurfaceOperation::ProviderSnapshotRestore,
-                json!({"state":state,"snapshot_ref":"snapshot.host.1","expected_state_generation":3}),
-            ),
-            (
-                RetainedSurfaceOperation::ProviderReplay,
-                json!({"state":state,"observation_batch_refs":["batch.host.1"],"first_source_sequence":1,"last_source_sequence":1,"expected_state_generation":3,"expected_previous_acknowledged_sequence":0}),
             ),
         ];
         for (operation, body) in cases {
@@ -225,11 +180,11 @@ mod tests {
                 decode_retained_request(operation, injected).expect_err("closed concrete body");
             assert!(error.to_string().contains("caller_authority"));
         }
-        let invalid_source = json!({"source":{"trace_ref":"trace.retained.1","item_ref":"item.1","observation_id":42},"signal":"helpful","weight":"1","evidence_refs":[],"occurred_at":1});
+        let invalid_state = json!({"state":{"kind":"canonical_session","provider_id":"native","registration_revision":7,"canonical_provider_id":"codex","session_id":42},"requested_checks":["state"]});
         let error =
-            decode_retained_request(RetainedSurfaceOperation::ProviderFeedback, invalid_source)
+            decode_retained_request(RetainedSurfaceOperation::ProviderHealth, invalid_state)
                 .expect_err("wrong nested field type");
-        assert!(error.to_string().contains("source.observation_id"));
+        assert!(error.to_string().contains("state"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! Application outcomes derived from witnessed provider execution and host intent.
+//! Application outcomes derived from witnessed provider execution.
 //!
-//! Hashing evidence names what was observed; it does not persist a new receipt,
-//! confirm an unobserved provider effect, or turn a source fence into erasure.
+//! Hashing evidence names what was observed; it does not persist a new receipt
+//! or confirm an unobserved provider effect.
 
 use serde::Serialize;
 use tracedecay_contracts::retained_surfaces::*;
@@ -14,7 +14,6 @@ use tracedecay_contracts::{
     measured_budget, now_micros,
 };
 use tracedecay_domain::{ComponentVersion, ManifestDigest, UtcMicros, canonical_sha256};
-use tracedecay_memory_observation::ProviderSourceIntentReceiptV1;
 use tracedecay_memory_provider_registry::{
     ProviderCall, ProviderReply, TerminalCode, TerminalRecord,
 };
@@ -26,11 +25,10 @@ use super::super::cognitive_recall::control_attribution::{
 use super::super::observation_journey::control_dispatch::{
     JourneyControlDispatchErrorV1, JourneyControlNotDispatchedV1,
 };
-use super::super::provider_history::ProviderHistoryErrorV1;
-use super::feedback_receipt::AcceptedDeletionCommandV1;
+use super::authority::ControlAuthorityErrorV1;
 use super::{
-    AuthorizedControlSourceV1, CompletedProviderControlV1, ControlFailureStageV1, ControlFailureV1,
-    ControlInvocationV1, ControlOperationIdentityV1, ControlResult, projection,
+    CompletedProviderControlV1, ControlFailureStageV1, ControlFailureV1,
+    ControlOperationIdentityV1, ControlResult, projection,
 };
 
 type OutcomeResult<T> = Result<T, RetainedSurfaceExecutionErrorV1>;
@@ -48,8 +46,7 @@ pub(super) fn assemble_outcome(
     // A successful no-effect reply is only representable as NoChange when its
     // actual operation receipt proves unchanged generation and operation state.
     // Retain the original identity on a malformed post-contact response.
-    if completed.host_receipt.is_none()
-        && retained_surface_operation_is_effect(request.operation())
+    if retained_surface_operation_is_effect(request.operation())
         && completed.result.effect.state == ProviderControlEffectStateV1::None
         && matches!(
             completed.result.terminal,
@@ -75,81 +72,8 @@ pub(super) fn assemble_outcome(
     if retained_surface_operation_is_effect(request.operation()) {
         effect_outcome(context, request, completed, configuration_digest)
     } else {
-        if completed.host_receipt.is_some() {
-            return Err(invalid_field("host effect on a provider read"));
-        }
         read_outcome(context, request, completed.result)
     }
-}
-
-/// The same projected receipt is placed in the deletion data and outer effect.
-/// Its proof is the actual persisted host intent, not a provider response.
-pub(super) fn deletion_intent_receipt(
-    invocation: &ControlInvocationV1<'_, '_>,
-    source: &AuthorizedControlSourceV1,
-    accepted: &AcceptedDeletionCommandV1,
-    intent: &ProviderSourceIntentReceiptV1,
-    configuration_digest: &ManifestDigest,
-) -> ControlResult<EffectReceipt> {
-    let ProviderControlRequestV1::DeleteBySource(request) = invocation.request else {
-        return Err(invalid_field("deletion receipt request operation").into());
-    };
-    let original = &source.granted_source()?.attribution;
-    if !accepted
-        .matches(
-            invocation.context.request_context,
-            request,
-            &source.target,
-            original,
-        )
-        .map_err(|_| invalid_field("accepted deletion command binding"))?
-        || intent.operation_id != accepted.operation_id()
-        || intent.fence.provider_id != source.target.provider_id.as_str()
-        || intent.fence.original_source_sha256
-            != super::super::provider_history::original_source_fence_digest(original)?
-        || !matches!(
-            intent.fence.mode.as_str(),
-            "remove_influence" | "anonymize" | "hard_delete"
-        )
-        || (request.mode == ProviderControlDeletionModeV1::HardDelete
-            && intent.fence.mode != "hard_delete")
-        || (request.mode == ProviderControlDeletionModeV1::Anonymize
-            && intent.fence.mode == "remove_influence")
-        || intent.fence.authority_ref != accepted.operation_id()
-        || intent.fence.admitted_source_revision.is_some()
-        || intent.fence.deleted_source_revision != source.target.source.source_revision
-        || intent.fence.revision != request.expected_fence_revision.checked_add(1).unwrap_or(0)
-        || intent.fence.accepted_at_utc_micros != accepted.accepted_at().0
-        || intent.provider_erasure_verified
-    {
-        return Err(invalid_field("stored deletion intent binding").into());
-    }
-    let expected_state = digest(&(
-        "tracedecay.provider-control.host-intent.expected.v1",
-        &source.authorized.retained.scope.provider_id.as_str(),
-        source.authorized.retained.scope.registration_revision,
-        projection::scope(&source.target.delivery_scope),
-        &intent.fence.original_source_sha256,
-        request.expected_fence_revision,
-    ))?;
-    let committed_state = digest(&(
-        "tracedecay.provider-control.host-intent.committed.v1",
-        intent,
-    ))?;
-    receipt(
-        invocation.context,
-        invocation.request,
-        &source.authorized.retained.scope,
-        &ControlOperationIdentityV1 {
-            operation_id: accepted.operation_id().to_owned(),
-            idempotency_key: Some(accepted.idempotency_key().to_owned()),
-        },
-        configuration_digest,
-        expected_state,
-        EffectTermination::Completed,
-        Some(committed_state),
-    )
-    .map_err(Into::into)
 }
 
 /// Used only with independently resolved state and an existing operation ID.
@@ -164,7 +88,6 @@ pub(super) fn result_after_failure(
     let (terminal, possible_effect) = failure_terminal(failure, mutation);
     let received_terminal = match failure {
         ControlFailureStageV1::Projection { dispatched, .. }
-        | ControlFailureStageV1::PortabilityArtifact { dispatched, .. }
             if dispatched.call.provider_id == state.provider_id
                 && dispatched.call.registration_revision == state.registration_revision
                 && dispatched.call.exact_scope == state.delivery_scope
@@ -223,10 +146,7 @@ fn completed_failure(
     request: &ProviderControlRequestV1,
     failure: ControlFailureV1,
 ) -> OutcomeResult<CompletedProviderControlV1> {
-    let ControlFailureV1 {
-        stage,
-        host_receipt,
-    } = failure;
+    let ControlFailureV1 { stage } = failure;
     let result = match &stage {
         ControlFailureStageV1::Offline {
             state, identity, ..
@@ -234,12 +154,10 @@ fn completed_failure(
         | ControlFailureStageV1::Dispatch {
             state, identity, ..
         }
-        | ControlFailureStageV1::DispatchWorker { state, identity }
-        | ControlFailureStageV1::HostIntentUnknown {
-            state, identity, ..
-        } => result_after_failure(request, state, identity, &stage),
-        ControlFailureStageV1::Projection { dispatched, .. }
-        | ControlFailureStageV1::PortabilityArtifact { dispatched, .. } => {
+        | ControlFailureStageV1::DispatchWorker { state, identity } => {
+            result_after_failure(request, state, identity, &stage)
+        }
+        ControlFailureStageV1::Projection { dispatched, .. } => {
             let state = RetainedRecallControlScopeV1 {
                 provider_id: dispatched.call.provider_id.clone(),
                 registration_revision: dispatched.call.registration_revision,
@@ -253,10 +171,7 @@ fn completed_failure(
         }
         _ => return Err(pre_dispatch_error(stage)),
     };
-    Ok(CompletedProviderControlV1 {
-        result,
-        host_receipt,
-    })
+    Ok(CompletedProviderControlV1 { result })
 }
 
 fn pre_dispatch_error(stage: ControlFailureStageV1) -> RetainedSurfaceExecutionErrorV1 {
@@ -274,10 +189,10 @@ fn pre_dispatch_error(stage: ControlFailureStageV1) -> RetainedSurfaceExecutionE
             error => RetainedSurfaceExecutionErrorV1::unavailable(error.to_string()),
         },
         ControlFailureStageV1::Authority(error) => match error {
-            ProviderHistoryErrorV1::Ineligible(_) | ProviderHistoryErrorV1::ClaimMismatch(_) => {
+            ControlAuthorityErrorV1::Ineligible(_) | ControlAuthorityErrorV1::ClaimMismatch(_) => {
                 RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized
             }
-            ProviderHistoryErrorV1::Control(code) => pre_dispatch_control(code),
+            ControlAuthorityErrorV1::Control(code) => pre_dispatch_control(code),
             error => RetainedSurfaceExecutionErrorV1::unavailable(error.to_string()),
         },
         ControlFailureStageV1::Control(code) => pre_dispatch_control(code),
@@ -312,17 +227,8 @@ fn failure_terminal(
 ) -> (ProviderControlTerminalV1, bool) {
     use ProviderControlTerminalV1 as Terminal;
     match stage {
-        ControlFailureStageV1::HostIntentUnknown { .. } => (Terminal::EffectUnknown, true),
         ControlFailureStageV1::Offline { .. } => (Terminal::ProviderUnavailable, false),
         ControlFailureStageV1::Projection { .. } => (Terminal::ContractViolation, mutation),
-        ControlFailureStageV1::PortabilityArtifact { .. } => (
-            if mutation {
-                Terminal::EffectUnknown
-            } else {
-                Terminal::InternalFailure
-            },
-            mutation,
-        ),
         ControlFailureStageV1::DispatchWorker { .. } => (
             if mutation {
                 Terminal::EffectUnknown
@@ -389,10 +295,10 @@ fn failure_terminal(
         ),
         ControlFailureStageV1::Authority(error) => (
             match error {
-                ProviderHistoryErrorV1::Ineligible(_)
-                | ProviderHistoryErrorV1::ClaimMismatch(_) => Terminal::Unauthorized,
-                ProviderHistoryErrorV1::Control(code) => terminal(*code),
-                ProviderHistoryErrorV1::Unavailable(_) => Terminal::ProviderUnavailable,
+                ControlAuthorityErrorV1::Ineligible(_)
+                | ControlAuthorityErrorV1::ClaimMismatch(_) => Terminal::Unauthorized,
+                ControlAuthorityErrorV1::Control(code) => terminal(*code),
+                ControlAuthorityErrorV1::Unavailable(_) => Terminal::ProviderUnavailable,
             },
             false,
         ),
@@ -415,17 +321,11 @@ fn failure_terminal(
 
 fn failure_notice(stage: &ControlFailureStageV1) -> &'static str {
     match stage {
-        ControlFailureStageV1::HostIntentUnknown { .. } => {
-            "host: deletion intent was attempted but its durable receipt could not be confirmed; reconcile the same operation"
-        }
         ControlFailureStageV1::Offline { .. } => {
             "host: the producing provider registration is unavailable for this control"
         }
         ControlFailureStageV1::Projection { .. } => {
             "host: the provider reply failed control-result validation; possible effects remain unconfirmed"
-        }
-        ControlFailureStageV1::PortabilityArtifact { .. } => {
-            "host: the provider replied but its portability artifact could not be durably confirmed"
         }
         ControlFailureStageV1::DispatchWorker { .. } => {
             "host: the control worker ended without a witnessed result"
@@ -441,13 +341,6 @@ fn terminal(code: TerminalCode) -> ProviderControlTerminalV1 {
 
 fn absent_operation_result(request: &ProviderControlRequestV1) -> ProviderControlOperationResultV1 {
     match request {
-        ProviderControlRequestV1::Feedback(_) => ProviderControlOperationResultV1::Feedback(None),
-        ProviderControlRequestV1::Correction(_) => {
-            ProviderControlOperationResultV1::Correction(None)
-        }
-        ProviderControlRequestV1::DeleteBySource(_) => {
-            ProviderControlOperationResultV1::DeleteBySource(None)
-        }
         ProviderControlRequestV1::Health(_) => ProviderControlOperationResultV1::Health(None),
         ProviderControlRequestV1::Inspection(_) => {
             ProviderControlOperationResultV1::Inspection(None)
@@ -455,13 +348,6 @@ fn absent_operation_result(request: &ProviderControlRequestV1) -> ProviderContro
         ProviderControlRequestV1::Maintenance(_) => {
             ProviderControlOperationResultV1::Maintenance(None)
         }
-        ProviderControlRequestV1::SnapshotExport(_) => {
-            ProviderControlOperationResultV1::SnapshotExport(None)
-        }
-        ProviderControlRequestV1::SnapshotRestore(_) => {
-            ProviderControlOperationResultV1::SnapshotRestore(None)
-        }
-        ProviderControlRequestV1::Replay(_) => ProviderControlOperationResultV1::Replay(None),
     }
 }
 
@@ -498,29 +384,12 @@ fn effect_outcome(
     configuration_digest: &ManifestDigest,
 ) -> OutcomeResult<ApplicationOutcome<RetainedSurfaceResultV1>> {
     let result = completed.result;
-    let cancellation_stage = if completed.host_receipt.is_none()
-        && result.effect.state == ProviderControlEffectStateV1::None
-    {
+    let cancellation_stage = if result.effect.state == ProviderControlEffectStateV1::None {
         CancellationStage::BeforeEffect
     } else {
         CancellationStage::EffectInFlight
     };
-    let effect_receipt = if let Some(receipt) = completed.host_receipt {
-        if !matches!(request, ProviderControlRequestV1::DeleteBySource(_))
-            || receipt.outcome != EffectTermination::Completed
-        {
-            return Err(invalid_field("host intent effect operation"));
-        }
-        receipt.validate().map_err(invalid_outcome)?;
-        if let ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = &result.result {
-            if deletion.intent.host_receipt != receipt {
-                return Err(invalid_field(
-                    "deletion inner and outer host intent receipts",
-                ));
-            }
-        }
-        receipt
-    } else {
+    let effect_receipt = {
         let termination = effect_termination(&result)?;
         let before = mutation_receipt(&result.result)
             .map(|receipt| receipt.state_generation_before)
@@ -653,25 +522,11 @@ fn verified_no_change(result: &ProviderControlResultV1) -> bool {
         return false;
     }
     match &result.result {
-        ProviderControlOperationResultV1::Feedback(Some(value)) => {
-            value.signal == ProviderControlFeedbackSignalV1::Ignored
-        }
-        ProviderControlOperationResultV1::Correction(Some(value)) => {
-            value.affected_provider_effects == 0
-        }
         ProviderControlOperationResultV1::Maintenance(Some(value)) => {
             (value.dry_run || (value.changed_items == 0 && value.removed_items == 0))
                 && value.state_changed != Some(true)
                 && !value.partial
         }
-        ProviderControlOperationResultV1::SnapshotRestore(Some(_)) => true,
-        ProviderControlOperationResultV1::Replay(Some(value)) => {
-            value.applied_observations == 0
-                && value.rejected_observations == 0
-                && value.effect_unknown_observations == 0
-                && !value.partial
-        }
-        // Deletion is the distinct durable host intent, even when provider state is unchanged.
         _ => false,
     }
 }
@@ -680,17 +535,7 @@ fn mutation_receipt(
     result: &ProviderControlOperationResultV1,
 ) -> Option<&ProviderControlMutationReceiptV1> {
     match result {
-        ProviderControlOperationResultV1::Feedback(Some(value)) => Some(&value.receipt),
-        ProviderControlOperationResultV1::Correction(Some(value)) => Some(&value.receipt),
         ProviderControlOperationResultV1::Maintenance(Some(value)) => Some(&value.receipt),
-        ProviderControlOperationResultV1::SnapshotRestore(Some(value)) => Some(&value.receipt),
-        ProviderControlOperationResultV1::Replay(Some(value)) => Some(&value.receipt),
-        ProviderControlOperationResultV1::DeleteBySource(Some(value)) => match &value.erasure {
-            ProviderControlErasureV1::Verified { receipt, .. }
-            | ProviderControlErasureV1::RetainedUnderLock { receipt, .. } => Some(receipt),
-            ProviderControlErasureV1::Failed { receipt, .. } => receipt.as_ref(),
-            ProviderControlErasureV1::Pending { .. } => None,
-        },
         _ => None,
     }
 }
@@ -1071,10 +916,7 @@ mod tests {
         let output = assemble_outcome(
             &context,
             &request,
-            Ok(CompletedProviderControlV1 {
-                result,
-                host_receipt: None,
-            }),
+            Ok(CompletedProviderControlV1 { result }),
             &ManifestDigest::new(format!("sha256:{}", "d".repeat(64))).unwrap(),
         )
         .unwrap();
@@ -1151,8 +993,8 @@ mod tests {
                 ProviderControlTerminalV1::Conflict,
             ),
             (
-                ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Ineligible(
-                    "current canonical source",
+                ControlFailureStageV1::Authority(ControlAuthorityErrorV1::Ineligible(
+                    "registered canonical session missing",
                 )),
                 ProviderControlTerminalV1::Unauthorized,
             ),
@@ -1199,10 +1041,9 @@ mod tests {
             &request(),
             &state(),
             &identity(),
-            &ControlFailureStageV1::HostIntentUnknown {
+            &ControlFailureStageV1::DispatchWorker {
                 state: state(),
                 identity: identity(),
-                detail: "exact durable receipt unavailable",
             },
         );
         let unknown = assembled(unresolved);
@@ -1235,7 +1076,7 @@ mod tests {
             retained
                 .warnings
                 .iter()
-                .any(|warning| { warning.contains("durable receipt could not be confirmed") })
+                .any(|warning| { warning.contains("ended without a witnessed result") })
         );
 
         let mut committed = unchanged_result();
@@ -1399,7 +1240,7 @@ mod tests {
     fn multi_item_inspection_outcome_preserves_actual_page_and_cursor() {
         let maintenance = request();
         let mut request = ProviderControlRequestV1::Inspection(ProviderInspectionRequestV1 {
-            state: maintenance.state_selector().unwrap().clone(),
+            state: maintenance.state_selector().clone(),
             selection: ProviderControlInspectionSelectorV1::CapabilityStatus,
             maximum_items: 2,
             maximum_bytes: 65_536,
@@ -1433,7 +1274,6 @@ mod tests {
             result.result =
                 ProviderControlOperationResultV1::Inspection(Some(ProviderInspectionResultV1 {
                     selection: ProviderControlInspectionSelectorV1::CapabilityStatus,
-                    evidence_origin: ProviderControlInspectionEvidenceOriginV1::ProviderRuntime,
                     items: ProviderControlInspectionItemsV1::CapabilityStatus(vec![
                         ProviderControlCapabilityStatusV1 {
                             capability_id: "memory.recall".to_owned(),
@@ -1451,14 +1291,13 @@ mod tests {
                     },
                     next_cursor: cursor.clone(),
                     redactions: Vec::new(),
-                    state_generation: Some(5),
+                    state_generation: 5,
                 }));
             let output = assemble_outcome(
                 &context,
                 &request,
                 Ok(CompletedProviderControlV1 {
                     result: result.clone(),
-                    host_receipt: None,
                 }),
                 &configuration,
             )
@@ -1499,7 +1338,6 @@ mod tests {
             &request,
             Ok(CompletedProviderControlV1 {
                 result: result.clone(),
-                host_receipt: None,
             }),
             &configuration,
         )
@@ -1525,10 +1363,7 @@ mod tests {
             assemble_outcome(
                 &context,
                 &request,
-                Ok(CompletedProviderControlV1 {
-                    result,
-                    host_receipt: None,
-                }),
+                Ok(CompletedProviderControlV1 { result }),
                 &configuration
             )
             .is_err(),

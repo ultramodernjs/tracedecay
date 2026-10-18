@@ -1,25 +1,22 @@
 //! Real provider-control journeys over the Claude/Codex host fixture.
 //!
-//! Every selector below is taken from the preceding production recall result.
-//! Read requests use the shipped `tracedecay tool` surface; mutation retries
-//! stay on the authenticated daemon RPC so the test can hold their request
-//! identity stable across a daemon restart. Every refusal is asserted from the
-//! typed application outcome.
+//! The provider namespace is selected by a canonical session the journey's
+//! hooks actually committed. Read requests use the shipped
+//! `tracedecay tool` surface; the maintenance mutation stays on the
+//! authenticated daemon RPC so the test holds its request identity. Every
+//! refusal is asserted from the typed application outcome.
 
 use super::*;
-use std::fs;
 use std::path::PathBuf;
 
 use tracedecay_contracts::result::ApplicationProblem;
 use tracedecay_contracts::retained_surfaces::{
-    ProviderControlCorrectionV1, ProviderControlDeletionModeV1,
-    ProviderControlDeletionVerificationV1, ProviderControlEffectStateV1, ProviderControlErasureV1,
-    ProviderControlFeedbackSignalV1, ProviderControlHealthCheckV1,
-    ProviderControlMaintenanceTaskV1, ProviderControlOperationResultV1, ProviderControlRequestV1,
-    ProviderControlResultV1, ProviderControlSourceSelectorV1, ProviderControlStateSelectorV1,
-    ProviderControlTerminalV1, ProviderCorrectionRequestV1, ProviderDeleteBySourceRequestV1,
-    ProviderFeedbackRequestV1, ProviderHealthRequestV1, ProviderMaintenanceRequestV1,
-    RetainedSurfaceRequestV1, RetainedSurfaceResultV1, retained_surface_operation_is_effect,
+    ProviderControlEffectStateV1, ProviderControlHealthCheckV1, ProviderControlInspectionItemsV1,
+    ProviderControlInspectionSelectorV1, ProviderControlMaintenanceTaskV1,
+    ProviderControlOperationResultV1, ProviderControlRequestV1, ProviderControlResultV1,
+    ProviderControlStateSelectorV1, ProviderControlTerminalV1, ProviderHealthRequestV1,
+    ProviderInspectionRequestV1, ProviderMaintenanceRequestV1, RetainedSurfaceRequestV1,
+    RetainedSurfaceResultV1, retained_surface_operation_is_effect,
 };
 use tracedecay_contracts::{
     ApplicationOutcome, CancellationSignal, Deadline, RequestId, now_micros,
@@ -33,169 +30,35 @@ use tracedecay_daemon_protocol::{
 use tracedecay_domain::UtcMicros;
 
 const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
-const FAULTY_NATIVE_JOURNAL: &str = JOURNAL_FILE_NAME;
-const STALE_SOURCE_REVISION: &str = "stale-source-revision";
 
-#[derive(Clone, Debug)]
-struct RecalledSource {
-    selector: ProviderControlSourceSelectorV1,
-    source_revision: Option<String>,
-}
-
-/// Runs after the normal host journey has proved the selected provider can
-/// recall all four canonical messages across one restart.
-pub(super) fn assert_provider_control_journeys(
-    journey: &mut ClaudeHostJourney,
-    session_id: &str,
-    recalled_stdout: &[u8],
-    cross_scope_stdout: &[u8],
-) {
-    let (source, state) = source_and_state(journey, recalled_stdout, session_id, true);
-    let (cross_scope_source, _) =
-        source_and_state(journey, cross_scope_stdout, journey.session_id(), false);
+/// Runs after the host journey. Provider controls address only providers with
+/// a mounted observation journey; Native owns none and is refused typed. The
+/// provider namespace is the canonical session's, under the registration the
+/// routing policy pinned (every production registration is revision 1).
+pub(super) fn assert_provider_control_journeys(journey: &mut ClaudeHostJourney, session_id: &str) {
+    let state = ProviderControlStateSelectorV1::CanonicalSession {
+        provider_id: journey.active_provider.id().to_owned(),
+        registration_revision: 1,
+        canonical_provider_id: if journey.codex { "codex" } else { "claude" }.to_owned(),
+        session_id: session_id.to_owned(),
+    };
+    if !journey.active_provider.is_ncm() {
+        assert_unmounted_provider_controls_are_refused(journey, &state);
+        return;
+    }
 
     assert_health(journey, &state, "health.before-controls");
-    assert_feedback_idempotency(journey, &source.selector);
+    assert_state_summary(journey, &state);
     let generation_before_maintenance = assert_health(journey, &state, "health.before-maintenance");
     assert_maintenance(journey, &state, generation_before_maintenance);
 
     // Maintenance is a durable provider operation. A fresh daemon and a real
-    // SessionStart must leave the retained source recallable.
+    // SessionStart must leave the provider answering the recall lane.
     let after_maintenance = restart_and_recall(journey, session_id);
     assert_answered_lane(&after_maintenance, journey.active_provider.id());
-    assert_lane_contains_source(&after_maintenance, &source.selector);
 
-    assert_correction_revision_refusal(journey, &source);
-    assert_wrong_selector_is_hidden_as_missing_grant(
-        journey,
-        &source.selector,
-        &cross_scope_source.selector,
-        &state,
-    );
-
-    // Exercise the typed unavailable advisory lane through the real Native
-    // mount fault seam, then restore the same journal and prove recovery.
-    assert_provider_unavailable_fallback_and_recovery(journey, session_id, &source.selector);
-
-    // Deletion is last because the final restart/recall assertion must prove
-    // that this exact source cannot resurrect after a provider restart.
-    assert_delete_by_source_non_resurrection(journey, session_id, &source.selector);
-}
-
-fn source_and_state(
-    journey: &ClaudeHostJourney,
-    recalled_stdout: &[u8],
-    session_id: &str,
-    require_revision: bool,
-) -> (RecalledSource, ProviderControlStateSelectorV1) {
-    let outer: Value =
-        serde_json::from_slice(recalled_stdout).expect("real context stdout must be JSON");
-    let answer = super::join_content_text(&outer)
-        .map(|text| serde_json::from_str::<Value>(&text).expect("context content JSON"))
-        .unwrap_or(outer);
-    let lane = super::advisory_lane(&answer).expect("real recall must carry provider lane");
-    let provider_id = lane["provider_id"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .expect("recall lane provider id")
-        .to_owned();
-    let registration_revision = lane["registration_revision"]
-        .as_u64()
-        .filter(|value| *value > 0)
-        .expect("recall lane registration revision");
-    let canonical_provider_id = if journey.codex { "codex" } else { "claude" };
-    let trace_ref = lane["recall_trace"]["trace_ref"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .expect("recall trace selector")
-        .to_owned();
-    let candidate = lane["candidates"]
-        .as_array()
-        .and_then(|candidates| {
-            candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate["provenance_evidence"]["sources"]
-                        .as_array()
-                        .is_some_and(|sources| !sources.is_empty())
-                })
-                .find(|candidate| {
-                    candidate["provenance_evidence"]["sources"]
-                        .as_array()
-                        .is_some_and(|sources| {
-                            sources
-                                .iter()
-                                .any(|source| source["source"]["source_revision"].is_string())
-                        })
-                })
-                .or_else(|| {
-                    candidates.iter().find(|candidate| {
-                        candidate["provenance_evidence"]["sources"]
-                            .as_array()
-                            .is_some_and(|sources| !sources.is_empty())
-                    })
-                })
-        })
-        .expect("recall must expose a canonical source candidate");
-    let evidence = &candidate["provenance_evidence"];
-    assert_eq!(evidence["recall"]["trace_ref"], trace_ref);
-    let item_ref = evidence["recall"]["item_ref"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .expect("recall item selector")
-        .to_owned();
-    let source = evidence["sources"]
-        .as_array()
-        .and_then(|sources| {
-            sources
-                .iter()
-                .find(|source| source["source"]["source_revision"].is_string())
-                .or_else(|| sources.first())
-        })
-        .expect("canonical source evidence");
-    let expected_provider = if journey.codex { "codex" } else { "claude" };
-    assert_eq!(
-        source["source"]["canonical_provider_id"], expected_provider,
-        "provider-control selector must retain the recalled host identity"
-    );
-    assert_eq!(
-        source["source"]["canonical_session_id"],
-        journey.session_id(),
-        "provider-control selector must retain the recalled origin session"
-    );
-    let observation_id = source["source"]["observation_id"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .expect("observation selector")
-        .to_owned();
-    let source_revision = source["source"]["source_revision"]
-        .as_str()
-        .map(str::to_owned);
-    if require_revision {
-        assert_eq!(
-            source_revision.as_deref(),
-            Some(super::REVISION_FIXTURE_REVISION),
-            "provider controls must target the producer fixture with a canonical source revision"
-        );
-    }
-    let selector = ProviderControlSourceSelectorV1 {
-        trace_ref,
-        item_ref,
-        observation_id,
-    };
-    let state = ProviderControlStateSelectorV1::CanonicalSession {
-        provider_id,
-        registration_revision,
-        canonical_provider_id: canonical_provider_id.to_owned(),
-        session_id: session_id.to_owned(),
-    };
-    (
-        RecalledSource {
-            selector,
-            source_revision,
-        },
-        state,
-    )
+    assert_wrong_selectors_are_refused(journey, &state);
+    assert_ncm_unavailable_fallback_and_recovery(journey, session_id);
 }
 
 fn invoke(
@@ -267,7 +130,7 @@ fn typed_result(response: &DaemonInvocationResponse) -> ProviderControlResultV1 
         DaemonInvocationOutcome::RetainedApplication { outcome, .. } => match outcome {
             ApplicationOutcome::Evidence(packet) => packet.payload.as_ref(),
             ApplicationOutcome::Effect(effect) => effect.payload.as_ref(),
-            ApplicationOutcome::Preview(_) => None,
+            ApplicationOutcome::Preview(_) | ApplicationOutcome::Result(_) => None,
         },
         DaemonInvocationOutcome::RetainedApplicationProblem { problem, .. } => {
             panic!(
@@ -307,31 +170,13 @@ fn typed_tool_result(
     })
 }
 
-fn assert_outer_problem(response: &DaemonInvocationResponse, expected: &str) {
+fn assert_outer_problem(response: &DaemonInvocationResponse) {
     match &response.outcome {
-        DaemonInvocationOutcome::RetainedApplicationProblem { problem, .. } => match expected {
-            "missing-grant" => assert!(
-                matches!(problem, ApplicationProblem::NotFoundOrNotAuthorized { .. }),
-                "wrong selector must be hidden as missing grant: {problem:?}"
-            ),
-            "conflict" => assert!(
-                matches!(
-                    problem,
-                    ApplicationProblem::Conflict { .. } | ApplicationProblem::Stale { .. }
-                ),
-                "stale correction must be a typed conflict/refusal: {problem:?}"
-            ),
-            other => panic!("unknown expected problem {other}"),
-        },
-        DaemonInvocationOutcome::RetainedApplication { .. } if expected == "conflict" => {
-            let result = typed_result(response);
-            assert_eq!(
-                result.terminal,
-                ProviderControlTerminalV1::Conflict,
-                "stale correction must retain typed conflict: {result:?}"
-            );
-        }
-        other => panic!("expected typed application refusal {expected}, got {other:?}"),
+        DaemonInvocationOutcome::RetainedApplicationProblem { problem, .. } => assert!(
+            matches!(problem, ApplicationProblem::NotFoundOrNotAuthorized { .. }),
+            "a selector outside this project's session store must be hidden as a missing grant: {problem:?}"
+        ),
+        other => panic!("expected a typed missing-grant refusal, got {other:?}"),
     }
 }
 
@@ -379,6 +224,33 @@ fn assert_health(
         "{label} must report a ready provider: {health:?}"
     );
     health.state_generation
+}
+
+fn assert_state_summary(journey: &ClaudeHostJourney, state: &ProviderControlStateSelectorV1) {
+    let result = typed_tool_result(
+        journey,
+        "tracedecay_provider_inspection",
+        serde_json::to_value(ProviderInspectionRequestV1 {
+            state: state.clone(),
+            selection: ProviderControlInspectionSelectorV1::StateSummary,
+            maximum_items: 16,
+            maximum_bytes: 65_536,
+            cursor: None,
+        })
+        .expect("provider inspection request JSON"),
+    );
+    assert_success(&result, "inspection.state-summary");
+    let ProviderControlOperationResultV1::Inspection(Some(inspection)) = &result.result else {
+        panic!("state summary must include typed inspection evidence: {result:?}");
+    };
+    assert!(
+        matches!(
+            inspection.items,
+            ProviderControlInspectionItemsV1::StateSummary(_)
+        ),
+        "state summary must answer its own view: {inspection:?}"
+    );
+    assert_eq!(result.effect.state, ProviderControlEffectStateV1::None);
 }
 
 fn assert_maintenance(
@@ -475,278 +347,10 @@ fn assert_maintenance(
     );
 }
 
-fn assert_feedback_idempotency(
-    journey: &mut ClaudeHostJourney,
-    selector: &ProviderControlSourceSelectorV1,
-) {
-    let request = ProviderControlRequestV1::Feedback(ProviderFeedbackRequestV1 {
-        source: selector.clone(),
-        signal: ProviderControlFeedbackSignalV1::Helpful,
-        weight: "1".to_owned(),
-        evidence_refs: Vec::new(),
-        occurred_at: now_micros(),
-    });
-    let request_id = "host-provider-control.feedback.idempotent";
-    let first_response =
-        invoke(journey, request_id, request.clone()).expect("feedback RPC transport");
-    let first = typed_result(&first_response);
-    assert_success(&first, "feedback");
-    let ProviderControlOperationResultV1::Feedback(Some(first_feedback)) = &first.result else {
-        panic!("feedback must include typed provider evidence: {first:?}");
-    };
-    assert_eq!(&first_feedback.source, selector);
-    assert_eq!(
-        &first_feedback.target.source.observation_id,
-        &selector.observation_id
-    );
-    assert_eq!(
-        first.effect.state,
-        ProviderControlEffectStateV1::Committed,
-        "first feedback attempt must commit its provider effect: {first:?}"
-    );
-    assert!(
-        first_feedback.receipt.state_generation_after
-            > first_feedback.receipt.state_generation_before,
-        "first feedback must advance provider state: {:?}",
-        first_feedback.receipt
-    );
-    assert_eq!(
-        first.effect.state_generation_before,
-        Some(first_feedback.receipt.state_generation_before)
-    );
-    assert_eq!(
-        first.effect.state_generation_after,
-        Some(first_feedback.receipt.state_generation_after)
-    );
-    assert_eq!(
-        first.effect.provider_receipt_digest.as_deref(),
-        Some(first_feedback.receipt.provider_receipt_digest.as_str())
-    );
-    assert!(
-        first.effect.verification_digest.is_some(),
-        "first feedback must retain verification evidence: {first:?}"
-    );
-
-    // A new daemon process must recover the same provider operation before the
-    // exact same request is replayed. This is the persistence half of the
-    // exactly-once assertion; an in-memory duplicate would not be enough.
-    journey.stop_daemon();
-    journey.start_daemon();
-    journey.await_startup_history();
-
-    let duplicate = invoke(journey, request_id, request).expect("duplicate feedback RPC transport");
-    let duplicate = typed_result(&duplicate);
-    assert_success(&duplicate, "duplicate feedback");
-    let ProviderControlOperationResultV1::Feedback(Some(duplicate_feedback)) = &duplicate.result
-    else {
-        panic!("duplicate feedback must retain typed provider evidence: {duplicate:?}");
-    };
-    assert_eq!(
-        duplicate.effect.state,
-        ProviderControlEffectStateV1::Duplicate,
-        "same feedback identity must be reported as a duplicate: {duplicate:?}"
-    );
-    assert_eq!(
-        duplicate.effect.duplicate_of_idempotency_key, first.idempotency_key,
-        "duplicate feedback must identify the original idempotency key"
-    );
-    assert_eq!(
-        duplicate_feedback.receipt, first_feedback.receipt,
-        "duplicate feedback must retain the original committing receipt"
-    );
-    assert_eq!(
-        duplicate.effect.state_generation_before, duplicate.effect.state_generation_after,
-        "duplicate feedback cannot advance provider state"
-    );
-    assert_eq!(
-        duplicate.effect.state_generation_before, first.effect.state_generation_after,
-        "duplicate feedback must observe the persisted post-commit generation"
-    );
-    assert_eq!(
-        duplicate.effect.provider_receipt_digest, first.effect.provider_receipt_digest,
-        "duplicate feedback must retain the original provider receipt digest"
-    );
-    assert!(
-        duplicate.effect.committed_item_refs.is_empty()
-            && duplicate.effect.uncommitted_item_refs.is_empty(),
-        "duplicate feedback must report no second item commit: {duplicate:?}"
-    );
-}
-
-fn assert_correction_revision_refusal(journey: &mut ClaudeHostJourney, source: &RecalledSource) {
-    let expected = source
-        .source_revision
-        .as_deref()
-        .expect("correction journey requires a canonical source revision")
-        .to_owned();
-    let current_request = ProviderControlRequestV1::Correction(ProviderCorrectionRequestV1 {
-        source: source.selector.clone(),
-        expected_source_revision: expected.clone(),
-        correction: ProviderControlCorrectionV1::ChangeValidity {
-            valid_from: now_micros(),
-            valid_until: None,
-        },
-        reason: "real host correction revision check".to_owned(),
-        evidence_refs: Vec::new(),
-    });
-    let response = invoke(
-        journey,
-        "host-provider-control.correction.current",
-        current_request.clone(),
-    )
-    .expect("current correction RPC transport");
-    let current = typed_result(&response);
-    assert_success(&current, "current correction");
-    let ProviderControlOperationResultV1::Correction(Some(correction)) = &current.result else {
-        panic!("current correction must include typed provider evidence: {current:?}");
-    };
-    assert_eq!(&correction.source, &source.selector);
-    assert_eq!(
-        correction.target.source.source_revision.as_deref(),
-        Some(expected.as_str())
-    );
-    assert_eq!(
-        correction.receipt.state_generation_before,
-        current
-            .effect
-            .state_generation_before
-            .expect("correction generation")
-    );
-    assert!(
-        correction.receipt.state_generation_after > correction.receipt.state_generation_before,
-        "current correction must advance provider state: {:?}",
-        correction.receipt
-    );
-    assert!(
-        correction.affected_provider_effects > 0,
-        "current correction must affect the admitted provider source: {correction:?}"
-    );
-    assert_eq!(
-        current.effect.state,
-        ProviderControlEffectStateV1::Committed,
-        "current correction must commit a provider effect: {current:?}"
-    );
-
-    // Restart the shipped daemon before replaying the same correction identity.
-    // The duplicate result must retain the original receipt and observe the
-    // persisted post-commit generation; an in-memory-only correction would
-    // either apply twice or lose this receipt.
-    journey.stop_daemon();
-    journey.start_daemon();
-    journey.await_startup_history();
-    let duplicate_response = invoke(
-        journey,
-        "host-provider-control.correction.current",
-        current_request,
-    )
-    .expect("replayed current correction RPC transport");
-    let duplicate = typed_result(&duplicate_response);
-    assert_success(&duplicate, "replayed current correction");
-    let ProviderControlOperationResultV1::Correction(Some(duplicate_correction)) =
-        &duplicate.result
-    else {
-        panic!("replayed current correction must retain typed provider evidence: {duplicate:?}");
-    };
-    assert_eq!(
-        duplicate.effect.state,
-        ProviderControlEffectStateV1::Duplicate,
-        "replayed current correction must be exactly once: {duplicate:?}"
-    );
-    assert_eq!(
-        duplicate.effect.duplicate_of_idempotency_key, current.idempotency_key,
-        "replayed current correction must identify its original operation"
-    );
-    assert_eq!(
-        duplicate_correction.receipt, correction.receipt,
-        "replayed current correction must retain the committed receipt"
-    );
-    assert_eq!(
-        duplicate.effect.state_generation_before, duplicate.effect.state_generation_after,
-        "replayed current correction cannot advance provider state"
-    );
-    assert_eq!(
-        duplicate.effect.state_generation_before, current.effect.state_generation_after,
-        "replayed current correction must observe persisted post-commit state"
-    );
-    assert_eq!(
-        duplicate.effect.provider_receipt_digest, current.effect.provider_receipt_digest,
-        "replayed current correction must retain the provider receipt digest"
-    );
-
-    let stale = ProviderControlRequestV1::Correction(ProviderCorrectionRequestV1 {
-        source: source.selector.clone(),
-        expected_source_revision: STALE_SOURCE_REVISION.to_owned(),
-        correction: ProviderControlCorrectionV1::ChangeValidity {
-            valid_from: now_micros(),
-            valid_until: None,
-        },
-        reason: "stale host correction must refuse".to_owned(),
-        evidence_refs: Vec::new(),
-    });
-    let response = invoke(journey, "host-provider-control.correction.stale", stale)
-        .expect("stale correction RPC transport");
-    match &response.outcome {
-        DaemonInvocationOutcome::RetainedApplication { .. } => {
-            let stale = typed_result(&response);
-            assert_eq!(
-                stale.terminal,
-                ProviderControlTerminalV1::Conflict,
-                "stale correction must retain a typed conflict terminal: {stale:?}"
-            );
-            assert_eq!(
-                stale.effect.state,
-                ProviderControlEffectStateV1::None,
-                "stale correction must have no provider effect: {stale:?}"
-            );
-            assert!(
-                matches!(
-                    stale.result,
-                    ProviderControlOperationResultV1::Correction(None)
-                ),
-                "stale correction must retain no operation result: {stale:?}"
-            );
-        }
-        _ => assert_outer_problem(&response, "conflict"),
-    }
-}
-
-fn assert_wrong_selector_is_hidden_as_missing_grant(
+fn assert_wrong_selectors_are_refused(
     journey: &ClaudeHostJourney,
-    selector: &ProviderControlSourceSelectorV1,
-    cross_scope_selector: &ProviderControlSourceSelectorV1,
     state: &ProviderControlStateSelectorV1,
 ) {
-    assert_ne!(
-        selector.trace_ref, cross_scope_selector.trace_ref,
-        "cross-scope selector must come from the distinct origin recall trace"
-    );
-    // This selector is a real source from the originating session's recall,
-    // with a valid item and observation identity. The active route is the
-    // destination session, so source authorization must deny the cross-scope
-    // grant rather than taking a malformed or nonexistent-item path.
-    let response = invoke(
-        journey,
-        "host-provider-control.feedback.wrong-selector",
-        ProviderControlRequestV1::Feedback(ProviderFeedbackRequestV1 {
-            source: cross_scope_selector.clone(),
-            signal: ProviderControlFeedbackSignalV1::Ignored,
-            weight: "0".to_owned(),
-            evidence_refs: Vec::new(),
-            occurred_at: now_micros(),
-        }),
-    )
-    .expect("wrong selector RPC transport");
-    assert_outer_problem(&response, "missing-grant");
-
-    // A registered canonical session under the other host identity is a
-    // well-formed cross-scope selector, but it has no grant in this journey's
-    // canonical session table. The host must collapse that distinction into
-    // its typed not-found/not-authorized result.
-    let (other_provider, other_session) = if journey.codex {
-        ("claude", CLAUDE_SESSION)
-    } else {
-        ("codex", CODEX_SESSION)
-    };
     let ProviderControlStateSelectorV1::CanonicalSession {
         provider_id,
         registration_revision,
@@ -754,6 +358,14 @@ fn assert_wrong_selector_is_hidden_as_missing_grant(
     } = state
     else {
         panic!("host journey uses canonical-session state");
+    };
+    // A well-formed session under the other host identity has no row in this
+    // journey's canonical session table. The host must collapse that into its
+    // typed not-found/not-authorized result before any provider contact.
+    let (other_provider, other_session) = if journey.codex {
+        ("claude", CLAUDE_SESSION)
+    } else {
+        ("codex", CODEX_SESSION)
     };
     let response = invoke(
         journey,
@@ -769,7 +381,7 @@ fn assert_wrong_selector_is_hidden_as_missing_grant(
         }),
     )
     .expect("cross-scope selector RPC transport");
-    assert_outer_problem(&response, "missing-grant");
+    assert_outer_problem(&response);
 
     // The canonical row is real, but the provider registration revision is
     // stale. The host keeps the failure typed and effect-free instead of
@@ -829,7 +441,6 @@ fn restart_and_recall(journey: &mut ClaudeHostJourney, session_id: &str) -> Valu
         &json!({
             "task": format!("what does the {JOURNEY_TERM} transport probe record?"),
             "format": "json",
-            "_meta": { "session_id": session_id },
         }),
     )
 }
@@ -841,91 +452,35 @@ fn assert_answered_lane(answer: &Value, provider_id: &str) -> Value {
     lane
 }
 
-fn assert_lane_contains_source(answer: &Value, selector: &ProviderControlSourceSelectorV1) {
-    let lane = super::advisory_lane(answer).expect("context advisory lane");
-    let trace_ref = lane["recall_trace"]["trace_ref"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .expect("recovered recall must publish a fresh trace selector");
-    let found = lane["candidates"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|candidate| {
-            candidate["provenance_evidence"]["recall"]["trace_ref"] == trace_ref
-                && candidate["provenance_evidence"]["recall"]["item_ref"]
-                    .as_str()
-                    .is_some_and(|value| !value.is_empty())
-                && candidate["provenance_evidence"]["sources"]
-                    .as_array()
-                    .is_some_and(|sources| {
-                        sources.iter().any(|source| {
-                            source["source"]["observation_id"] == selector.observation_id
-                        })
-                    })
-        });
-    assert!(
-        found,
-        "recovered recall lost the selected original source: {lane}"
-    );
-}
-
-fn assert_provider_unavailable_fallback_and_recovery(
-    journey: &mut ClaudeHostJourney,
-    session_id: &str,
-    selector: &ProviderControlSourceSelectorV1,
-) -> Value {
-    if journey.active_provider.is_ncm() {
-        return assert_ncm_unavailable_fallback_and_recovery(journey, session_id, selector);
-    }
-    // The provider journal is the required Native observation mount. Renaming
-    // its main file while the daemon is stopped makes only the next full
-    // provider mount fail; the published core route still owns the cognitive
-    // recall lane, which must report MountRefused as typed advisory fallback.
-    let journal = super::find_file(&journey.profile, FAULTY_NATIVE_JOURNAL)
-        .expect("Native provider journal path");
-    let backup = journal.with_extension("sqlite3.host-journey-backup");
-    assert!(!backup.exists(), "fault backup must be fresh");
-    journey.stop_daemon();
-    fs::rename(&journal, &backup).expect("move Native journal behind fault");
-    fs::write(
-        &journal,
-        b"host journey deliberately invalidates this mount\n",
-    )
-    .expect("write invalid Native journal");
-    journey.start_daemon();
-
-    let unavailable = journey.tool(
-        "tracedecay_context",
-        &json!({
-            "task": format!("what does the {JOURNEY_TERM} transport probe record?"),
-            "format": "json",
-            "_meta": { "session_id": session_id },
+fn assert_unmounted_provider_controls_are_refused(
+    journey: &ClaudeHostJourney,
+    state: &ProviderControlStateSelectorV1,
+) {
+    let response = invoke(
+        journey,
+        "host-provider-control.health.unmounted",
+        ProviderControlRequestV1::Health(ProviderHealthRequestV1 {
+            state: state.clone(),
+            requested_checks: vec![ProviderControlHealthCheckV1::Protocol],
         }),
-    );
-    let lane = super::advisory_lane(&unavailable)
-        .expect("provider mount failure must retain advisory lane");
+    )
+    .expect("unmounted provider RPC transport");
+    let refused = typed_result(&response);
     assert_eq!(
-        lane["state"], "unavailable",
-        "typed unavailable lane: {lane}"
+        refused.terminal,
+        ProviderControlTerminalV1::ProviderUnavailable,
+        "a provider without an observation journey has no control mount: {refused:?}"
     );
-    assert_eq!(lane["provider_id"], journey.active_provider.id());
-    assert_eq!(lane["registration_revision"], 1);
-
-    journey.stop_daemon();
-    fs::remove_file(&journal).expect("remove invalid Native journal");
-    fs::rename(&backup, &journal).expect("restore Native journal after fault");
-    let recovered = restart_and_recall(journey, session_id);
-    let lane = assert_answered_lane(&recovered, journey.active_provider.id());
-    assert_eq!(lane["state"], "answered");
-    assert_lane_contains_source(&recovered, selector);
-    recovered
+    assert_eq!(refused.effect.state, ProviderControlEffectStateV1::None);
+    assert!(matches!(
+        refused.result,
+        ProviderControlOperationResultV1::Health(None)
+    ));
 }
 
 fn assert_ncm_unavailable_fallback_and_recovery(
     journey: &mut ClaudeHostJourney,
     session_id: &str,
-    selector: &ProviderControlSourceSelectorV1,
 ) -> Value {
     let worker = PathBuf::from(
         std::env::var_os("TRACEDECAY_NCM_WORKER").expect("real NCM worker binary is required"),
@@ -973,7 +528,6 @@ fn assert_ncm_unavailable_fallback_and_recovery(
         &json!({
             "task": format!("what does the {JOURNEY_TERM} transport probe record?"),
             "format": "json",
-            "_meta": { "session_id": session_id },
         }),
     );
     let lane =
@@ -988,141 +542,5 @@ fn assert_ncm_unavailable_fallback_and_recovery(
     let recovered = restart_and_recall(journey, session_id);
     let lane = assert_answered_lane(&recovered, journey.active_provider.id());
     assert_eq!(lane["state"], "answered");
-    assert_lane_contains_source(&recovered, selector);
     recovered
-}
-
-fn assert_delete_by_source_non_resurrection(
-    journey: &mut ClaudeHostJourney,
-    session_id: &str,
-    selector: &ProviderControlSourceSelectorV1,
-) {
-    let response = invoke(
-        journey,
-        "host-provider-control.delete-by-source",
-        ProviderControlRequestV1::DeleteBySource(ProviderDeleteBySourceRequestV1 {
-            source: selector.clone(),
-            mode: ProviderControlDeletionModeV1::RemoveInfluence,
-            expected_fence_revision: 0,
-            include_snapshots: true,
-        }),
-    )
-    .expect("delete-by-source RPC transport");
-    let result = typed_result(&response);
-    assert_success(&result, "delete-by-source");
-    assert_eq!(
-        result.terminal,
-        ProviderControlTerminalV1::Success,
-        "deleting a recalled source must report a committed success, not an empty result"
-    );
-    let ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = &result.result else {
-        panic!("delete-by-source must include typed deletion evidence: {result:?}");
-    };
-    assert_eq!(&deletion.source, selector);
-    assert_eq!(
-        deletion.mode,
-        ProviderControlDeletionModeV1::RemoveInfluence
-    );
-    assert!(deletion.include_snapshots);
-    assert_eq!(deletion.intent.fence_revision_before, 0);
-    assert_eq!(deletion.intent.fence_revision_after, 1);
-    assert_eq!(
-        deletion.host_snapshot_cleanup.state,
-        tracedecay_contracts::retained_surfaces::ProviderControlHostSnapshotCleanupStateV1::Complete,
-        "snapshot cleanup must finish before a successful source deletion is reported"
-    );
-    let ProviderControlErasureV1::Verified {
-        postcondition,
-        receipt,
-    } = &deletion.erasure
-    else {
-        panic!(
-            "deleting a recalled source must verify provider erasure: {:?}",
-            deletion.erasure
-        );
-    };
-    assert!(postcondition.matched_effects > 0);
-    assert!(postcondition.removed_effects > 0);
-    assert_eq!(postcondition.remaining_influence_count, 0);
-    assert_eq!(
-        postcondition.verification_state,
-        ProviderControlDeletionVerificationV1::VerifiedAbsent
-    );
-    assert!(
-        receipt.state_generation_after > receipt.state_generation_before,
-        "delete-by-source must advance provider state: {receipt:?}"
-    );
-    assert_eq!(
-        result.effect.state,
-        ProviderControlEffectStateV1::Committed,
-        "delete-by-source must retain its provider commit: {result:?}"
-    );
-    assert_eq!(
-        result.effect.state_generation_before,
-        Some(receipt.state_generation_before)
-    );
-    assert_eq!(
-        result.effect.state_generation_after,
-        Some(receipt.state_generation_after)
-    );
-
-    let after_delete = restart_and_recall(journey, session_id);
-    let lane = assert_answered_lane(&after_delete, journey.active_provider.id());
-    let candidates = lane["candidates"]
-        .as_array()
-        .expect("post-delete candidates");
-    assert!(
-        !candidates.is_empty(),
-        "post-delete recall must retain unrelated source candidates"
-    );
-    assert!(
-        candidates.iter().all(|candidate| {
-            candidate["provenance_evidence"]["sources"]
-                .as_array()
-                .is_some_and(|sources| {
-                    sources
-                        .iter()
-                        .all(|source| source["source"]["observation_id"] != selector.observation_id)
-                })
-        }),
-        "deleted source must leave no candidate after restart: {lane}"
-    );
-
-    let after_second_restart = restart_and_recall(journey, session_id);
-    let lane = assert_answered_lane(&after_second_restart, journey.active_provider.id());
-    let candidates = lane["candidates"]
-        .as_array()
-        .expect("second post-delete candidates");
-    assert!(
-        !candidates.is_empty(),
-        "second post-delete recall must retain unrelated source candidates"
-    );
-    assert!(
-        candidates.iter().all(|candidate| {
-            candidate["provenance_evidence"]["sources"]
-                .as_array()
-                .is_some_and(|sources| {
-                    sources
-                        .iter()
-                        .all(|source| source["source"]["observation_id"] != selector.observation_id)
-                })
-        }),
-        "deleted source must remain absent after the second restart: {lane}"
-    );
-
-    // The selector remains well-formed after deletion, but the fresh source
-    // grant must deny it instead of letting a stale caller mutate influence.
-    let response = invoke(
-        journey,
-        "host-provider-control.feedback.after-delete",
-        ProviderControlRequestV1::Feedback(ProviderFeedbackRequestV1 {
-            source: selector.clone(),
-            signal: ProviderControlFeedbackSignalV1::Helpful,
-            weight: "1".to_owned(),
-            evidence_refs: Vec::new(),
-            occurred_at: now_micros(),
-        }),
-    )
-    .expect("post-delete stale selector RPC transport");
-    assert_outer_problem(&response, "missing-grant");
 }

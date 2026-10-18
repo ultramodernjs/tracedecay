@@ -52,7 +52,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -88,8 +88,6 @@ use tracedecay_memory_observation::{
     SqliteObservationJournal, TerminalIdentityMismatchV1, WakeOutcomeV1, WithheldAdmissionV1,
     extensions_digest,
 };
-#[cfg(test)]
-use tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID;
 use tracedecay_memory_provider_registry::{
     ApiError, BoundedCallRefusalV1, BoundedProviderCallV1, CancellationToken, CanonicalPayload,
     CompositionLifecycleError, FabricError, HandshakeRequest, HandshakeRequestParts,
@@ -117,6 +115,7 @@ const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
 /// contained under, inside the canonical store layout. The host creates it and
 /// grants each admitted namespace a capability rooted beneath it; a provider
 /// never names a path outside it.
+#[cfg(test)]
 pub(crate) const PROVIDER_STATE_DIR_NAME: &str = "provider-state";
 
 /// Domain separator for the product-owned binding from a canonical source
@@ -366,8 +365,6 @@ impl ObservationJourneyPolicyV1 {
 /// Every way the mounted journey can refuse, typed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ObservationJourneyError {
-    #[error("host history authorization failed: {0}")]
-    History(#[from] super::provider_history::ProviderHistoryErrorV1),
     /// Composition is disabled, so there is no registry to mount against.
     #[error("provider composition is disabled, so no observation journey can mount")]
     CompositionDisabled,
@@ -832,19 +829,6 @@ impl UntrustedRecallMetadataV1 {
             Self::Withheld { reason, .. } => Some(*reason),
         }
     }
-
-    /// Digest of the provider's original label, admitted or not.
-    ///
-    /// Both arms carry it, so a caller that substitutes a host-minted stand-in
-    /// for a label it will not render can derive that stand-in from the
-    /// provider's own bytes without keeping a copy of them.
-    pub(super) fn source_sha256(&self) -> &str {
-        match self {
-            Self::Admitted { source_sha256, .. } | Self::Withheld { source_sha256, .. } => {
-                source_sha256
-            }
-        }
-    }
 }
 
 /// The narrow product-owned binding from a canonical source session identity to
@@ -870,9 +854,7 @@ pub(super) fn provider_agent_session_id(
     scope: &ResolvedScope,
     canonical_session_id: &str,
 ) -> String {
-    let mut digest = Sha256::new();
-    digest.update(AGENT_SESSION_BINDING_DOMAIN);
-    for value in [
+    agent_session_binding([
         profile_id.as_str().as_bytes(),
         scope.project_id.as_str().as_bytes(),
         scope.repository_id.as_str().as_bytes(),
@@ -883,7 +865,39 @@ pub(super) fn provider_agent_session_id(
             .map_or(&b""[..], |reference| reference.as_str().as_bytes()),
         scope.scope_digest.as_str().as_bytes(),
         canonical_session_id.as_bytes(),
-    ] {
+    ])
+}
+
+/// Recomputes the provider-qualified agent session a canonical session is
+/// bound to under an exact scope's own checkout identity.
+pub(super) fn agent_session_id_for_exact_scope(
+    scope: &OwnedExactScope,
+    canonical_session_id: &str,
+) -> String {
+    agent_session_binding([
+        scope.profile_id.as_bytes(),
+        scope.project_id.as_bytes(),
+        scope.repository_identity.as_bytes(),
+        scope.worktree_identity.as_bytes(),
+        scope.branch_identity.as_bytes(),
+        scope.resolved_scope_digest.as_bytes(),
+        canonical_session_id.as_bytes(),
+    ])
+}
+
+/// Whether an exact scope's agent session is the host binding of exactly this
+/// canonical session. A raw session label is never an agent-session binding.
+pub(super) fn exact_scope_names_canonical_session(
+    scope: &OwnedExactScope,
+    canonical_session_id: &str,
+) -> bool {
+    scope.agent_session_id == agent_session_id_for_exact_scope(scope, canonical_session_id)
+}
+
+fn agent_session_binding(fields: [&[u8]; 7]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(AGENT_SESSION_BINDING_DOMAIN);
+    for value in fields {
         absorb(&mut digest, value);
     }
     format!(
@@ -1014,8 +1028,6 @@ struct CanonicalObservationAdmissionAdapterV1 {
 /// ingress at the offending record with that record's own identity attached.
 #[derive(Debug, thiserror::Error)]
 enum AdmissionAdapterError {
-    #[error("host history authorization failed: {0}")]
-    History(#[source] super::provider_history::ProviderHistoryErrorV1),
     #[error(
         "canonical observation {source_event_id} is scoped outside the mounted project, so it \
          cannot be admitted under this journey's exact scope"
@@ -1056,6 +1068,19 @@ enum AdmissionAdapterError {
     #[error("hygiene rewrote the provider envelope shape for {source_event_id}")]
     EnvelopeShapeRewritten {
         /// Settled event identity whose envelope no longer parses.
+        source_event_id: String,
+    },
+    #[error("canonical observation {source_event_id} has no attributable original source: {source}")]
+    Attribution {
+        /// Settled event identity whose original source could not be derived.
+        source_event_id: String,
+        /// Underlying refusal.
+        #[source]
+        source: super::observation_attribution::ObservationAttributionErrorV1,
+    },
+    #[error("hygiene rewrote the host original-source attribution for {source_event_id}")]
+    SourceIdentityRewritten {
+        /// Settled event identity whose delivered attribution would be false.
         source_event_id: String,
     },
     #[error("journal contract refused the decision for {source_event_id}: {source}")]
@@ -1106,17 +1131,6 @@ impl ObservationAdmissionAdapterV1 for CanonicalObservationAdmissionAdapterV1 {
         record: &SourceRecordV1<Self::Record>,
         control: &Self::Control,
     ) -> Result<AdmissionDecisionV1, Self::Error> {
-        self.decide_with_history(record, control, None)
-    }
-}
-
-impl CanonicalObservationAdmissionAdapterV1 {
-    fn decide_with_history(
-        &self,
-        record: &SourceRecordV1<StoredObservation>,
-        control: &ReplayIngestControlV1,
-        history: Option<&tracedecay_memory_provider_registry::HistoryGrant>,
-    ) -> Result<AdmissionDecisionV1, AdmissionAdapterError> {
         let context = &self.context;
         let stored = &record.record;
         let observation = stored.observation();
@@ -1132,18 +1146,15 @@ impl CanonicalObservationAdmissionAdapterV1 {
         if !scoped_here {
             return Err(AdmissionAdapterError::ScopeMismatch { source_event_id });
         }
-        let exact_scope = match history {
-            Some(history) => history.destination_scope.clone(),
-            None => exact_scope_for_session(
-                &context.profile_id,
-                &context.scope,
-                observation.source().session_id().as_str(),
-            )
-            .map_err(|source| AdmissionAdapterError::ExactScope {
-                source_event_id: source_event_id.clone(),
-                source,
-            })?,
-        };
+        let exact_scope = exact_scope_for_session(
+            &context.profile_id,
+            &context.scope,
+            observation.source().session_id().as_str(),
+        )
+        .map_err(|source| AdmissionAdapterError::ExactScope {
+            source_event_id: source_event_id.clone(),
+            source,
+        })?;
 
         let message_payload = eligible_message_payload(observation).map_err(|detail| {
             AdmissionAdapterError::InvalidCanonicalEnvelope {
@@ -1163,27 +1174,56 @@ impl CanonicalObservationAdmissionAdapterV1 {
         // minted over the inner payload alone would not describe them. The
         // sanitizer walks the whole structure, so a secret nested anywhere in
         // the canonical payload is still found.
+        //
+        // The envelope carries the host's own attribution of the canonical
+        // record. A provider that later recalls this message cites it back,
+        // and the recall lane re-derives the same attribution from the store
+        // before anything is shown as grounded evidence.
+        //
+        // A record whose canonical shape exceeds the store ceilings is never
+        // delivered (it is withheld unclassified or refused below), so it
+        // carries no attribution.
+        let attribution = match shape_error.as_ref() {
+            Some(_) => None,
+            None => Some(
+                super::observation_attribution::canonical_observation_attribution(
+                    &context.profile_id,
+                    &context.scope,
+                    stored,
+                )
+                .map_err(|source| AdmissionAdapterError::Attribution {
+                    source_event_id: source_event_id.clone(),
+                    source,
+                })?,
+            ),
+        };
         let mut envelope = provider_observation_envelope(
             context.observation_kind.as_str(),
             SESSION_MESSAGE_PAYLOAD_CONTRACT,
             &message_payload,
         );
-        let trusted_history_source = if let Some(history) = history {
-            let attribution = super::provider_history::validate_history_record(history, stored)
-                .map_err(AdmissionAdapterError::History)?;
-            envelope["source_identity"] = serde_json::json!({
-                "original_source": super::provider_history::source_attribution_json(attribution)
-                    .map_err(AdmissionAdapterError::History)?,
-            });
-            envelope["history_grant"] = super::provider_history::history_grant_json(history)
-                .map_err(AdmissionAdapterError::History)?;
+        if let Some(attribution) = attribution.as_ref() {
+            let original_source = serde_json::to_value(attribution).map_err(|error| {
+                AdmissionAdapterError::InvalidCanonicalEnvelope {
+                    source_event_id: source_event_id.clone(),
+                    detail: error.to_string(),
+                }
+            })?;
+            if let Some(object) = envelope.as_object_mut() {
+                object.insert(
+                    "source_identity".to_owned(),
+                    serde_json::json!({ "original_source": original_source }),
+                );
+            }
+        }
+        // A Claude source key is a host-minted digest the secret detectors
+        // would otherwise redact; only that one attribution path is projected.
+        let trusted_source = attribution.as_ref().and_then(|attribution| {
             TrustedClaudeObservationSourceIdV1::from_validated_source(
-                attribution.source.canonical_provider_id.as_str(),
+                &attribution.source.canonical_provider_id,
                 &attribution.source.source_key,
             )
-        } else {
-            None
-        };
+        });
         // A settled record whose *shape* hygiene will not walk — nested or
         // sized beyond the ceilings the store itself never lets a record reach
         // — has been classified as nothing, so it is withheld under a typed
@@ -1191,10 +1231,12 @@ impl CanonicalObservationAdmissionAdapterV1 {
         // cursor on evidence the host already settled and repeat on every
         // open. Every other hygiene error stays a refusal, because a detector
         // fault must keep failing closed and a caller bug must stay visible.
-        let admission_result = match trusted_history_source.as_ref() {
-            Some(trusted_source) => context
-                .sanitizer
-                .admit_observation_with_trusted_history_source(&envelope, &[], trusted_source),
+        let admission_result = match trusted_source.as_ref() {
+            Some(trusted_source) => context.sanitizer.admit_observation_with_trusted_source(
+                &envelope,
+                &[],
+                trusted_source,
+            ),
             None => context.sanitizer.admit_observation(&envelope, &[]),
         };
         let admission = admission_result
@@ -1216,20 +1258,13 @@ impl CanonicalObservationAdmissionAdapterV1 {
             })?;
 
         let settlement = canonical_settlement_receipt(record, stored);
-        let forget_source_key = match history {
-            Some(history) => {
-                let attribution = super::provider_history::validate_history_record(history, stored)
-                    .map_err(AdmissionAdapterError::History)?;
-                let digest = super::provider_history::original_source_fence_digest(attribution)
-                    .map_err(AdmissionAdapterError::History)?;
-                ForgetSourceKeyV1::new(format!("original-source:{digest}"))
-            }
-            None => forget_source_key_for(&exact_scope, observation),
-        }
-        .map_err(|source| AdmissionAdapterError::Journal {
-            source_event_id: source_event_id.clone(),
-            source,
-        })?;
+        let forget_source_key =
+            forget_source_key_for(&exact_scope, observation).map_err(|source| {
+                AdmissionAdapterError::Journal {
+                    source_event_id: source_event_id.clone(),
+                    source,
+                }
+            })?;
 
         match admission {
             ObservationAdmission::Withheld {
@@ -1241,16 +1276,6 @@ impl CanonicalObservationAdmissionAdapterV1 {
                 finding_count,
                 findings_digest,
             } => {
-                #[cfg(feature = "test-helpers")]
-                if history.is_some() {
-                    super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
-                        serde_json::json!({
-                            "phase": "history_withheld",
-                            "source_sequence": record.source_sequence.0,
-                            "reason": reason.as_str(),
-                        })
-                    });
-                }
                 // Digests and a typed reason only. The canonical evidence the
                 // host settled is not touched; the withheld row advances the
                 // replay cursor so a refused event is not re-emitted forever,
@@ -1294,15 +1319,11 @@ impl CanonicalObservationAdmissionAdapterV1 {
                 if !envelope_shape_survived(&sanitized, context.observation_kind.as_str()) {
                     return Err(AdmissionAdapterError::EnvelopeShapeRewritten { source_event_id });
                 }
-                if history.is_some()
-                    && (sanitized.get("history_grant") != envelope.get("history_grant")
-                        || sanitized.get("source_identity") != envelope.get("source_identity"))
-                {
-                    return Err(AdmissionAdapterError::History(
-                        super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
-                            "sanitized history metadata",
-                        ),
-                    ));
+                // Redacted attribution would name a source that does not
+                // exist; the provider would retain a claim the host can never
+                // confirm. Refuse rather than deliver it.
+                if sanitized.get("source_identity") != envelope.get("source_identity") {
+                    return Err(AdmissionAdapterError::SourceIdentityRewritten { source_event_id });
                 }
                 let bytes = canonical_payload_bytes(&sanitized).map_err(|source| {
                     AdmissionAdapterError::CanonicalEncoding {
@@ -1416,51 +1437,6 @@ impl CanonicalObservationAdmissionAdapterV1 {
     }
 }
 
-struct GrantedHistoryAdmissionAdapterV1 {
-    canonical: Arc<CanonicalObservationAdmissionAdapterV1>,
-    grant: Option<tracedecay_memory_provider_registry::HistoryGrant>,
-}
-
-impl ObservationAdmissionAdapterV1 for GrantedHistoryAdmissionAdapterV1 {
-    type Record = StoredObservation;
-    type Error = AdmissionAdapterError;
-    type Control = ReplayIngestControlV1;
-
-    fn lane(&self, record: &SourceRecordV1<Self::Record>) -> ObservationLaneKeyV1 {
-        self.canonical.lane(record)
-    }
-
-    fn classify(&self, record: &SourceRecordV1<Self::Record>) -> ObservationLoadClassV1 {
-        self.canonical.classify(record)
-    }
-
-    fn decide(
-        &self,
-        record: &SourceRecordV1<Self::Record>,
-        control: &Self::Control,
-    ) -> Result<AdmissionDecisionV1, Self::Error> {
-        let Some(grant) = self.grant.as_ref().filter(|grant| {
-            grant
-                .sources
-                .iter()
-                .any(|source| source.attribution.source.observation_id == record.source_event_id)
-        }) else {
-            // An authoritative bounded scan found this canonical event outside
-            // this destination's delivery contract. Checkpoint it in this
-            // destination stream; no source bytes are copied or relabeled.
-            return Ok(AdmissionDecisionV1::NonMessage(Box::new(
-                canonical_settlement_receipt(record, &record.record),
-            )));
-        };
-        let mut grant = grant.clone();
-        grant
-            .sources
-            .retain(|source| source.attribution.source.observation_id == record.source_event_id);
-        self.canonical
-            .decide_with_history(record, control, Some(&grant))
-    }
-}
-
 /// Exact operation identity used by every original Observe delivery attempt.
 pub(crate) fn delivery_operation_id(
     observation_id: &tracedecay_memory_observation::ObservationIdV1,
@@ -1469,133 +1445,7 @@ pub(crate) fn delivery_operation_id(
     format!("{}.{}", observation_id.as_str(), attempt_number)
 }
 
-pub(crate) fn history_source_stream(
-    destination: &OwnedExactScope,
-    policy_revision: u64,
-) -> Result<SourceStreamIdV1, ObservationJournalError> {
-    SourceStreamIdV1::new(format!(
-        "host-history.{policy_revision}.{}",
-        destination.exact_scope_sha256()
-    ))
-}
-
-/// Cancels a queued/running bounded snapshot even if its async caller is dropped.
-struct HistoryDeliveryCancellationV1(CancellationToken);
-
-impl Drop for HistoryDeliveryCancellationV1 {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
-pub(crate) fn validate_history_delivery_evidence(
-    grant: &tracedecay_memory_provider_registry::HistoryGrant,
-    evidence: Vec<tracedecay_memory_observation::SourceDeliveryEvidenceV1>,
-    cancellation: &CancellationToken,
-    deadline: tokio::time::Instant,
-) -> Result<bool, ObservationJourneyError> {
-    use super::provider_history::ProviderHistoryErrorV1;
-    use tracedecay_memory_observation::{
-        DeliveryStateV1, ObservationCommittedEffectV1, ObservationOutcomeV1,
-        SourceDeliveryEvidenceV1,
-    };
-    if evidence.len() != grant.sources.len() {
-        return Err(
-            ProviderHistoryErrorV1::ClaimMismatch("history delivery evidence count").into(),
-        );
-    }
-    let mut settled = true;
-    for (source, evidence) in grant.sources.iter().zip(evidence) {
-        if cancellation.is_cancelled() {
-            return Err(ObservationJourneyError::Cancelled { admitted: 0 });
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 });
-        }
-        let (admitted, state, receipt) = match evidence {
-            SourceDeliveryEvidenceV1::Missing => {
-                #[cfg(feature = "test-helpers")]
-                super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
-                    serde_json::json!({
-                        "phase": "history_delivery_missing",
-                        "source_sequence": source.attribution.source_sequence,
-                    })
-                });
-                return Err(
-                    ProviderHistoryErrorV1::Ineligible("history source not admitted").into(),
-                );
-            }
-            SourceDeliveryEvidenceV1::Purged { .. } => {
-                return Err(ProviderHistoryErrorV1::Ineligible("history source purged").into());
-            }
-            SourceDeliveryEvidenceV1::Retained {
-                admitted,
-                state,
-                receipt,
-            } => (admitted, state, receipt),
-        };
-        let payload: Value = serde_json::from_slice(&admitted.payload.bytes)
-            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("history delivery envelope"))?;
-        let retained = payload
-            .get("history_grant")
-            .ok_or(ProviderHistoryErrorV1::ClaimMismatch(
-                "history delivery grant",
-            ))
-            .and_then(super::provider_history::history_grant_from_json)?;
-        let original = super::provider_history::source_attribution_json(&source.attribution)?;
-        if retained.policy_revision != grant.policy_revision
-            || retained.destination_scope != grant.destination_scope
-            || retained.relation != grant.relation
-            || retained.sources.len() != 1
-            || retained.sources[0].attribution != source.attribution
-            || payload.pointer("/source_identity/original_source") != Some(&original)
-            || admitted.source.source_event_id != source.attribution.source.observation_id
-            || admitted.source.source_sequence.0 != source.attribution.source_sequence
-            || admitted.source.settled_at_unix_micros.checked_mul(1_000)
-                != Some(source.attribution.ingested_at_utc_nanos)
-            || admitted.observation_kind.as_str() != SESSION_MESSAGE_OBSERVATION_KIND
-            || !envelope_shape_survived(&payload, SESSION_MESSAGE_OBSERVATION_KIND)
-        {
-            return Err(
-                ProviderHistoryErrorV1::ClaimMismatch("history delivery original source").into(),
-            );
-        }
-        match state {
-            DeliveryStateV1::Pending | DeliveryStateV1::Leased | DeliveryStateV1::EffectUnknown => {
-                settled = false
-            }
-            DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged => {
-                let receipt = receipt.ok_or(ProviderHistoryErrorV1::ClaimMismatch(
-                    "history acknowledgement receipt",
-                ))?;
-                if !matches!(
-                    (receipt.outcome, receipt.committed_effect),
-                    (
-                        ObservationOutcomeV1::Applied,
-                        ObservationCommittedEffectV1::Applied
-                    ) | (
-                        ObservationOutcomeV1::DuplicateAcknowledged,
-                        ObservationCommittedEffectV1::Duplicate
-                    )
-                ) {
-                    return Err(ProviderHistoryErrorV1::Ineligible(
-                        "history delivery has no complete effect",
-                    )
-                    .into());
-                }
-            }
-            _ => {
-                return Err(ProviderHistoryErrorV1::Ineligible(
-                    "history delivery terminal refusal",
-                )
-                .into());
-            }
-        }
-    }
-    Ok(settled)
-}
-
-/// Builds the provider observation envelope the Native adapter parses.
+/// Builds the provider observation envelope an observing provider parses.
 fn provider_observation_envelope(
     observation_kind: &str,
     payload_contract: &str,
@@ -1790,7 +1640,6 @@ struct RegistryObservationDeliveryAdapterV1 {
     /// Restart recovery. Every attempt passes through it, so a provider whose
     /// state moved under the journal is refused before it is written to.
     recovery: ObservationRecoveryGateV1,
-    history_authority: Arc<OnceLock<Arc<dyn super::provider_history::HistoryGrantRevalidationV1>>>,
 }
 
 /// Typed delivery-adapter failures and provider-terminal refusals.
@@ -1800,8 +1649,6 @@ struct RegistryObservationDeliveryAdapterV1 {
 /// as refusal evidence with an unknown-effect receipt before redelivery.
 #[derive(Debug, thiserror::Error)]
 enum DeliveryAdapterError {
-    #[error("host history authorization failed: {0}")]
-    History(#[source] super::provider_history::ProviderHistoryErrorV1),
     #[error("provider composition is disabled, so no observation can be delivered")]
     Disabled,
     #[error("provider readiness could not be proven for the leased exact scope: {0}")]
@@ -1843,8 +1690,6 @@ const DELIVERY_REFUSAL_HISTORY: usize = 16;
 /// answer, typed, published by the lane and carried on its log line.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeliveryRefusalClassV1 {
-    /// Current host source/session/privacy authority refused historical reuse.
-    HistoryRefused,
     /// The provider composition is disabled, so nothing could be delivered.
     CompositionDisabled,
     /// Readiness could not be proven for the leased exact scope.
@@ -1880,7 +1725,6 @@ impl DeliveryRefusalClassV1 {
     /// Stable wire label for the log line and any operator surface built on it.
     pub(crate) const fn as_wire(&self) -> &'static str {
         match self {
-            Self::HistoryRefused => "history_refused",
             Self::CompositionDisabled => "composition_disabled",
             Self::ReadinessRefused => "readiness_refused",
             Self::RecoveryRefused => "recovery_refused",
@@ -1905,7 +1749,6 @@ impl DeliveryRefusalClassV1 {
     fn classify(cause: &(dyn std::error::Error + Send + Sync + 'static)) -> Self {
         if let Some(adapter) = cause.downcast_ref::<DeliveryAdapterError>() {
             return match adapter {
-                DeliveryAdapterError::History(_) => Self::HistoryRefused,
                 DeliveryAdapterError::Disabled => Self::CompositionDisabled,
                 DeliveryAdapterError::Readiness(_) => Self::ReadinessRefused,
                 DeliveryAdapterError::Recovery(_) => Self::RecoveryRefused,
@@ -1986,6 +1829,7 @@ impl DeliveryRefusalWindowV1 {
         self.total.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     async fn wait_for(
         &self,
         within: Duration,
@@ -2260,59 +2104,6 @@ impl RegistryObservationDeliveryAdapterV1 {
                 control.cancellation(),
             )
         };
-        let payload: Value = serde_json::from_slice(&leased.payload.bytes).map_err(|_| {
-            DeliveryAdapterError::History(
-                super::provider_history::ProviderHistoryErrorV1::ClaimMismatch("journal envelope"),
-            )
-        })?;
-        let history = payload
-            .get("history_grant")
-            .map(super::provider_history::history_grant_from_json)
-            .transpose()
-            .map_err(DeliveryAdapterError::History)?;
-        let mut recovery = self.recovery.clone();
-        if let Some(history) = &history {
-            if history.destination_scope != leased.exact_scope || history.sources.len() != 1 {
-                return Err(DeliveryAdapterError::History(
-                    super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
-                        "journal history destination/source",
-                    ),
-                ));
-            }
-            let original =
-                super::provider_history::source_attribution_json(&history.sources[0].attribution)
-                    .map_err(DeliveryAdapterError::History)?;
-            if payload.pointer("/source_identity/original_source") != Some(&original) {
-                return Err(DeliveryAdapterError::History(
-                    super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
-                        "journal original attribution",
-                    ),
-                ));
-            }
-            let authority = self.history_authority.get().ok_or_else(|| {
-                DeliveryAdapterError::History(
-                    super::provider_history::ProviderHistoryErrorV1::Unavailable(
-                        "history authority mount",
-                    ),
-                )
-            })?;
-            authority
-                .revalidate(
-                    &self.provider_id,
-                    history,
-                    &operation_control(started_at_unix_micros),
-                )
-                .map_err(DeliveryAdapterError::History)?;
-            recovery.source_stream =
-                history_source_stream(&history.destination_scope, history.policy_revision)
-                    .map_err(|_| {
-                        DeliveryAdapterError::History(
-                            super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
-                                "history stream",
-                            ),
-                        )
-                    })?;
-        }
         let readiness_request = readiness_handshake_request(
             &self.provider_id,
             &leased.exact_scope,
@@ -2356,7 +2147,7 @@ impl RegistryObservationDeliveryAdapterV1 {
         // before one byte reaches the provider. A refusal is typed and leaves
         // the row exactly as deliverable as it was; shutdown cancellation is
         // additionally recorded as host-owned attempt evidence.
-        let expected_state_generation = match recovery.admit_delivery(
+        let expected_state_generation = match self.recovery.admit_delivery(
             &leased.exact_scope_sha256,
             readiness_dispatch.evidence(),
             control,
@@ -2410,20 +2201,6 @@ impl RegistryObservationDeliveryAdapterV1 {
         .with_sanitization(sanitization);
         call.validate_request_bytes(self.limits.request_bytes)
             .map_err(DeliveryAdapterError::Call)?;
-
-        if let Some(history) = &history {
-            self.history_authority
-                .get()
-                .ok_or_else(|| {
-                    DeliveryAdapterError::History(
-                        super::provider_history::ProviderHistoryErrorV1::Unavailable(
-                            "history authority mount",
-                        ),
-                    )
-                })?
-                .revalidate(&self.provider_id, history, &call.control)
-                .map_err(DeliveryAdapterError::History)?;
-        }
 
         // This helper itself runs on the attempt's borrowed worker. Keep the
         // readiness guard alive through the direct registry call so no other
@@ -2605,6 +2382,7 @@ impl CensusTransitionV1 {
         self.async_changed.notify_waiters();
     }
 
+    #[cfg(test)]
     fn wait_until<T>(
         &self,
         within: Duration,
@@ -2642,6 +2420,7 @@ impl CensusTransitionV1 {
         }
     }
 
+    #[cfg(test)]
     async fn wait_until_async<T>(
         &self,
         within: Duration,
@@ -2820,6 +2599,7 @@ impl ThreadBoundedProviderCallV1 {
     /// resulting census. The condition is checked before waiting and again at
     /// the terminal deadline, so neither an early transition nor the final one
     /// can be missed.
+    #[cfg(test)]
     fn wait_for_census(
         &self,
         within: Duration,
@@ -3558,319 +3338,25 @@ impl ProviderInstanceStateV1 {
 }
 
 impl ProjectObservationJourneyV1 {
-    /// Installs the root's existing-authority adapter once. Replacing an
-    /// authority while queued records are being delivered is not permitted.
-    pub(crate) fn bind_history_authority(
-        &self,
-        authority: Arc<dyn super::provider_history::HistoryGrantRevalidationV1>,
-    ) -> Result<(), ObservationJourneyError> {
-        self.delivery.history_authority.set(authority).map_err(|_| {
-            super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
-                "history authority already bound",
-            )
-            .into()
-        })
-    }
-
-    /// Checks a selected history binding against this journey's existing
-    /// mounted identity without retaining another copy of that identity.
-    pub(crate) fn validate_history_mount(
+    /// Whether this journey is the mounted owner of exactly this provider
+    /// registration, profile, and authoritative scope. Control dispatch checks
+    /// it against the journey's own admission context, never a caller claim.
+    pub(crate) fn is_mounted_for(
         &self,
         provider_id: &OwnedProviderId,
         registration_revision: u64,
         profile_id: &UserProfileId,
         scope: &ResolvedScope,
-    ) -> Result<(), ObservationJourneyError> {
+    ) -> bool {
         let context = &self.adapter.context;
-        if self.provider_id != provider_id.as_str()
-            || self.registration_revision != registration_revision
-            || &self.provider_lane.provider_id != provider_id
-            || self.provider_lane.registration_revision != registration_revision
-            || &context.provider_lane.provider_id != provider_id
-            || context.provider_lane.registration_revision != registration_revision
-            || &context.profile_id != profile_id
-            || &context.scope != scope
-        {
-            return Err(
-                super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
-                    "history journey mount",
-                )
-                .into(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Provider-specific host deletion intents share this existing journal.
-    /// The caller records intent here before attempting provider control.
-    pub(crate) fn history_journal(&self) -> Arc<SqliteObservationJournal> {
-        Arc::clone(&self.journal)
-    }
-
-    /// Each exact destination/policy has independent durable scan progress.
-    pub(crate) async fn history_replay_watermark(
-        &self,
-        destination: &OwnedExactScope,
-        policy_revision: u64,
-    ) -> Result<u64, ObservationJourneyError> {
-        let source_stream = history_source_stream(destination, policy_revision)
-            .map_err(ObservationJourneyError::Journal)?;
-        let journal = Arc::clone(&self.journal);
-        tokio::task::spawn_blocking(move || {
-            journal.maximum_replay_sequence(SourceAuthorityV1::HostSession, &source_stream)
-        })
-        .await
-        .map_err(ObservationJourneyError::IngestTask)?
-        .map(|position| position.map_or(0, |position| position.0))
-        .map_err(ObservationJourneyError::Journal)
-    }
-
-    /// Waits for actual durable full-effect receipts for every granted source.
-    /// Current provider readiness/recovery remains a separate pre-recall check.
-    pub(crate) async fn await_history_delivery(
-        &self,
-        grant: &tracedecay_memory_provider_registry::HistoryGrant,
-        bounds: ReplayBoundsV1<'_>,
-    ) -> Result<(), ObservationJourneyError> {
-        use super::provider_history::ProviderHistoryErrorV1;
-        check_replay_bounds(bounds, 0)?;
-        if grant.sources.len() > 256 {
-            return Err(
-                ProviderHistoryErrorV1::ClaimMismatch("history delivery source bound").into(),
-            );
-        }
-        let authority = self.delivery.history_authority.get().cloned().ok_or(
-            ProviderHistoryErrorV1::Unavailable("history authority mount"),
-        )?;
-        let cancellation = HistoryDeliveryCancellationV1(CancellationToken::new());
-        let deadline_micros = wall_deadline_micros(bounds.deadline);
-        let control = OperationControl::new(
-            deadline_micros,
-            u64::try_from(
-                deadline_micros
-                    .saturating_sub(tracedecay_contracts::now_micros().0)
-                    .max(0)
-                    / 1_000,
-            )
-            .unwrap_or(u64::MAX),
-            cancellation.0.clone(),
-        );
-        let work = async {
-            authority
-                .revalidate_async(
-                    &self.adapter.context.provider_lane.provider_id,
-                    grant,
-                    &control,
-                )
-                .await?;
-            if grant.sources.is_empty() {
-                return Ok(());
-            }
-            let stream = SourceStreamKeyV1 {
-                source_authority: SourceAuthorityV1::HostSession,
-                exact_scope_sha256: grant.destination_scope.exact_scope_sha256(),
-                source_stream: history_source_stream(
-                    &grant.destination_scope,
-                    grant.policy_revision,
-                )
-                .map_err(ObservationJourneyError::Journal)?,
-            };
-            let sources = grant
-                .sources
-                .iter()
-                .map(
-                    |source| tracedecay_memory_observation::ExpectedSourceDeliveryV1 {
-                        source_sequence: SourceSequenceV1(source.attribution.source_sequence),
-                        source_event_id: source.attribution.source.observation_id.clone(),
-                    },
-                )
-                .collect::<Vec<_>>();
-            loop {
-                // Enable before observing: a commit during the snapshot must
-                // wake this waiter even if the worker publishes before await.
-                let mut changed = Box::pin(self.delivery_changed.async_changed.notified());
-                changed.as_mut().enable();
-                self.wake_delivery();
-                let journal = Arc::clone(&self.journal);
-                let lane = self.adapter.context.provider_lane.clone();
-                let snapshot_grant = grant.clone();
-                let stream = stream.clone();
-                let sources = sources.clone();
-                let token = cancellation.0.clone();
-                let deadline = bounds.deadline;
-                let settled = tokio::task::spawn_blocking(move || {
-                    let evidence = journal
-                        .read_source_deliveries(
-                            &lane,
-                            &snapshot_grant.destination_scope,
-                            &stream,
-                            &sources,
-                            tracedecay_memory_observation::RecoveryTimeBudgetV1 {
-                                remaining_micros: i64::try_from(
-                                    deadline
-                                        .saturating_duration_since(tokio::time::Instant::now())
-                                        .as_micros(),
-                                )
-                                .unwrap_or(i64::MAX),
-                            },
-                            &token,
-                        )
-                        .map_err(ObservationJourneyError::Journal)?;
-                    validate_history_delivery_evidence(&snapshot_grant, evidence, &token, deadline)
-                })
-                .await
-                .map_err(ObservationJourneyError::IngestTask)??;
-                if settled {
-                    authority
-                        .revalidate_async(
-                            &self.adapter.context.provider_lane.provider_id,
-                            grant,
-                            &control,
-                        )
-                        .await?;
-                    return Ok(());
-                }
-                changed.await;
-            }
-        };
-        tokio::select! {
-            biased;
-            () = bounds.cancellation.cancelled() => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
-            () = self.stopping.cancelled() => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
-            result = tokio::time::timeout_at(bounds.deadline, work) => {
-                match result {
-                    Err(_) => Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 }),
-                    Ok(Err(ObservationJourneyError::Journal(ObservationJournalError::BudgetExhausted { .. }))) => Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 }),
-                    Ok(Err(ObservationJourneyError::Journal(ObservationJournalError::OperationCancelled { .. }))) => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
-                    Ok(result) => result,
-                }
-            }
-        }
-    }
-
-    /// Delivers one bounded canonical history page through the same hygiene,
-    /// journal, idempotency, backpressure and supervised provider path as live
-    /// observations. Every effect retains the original source session/key.
-    pub(crate) async fn replay_authorized_history_page(
-        &self,
-        page: super::provider_history::ProviderHistoryPageV1,
-        destination: OwnedExactScope,
-        policy_revision: u64,
-        bounds: ReplayBoundsV1<'_>,
-    ) -> Result<ReplayPassV1, ObservationJourneyError> {
-        check_replay_bounds(bounds, 0)?;
-        if policy_revision == 0
-            || page.records.len() > 256
-            || page.grant.as_ref().is_some_and(|grant| {
-                grant.destination_scope != destination || grant.policy_revision != policy_revision
-            })
-        {
-            return Err(
-                super::provider_history::ProviderHistoryErrorV1::ClaimMismatch(
-                    "history page destination/bounds",
-                )
-                .into(),
-            );
-        }
-        let authority = self.delivery.history_authority.get().cloned().ok_or(
-            super::provider_history::ProviderHistoryErrorV1::Unavailable("history authority mount"),
-        )?;
-        if let Some(grant) = &page.grant {
-            let deadline = wall_deadline_micros(bounds.deadline);
-            let now = tracedecay_contracts::now_micros().0;
-            let control = OperationControl::new(
-                deadline,
-                u64::try_from(deadline.saturating_sub(now).max(0) / 1000).unwrap_or(u64::MAX),
-                CancellationToken::new(),
-            );
-            tokio::select! {
-                () = bounds.cancellation.cancelled() => return Err(ObservationJourneyError::Cancelled { admitted: 0 }),
-                () = self.stopping.cancelled() => return Err(ObservationJourneyError::Cancelled { admitted: 0 }),
-                result = tokio::time::timeout_at(bounds.deadline, authority.revalidate_async(
-                    &self.adapter.context.provider_lane.provider_id, grant, &control,
-                )) => {
-                    result.map_err(|_| ObservationJourneyError::DeadlineExceeded { admitted: 0 })??;
-                }
-            }
-        }
-        let adapter = Arc::new(GrantedHistoryAdmissionAdapterV1 {
-            canonical: Arc::clone(&self.adapter),
-            grant: page.grant,
-        });
-        let stream = SourceStreamKeyV1 {
-            source_authority: SourceAuthorityV1::HostSession,
-            exact_scope_sha256: destination.exact_scope_sha256(),
-            source_stream: history_source_stream(&destination, policy_revision)
-                .map_err(ObservationJourneyError::Journal)?,
-        };
-        let mut admitted = 0;
-        for stored in page.records {
-            check_replay_bounds(bounds, admitted)?;
-            if self.stopping.is_cancelled() {
-                break;
-            }
-            let record = SourceRecordV1 {
-                stream: stream.clone(),
-                source_sequence: SourceSequenceV1(stored.sequence()),
-                source_event_id: stored.observation().observation_id().as_str().to_owned(),
-                source_event_revision: 1,
-                record: stored,
-            };
-            #[cfg(feature = "test-helpers")]
-            let (source_sequence, granted) = (
-                record.source_sequence.0,
-                adapter.grant.as_ref().is_some_and(|grant| {
-                    grant.sources.iter().any(|source| {
-                        source.attribution.source.observation_id == record.source_event_id
-                    })
-                }),
-            );
-            let report = match self
-                .ingest_record_with_adapter(record, Arc::clone(&adapter), bounds)
-                .await?
-            {
-                RecordOutcomeV1::Reported(report) => report,
-                RecordOutcomeV1::DeadlineExceeded => {
-                    return Err(ObservationJourneyError::DeadlineExceeded { admitted });
-                }
-            };
-            #[cfg(feature = "test-helpers")]
-            super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
-                serde_json::json!({
-                    "phase": "history_ingress",
-                    "source_sequence": source_sequence,
-                    "granted": granted,
-                    "appended": report.appended,
-                    "duplicates": report.duplicates,
-                    "withheld": report.withheld,
-                    "non_messages": report.non_messages,
-                    "already_processed": report.already_processed,
-                })
-            });
-            admitted += u64::from(report.appended);
-            if let Some(stop) = report.stopped_on {
-                return Err(match stop.reason {
-                    IngressStopReasonV1::Cancelled => {
-                        ObservationJourneyError::Cancelled { admitted }
-                    }
-                    IngressStopReasonV1::DeadlineExceeded => {
-                        ObservationJourneyError::DeadlineExceeded { admitted }
-                    }
-                });
-            }
-            if report.halted_on.is_some() || report.shed_on.is_some() {
-                return Ok(ReplayPassV1 {
-                    admitted,
-                    halted: report.halted_on,
-                    shed: report.shed_on,
-                });
-            }
-        }
-        Ok(ReplayPassV1 {
-            admitted,
-            halted: None,
-            shed: None,
-        })
+        self.provider_id == provider_id.as_str()
+            && self.registration_revision == registration_revision
+            && &self.provider_lane.provider_id == provider_id
+            && self.provider_lane.registration_revision == registration_revision
+            && &context.provider_lane.provider_id == provider_id
+            && context.provider_lane.registration_revision == registration_revision
+            && &context.profile_id == profile_id
+            && &context.scope == scope
     }
 
     /// Storage placement of the journal. Diagnostics only — never identity.
@@ -3895,12 +3381,14 @@ impl ProjectObservationJourneyV1 {
     /// provider is costing the host right now, this says *why* the host is
     /// refusing what the provider does. Bounded by
     /// [`DELIVERY_REFUSAL_HISTORY`].
+    #[cfg(test)]
     pub(crate) fn recent_delivery_refusals(&self) -> Vec<DeliveryRefusalV1> {
         self.delivery_refusals.recent()
     }
 
     /// Every delivery this lane has refused since it was mounted, including
     /// the ones already aged out of [`Self::recent_delivery_refusals`].
+    #[cfg(test)]
     pub(crate) fn delivery_refusals_total(&self) -> u64 {
         self.delivery_refusals.total()
     }
@@ -4076,25 +3564,7 @@ impl ProjectObservationJourneyV1 {
         record: SourceRecordV1<StoredObservation>,
         bounds: ReplayBoundsV1<'_>,
     ) -> Result<RecordOutcomeV1, ObservationJourneyError> {
-        self.ingest_record_with_adapter(record, Arc::clone(&self.adapter), bounds)
-            .await
-    }
-
-    async fn ingest_record_with_adapter<A>(
-        &self,
-        record: SourceRecordV1<StoredObservation>,
-        adapter: Arc<A>,
-        bounds: ReplayBoundsV1<'_>,
-    ) -> Result<RecordOutcomeV1, ObservationJourneyError>
-    where
-        A: ObservationAdmissionAdapterV1<
-                Record = StoredObservation,
-                Error = AdmissionAdapterError,
-                Control = ReplayIngestControlV1,
-            > + Send
-            + Sync
-            + 'static,
-    {
+        let adapter = Arc::clone(&self.adapter);
         let journal = Arc::clone(&self.journal);
         let wake = Arc::clone(&self.wake);
         let backpressure = Arc::clone(&self.backpressure);
@@ -4399,6 +3869,7 @@ impl ProjectObservationJourneyV1 {
 
     /// The typed journal refusal the most recent replay pass stopped on, when
     /// that is what it stopped on.
+    #[cfg(test)]
     pub(crate) fn halted_on(&self) -> Option<IngressHaltV1> {
         match self.stalled_on() {
             Some(LiveReplayStallV1::Halted(halt)) => Some(halt),
@@ -5220,6 +4691,7 @@ pub(crate) struct ObservationJourneyMountInputsV1 {
 /// function without an authoritative resolved scope and an enabled composition.
 /// Readiness is proved separately for each canonical record's own source-session
 /// scope before admission and again immediately before delivery.
+#[cfg(test)]
 pub(crate) fn mount_project_observation_journey(
     inputs: ObservationJourneyMountInputsV1,
 ) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError> {
@@ -5318,7 +4790,6 @@ fn construct_project_observation_journey(
         },
     });
     let delivery = Arc::new(RegistryObservationDeliveryAdapterV1 {
-        history_authority: Arc::new(OnceLock::new()),
         provider_id: inputs.provider.provider_id.clone(),
         composition: Arc::clone(&inputs.composition),
         readiness: supervised_readiness,
@@ -5443,209 +4914,6 @@ where
     Ok(pass)
 }
 
-/// Journal inspection for the host journeys mounted beside this module.
-///
-/// The durable journal is *this* mount's dependency, never a journey's: a
-/// journey asks what settled through the opaque view below instead of naming
-/// the journal crate itself, so ownership of the journal — and of the store
-/// handle a second reader opens on it — stays with the module that mounts it.
-///
-/// The indirection softens nothing. Every field a journey compares is carried
-/// across verbatim from the journal crate's own inspection row — observation
-/// and idempotency identity, payload digest, exact scope, source position,
-/// attempt count, content presence, and the delivery state in the enum's own
-/// canonical wire spelling — and a refused inspection, or a page that did not
-/// fit, still fails loudly rather than reading as an empty journal.
-#[cfg(all(test, feature = "memory-provider-host"))]
-mod journey_journal_inspection {
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    use tracedecay_memory_observation::{
-        DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
-        ObservationJournalReaderV1, SqliteObservationJournal,
-    };
-
-    use super::ObservationJourneyPolicyV1;
-
-    /// One page of inspection is more than a host journey can ever produce, so
-    /// a full page means the reader, not the journey, is what changed.
-    const INSPECTION_PAGE_LIMIT: u32 = 100;
-
-    /// How long [`JourneyJournalV1::await_settlement`] waits. A journey runs a
-    /// bounded background delivery worker, so this is a convergence bound and
-    /// never a sleep: the wait ends as soon as every row is terminal.
-    const SETTLEMENT_BUDGET: Duration = Duration::from_secs(30);
-
-    /// How often the settlement wait re-reads the journal. It only bounds how
-    /// promptly a *satisfied* condition is noticed; the condition itself, never
-    /// this interval, is what a journey's assertions rest on.
-    const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-    /// The canonical wire spelling of the state an accepted delivery settles
-    /// in, taken from the journal crate's own enum. A renamed or re-encoded
-    /// state fails to compile here instead of silently never matching.
-    pub(super) const ACKNOWLEDGED_DELIVERY_STATE: &str = DeliveryStateV1::Acknowledged.as_wire();
-
-    /// A second, read-only handle on the journal a mounted journey owns.
-    pub(super) struct JourneyJournalV1(SqliteObservationJournal);
-
-    /// One journalled delivery, as a host journey sees it.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(super) struct JourneyJournalRowV1 {
-        /// Observation identity.
-        pub(super) observation_id: String,
-        /// Content-derived idempotency key.
-        pub(super) idempotency_key: String,
-        /// Digest of the sanitized canonical payload.
-        pub(super) payload_sha256: String,
-        /// Digest of the exact coding scope this delivery is bound to.
-        pub(super) exact_scope_sha256: String,
-        /// Observation kind identity.
-        pub(super) observation_kind: String,
-        /// Position in the source stream.
-        pub(super) source_sequence: u64,
-        /// Attempts recorded so far.
-        pub(super) attempt_number: u32,
-        /// Whether the row's content bytes are still present.
-        pub(super) content_present: bool,
-        /// Delivery state, in its canonical wire spelling.
-        pub(super) state: &'static str,
-        /// Whether that state ends delivery.
-        pub(super) terminal: bool,
-    }
-
-    impl JourneyJournalRowV1 {
-        fn of(row: &JournalInspectionRowV1) -> Self {
-            Self {
-                observation_id: row.observation_id.as_str().to_owned(),
-                idempotency_key: row.idempotency_key.as_str().to_owned(),
-                payload_sha256: row.payload_sha256.clone(),
-                exact_scope_sha256: row.exact_scope_sha256.clone(),
-                observation_kind: row.observation_kind.clone(),
-                source_sequence: row.source_sequence.0,
-                attempt_number: row.attempt_number,
-                content_present: row.content_present,
-                state: row.state.as_wire(),
-                terminal: row.state.is_terminal(),
-            }
-        }
-    }
-
-    /// Opens a second, read-only handle on the journal at `journal_path`.
-    ///
-    /// Once per journey, not once per poll: opening the store re-applies its
-    /// schema inside a write transaction, and a reader that did that every
-    /// hundred milliseconds would contend with the delivery worker it is meant
-    /// to be observing. One handle in WAL mode still sees every later commit.
-    pub(super) fn open_journal(journal_path: &Path) -> JourneyJournalV1 {
-        JourneyJournalV1(
-            SqliteObservationJournal::open(
-                journal_path,
-                ObservationJourneyPolicyV1::project_default().retention,
-            )
-            .expect("the durable observation journal must open through its own store API"),
-        )
-    }
-
-    impl JourneyJournalV1 {
-        /// Every delivery the journal holds, read through the journal crate's
-        /// own inspection surface.
-        ///
-        /// The journal's schema is that crate's business: nothing here names a
-        /// table or a column, so a schema change cannot leave a journey
-        /// silently reading nothing.
-        pub(super) fn rows(&self) -> Vec<JourneyJournalRowV1> {
-            let page = self
-                .0
-                .inspect(&JournalInspectionFilterV1 {
-                    limit: INSPECTION_PAGE_LIMIT,
-                    ..JournalInspectionFilterV1::default()
-                })
-                .expect("the durable observation journal must answer an inspection");
-            assert!(
-                page.next_cursor.is_none(),
-                "a host journey cannot produce more than {INSPECTION_PAGE_LIMIT} deliveries; \
-                 {} rows were reported",
-                page.total_rows
-            );
-            page.rows.iter().map(JourneyJournalRowV1::of).collect()
-        }
-
-        /// Waits, bounded, until the journal holds at least `minimum_rows`
-        /// deliveries and every one of them is terminal, and returns them the
-        /// moment it does.
-        ///
-        /// The deadline is a failure, never a result: a wait that runs out
-        /// reports the rows it last observed instead of handing a caller a
-        /// half-settled journal to assert against.
-        pub(super) async fn await_settlement(
-            &self,
-            minimum_rows: usize,
-        ) -> Vec<JourneyJournalRowV1> {
-            let deadline = Instant::now() + SETTLEMENT_BUDGET;
-            loop {
-                let rows = self.rows();
-                if rows.len() >= minimum_rows && rows.iter().all(|row| row.terminal) {
-                    return rows;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "the durable observation journal never settled {minimum_rows} deliveries \
-                     within {SETTLEMENT_BUDGET:?}; last observed {:?}",
-                    journal_digest(&rows)
-                );
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        }
-    }
-
-    /// The row identity a replayed source must reproduce exactly: who the
-    /// observation is, what content it carries, and how many attempts it cost.
-    ///
-    /// Comparing this set — not a length — is what makes the idempotency claim
-    /// real: a journal that dropped one row and admitted a different one has
-    /// the same length and a different set.
-    pub(super) fn journal_row_identities(
-        rows: &[JourneyJournalRowV1],
-    ) -> Vec<(String, String, String, u32)> {
-        let mut identities = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.idempotency_key.clone(),
-                    row.observation_id.clone(),
-                    row.payload_sha256.clone(),
-                    row.attempt_number,
-                )
-            })
-            .collect::<Vec<_>>();
-        identities.sort();
-        identities
-    }
-
-    /// A compact, sorted description of the journal for a failed assertion, so
-    /// a deadline failure names what it actually saw.
-    pub(super) fn journal_digest(rows: &[JourneyJournalRowV1]) -> Vec<String> {
-        let mut digest = rows
-            .iter()
-            .map(|row| {
-                format!(
-                    "{}|{}|{}|attempt={}|seq={}|content_present={}",
-                    row.observation_kind,
-                    row.exact_scope_sha256,
-                    row.state,
-                    row.attempt_number,
-                    row.source_sequence,
-                    row.content_present,
-                )
-            })
-            .collect::<Vec<_>>();
-        digest.sort();
-        digest
-    }
-}
-
 /// Whether a startup replay refusal is one a later pass can clear.
 ///
 /// The rule is fail-closed: a refusal counts as retryable only when the store
@@ -5741,6 +5009,7 @@ pub(crate) fn replay_recoverability(error: &ObservationJourneyError) -> ReplayRe
 /// project open fails with the reason instead of starting degraded in silence.
 ///
 /// Mount and live-replay-start failures are returned typed.
+#[cfg(test)]
 pub(crate) async fn mount_and_replay<S>(
     inputs: ObservationJourneyMountInputsV1,
     observation_store: S,
@@ -5880,12 +5149,15 @@ mod tests {
     };
     use tracedecay_memory_provider_registry::{
         CommittedEffectEvidence, EnabledProviderMode, FabricConfig, FallbackDirective,
-        HandshakeResponse, NativeMemoryApplicationPort, NativeProviderActivation, ProviderDescriptor, ProviderReply, TerminalRecord,
+        HandshakeResponse, MemoryProviderV1, ObservationProviderMountV1,
+        ObservationStateNamespacePolicyV1, ProviderDescriptor, ProviderExecutionShapeV1,
+        ProviderLifecycleOwnershipV1, ProviderRegistrationV1, ProviderReply,
+        RecallScopeBindingsV1, SelectedProviderActivationV1, TerminalRecord,
     };
     use tracedecay_sessions::admission::HostAdmissionScope;
     use tracedecay_store::{
         AnchoredObservationWrite, ObservationStore, ObservationWrite,
-        build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
+        build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
     };
 
     use super::*;
@@ -5905,7 +5177,6 @@ mod tests {
     /// boundary between the host's canonical commit and the provider's durable
     /// acknowledgement.
     mod crash_restart_fuzz;
-    mod provider_history;
     #[cfg(unix)]
     mod real_ncm_observer;
 
@@ -6436,9 +5707,9 @@ mod tests {
         use super::*;
 
         /// State namespace the double reports at handshake. It has to sit under the
-        /// Native provider's own admitted prefix or readiness is refused before a
+        /// fixture observer's own admitted prefix or readiness is refused before a
         /// single delivery — which would prove nothing about delivery.
-        const ADVERSARIAL_STATE_NAMESPACE: &str = "tracedecay.native.adversarial";
+        const ADVERSARIAL_STATE_NAMESPACE: &str = "journey.observer.adversarial";
 
         /// How long a settlement wait may run before the test reports the journal
         /// snapshot instead of a bare timeout.
@@ -6455,45 +5726,9 @@ mod tests {
         /// test can then wait for the late answer it must not accept.
         const IGNORED_CANCELLATION_BLOCK_MILLIS: u64 = 1_500;
 
-        // ---------------------------------------------------------------------------
-        // The double on the Native application port
-        // ---------------------------------------------------------------------------
-
-        /// Presents the provider-neutral double on the Native application port, which
-        /// is the only port the composition can build. Every host layer — supervised
-        /// readiness, the recovery gate, the fabric, the journal — therefore runs
-        /// exactly as it does in the daemon.
-        struct AdversarialNativePortV1 {
-            inner: Arc<AdversarialProviderV1>,
-        }
-
-        impl AdversarialNativePortV1 {
-            fn new(inner: Arc<AdversarialProviderV1>) -> Self {
-                Self { inner }
-            }
-        }
-
-        impl NativeMemoryApplicationPort for AdversarialNativePortV1 {
-            fn descriptor(&self) -> ProviderDescriptor {
-                MemoryProviderV1::descriptor(self.inner.as_ref())
-            }
-
-            fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
-                MemoryProviderV1::handshake(self.inner.as_ref(), request)
-            }
-
-            fn health(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn recall(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-        }
-
-        /// The descriptor the double registers under: the Native identity, the host's
-        /// own limits, and the implementation identity the durable recovery record
-        /// compares against.
+        /// The descriptor the double registers under: the fixture observer
+        /// identity, the host's own limits, and the implementation identity the
+        /// durable recovery record compares against.
         /// The state generation a freshly mounted adversarial double reports.
         ///
         /// Deliberately not zero. A provider whose state generation *moved
@@ -6506,7 +5741,7 @@ mod tests {
 
         fn adversarial_descriptor() -> ProviderDescriptor {
             ProviderDescriptor::new(
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+                OwnedProviderId::new(FIXTURE_OBSERVER_ID).expect("fixture observer"),
                 "0".repeat(64),
                 "adversarial-journey-v1",
                 ADVERSARIAL_STATE_GENERATION,
@@ -6515,7 +5750,7 @@ mod tests {
                     OwnedVersionedId::new("observation.accept.v1").expect("observe capability"),
                     OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
                 ]),
-                crate::retained_owner::native_provider::native_provider_limits(),
+                fixture_observer_limits(),
             )
             .expect("adversarial descriptor")
         }
@@ -6643,14 +5878,12 @@ mod tests {
             let journal_root = temp.path().join("journey");
             std::fs::create_dir_all(&journal_root).expect("journal root");
             let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
-                composition: composition(Arc::new(AdversarialNativePortV1::new(Arc::clone(
-                    provider,
-                )))),
+                composition: composition(Arc::clone(provider) as Arc<dyn MemoryProviderV1>),
                 profile_id,
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
-                    .expect("native mount metadata"),
+                provider: fixture_observer_mount(&(journal_root), 1)
+                    .expect("fixture observer mount metadata"),
                 store_data_root: journal_root,
                 policy,
             })
@@ -7995,7 +7228,7 @@ mod tests {
         exact_scope: OwnedExactScope,
     }
 
-    struct JourneyNativePort {
+    struct JourneyObserverPort {
         descriptor: ProviderDescriptor,
         observe_calls: AtomicUsize,
         delivered: Mutex<Vec<DeliveredObservation>>,
@@ -8004,7 +7237,7 @@ mod tests {
         health_hook: Mutex<Option<Box<dyn Fn(&ProviderCall) -> ProviderReply + Send + Sync>>>,
     }
 
-    impl JourneyNativePort {
+    impl JourneyObserverPort {
         fn new() -> Self {
             Self::with_state_generation(0)
         }
@@ -8022,12 +7255,12 @@ mod tests {
                 OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
             ]);
             let descriptor = ProviderDescriptor::new(
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+                OwnedProviderId::new(FIXTURE_OBSERVER_ID).expect("fixture observer"),
                 "0".repeat(64),
                 "journey-test-v1",
                 state_generation,
                 capabilities,
-                super::super::native_provider::native_provider_limits(),
+                fixture_observer_limits(),
             )
             .expect("provider descriptor");
             Self {
@@ -8064,7 +7297,7 @@ mod tests {
         }
     }
 
-    impl NativeMemoryApplicationPort for JourneyNativePort {
+    impl MemoryProviderV1 for JourneyObserverPort {
         fn descriptor(&self) -> ProviderDescriptor {
             self.descriptor.clone()
         }
@@ -8086,12 +7319,10 @@ mod tests {
                 )
                 .expect("handshake terminal"),
                 descriptor: Some(self.descriptor.clone()),
-                provider_instance_id: Some(
-                    super::super::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
-                ),
-                // Inside the namespace the mount admits for the Native
-                // provider; a namespace outside it is a readiness refusal.
-                state_namespace: Some("tracedecay.native.journey-test".to_owned()),
+                provider_instance_id: Some(FIXTURE_OBSERVER_INSTANCE_ID.to_owned()),
+                // Inside the namespace the mount admits for the fixture
+                // observer; a namespace outside it is a readiness refusal.
+                state_namespace: Some(format!("{FIXTURE_OBSERVER_ID}.journey-test")),
                 accepted_scope: Some(request.exact_scope.clone()),
                 effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
                 ready_receipt_sha256: Some(READY_RECEIPT.to_owned()),
@@ -8099,15 +7330,57 @@ mod tests {
             }
         }
 
-        fn health(&self, call: &ProviderCall) -> ProviderReply {
-            match self.health_hook.lock().unwrap().as_ref() {
-                Some(hook) => hook(call),
-                None => Self::unexpected(),
+        fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+            match call.operation {
+                ProviderOperation::Observe => self.observe(call),
+                ProviderOperation::Health => match self.health_hook.lock().unwrap().as_ref() {
+                    Some(hook) => hook(call),
+                    None => Self::unexpected(),
+                },
+                _ => Self::unexpected(),
             }
         }
+    }
 
-        fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
+    impl JourneyObserverPort {
+        fn observe(&self, call: &ProviderCall) -> ProviderReply {
+            self.observe_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(hook) = self.observe_hook.lock().unwrap().as_ref() {
+                hook();
+            }
+            self.delivered.lock().unwrap().push(DeliveredObservation {
+                bytes: call.payload.bytes.clone(),
+                exact_scope: call.exact_scope.clone(),
+            });
+            // The generation this port declares is its descriptor's, fixed for
+            // the incarnation. Reporting an advance would be read back as a
+            // regression at the next handshake and refuse every later
+            // delivery, so the committed effect is non-regressing and
+            // unchanged, which the contract permits.
+            ProviderReply {
+                terminal: TerminalRecord::new(
+                    ProviderOperation::Observe,
+                    call.provider_id.clone(),
+                    TerminalCode::Success,
+                    CommittedEffectEvidence::committed(
+                        call.expected_state_generation,
+                        call.expected_state_generation,
+                        vec!["observation:journey-test".to_owned()],
+                        PROVIDER_RECEIPT,
+                        EFFECT_DIGEST,
+                    )
+                    .expect("committed effect"),
+                    FallbackDirective::forbidden(),
+                    call.operation_id.clone(),
+                    call.exact_scope.exact_scope_sha256(),
+                    None,
+                )
+                .expect("observation terminal"),
+                payload: Some(call.payload.clone()),
+                warnings: Vec::new(),
+                extensions: call.extensions.clone(),
+                state_generation: call.expected_state_generation,
+            }
         }
     }
 
@@ -8258,7 +7531,7 @@ mod tests {
             "observation-journey-test",
         )
         .expect("resolution authorization");
-        let anchor = build_observation_retrieval_anchor_v2(
+        let anchor = build_observation_retrieval_anchor(
             write.observation(),
             projection_generation.clone(),
             UtcMicros(1_750_000_000_000_000),
@@ -8287,7 +7560,7 @@ mod tests {
         let authorization =
             build_observation_resolution_authorization_v1(&observation, "observation-journey-test")
                 .expect("resolution authorization");
-        let anchor = build_observation_retrieval_anchor_v2(
+        let anchor = build_observation_retrieval_anchor(
             &observation,
             projection_generation.clone(),
             UtcMicros(1_750_000_000_000_000),
@@ -8309,19 +7582,6 @@ mod tests {
     /// the canonical store only where the store's own write boundary cannot
     /// produce the row under test; the journey reads it through the same
     /// trait it reads the store through.
-    fn recent_record_window(
-        records: &[StoredObservation],
-        request: tracedecay_store::ObservationRecentWindowRequest,
-    ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError> {
-        let sequences: Vec<_> = records
-            .iter()
-            .rev()
-            .take(request.limit() + 1)
-            .map(StoredObservation::sequence)
-            .collect();
-        tracedecay_store::ObservationRecentWindowV1::from_descending_sequences(request, &sequences)
-    }
-
     struct SettledRecordsPort {
         records: Vec<StoredObservation>,
     }
@@ -8335,14 +7595,6 @@ mod tests {
     }
 
     impl ObservationAdmissionPort for SettledRecordsPort {
-        async fn recent_admitted_observation_window(
-            &self,
-            request: tracedecay_store::ObservationRecentWindowRequest,
-        ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError>
-        {
-            recent_record_window(&self.records, request)
-        }
-
         async fn read_admitted_observation(
             &self,
             observation_id: &CanonicalObservationIdV1,
@@ -8388,15 +7640,6 @@ mod tests {
     }
 
     impl ObservationAdmissionPort for CountingReplayPort {
-        async fn recent_admitted_observation_window(
-            &self,
-            request: tracedecay_store::ObservationRecentWindowRequest,
-        ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError>
-        {
-            self.passes.fetch_add(1, Ordering::Relaxed);
-            self.inner.recent_admitted_observation_window(request).await
-        }
-
         async fn read_admitted_observation(
             &self,
             observation_id: &CanonicalObservationIdV1,
@@ -8413,21 +7656,100 @@ mod tests {
         }
     }
 
-    fn composition(
-        port: Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
-    ) -> Arc<ProjectMemoryProviderComposition> {
+    /// Identity of the observing fixture provider these journeys mount. Native
+    /// observes nothing, so the journal, delivery and recovery mechanics are
+    /// exercised against a provider registered exactly the way NCM is: an
+    /// observer with its own journal, never a recall route.
+    const FIXTURE_OBSERVER_ID: &str = "journey.observer";
+    const FIXTURE_OBSERVER_INSTANCE_ID: &str = "journey.observer.instance-1";
+
+    fn composition(provider: Arc<dyn MemoryProviderV1>) -> Arc<ProjectMemoryProviderComposition> {
+        let provider_id = MemoryProviderV1::descriptor(provider.as_ref()).provider_id;
         Arc::new(
-            ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
-                fabric_config: FabricConfig {
-                    max_registered_providers: 1,
-                    max_in_flight: 1,
+            ProjectMemoryProviderComposition::compose_registered(
+                SelectedProviderActivationV1::ObserversOnly {
+                    fabric_config: FabricConfig {
+                        max_registered_providers: 1,
+                        max_in_flight: 1,
+                    },
                 },
-                port,
-                registration_revision: 1,
-                mode: EnabledProviderMode::Observer,
-            })
+                vec![ProviderRegistrationV1 {
+                    provider,
+                    provider_id,
+                    registration_revision: 1,
+                    mode: EnabledProviderMode::Observer,
+                    execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+                    recall_scope_bindings: RecallScopeBindingsV1::default(),
+                    lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
+                }],
+            )
             .expect("provider composition"),
         )
+    }
+
+    /// The exact envelope bytes the journey hands hygiene for one persisted
+    /// message: the provider envelope plus the host attribution derived from
+    /// the stored record.
+    async fn attributed_envelope_bytes(
+        store: &GlobalDbObservationStore,
+        profile_id: &UserProfileId,
+        resolved_scope: &ResolvedScope,
+        observation_id: &CanonicalObservationIdV1,
+    ) -> Vec<u8> {
+        let stored = store
+            .get_observation(observation_id)
+            .await
+            .expect("canonical read")
+            .expect("stored observation");
+        let attribution = super::super::observation_attribution::canonical_observation_attribution(
+            profile_id,
+            resolved_scope,
+            &stored,
+        )
+        .expect("host attribution");
+        let mut envelope = provider_observation_envelope(
+            SESSION_MESSAGE_OBSERVATION_KIND,
+            SESSION_MESSAGE_PAYLOAD_CONTRACT,
+            stored.observation().payload(),
+        );
+        envelope["source_identity"] = json!({ "original_source": attribution });
+        canonical_payload_bytes(&envelope).expect("provider envelope bytes")
+    }
+
+    /// Limits of the fixture observer: bounded like a real observer, with room
+    /// for one attributed session message per request and a small reply
+    /// ceiling the adversarial suite pads past.
+    fn fixture_observer_limits() -> ProviderLimits {
+        ProviderLimits {
+            request_bytes: 16_384,
+            response_bytes: 8_192,
+            observation_batch_items: 16,
+            recall_candidates: 32,
+            concurrent_operations: 4,
+            operation_millis: 1_000,
+            snapshot_bytes: 65_536,
+            inspection_items: 64,
+        }
+    }
+
+    /// Observation mount metadata for the fixture observer, under the store's
+    /// own provider-state root and the fixture's own namespace prefix.
+    fn fixture_observer_mount(
+        data_root: &Path,
+        registration_revision: u64,
+    ) -> Result<ObservationProviderMountV1, tracedecay_memory_provider_registry::ApiError> {
+        Ok(ObservationProviderMountV1 {
+            provider_id: OwnedProviderId::new(FIXTURE_OBSERVER_ID)?,
+            registration_revision,
+            provider_instance_id: Some(FIXTURE_OBSERVER_INSTANCE_ID.to_owned()),
+            instance_proof: None,
+            host_limits: fixture_observer_limits(),
+            state_root: data_root.join(PROVIDER_STATE_DIR_NAME),
+            journal_file_name: JOURNAL_FILE_NAME,
+            state_namespace_policy: ObservationStateNamespacePolicyV1::Prefix(
+                FIXTURE_OBSERVER_ID.to_owned(),
+            ),
+        })
     }
 
     /// Diagnostic snapshot of the journal so a failed wait explains itself
@@ -8526,7 +7848,7 @@ mod tests {
         temp: &TempDir,
         project: &str,
         profile: &str,
-        port: Arc<JourneyNativePort>,
+        port: Arc<JourneyObserverPort>,
     ) -> RecoveryJourneyFixture {
         let project_id = ProjectId::new(project).expect("project id");
         let runtime = HostAdmissionTestRuntimeV1::project(
@@ -8549,8 +7871,8 @@ mod tests {
             profile_id: profile_id.clone(),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
-                .expect("native mount metadata"),
+            provider: fixture_observer_mount(&(journal_root), 1)
+                .expect("fixture observer mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -8616,7 +7938,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mounted_delivery_declares_the_state_generation_recovery_verified() {
         let temp = TempDir::new().expect("temporary journey root");
-        let port = Arc::new(JourneyNativePort::with_state_generation(5));
+        let port = Arc::new(JourneyObserverPort::with_state_generation(5));
         let fixture = mount_journey_over_port(
             &temp,
             "project.observation-recovery-generation",
@@ -8677,7 +7999,7 @@ mod tests {
         use tracedecay_memory_conformance::ReleaseLatchV1;
 
         let temp = TempDir::new().expect("temporary journey root");
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObserverPort::new());
         let fixture = mount_journey_over_port(
             &temp,
             "project.observation-readiness-cancellation",
@@ -8780,7 +8102,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_moved_provider_identity_refuses_mounted_delivery_before_the_provider_call() {
         let temp = TempDir::new().expect("temporary journey root");
-        let port = Arc::new(JourneyNativePort::with_state_generation(5));
+        let port = Arc::new(JourneyObserverPort::with_state_generation(5));
         let fixture = mount_journey_over_port(
             &temp,
             "project.observation-recovery-identity",
@@ -8812,7 +8134,7 @@ mod tests {
                          automatic_repair_attempts, updated_at_micros) \
                      VALUES (?1, 1, 'host_session', ?2, ?3, ?4, 'journey-test-v1', 5, 0, 0, 1)",
                     rusqlite::params![
-                        NATIVE_PROVIDER_ID,
+                        FIXTURE_OBSERVER_ID,
                         exact_scope.exact_scope_sha256(),
                         SESSION_SOURCE_STREAM,
                         "1".repeat(64),
@@ -8875,6 +8197,84 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
+    /// The attribution a delivery carries is the one the recall lane derives
+    /// again from the store: deterministic for one record and mount, bound to
+    /// the mounted project, and recorded under the record's own session scope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_attribution_is_deterministic_project_bound_and_session_scoped() {
+        use super::super::observation_attribution::{
+            ObservationAttributionErrorV1, canonical_observation_attribution, owned_attribution,
+        };
+        use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallOriginScopeEvidenceV1;
+
+        let temp = TempDir::new().expect("temporary attribution root");
+        let project_id = ProjectId::new("project.observation-attribution").expect("project id");
+        let runtime = HostAdmissionTestRuntimeV1::project(
+            &temp.path().join("profile"),
+            &temp.path().join("project"),
+            project_id.clone(),
+        )
+        .await
+        .expect("registered project database");
+        let store = runtime
+            .registered_database_arc(HostAdmissionScope::Project)
+            .expect("project database")
+            .observation_store();
+        let session_id = SessionId::new("session.observation-attribution").expect("session id");
+        let observation = canonical_observation(&project_id, &session_id, "attributed text");
+        let observation_id = observation.observation_id().clone();
+        store
+            .persist_observation(anchored_write(observation))
+            .await
+            .expect("canonical observation commit");
+        let stored = store
+            .get_observation(&observation_id)
+            .await
+            .expect("canonical read")
+            .expect("stored observation");
+        let profile_id = UserProfileId::new("profile.observation-attribution").expect("profile");
+        let mounted = scope(project_id.clone());
+
+        let first =
+            canonical_observation_attribution(&profile_id, &mounted, &stored).expect("attribution");
+        let second =
+            canonical_observation_attribution(&profile_id, &mounted, &stored).expect("attribution");
+        assert_eq!(first, second, "one record and mount derive one attribution");
+        assert_eq!(
+            owned_attribution(&first).expect("owned"),
+            owned_attribution(&second).expect("owned")
+        );
+        assert_eq!(first.source.canonical_provider_id, "claude");
+        assert_eq!(first.source.canonical_session_id, session_id.as_str());
+        assert_eq!(first.source.observation_id, observation_id.as_str());
+        assert_eq!(first.source_sequence, stored.sequence());
+        let session_scope =
+            exact_scope_for_session(&profile_id, &mounted, session_id.as_str()).expect("scope");
+        let RecallOriginScopeEvidenceV1::Recorded {
+            exact_scope_identity,
+            ..
+        } = &first.origin_scope
+        else {
+            panic!("a live record carries its recorded session scope");
+        };
+        assert_eq!(
+            exact_scope_identity.agent_session_id,
+            session_scope.agent_session_id
+        );
+        assert_eq!(exact_scope_identity.branch_identity, session_scope.branch_identity);
+        let wire = serde_json::to_value(&first).expect("wire attribution");
+        assert!(
+            wire["ingested_at"].as_str().is_some_and(|time| time.ends_with('Z')),
+            "the provider parses UTC RFC 3339 clocks: {wire}"
+        );
+
+        let foreign = scope(ProjectId::new("project.foreign-attribution").expect("project id"));
+        assert!(matches!(
+            canonical_observation_attribution(&profile_id, &foreign, &stored),
+            Err(ObservationAttributionErrorV1::ForeignProject)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_canonical_commit_settles_native_session_acknowledgement_with_receipt() {
         let _ = tracing_subscriber::fmt()
@@ -8894,17 +8294,17 @@ mod tests {
             .expect("project database");
         let store = database.observation_store();
         let resolved_scope = scope(project_id.clone());
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObserverPort::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
             composition: composition(Arc::clone(&port)
-                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+                as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new("profile.observation-journey").expect("profile id"),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
-                .expect("native mount metadata"),
+            provider: fixture_observer_mount(&(journal_root), 1)
+                .expect("fixture observer mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -8923,16 +8323,18 @@ mod tests {
 
         let session_id = SessionId::new("session.observation-journey").expect("session id");
         let observation = canonical_observation(&project_id, &session_id, "persisted journey text");
-        let expected_bytes = canonical_payload_bytes(&provider_observation_envelope(
-            SESSION_MESSAGE_OBSERVATION_KIND,
-            SESSION_MESSAGE_PAYLOAD_CONTRACT,
-            observation.payload(),
-        ))
-        .expect("provider payload bytes");
+        let observation_id = observation.observation_id().clone();
         store
             .persist_observation(anchored_write(observation))
             .await
             .expect("canonical observation commit");
+        let expected_bytes = attributed_envelope_bytes(
+            &store,
+            &UserProfileId::new("profile.observation-journey").expect("profile id"),
+            &resolved_scope,
+            &observation_id,
+        )
+        .await;
 
         // Direct replay surfaces a typed admission failure immediately; the
         // live task may already have consumed the record, so either 0 or 1.
@@ -9095,17 +8497,17 @@ mod tests {
         let resolved_scope = scope(project_id.clone());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
-        let mount = |port: Arc<JourneyNativePort>| {
+        let mount = |port: Arc<JourneyObserverPort>| {
             mount_project_observation_journey(ObservationJourneyMountInputsV1 {
                 composition: composition(port),
                 profile_id: profile_id.clone(),
                 scope: resolved_scope.clone(),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(
+                provider: fixture_observer_mount(
                     &(journal_root.clone()),
                     1,
                 )
-                .expect("native mount metadata"),
+                .expect("fixture observer mount metadata"),
                 store_data_root: journal_root.clone(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             })
@@ -9118,7 +8520,7 @@ mod tests {
         };
 
         // First mount: two sessions interleave on the canonical stream.
-        let first_port = Arc::new(JourneyNativePort::new());
+        let first_port = Arc::new(JourneyObserverPort::new());
         let journey = mount(Arc::clone(&first_port));
         assert_eq!(
             run_startup_replay(journey.as_ref(), &store, &HostCancellationToken::new())
@@ -9213,7 +8615,7 @@ mod tests {
 
         // Second mount over the same journal: startup replay must read the
         // durable watermark and admit nothing that is already journaled.
-        let second_port = Arc::new(JourneyNativePort::new());
+        let second_port = Arc::new(JourneyObserverPort::new());
         let journey = mount(Arc::clone(&second_port));
         assert_eq!(journey.journal_path(), journal_path.as_path());
         assert_eq!(
@@ -9287,7 +8689,7 @@ mod tests {
     struct HygieneJourneyFixture {
         _runtime: HostAdmissionTestRuntimeV1,
         store: GlobalDbObservationStore,
-        port: Arc<JourneyNativePort>,
+        port: Arc<JourneyObserverPort>,
         journey: Arc<ProjectObservationJourneyV1>,
         project_id: ProjectId,
         /// The journal root this fixture's journey was mounted over, so a test
@@ -9311,15 +8713,15 @@ mod tests {
         fn reopen(&self) -> Arc<ProjectObservationJourneyV1> {
             mount_project_observation_journey(ObservationJourneyMountInputsV1 {
                 composition: composition(Arc::clone(&self.port)
-                    as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+                    as Arc<dyn MemoryProviderV1>),
                 profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
                 scope: scope(self.project_id.clone()),
                 authoritative_project_id: self.project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(
+                provider: fixture_observer_mount(
                     &(self.journal_root.clone()),
                     1,
                 )
-                .expect("native mount metadata"),
+                .expect("fixture observer mount metadata"),
                 store_data_root: self.journal_root.clone(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             })
@@ -9614,7 +9016,12 @@ mod tests {
             }
         })
         .await
-        .expect("the restarted delivery must reach the provider");
+        .unwrap_or_else(|_| {
+            panic!(
+                "the restarted delivery must reach the provider: {}",
+                journal_snapshot(&pending_path)
+            )
+        });
 
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut activation)
@@ -9660,17 +9067,17 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database")
             .observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObserverPort::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
             composition: composition(Arc::clone(&port)
-                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+                as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
-                .expect("native mount metadata"),
+            provider: fixture_observer_mount(&(journal_root.clone()), 1)
+                .expect("fixture observer mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -10126,17 +9533,18 @@ mod tests {
         );
         let canonical_id = observation.observation_id().clone();
         let canonical_payload = observation.payload().clone();
-        let source_envelope_bytes = canonical_payload_bytes(&provider_observation_envelope(
-            SESSION_MESSAGE_OBSERVATION_KIND,
-            SESSION_MESSAGE_PAYLOAD_CONTRACT,
-            &canonical_payload,
-        ))
-        .expect("provider envelope bytes");
         fixture
             .store
             .persist_observation(anchored_write(observation))
             .await
             .expect("canonical observation commit");
+        let source_envelope_bytes = attributed_envelope_bytes(
+            &fixture.store,
+            &UserProfileId::new("profile.observation-hygiene").expect("profile id"),
+            &scope(fixture.project_id.clone()),
+            &canonical_id,
+        )
+        .await;
 
         let admitted = fixture
             .journey
@@ -10256,17 +9664,18 @@ mod tests {
         );
         let canonical_id = observation.observation_id().clone();
         let canonical_payload = observation.payload().clone();
-        let source_envelope_bytes = canonical_payload_bytes(&provider_observation_envelope(
-            SESSION_MESSAGE_OBSERVATION_KIND,
-            SESSION_MESSAGE_PAYLOAD_CONTRACT,
-            &canonical_payload,
-        ))
-        .expect("provider envelope bytes");
         fixture
             .store
             .persist_observation(anchored_write(observation))
             .await
             .expect("canonical observation commit");
+        let source_envelope_bytes = attributed_envelope_bytes(
+            &fixture.store,
+            &UserProfileId::new("profile.observation-hygiene").expect("profile id"),
+            &scope(fixture.project_id.clone()),
+            &canonical_id,
+        )
+        .await;
 
         let admitted = fixture
             .journey
@@ -10612,17 +10021,17 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database");
         let store = database.observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObserverPort::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let inputs = || ObservationJourneyMountInputsV1 {
             composition: composition(Arc::clone(&port)
-                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+                as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new("profile.observation-retention").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
-                .expect("native mount metadata"),
+            provider: fixture_observer_mount(&(journal_root.clone()), 1)
+                .expect("fixture observer mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
@@ -10721,21 +10130,6 @@ mod tests {
     }
 
     impl ObservationAdmissionPort for RefusingReplayPort {
-        async fn recent_admitted_observation_window(
-            &self,
-            request: tracedecay_store::ObservationRecentWindowRequest,
-        ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError>
-        {
-            let next = match self.refusals.lock() {
-                Ok(mut slot) => slot.pop(),
-                Err(poisoned) => poisoned.into_inner().pop(),
-            };
-            if let Some(error) = next {
-                return Err(error);
-            }
-            recent_record_window(&self.then, request)
-        }
-
         async fn read_admitted_observation(
             &self,
             _observation_id: &CanonicalObservationIdV1,
@@ -10781,13 +10175,13 @@ mod tests {
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::new(JourneyNativePort::new())),
+            composition: composition(Arc::new(JourneyObserverPort::new())),
             profile_id: UserProfileId::new("profile.observation-startup-classification")
                 .expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
-            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
-                .expect("native mount metadata"),
+            provider: fixture_observer_mount(&(journal_root), 1)
+                .expect("fixture observer mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         }
@@ -11555,16 +10949,16 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database");
         let store = database.observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObserverPort::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).unwrap();
         let inputs = || ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port) as Arc<dyn NativeMemoryApplicationPort>),
+            composition: composition(Arc::clone(&port) as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new("profile.mount-off-worker").unwrap(),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
-                .expect("native mount metadata"),
+            provider: fixture_observer_mount(&(journal_root.clone()), 1)
+                .expect("fixture observer mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
@@ -11648,20 +11042,20 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database");
         let store = database.observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObserverPort::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).unwrap();
         let journey = mount_and_replay(
             ObservationJourneyMountInputsV1 {
-                composition: composition(Arc::clone(&port) as Arc<dyn NativeMemoryApplicationPort>),
+                composition: composition(Arc::clone(&port) as Arc<dyn MemoryProviderV1>),
                 profile_id: UserProfileId::new("profile.shutdown-off-worker").unwrap(),
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(
+                provider: fixture_observer_mount(
                     &(journal_root.clone()),
                     1,
                 )
-                .expect("native mount metadata"),
+                .expect("fixture observer mount metadata"),
                 store_data_root: journal_root.clone(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             },

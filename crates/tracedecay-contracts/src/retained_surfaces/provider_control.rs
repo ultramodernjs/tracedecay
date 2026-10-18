@@ -1,41 +1,22 @@
 //! Retained provider-local controls, independent from canonical fact CRUD.
 //!
-//! Public requests carry retained lookup keys and bounded caller parameters.
-//! The host resolves source attribution and the exact provider namespace, then
-//! assembles operation identity, readiness, request controls, and history proof.
-//! Constructing one of these values never grants provider or source authority.
+//! Public requests carry a retained namespace lookup key and bounded caller
+//! parameters. The host resolves the exact provider namespace, then assembles
+//! operation identity, readiness, and request controls. Constructing one of
+//! these values never grants provider authority.
 
 use std::collections::BTreeSet;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracedecay_domain::UtcMicros;
 
 use super::{CURRENT_SURFACES, RetainedSurfaceOperation, RetainedSurfaceSpec};
 use crate::error::ApplicationContractError;
 use tracedecay_tool_catalog::{EffectClass, ScopeDimension};
 
 pub const MAX_PROVIDER_CONTROL_REFERENCE_BYTES: usize = 1024;
-pub const MAX_PROVIDER_CONTROL_EVIDENCE_REFS: usize = 64;
-pub const MAX_PROVIDER_CONTROL_REASON_BYTES: usize = 8192;
 pub const MAX_PROVIDER_CONTROL_INSPECTION_ITEMS: usize = 100_000;
 pub const MAX_PROVIDER_CONTROL_RESPONSE_BYTES: usize = 33_554_432;
-pub const MAX_PROVIDER_CONTROL_SNAPSHOT_BYTES: u64 = 1_073_741_824;
-pub const MAX_PROVIDER_CONTROL_REPLAY_REFS: usize = 4096;
-
-/// An item and exact original-source member retained by the host's recall owner.
-/// These lookup keys are never caller-supplied stable source authority.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlSourceSelectorV1 {
-    #[schemars(length(min = 1, max = 1024))]
-    pub trace_ref: String,
-    #[schemars(length(min = 1, max = 1024))]
-    pub item_ref: String,
-    /// Chooses exactly one original source within a potentially derived item.
-    #[schemars(length(min = 1, max = 1024))]
-    pub observation_id: String,
-}
 
 /// A request for host namespace resolution. These fields are untrusted lookup
 /// keys; the host must authorize their exact provider, registration, and scope.
@@ -63,24 +44,6 @@ pub enum ProviderControlStateSelectorV1 {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderControlFeedbackSignalV1 {
-    Helpful,
-    Harmful,
-    Ignored,
-    Corrected,
-    Superseded,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderControlDeletionModeV1 {
-    RemoveInfluence,
-    HardDelete,
-    Anonymize,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ProviderControlMaintenanceTaskV1 {
     Consolidate,
     Decay,
@@ -102,93 +65,6 @@ pub enum ProviderControlHealthCheckV1 {
     Privacy,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderControlCorrectionKindV1 {
-    Supersede,
-    RestrictScope,
-    ChangeValidity,
-    ReplaceContent,
-    MarkIncorrect,
-}
-
-/// Replacement observations are point-read through existing retained source selectors.
-/// Metadata changes remain requests for authorization, not admitted wire data.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProviderControlCorrectionV1 {
-    Supersede {
-        replacement_source: ProviderControlSourceSelectorV1,
-    },
-    ReplaceContent {
-        replacement_source: ProviderControlSourceSelectorV1,
-    },
-    ChangeValidity {
-        valid_from: UtcMicros,
-        valid_until: Option<UtcMicros>,
-    },
-    MarkIncorrect {
-        revoked_at: UtcMicros,
-    },
-    RestrictScope {
-        destination: ProviderControlStateSelectorV1,
-    },
-}
-
-impl ProviderControlCorrectionV1 {
-    pub const fn kind(&self) -> ProviderControlCorrectionKindV1 {
-        match self {
-            Self::Supersede { .. } => ProviderControlCorrectionKindV1::Supersede,
-            Self::ReplaceContent { .. } => ProviderControlCorrectionKindV1::ReplaceContent,
-            Self::ChangeValidity { .. } => ProviderControlCorrectionKindV1::ChangeValidity,
-            Self::MarkIncorrect { .. } => ProviderControlCorrectionKindV1::MarkIncorrect,
-            Self::RestrictScope { .. } => ProviderControlCorrectionKindV1::RestrictScope,
-        }
-    }
-}
-
-/// An explicit caller feedback assertion. The host durably records the
-/// authenticated assertion and supplies its real outcome receipt to the provider.
-/// Acceptance does not establish objective usefulness or provider completion.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderFeedbackRequestV1 {
-    pub source: ProviderControlSourceSelectorV1,
-    pub signal: ProviderControlFeedbackSignalV1,
-    /// Canonical decimal text in the closed interval zero through one.
-    #[schemars(length(min = 1, max = 64))]
-    pub weight: String,
-    /// Bounded caller evidence claims. These are not resolved as host authority
-    /// and do not establish objective usefulness or provider completion.
-    #[schemars(length(max = 64))]
-    pub evidence_refs: Vec<String>,
-    pub occurred_at: UtcMicros,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderCorrectionRequestV1 {
-    pub source: ProviderControlSourceSelectorV1,
-    #[schemars(length(min = 1, max = 1024))]
-    pub expected_source_revision: String,
-    pub correction: ProviderControlCorrectionV1,
-    #[schemars(length(min = 1, max = 8192))]
-    pub reason: String,
-    /// Bounded caller claims; target and replacement sources are independently authorized.
-    #[schemars(length(max = 64))]
-    pub evidence_refs: Vec<String>,
-}
-
-/// One source, one durable host fence compare-and-set, and one erasure action.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderDeleteBySourceRequestV1 {
-    pub source: ProviderControlSourceSelectorV1,
-    pub mode: ProviderControlDeletionModeV1,
-    pub expected_fence_revision: u64,
-    pub include_snapshots: bool,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderHealthRequestV1 {
@@ -201,30 +77,16 @@ pub struct ProviderHealthRequestV1 {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderControlInspectionViewV1 {
     StateSummary,
-    SourceInfluence,
-    Trace,
-    DeliveryReceipt,
     MaintenanceReceipt,
-    SnapshotMetadata,
     CapabilityStatus,
 }
 
-/// Receipt and snapshot references are untrusted keys looked up within the
-/// separately authorized state namespace. Source views also require the host's
-/// retained recall-item resolver; no provider stable reference is accepted.
+/// Receipt references are untrusted keys looked up within the separately
+/// authorized state namespace; no provider stable reference is accepted.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "view", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderControlInspectionSelectorV1 {
     StateSummary,
-    SourceInfluence {
-        source: ProviderControlSourceSelectorV1,
-    },
-    Trace {
-        source: ProviderControlSourceSelectorV1,
-    },
-    DeliveryReceipt {
-        source: ProviderControlSourceSelectorV1,
-    },
     /// Provider-reported outcome query using actual returned control identities.
     /// Caller-supplied identities do not grant host receipt authority.
     MaintenanceReceipt {
@@ -233,10 +95,6 @@ pub enum ProviderControlInspectionSelectorV1 {
         #[schemars(length(min = 64, max = 64))]
         idempotency_key: String,
     },
-    SnapshotMetadata {
-        #[schemars(length(min = 1, max = 1024))]
-        snapshot_ref: String,
-    },
     CapabilityStatus,
 }
 
@@ -244,11 +102,7 @@ impl ProviderControlInspectionSelectorV1 {
     pub const fn view(&self) -> ProviderControlInspectionViewV1 {
         match self {
             Self::StateSummary => ProviderControlInspectionViewV1::StateSummary,
-            Self::SourceInfluence { .. } => ProviderControlInspectionViewV1::SourceInfluence,
-            Self::Trace { .. } => ProviderControlInspectionViewV1::Trace,
-            Self::DeliveryReceipt { .. } => ProviderControlInspectionViewV1::DeliveryReceipt,
             Self::MaintenanceReceipt { .. } => ProviderControlInspectionViewV1::MaintenanceReceipt,
-            Self::SnapshotMetadata { .. } => ProviderControlInspectionViewV1::SnapshotMetadata,
             Self::CapabilityStatus => ProviderControlInspectionViewV1::CapabilityStatus,
         }
     }
@@ -287,37 +141,6 @@ pub struct ProviderMaintenanceRequestV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderSnapshotExportRequestV1 {
-    pub state: ProviderControlStateSelectorV1,
-    /// The host also applies the negotiated snapshot and response byte limits.
-    #[schemars(range(min = 1, max = 1073741824))]
-    pub maximum_bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderSnapshotRestoreRequestV1 {
-    pub state: ProviderControlStateSelectorV1,
-    #[schemars(length(min = 1, max = 1024))]
-    pub snapshot_ref: String,
-    pub expected_state_generation: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderReplayRequestV1 {
-    pub state: ProviderControlStateSelectorV1,
-    /// Host-retained canonical receipts, never provider snapshot references.
-    #[schemars(length(min = 1, max = 4096))]
-    pub observation_batch_refs: Vec<String>,
-    pub first_source_sequence: u64,
-    pub last_source_sequence: u64,
-    pub expected_state_generation: u64,
-    pub expected_previous_acknowledged_sequence: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(
     tag = "operation",
     content = "request",
@@ -325,95 +148,32 @@ pub struct ProviderReplayRequestV1 {
     deny_unknown_fields
 )]
 pub enum ProviderControlRequestV1 {
-    Feedback(ProviderFeedbackRequestV1),
-    Correction(ProviderCorrectionRequestV1),
-    DeleteBySource(ProviderDeleteBySourceRequestV1),
     Health(ProviderHealthRequestV1),
     Inspection(ProviderInspectionRequestV1),
     Maintenance(ProviderMaintenanceRequestV1),
-    SnapshotExport(ProviderSnapshotExportRequestV1),
-    SnapshotRestore(ProviderSnapshotRestoreRequestV1),
-    Replay(ProviderReplayRequestV1),
 }
 
 impl ProviderControlRequestV1 {
     pub const fn operation(&self) -> RetainedSurfaceOperation {
         match self {
-            Self::Feedback(_) => RetainedSurfaceOperation::ProviderFeedback,
-            Self::Correction(_) => RetainedSurfaceOperation::ProviderCorrection,
-            Self::DeleteBySource(_) => RetainedSurfaceOperation::ProviderDeleteBySource,
             Self::Health(_) => RetainedSurfaceOperation::ProviderHealth,
             Self::Inspection(_) => RetainedSurfaceOperation::ProviderInspection,
             Self::Maintenance(_) => RetainedSurfaceOperation::ProviderMaintenance,
-            Self::SnapshotExport(_) => RetainedSurfaceOperation::ProviderSnapshotExport,
-            Self::SnapshotRestore(_) => RetainedSurfaceOperation::ProviderSnapshotRestore,
-            Self::Replay(_) => RetainedSurfaceOperation::ProviderReplay,
         }
     }
 
-    pub fn state_selector(&self) -> Option<&ProviderControlStateSelectorV1> {
+    pub const fn state_selector(&self) -> &ProviderControlStateSelectorV1 {
         match self {
-            Self::Health(request) => Some(&request.state),
-            Self::Inspection(request) => Some(&request.state),
-            Self::Maintenance(request) => Some(&request.state),
-            Self::SnapshotExport(request) => Some(&request.state),
-            Self::SnapshotRestore(request) => Some(&request.state),
-            Self::Replay(request) => Some(&request.state),
-            Self::Feedback(_) | Self::Correction(_) | Self::DeleteBySource(_) => None,
+            Self::Health(request) => &request.state,
+            Self::Inspection(request) => &request.state,
+            Self::Maintenance(request) => &request.state,
         }
     }
 
-    /// Bounds and time validation only. Canonical receipt settlement, exact
-    /// source ownership, namespace authorization, and disposition are host reads.
-    pub fn validate_at(&self, observed_at: UtcMicros) -> Result<(), ApplicationContractError> {
-        if let Some(state) = self.state_selector() {
-            validate_state_selector(state)?;
-        }
+    /// Bounds validation only. Namespace authorization is a host read.
+    pub fn validate(&self) -> Result<(), ApplicationContractError> {
+        validate_state_selector(self.state_selector())?;
         match self {
-            Self::Feedback(request) => {
-                validate_source_selector(&request.source)?;
-                require(valid_weight(&request.weight), "provider feedback weight")?;
-                validate_references(
-                    &request.evidence_refs,
-                    0,
-                    MAX_PROVIDER_CONTROL_EVIDENCE_REFS,
-                )?;
-                require(
-                    request.occurred_at <= observed_at,
-                    "provider feedback occurrence",
-                )
-            }
-            Self::Correction(request) => {
-                validate_source_selector(&request.source)?;
-                validate_reference(&request.expected_source_revision)?;
-                require(
-                    valid_text(&request.reason, MAX_PROVIDER_CONTROL_REASON_BYTES),
-                    "provider correction reason",
-                )?;
-                validate_references(
-                    &request.evidence_refs,
-                    0,
-                    MAX_PROVIDER_CONTROL_EVIDENCE_REFS,
-                )?;
-                match &request.correction {
-                    ProviderControlCorrectionV1::Supersede { replacement_source }
-                    | ProviderControlCorrectionV1::ReplaceContent { replacement_source } => {
-                        validate_source_selector(replacement_source)
-                    }
-                    ProviderControlCorrectionV1::ChangeValidity {
-                        valid_from,
-                        valid_until,
-                    } => require(
-                        valid_until.is_none_or(|until| until > *valid_from),
-                        "provider correction validity",
-                    ),
-                    ProviderControlCorrectionV1::MarkIncorrect { .. } => Ok(()),
-                    ProviderControlCorrectionV1::RestrictScope { destination } => {
-                        validate_state_selector(destination)
-                    }
-                }
-            }
-            Self::DeleteBySource(request) => validate_source_selector(&request.source),
             Self::Health(request) => {
                 require(
                     !request.requested_checks.is_empty() && request.requested_checks.len() <= 7,
@@ -442,13 +202,6 @@ impl ProviderControlRequestV1 {
                     validate_reference(cursor)?;
                 }
                 match &request.selection {
-                    ProviderControlInspectionSelectorV1::SourceInfluence { source }
-                    | ProviderControlInspectionSelectorV1::Trace { source } => {
-                        validate_source_selector(source)
-                    }
-                    ProviderControlInspectionSelectorV1::DeliveryReceipt { source } => {
-                        validate_source_selector(source)
-                    }
                     ProviderControlInspectionSelectorV1::MaintenanceReceipt {
                         operation_id,
                         idempotency_key,
@@ -456,9 +209,6 @@ impl ProviderControlRequestV1 {
                         valid_uuid_v7(operation_id) && valid_sha256(idempotency_key),
                         "maintenance receipt query identities",
                     ),
-                    ProviderControlInspectionSelectorV1::SnapshotMetadata { snapshot_ref } => {
-                        validate_reference(snapshot_ref)
-                    }
                     ProviderControlInspectionSelectorV1::StateSummary
                     | ProviderControlInspectionSelectorV1::CapabilityStatus => Ok(()),
                 }
@@ -478,22 +228,6 @@ impl ProviderControlRequestV1 {
                 require(
                     (1..=3_600_000).contains(&request.maximum_duration_millis),
                     "provider maintenance duration",
-                )
-            }
-            Self::SnapshotExport(request) => require(
-                (1..=MAX_PROVIDER_CONTROL_SNAPSHOT_BYTES).contains(&request.maximum_bytes),
-                "provider snapshot bytes",
-            ),
-            Self::SnapshotRestore(request) => validate_reference(&request.snapshot_ref),
-            Self::Replay(request) => {
-                validate_references(
-                    &request.observation_batch_refs,
-                    1,
-                    MAX_PROVIDER_CONTROL_REPLAY_REFS,
-                )?;
-                require(
-                    request.first_source_sequence <= request.last_source_sequence,
-                    "provider replay sequence bounds",
                 )
             }
         }
@@ -522,31 +256,6 @@ fn validate_reference(value: &str) -> Result<(), ApplicationContractError> {
     )
 }
 
-fn validate_references(
-    values: &[String],
-    minimum: usize,
-    maximum: usize,
-) -> Result<(), ApplicationContractError> {
-    require(
-        (minimum..=maximum).contains(&values.len()),
-        "provider control reference count",
-    )?;
-    let mut unique = BTreeSet::new();
-    for value in values {
-        validate_reference(value)?;
-        require(unique.insert(value), "duplicate provider control reference")?;
-    }
-    Ok(())
-}
-
-fn validate_source_selector(
-    source: &ProviderControlSourceSelectorV1,
-) -> Result<(), ApplicationContractError> {
-    validate_reference(&source.trace_ref)?;
-    validate_reference(&source.item_ref)?;
-    validate_reference(&source.observation_id)
-}
-
 fn validate_state_selector(
     state: &ProviderControlStateSelectorV1,
 ) -> Result<(), ApplicationContractError> {
@@ -564,21 +273,6 @@ fn validate_state_selector(
         }
         ProviderControlStateSelectorV1::RecallScope { trace_ref } => validate_reference(trace_ref),
     }
-}
-
-fn valid_weight(value: &str) -> bool {
-    if value.len() > 64 {
-        return false;
-    }
-    if matches!(value, "0" | "1") {
-        return true;
-    }
-    let Some((whole, fractional)) = value.split_once('.') else {
-        return false;
-    };
-    !fractional.is_empty()
-        && fractional.bytes().all(|byte| byte.is_ascii_digit())
-        && (whole == "0" || (whole == "1" && fractional.bytes().all(|byte| byte == b'0')))
 }
 
 /// Bounded advisory data for explicitly open provider-local fields only.
@@ -648,31 +342,6 @@ pub struct ProviderControlScopeV1 {
     pub resolved_scope_digest: String,
 }
 
-/// Exact original identity projected only after host validation of the full
-/// canonical source attribution. Unknown legacy revision remains null.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlSourceIdentityV1 {
-    pub canonical_provider_id: String,
-    pub canonical_session_id: String,
-    pub source_key: String,
-    pub stable_record_id: Option<String>,
-    pub observation_id: String,
-    pub source_revision: Option<String>,
-    /// Original canonical source-payload digest, not projected content bytes.
-    pub content_sha256: String,
-}
-
-/// Public projection of one fully validated lifecycle target. The host retains
-/// and validates original/delivery scope and target-reference kind separately;
-/// this projection cannot be round-tripped as an input authority selector.
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlSourceTargetV1 {
-    pub stable_memory_ref: String,
-    pub source: ProviderControlSourceIdentityV1,
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderControlTerminalV1 {
@@ -709,8 +378,7 @@ pub enum ProviderControlEffectStateV1 {
 }
 
 /// Complete provider effect evidence, independent from the outer application's
-/// durable receipt. An offline deletion can commit a host fence while this
-/// provider effect remains none and provider erasure remains pending.
+/// durable receipt.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderControlEffectV1 {
@@ -745,116 +413,6 @@ pub struct ProviderControlMutationReceiptV1 {
     pub state_generation_before: u64,
     pub state_generation_after: u64,
     pub provider_receipt_digest: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderFeedbackResultV1 {
-    pub source: ProviderControlSourceSelectorV1,
-    pub target: ProviderControlSourceTargetV1,
-    pub target_digest: String,
-    pub signal: ProviderControlFeedbackSignalV1,
-    pub applied_effect: ProviderControlEvidenceV1,
-    pub receipt: ProviderControlMutationReceiptV1,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderCorrectionResultV1 {
-    pub source: ProviderControlSourceSelectorV1,
-    pub target: ProviderControlSourceTargetV1,
-    pub target_digest: String,
-    pub correction_kind: ProviderControlCorrectionKindV1,
-    pub affected_provider_effects: u64,
-    pub receipt: ProviderControlMutationReceiptV1,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlDeletionIntentV1 {
-    pub fence_revision_before: u64,
-    pub fence_revision_after: u64,
-    /// Proves the host's durable fence acceptance only, never provider erasure.
-    pub host_receipt: crate::EffectReceipt,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderControlDeletionVerificationV1 {
-    VerifiedAbsent,
-    VerifiedAnonymized,
-    RetainedUnderExplicitLock,
-    VerificationFailed,
-    Partial,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlDeletionPostconditionV1 {
-    pub matched_effects: u64,
-    pub removed_effects: u64,
-    pub anonymized_effects: u64,
-    pub retained_under_lock: u64,
-    pub remaining_influence_count: u64,
-    pub snapshots_examined: u64,
-    pub snapshots_rewritten: u64,
-    pub verification_query_digest: String,
-    pub verification_state: ProviderControlDeletionVerificationV1,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProviderControlErasureV1 {
-    Pending {
-        reason_code: String,
-    },
-    Verified {
-        postcondition: ProviderControlDeletionPostconditionV1,
-        receipt: ProviderControlMutationReceiptV1,
-    },
-    RetainedUnderLock {
-        postcondition: ProviderControlDeletionPostconditionV1,
-        /// Actual provider control receipt for its reported retention outcome.
-        /// This is not independent host authorization of a retention lock.
-        retention_lock_receipt: String,
-        receipt: ProviderControlMutationReceiptV1,
-    },
-    Failed {
-        reason_code: String,
-        postcondition: Option<ProviderControlDeletionPostconditionV1>,
-        receipt: Option<ProviderControlMutationReceiptV1>,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlHostSnapshotCleanupV1 {
-    pub state: ProviderControlHostSnapshotCleanupStateV1,
-    pub removed_snapshot_refs: Vec<String>,
-    pub matched_count: u64,
-    pub unverifiable_count: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderControlHostSnapshotCleanupStateV1 {
-    NotRequested,
-    Complete,
-    Partial,
-    Unverifiable,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderDeleteBySourceResultV1 {
-    pub source: ProviderControlSourceSelectorV1,
-    pub target: ProviderControlSourceTargetV1,
-    pub mode: ProviderControlDeletionModeV1,
-    pub include_snapshots: bool,
-    pub intent: ProviderControlDeletionIntentV1,
-    /// Actual host artifact cleanup, independent of provider erasure evidence.
-    pub host_snapshot_cleanup: ProviderControlHostSnapshotCleanupV1,
-    pub erasure: ProviderControlErasureV1,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -892,80 +450,6 @@ pub struct ProviderHealthResultV1 {
     pub staged_rows: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderControlSourceDispositionV1 {
-    Available,
-    Superseded,
-    Revoked,
-    Deleted,
-    Redacted,
-    Expired,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlSettledFeedbackV1 {
-    pub helpful: u64,
-    pub harmful: u64,
-    pub ignored: u64,
-    pub corrected: u64,
-    pub superseded: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlSourceInfluenceItemV1 {
-    pub target: ProviderControlSourceTargetV1,
-    pub active: bool,
-    pub disposition: ProviderControlSourceDispositionV1,
-    pub settled_feedback: ProviderControlSettledFeedbackV1,
-    pub last_feedback_receipt: Option<String>,
-    #[schemars(length(min = 1, max = 8192))]
-    pub provider_local_effect_summary: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlTraceItemV1 {
-    pub stable_memory_ref: String,
-    pub content: Option<String>,
-    /// SHA-256 of exactly the emitted UTF-8 content, including truncation.
-    pub content_sha256: Option<String>,
-    /// Identity projection of retained original attribution, or null without
-    /// synthesis. Full original scope and validity stay with the host resolver.
-    pub original_source: Option<ProviderControlSourceIdentityV1>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlDeliveryReceiptItemV1 {
-    pub operation_id: String,
-    pub idempotency_key: String,
-    pub provider_receipt_digest: String,
-    pub stable_memory_ref: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderControlSnapshotIdentityV1 {
-    pub snapshot_id: String,
-    pub provider_id: String,
-    pub implementation_identity_digest: String,
-    pub state_schema_version: String,
-    pub exact_scope_digest: String,
-    pub state_generation: u64,
-    pub observation_sequence: u64,
-    pub parent_snapshot_id: Option<String>,
-    pub content_sha256: String,
-    pub byte_length: u64,
-    /// Exact RFC3339 timestamp after canonical wire validation by the host.
-    /// It remains text so the public projection cannot truncate nanoseconds.
-    #[schemars(length(min = 1, max = 64), extend("format" = "date-time"))]
-    pub created_at: String,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderMaintenanceResultV1 {
@@ -988,8 +472,8 @@ pub struct ProviderMaintenanceResultV1 {
 }
 
 /// Every pinned inspection identity is a closed typed field. Only state-summary
-/// content is provider-local open evidence; source and receipt views cannot use
-/// that variant, and the host validates each original wire binding first.
+/// content is provider-local open evidence; receipt views cannot use that
+/// variant, and the host validates each original wire binding first.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(
     tag = "view",
@@ -999,11 +483,7 @@ pub struct ProviderMaintenanceResultV1 {
 )]
 pub enum ProviderControlInspectionItemsV1 {
     StateSummary(Vec<ProviderControlEvidenceV1>),
-    SourceInfluence(Vec<ProviderControlSourceInfluenceItemV1>),
-    Trace(Vec<ProviderControlTraceItemV1>),
-    DeliveryReceipt(Vec<ProviderControlDeliveryReceiptItemV1>),
     MaintenanceReceipt(Vec<ProviderControlMaintenanceReceiptItemV1>),
-    SnapshotMetadata(Vec<ProviderControlSnapshotIdentityV1>),
     CapabilityStatus(Vec<ProviderControlCapabilityStatusV1>),
 }
 
@@ -1023,63 +503,15 @@ pub enum ProviderControlInspectionCoverageV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProviderControlInspectionEvidenceOriginV1 {
-    ProviderRuntime,
-    HostSnapshotArtifact {
-        snapshot_ref: String,
-        export_registration_revision: u64,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderInspectionResultV1 {
     pub selection: ProviderControlInspectionSelectorV1,
-    pub evidence_origin: ProviderControlInspectionEvidenceOriginV1,
     pub items: ProviderControlInspectionItemsV1,
     pub coverage: ProviderControlInspectionCoverageV1,
     pub next_cursor: Option<String>,
     pub redactions: Vec<String>,
-    /// Current generation observed by a provider runtime; unknown for a host artifact.
-    pub state_generation: Option<u64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderSnapshotExportResultV1 {
-    /// Host-retained immutable snapshot reference; opaque lookup, not authority.
-    pub snapshot_ref: String,
-    pub identity: ProviderControlSnapshotIdentityV1,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderSnapshotRestoreResultV1 {
-    pub snapshot_ref: String,
-    pub snapshot_id: String,
-    pub restored_observation_sequence: u64,
-    /// Actual restored row count, independent of the restored sequence watermark.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restored_rows: Option<u64>,
-    pub receipt: ProviderControlMutationReceiptV1,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderReplayResultV1 {
-    pub first_source_sequence: u64,
-    pub last_source_sequence: u64,
-    pub acknowledged_sequence: u64,
-    /// Actual host-resolved observation inventory size, not receipt-ref count.
-    pub resolved_observations: u64,
-    pub applied_observations: u64,
-    pub duplicate_observations: u64,
-    pub sources_already_applied: u64,
-    pub rejected_observations: u64,
-    pub effect_unknown_observations: u64,
-    pub partial: bool,
-    pub receipt: ProviderControlMutationReceiptV1,
+    /// Current generation observed by the provider runtime.
+    pub state_generation: u64,
 }
 
 /// Null data is allowed for a typed unsuccessful provider terminal only.
@@ -1092,15 +524,9 @@ pub struct ProviderReplayResultV1 {
     deny_unknown_fields
 )]
 pub enum ProviderControlOperationResultV1 {
-    Feedback(Option<ProviderFeedbackResultV1>),
-    Correction(Option<ProviderCorrectionResultV1>),
-    DeleteBySource(Option<ProviderDeleteBySourceResultV1>),
     Health(Option<ProviderHealthResultV1>),
     Inspection(Option<ProviderInspectionResultV1>),
     Maintenance(Option<ProviderMaintenanceResultV1>),
-    SnapshotExport(Option<ProviderSnapshotExportResultV1>),
-    SnapshotRestore(Option<ProviderSnapshotRestoreResultV1>),
-    Replay(Option<ProviderReplayResultV1>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1163,36 +589,6 @@ impl ProviderControlScopeV1 {
             digest.update(value.as_bytes());
         }
         hex::encode(digest.finalize())
-    }
-}
-
-impl ProviderControlSourceIdentityV1 {
-    fn validate(&self) -> Result<(), ApplicationContractError> {
-        for value in [
-            &self.canonical_provider_id,
-            &self.canonical_session_id,
-            &self.source_key,
-            &self.observation_id,
-        ] {
-            validate_reference(value)?;
-        }
-        for value in [&self.stable_record_id, &self.source_revision]
-            .into_iter()
-            .flatten()
-        {
-            validate_reference(value)?;
-        }
-        require(
-            valid_sha256(&self.content_sha256),
-            "provider original content digest",
-        )
-    }
-}
-
-impl ProviderControlSourceTargetV1 {
-    fn validate(&self) -> Result<(), ApplicationContractError> {
-        validate_reference(&self.stable_memory_ref)?;
-        self.source.validate()
     }
 }
 
@@ -1313,62 +709,11 @@ impl ProviderControlMutationReceiptV1 {
     }
 }
 
-impl ProviderControlDeletionPostconditionV1 {
-    fn validate(&self) -> Result<(), ApplicationContractError> {
-        require(
-            self.removed_effects <= self.matched_effects
-                && self.anonymized_effects <= self.matched_effects
-                && self.retained_under_lock <= self.matched_effects
-                && self.snapshots_rewritten <= self.snapshots_examined,
-            "provider deletion counts",
-        )?;
-        require(
-            valid_sha256(&self.verification_query_digest),
-            "provider deletion verification digest",
-        )
-    }
-}
-
-impl ProviderControlSnapshotIdentityV1 {
-    fn validate_for(
-        &self,
-        provider_id: &str,
-        scope: &ProviderControlScopeV1,
-    ) -> Result<(), ApplicationContractError> {
-        validate_reference(&self.snapshot_id)?;
-        if let Some(parent) = &self.parent_snapshot_id {
-            validate_reference(parent)?;
-        }
-        require(
-            self.provider_id == provider_id && self.exact_scope_digest == scope.sha256(),
-            "provider snapshot identity binding",
-        )?;
-        require(
-            valid_text(
-                &self.state_schema_version,
-                MAX_PROVIDER_CONTROL_REFERENCE_BYTES,
-            ) && self.byte_length <= MAX_PROVIDER_CONTROL_SNAPSHOT_BYTES
-                && valid_sha256(&self.implementation_identity_digest)
-                && valid_sha256(&self.content_sha256),
-            "provider snapshot identity",
-        )?;
-        // The host validates the full canonical RFC3339 value before projection.
-        require(
-            valid_text(&self.created_at, 64),
-            "provider snapshot timestamp",
-        )
-    }
-}
-
 impl ProviderControlInspectionItemsV1 {
     pub const fn view(&self) -> ProviderControlInspectionViewV1 {
         match self {
             Self::StateSummary(_) => ProviderControlInspectionViewV1::StateSummary,
-            Self::SourceInfluence(_) => ProviderControlInspectionViewV1::SourceInfluence,
-            Self::Trace(_) => ProviderControlInspectionViewV1::Trace,
-            Self::DeliveryReceipt(_) => ProviderControlInspectionViewV1::DeliveryReceipt,
             Self::MaintenanceReceipt(_) => ProviderControlInspectionViewV1::MaintenanceReceipt,
-            Self::SnapshotMetadata(_) => ProviderControlInspectionViewV1::SnapshotMetadata,
             Self::CapabilityStatus(_) => ProviderControlInspectionViewV1::CapabilityStatus,
         }
     }
@@ -1376,11 +721,7 @@ impl ProviderControlInspectionItemsV1 {
     pub fn len(&self) -> usize {
         match self {
             Self::StateSummary(items) => items.len(),
-            Self::SourceInfluence(items) => items.len(),
-            Self::Trace(items) => items.len(),
-            Self::DeliveryReceipt(items) => items.len(),
             Self::MaintenanceReceipt(items) => items.len(),
-            Self::SnapshotMetadata(items) => items.len(),
             Self::CapabilityStatus(items) => items.len(),
         }
     }
@@ -1389,11 +730,7 @@ impl ProviderControlInspectionItemsV1 {
         self.len() == 0
     }
 
-    fn validate_for(
-        &self,
-        provider_id: &str,
-        scope: &ProviderControlScopeV1,
-    ) -> Result<(), ApplicationContractError> {
+    fn validate(&self) -> Result<(), ApplicationContractError> {
         require(
             self.len() <= MAX_PROVIDER_CONTROL_INSPECTION_ITEMS,
             "provider inspection item count",
@@ -1402,58 +739,6 @@ impl ProviderControlInspectionItemsV1 {
             Self::StateSummary(items) => {
                 for item in items {
                     item.validate()?;
-                }
-            }
-            Self::SourceInfluence(items) => {
-                for item in items {
-                    item.target.validate()?;
-                    require(
-                        !item.active
-                            || item.disposition == ProviderControlSourceDispositionV1::Available,
-                        "provider source activity",
-                    )?;
-                    if let Some(receipt) = &item.last_feedback_receipt {
-                        validate_reference(receipt)?;
-                    }
-                    require(
-                        valid_text(&item.provider_local_effect_summary, 8192),
-                        "provider source effect summary",
-                    )?;
-                }
-            }
-            Self::Trace(items) => {
-                use sha2::{Digest, Sha256};
-                for item in items {
-                    validate_reference(&item.stable_memory_ref)?;
-                    if let Some(content) = &item.content {
-                        require(
-                            content.len() <= MAX_PROVIDER_CONTROL_RESPONSE_BYTES
-                                && item.content_sha256.as_deref()
-                                    == Some(
-                                        hex::encode(Sha256::digest(content.as_bytes())).as_str(),
-                                    ),
-                            "provider trace content digest",
-                        )?;
-                        if let Some(source) = &item.original_source {
-                            source.validate()?;
-                        }
-                    } else {
-                        require(
-                            item.content_sha256.is_none() && item.original_source.is_none(),
-                            "provider trace privacy withholding",
-                        )?;
-                    }
-                }
-            }
-            Self::DeliveryReceipt(items) => {
-                for item in items {
-                    require(
-                        valid_text(&item.operation_id, 256)
-                            && valid_text(&item.idempotency_key, 256)
-                            && valid_sha256(&item.provider_receipt_digest),
-                        "provider original delivery receipt",
-                    )?;
-                    validate_reference(&item.stable_memory_ref)?;
                 }
             }
             Self::MaintenanceReceipt(items) => {
@@ -1466,11 +751,6 @@ impl ProviderControlInspectionItemsV1 {
                     validate_maintenance_result(&item.outcome)?;
                 }
             }
-            Self::SnapshotMetadata(items) => {
-                for item in items {
-                    item.validate_for(provider_id, scope)?;
-                }
-            }
             Self::CapabilityStatus(items) => validate_capabilities(items)?,
         }
         Ok(())
@@ -1480,46 +760,24 @@ impl ProviderControlInspectionItemsV1 {
 impl ProviderControlOperationResultV1 {
     pub const fn operation(&self) -> RetainedSurfaceOperation {
         match self {
-            Self::Feedback(_) => RetainedSurfaceOperation::ProviderFeedback,
-            Self::Correction(_) => RetainedSurfaceOperation::ProviderCorrection,
-            Self::DeleteBySource(_) => RetainedSurfaceOperation::ProviderDeleteBySource,
             Self::Health(_) => RetainedSurfaceOperation::ProviderHealth,
             Self::Inspection(_) => RetainedSurfaceOperation::ProviderInspection,
             Self::Maintenance(_) => RetainedSurfaceOperation::ProviderMaintenance,
-            Self::SnapshotExport(_) => RetainedSurfaceOperation::ProviderSnapshotExport,
-            Self::SnapshotRestore(_) => RetainedSurfaceOperation::ProviderSnapshotRestore,
-            Self::Replay(_) => RetainedSurfaceOperation::ProviderReplay,
         }
     }
 
     fn has_data(&self) -> bool {
         match self {
-            Self::Feedback(data) => data.is_some(),
-            Self::Correction(data) => data.is_some(),
-            Self::DeleteBySource(data) => data.is_some(),
             Self::Health(data) => data.is_some(),
             Self::Inspection(data) => data.is_some(),
             Self::Maintenance(data) => data.is_some(),
-            Self::SnapshotExport(data) => data.is_some(),
-            Self::SnapshotRestore(data) => data.is_some(),
-            Self::Replay(data) => data.is_some(),
         }
     }
 
     fn mutation_receipt(&self) -> Option<&ProviderControlMutationReceiptV1> {
         match self {
-            Self::Feedback(Some(data)) => Some(&data.receipt),
-            Self::Correction(Some(data)) => Some(&data.receipt),
             Self::Maintenance(Some(data)) => Some(&data.receipt),
-            Self::SnapshotRestore(Some(data)) => Some(&data.receipt),
-            Self::Replay(Some(data)) => Some(&data.receipt),
-            Self::DeleteBySource(Some(data)) => match &data.erasure {
-                ProviderControlErasureV1::Verified { receipt, .. }
-                | ProviderControlErasureV1::RetainedUnderLock { receipt, .. } => Some(receipt),
-                ProviderControlErasureV1::Failed { receipt, .. } => receipt.as_ref(),
-                ProviderControlErasureV1::Pending { .. } => None,
-            },
-            _ => None,
+            Self::Health(_) | Self::Inspection(_) | Self::Maintenance(None) => None,
         }
     }
 }
@@ -1629,24 +887,6 @@ impl ProviderControlResultV1 {
             }
         }
         match &self.result {
-            ProviderControlOperationResultV1::Feedback(Some(data)) => {
-                validate_source_result(&data.source, &data.target)?;
-                require(
-                    valid_sha256(&data.target_digest),
-                    "provider feedback target digest",
-                )?;
-                data.applied_effect.validate()?;
-            }
-            ProviderControlOperationResultV1::Correction(Some(data)) => {
-                validate_source_result(&data.source, &data.target)?;
-                require(
-                    valid_sha256(&data.target_digest),
-                    "provider correction target digest",
-                )?;
-            }
-            ProviderControlOperationResultV1::DeleteBySource(Some(data)) => {
-                self.validate_deletion(data)?
-            }
             ProviderControlOperationResultV1::Health(Some(data)) => {
                 validate_reference(&data.provider_instance_id)?;
                 require(
@@ -1665,52 +905,17 @@ impl ProviderControlResultV1 {
                     data.items.view() == data.selection.view(),
                     "provider inspection view",
                 )?;
-                match &data.selection {
-                    ProviderControlInspectionSelectorV1::DeliveryReceipt { source } => {
-                        validate_source_selector(source)?
-                    }
-                    ProviderControlInspectionSelectorV1::MaintenanceReceipt {
-                        operation_id,
-                        idempotency_key,
-                    } => require(
+                if let ProviderControlInspectionSelectorV1::MaintenanceReceipt {
+                    operation_id,
+                    idempotency_key,
+                } = &data.selection
+                {
+                    require(
                         valid_uuid_v7(operation_id) && valid_sha256(idempotency_key),
                         "maintenance receipt query identities",
-                    )?,
-                    ProviderControlInspectionSelectorV1::SnapshotMetadata { snapshot_ref } => {
-                        validate_reference(snapshot_ref)?
-                    }
-                    _ => {}
+                    )?;
                 }
-                match &data.evidence_origin {
-                    ProviderControlInspectionEvidenceOriginV1::ProviderRuntime => require(
-                        data.state_generation.is_some(),
-                        "provider runtime inspection generation",
-                    )?,
-                    ProviderControlInspectionEvidenceOriginV1::HostSnapshotArtifact {
-                        snapshot_ref,
-                        export_registration_revision,
-                    } => {
-                        validate_reference(snapshot_ref)?;
-                        require(
-                            matches!(&data.selection, ProviderControlInspectionSelectorV1::SnapshotMetadata { snapshot_ref: selected } if selected == snapshot_ref)
-                                && matches!(&data.items, ProviderControlInspectionItemsV1::SnapshotMetadata(items) if items.len() == 1)
-                                && *export_registration_revision == self.registration_revision
-                                && data.state_generation.is_none()
-                                && data.coverage == ProviderControlInspectionCoverageV1::Complete
-                                && data.next_cursor.is_none()
-                                && data.redactions.is_empty()
-                                && self.terminal == ProviderControlTerminalV1::Success
-                                && self.effect.state == ProviderControlEffectStateV1::None
-                                && self.effect.state_generation_before.is_none()
-                                && self.effect.state_generation_after.is_none()
-                                && self.diagnostic_id.is_none()
-                                && self.domain_detail.is_none()
-                                && self.warnings.is_empty(),
-                            "host snapshot metadata evidence",
-                        )?;
-                    }
-                }
-                data.items.validate_for(&self.provider_id, &self.scope)?;
+                data.items.validate()?;
                 if let Some(cursor) = &data.next_cursor {
                     validate_reference(cursor)?;
                     require(
@@ -1725,84 +930,25 @@ impl ProviderControlResultV1 {
                 for redaction in &data.redactions {
                     validate_reference(redaction)?;
                 }
-                match (&data.selection, &data.items) {
-                    (
-                        ProviderControlInspectionSelectorV1::SourceInfluence { source },
-                        ProviderControlInspectionItemsV1::SourceInfluence(items),
-                    ) => {
-                        validate_source_selector(source)?;
-                        require(
-                            items.iter().all(|item| {
-                                item.target.source.observation_id == source.observation_id
-                            }),
-                            "provider inspection source membership",
-                        )?;
-                    }
-                    (
-                        ProviderControlInspectionSelectorV1::MaintenanceReceipt {
-                            operation_id,
-                            idempotency_key,
-                        },
-                        ProviderControlInspectionItemsV1::MaintenanceReceipt(items),
-                    ) => require(
+                if let (
+                    ProviderControlInspectionSelectorV1::MaintenanceReceipt {
+                        operation_id,
+                        idempotency_key,
+                    },
+                    ProviderControlInspectionItemsV1::MaintenanceReceipt(items),
+                ) = (&data.selection, &data.items)
+                {
+                    require(
                         items.iter().all(|item| {
                             item.operation_id == *operation_id
                                 && item.idempotency_key == *idempotency_key
                         }),
                         "provider maintenance receipt query binding",
-                    )?,
-                    (
-                        ProviderControlInspectionSelectorV1::Trace { source },
-                        ProviderControlInspectionItemsV1::Trace(items),
-                    ) => {
-                        validate_source_selector(source)?;
-                        require(
-                            items.iter().all(|item| {
-                                item.original_source.as_ref().is_none_or(|original| {
-                                    original.observation_id == source.observation_id
-                                })
-                            }),
-                            "provider trace source membership",
-                        )?;
-                    }
-                    _ => {}
+                    )?;
                 }
             }
             ProviderControlOperationResultV1::Maintenance(Some(data)) => {
                 validate_maintenance_result(data)?
-            }
-            ProviderControlOperationResultV1::SnapshotExport(Some(data)) => {
-                validate_reference(&data.snapshot_ref)?;
-                data.identity.validate_for(&self.provider_id, &self.scope)?;
-            }
-            ProviderControlOperationResultV1::SnapshotRestore(Some(data)) => {
-                validate_reference(&data.snapshot_ref)?;
-                validate_reference(&data.snapshot_id)?;
-            }
-            ProviderControlOperationResultV1::Replay(Some(data)) => {
-                let total = [
-                    data.applied_observations,
-                    data.duplicate_observations,
-                    data.sources_already_applied,
-                    data.rejected_observations,
-                    data.effect_unknown_observations,
-                ]
-                .into_iter()
-                .try_fold(0_u64, u64::checked_add);
-                require(
-                    total == Some(data.resolved_observations)
-                        && (1..=4096).contains(&data.resolved_observations)
-                        && data.first_source_sequence <= data.last_source_sequence
-                        && data.acknowledged_sequence <= data.last_source_sequence,
-                    "provider replay accounting",
-                )?;
-                require(
-                    data.partial
-                        || (data.acknowledged_sequence == data.last_source_sequence
-                            && data.rejected_observations == 0
-                            && data.effect_unknown_observations == 0),
-                    "provider replay completion",
-                )?;
             }
             _ => {}
         }
@@ -1811,20 +957,9 @@ impl ProviderControlResultV1 {
             && self.effect.state == ProviderControlEffectStateV1::None
         {
             let supported_no_effect = match &self.result {
-                ProviderControlOperationResultV1::Feedback(Some(data)) => {
-                    data.signal == ProviderControlFeedbackSignalV1::Ignored
-                }
                 ProviderControlOperationResultV1::Maintenance(Some(data)) => {
                     (data.dry_run || (data.changed_items == 0 && data.removed_items == 0))
                         && data.state_changed != Some(true)
-                }
-                ProviderControlOperationResultV1::DeleteBySource(Some(data)) => matches!(
-                    data.erasure,
-                    ProviderControlErasureV1::Verified { .. }
-                        | ProviderControlErasureV1::RetainedUnderLock { .. }
-                ),
-                ProviderControlOperationResultV1::Replay(Some(data)) => {
-                    data.applied_observations == 0 && data.effect_unknown_observations == 0
                 }
                 _ => false,
             };
@@ -1841,7 +976,7 @@ impl ProviderControlResultV1 {
     }
 
     /// Binds the result to the selected public operation and caller parameters.
-    /// Trace/source/receipt authority still comes from host resolution, not echoes.
+    /// Namespace and receipt authority still come from host resolution, not echoes.
     pub fn validate_for(
         &self,
         request: &ProviderControlRequestV1,
@@ -1851,58 +986,27 @@ impl ProviderControlResultV1 {
             self.operation() == request.operation(),
             "provider result operation",
         )?;
-        if let Some(ProviderControlStateSelectorV1::CanonicalSession {
+        // The host binds a canonical session to its provider-qualified agent
+        // session; only the provider registration is comparable here.
+        if let ProviderControlStateSelectorV1::CanonicalSession {
             provider_id,
             registration_revision,
-            session_id,
             ..
-        }) = request.state_selector()
+        } = request.state_selector()
         {
             require(
                 *provider_id == self.provider_id
-                    && *registration_revision == self.registration_revision
-                    && *session_id == self.scope.agent_session_id,
+                    && *registration_revision == self.registration_revision,
                 "provider result selection",
             )?;
         }
         match (request, &self.result) {
-            (
-                ProviderControlRequestV1::Feedback(request),
-                ProviderControlOperationResultV1::Feedback(Some(data)),
-            ) => require(
-                data.source == request.source && data.signal == request.signal,
-                "provider feedback request binding",
-            )?,
-            (
-                ProviderControlRequestV1::Correction(request),
-                ProviderControlOperationResultV1::Correction(Some(data)),
-            ) => require(
-                data.source == request.source
-                    && data.correction_kind == request.correction.kind()
-                    && data.target.source.source_revision.as_ref()
-                        == Some(&request.expected_source_revision),
-                "provider correction request binding",
-            )?,
-            (
-                ProviderControlRequestV1::DeleteBySource(request),
-                ProviderControlOperationResultV1::DeleteBySource(Some(data)),
-            ) => require(
-                data.source == request.source
-                    && data.mode == request.mode
-                    && data.include_snapshots == request.include_snapshots
-                    && data.intent.fence_revision_before == request.expected_fence_revision,
-                "provider deletion request binding",
-            )?,
             (
                 ProviderControlRequestV1::Inspection(request),
                 ProviderControlOperationResultV1::Inspection(Some(data)),
             ) => {
                 require(
                     data.selection == request.selection
-                        && (!matches!(
-                            data.evidence_origin,
-                            ProviderControlInspectionEvidenceOriginV1::HostSnapshotArtifact { .. }
-                        ) || request.cursor.is_none())
                         && data.items.len() as u64 <= request.maximum_items
                         && serde_json::to_vec(&data.items)
                             .is_ok_and(|bytes| bytes.len() as u64 <= request.maximum_bytes),
@@ -1918,217 +1022,10 @@ impl ProviderControlResultV1 {
                     && data.scanned_items <= request.maximum_items,
                 "provider maintenance request binding",
             )?,
-            (
-                ProviderControlRequestV1::SnapshotExport(request),
-                ProviderControlOperationResultV1::SnapshotExport(Some(data)),
-            ) => require(
-                data.identity.byte_length <= request.maximum_bytes,
-                "provider snapshot export request binding",
-            )?,
-            (
-                ProviderControlRequestV1::SnapshotRestore(request),
-                ProviderControlOperationResultV1::SnapshotRestore(Some(data)),
-            ) => require(
-                data.snapshot_ref == request.snapshot_ref
-                    && data.receipt.state_generation_before == request.expected_state_generation,
-                "provider restore request binding",
-            )?,
-            (
-                ProviderControlRequestV1::Replay(request),
-                ProviderControlOperationResultV1::Replay(Some(data)),
-            ) => require(
-                data.first_source_sequence == request.first_source_sequence
-                    && data.last_source_sequence == request.last_source_sequence
-                    && data.receipt.state_generation_before == request.expected_state_generation
-                    && data.acknowledged_sequence
-                        >= request.expected_previous_acknowledged_sequence,
-                "provider replay request binding",
-            )?,
             _ => {}
         }
         Ok(())
     }
-
-    fn validate_deletion(
-        &self,
-        data: &ProviderDeleteBySourceResultV1,
-    ) -> Result<(), ApplicationContractError> {
-        validate_source_result(&data.source, &data.target)?;
-        let cleanup = &data.host_snapshot_cleanup;
-        require(
-            cleanup.removed_snapshot_refs.len() as u64 <= cleanup.matched_count,
-            "host snapshot cleanup count",
-        )?;
-        let mut removed = BTreeSet::new();
-        for reference in &cleanup.removed_snapshot_refs {
-            validate_reference(reference)?;
-            require(removed.insert(reference), "host snapshot cleanup duplicate")?;
-        }
-        require(
-            match cleanup.state {
-                ProviderControlHostSnapshotCleanupStateV1::NotRequested => {
-                    cleanup.matched_count == 0 && cleanup.unverifiable_count == 0
-                }
-                ProviderControlHostSnapshotCleanupStateV1::Complete => {
-                    cleanup.unverifiable_count == 0
-                }
-                ProviderControlHostSnapshotCleanupStateV1::Partial => {
-                    cleanup.unverifiable_count > 0 && !removed.is_empty()
-                }
-                ProviderControlHostSnapshotCleanupStateV1::Unverifiable => {
-                    cleanup.unverifiable_count > 0 && removed.is_empty()
-                }
-            },
-            "host snapshot cleanup state",
-        )?;
-        require(
-            (cleanup.state == ProviderControlHostSnapshotCleanupStateV1::NotRequested)
-                == !data.include_snapshots,
-            "host snapshot cleanup request",
-        )?;
-        require(
-            data.intent.fence_revision_before.checked_add(1)
-                == Some(data.intent.fence_revision_after),
-            "provider deletion fence transition",
-        )?;
-        data.intent.host_receipt.validate()?;
-        require(
-            data.intent.host_receipt.operation.as_str()
-                == "use-case.application.retained.provider-delete-by-source"
-                && data.intent.host_receipt.effect_class == EffectClass::Administrative,
-            "provider deletion intent operation",
-        )?;
-        require(
-            data.intent.host_receipt.outcome == crate::EffectTermination::Completed,
-            "provider deletion intent acceptance",
-        )?;
-        let postcondition = match &data.erasure {
-            ProviderControlErasureV1::Verified { postcondition, .. }
-            | ProviderControlErasureV1::RetainedUnderLock { postcondition, .. } => {
-                require(
-                    matches!(
-                        self.terminal,
-                        ProviderControlTerminalV1::Success
-                            | ProviderControlTerminalV1::SuccessZeroResults
-                    ) && matches!(
-                        self.effect.state,
-                        ProviderControlEffectStateV1::None
-                            | ProviderControlEffectStateV1::Committed
-                            | ProviderControlEffectStateV1::Duplicate
-                    ),
-                    "provider verified erasure terminal and effect",
-                )?;
-                Some(postcondition)
-            }
-            ProviderControlErasureV1::Failed { postcondition, .. } => postcondition.as_ref(),
-            ProviderControlErasureV1::Pending { .. } => None,
-        };
-        if self.effect.state == ProviderControlEffectStateV1::None {
-            if let Some(postcondition) = postcondition {
-                require(
-                    postcondition.removed_effects == 0
-                        && postcondition.anonymized_effects == 0
-                        && postcondition.snapshots_rewritten == 0,
-                    "provider no-effect deletion counts",
-                )?;
-            }
-        }
-        match &data.erasure {
-            ProviderControlErasureV1::Pending { reason_code } => {
-                require(
-                    valid_text(reason_code, 128),
-                    "provider erasure pending reason",
-                )?;
-                require(
-                    !matches!(
-                        self.terminal,
-                        ProviderControlTerminalV1::Success
-                            | ProviderControlTerminalV1::SuccessZeroResults
-                    ) && matches!(
-                        self.effect.state,
-                        ProviderControlEffectStateV1::None | ProviderControlEffectStateV1::Unknown
-                    ),
-                    "provider pending erasure terminal",
-                )?;
-            }
-            ProviderControlErasureV1::Verified { postcondition, .. } => {
-                postcondition.validate()?;
-                require(
-                    matches!(
-                        postcondition.verification_state,
-                        ProviderControlDeletionVerificationV1::VerifiedAbsent
-                            | ProviderControlDeletionVerificationV1::VerifiedAnonymized
-                    ) && postcondition.remaining_influence_count == 0
-                        && postcondition.retained_under_lock == 0,
-                    "provider verified erasure",
-                )?;
-                require(
-                    postcondition.verification_state
-                        != ProviderControlDeletionVerificationV1::VerifiedAnonymized
-                        || data.mode == ProviderControlDeletionModeV1::Anonymize,
-                    "provider anonymized deletion mode",
-                )?;
-            }
-            ProviderControlErasureV1::RetainedUnderLock {
-                postcondition,
-                retention_lock_receipt,
-                ..
-            } => {
-                postcondition.validate()?;
-                validate_reference(retention_lock_receipt)?;
-                require(
-                    postcondition.verification_state
-                        == ProviderControlDeletionVerificationV1::RetainedUnderExplicitLock
-                        && postcondition.retained_under_lock > 0
-                        && postcondition.remaining_influence_count
-                            <= postcondition.retained_under_lock,
-                    "provider explicit retention lock",
-                )?;
-            }
-            ProviderControlErasureV1::Failed {
-                reason_code,
-                postcondition,
-                ..
-            } => {
-                require(
-                    valid_text(reason_code, 128),
-                    "provider erasure failure reason",
-                )?;
-                if let Some(postcondition) = postcondition {
-                    postcondition.validate()?;
-                    require(
-                        matches!(
-                            postcondition.verification_state,
-                            ProviderControlDeletionVerificationV1::VerificationFailed
-                                | ProviderControlDeletionVerificationV1::Partial
-                        ),
-                        "provider failed erasure verification",
-                    )?;
-                }
-                require(
-                    !matches!(
-                        self.terminal,
-                        ProviderControlTerminalV1::Success
-                            | ProviderControlTerminalV1::SuccessZeroResults
-                    ),
-                    "provider failed erasure terminal",
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn validate_source_result(
-    selection: &ProviderControlSourceSelectorV1,
-    target: &ProviderControlSourceTargetV1,
-) -> Result<(), ApplicationContractError> {
-    validate_source_selector(selection)?;
-    target.validate()?;
-    require(
-        selection.observation_id == target.source.observation_id,
-        "provider retained source membership",
-    )
 }
 
 fn validate_capabilities(
@@ -2216,37 +1113,7 @@ fn terminal_allows_effect(
 
 const PROVIDER_CONTROL_SCOPE: &[ScopeDimension] = &[ScopeDimension::Resource];
 
-pub(super) const SPECS: [RetainedSurfaceSpec; 9] = [
-    RetainedSurfaceSpec {
-        operation: RetainedSurfaceOperation::ProviderFeedback,
-        summary: "Record provider feedback",
-        description: "Record an authenticated feedback assertion for one retained provider source.",
-        example: "Mark this recalled provider source as helpful",
-        effect: EffectClass::Administrative,
-        scope: PROVIDER_CONTROL_SCOPE,
-        paginated: false,
-        surfaces: CURRENT_SURFACES,
-    },
-    RetainedSurfaceSpec {
-        operation: RetainedSurfaceOperation::ProviderCorrection,
-        summary: "Correct provider source",
-        description: "Correct one retained provider source through host-authorized canonical evidence.",
-        example: "Correct this recalled provider source",
-        effect: EffectClass::Administrative,
-        scope: PROVIDER_CONTROL_SCOPE,
-        paginated: false,
-        surfaces: CURRENT_SURFACES,
-    },
-    RetainedSurfaceSpec {
-        operation: RetainedSurfaceOperation::ProviderDeleteBySource,
-        summary: "Delete provider source",
-        description: "Accept one durable provider-source fence and separately verify provider erasure.",
-        example: "Remove this recalled source from the producing provider",
-        effect: EffectClass::Administrative,
-        scope: PROVIDER_CONTROL_SCOPE,
-        paginated: false,
-        surfaces: CURRENT_SURFACES,
-    },
+pub(super) const SPECS: [RetainedSurfaceSpec; 3] = [
     RetainedSurfaceSpec {
         operation: RetainedSurfaceOperation::ProviderHealth,
         summary: "Inspect provider health",
@@ -2261,7 +1128,7 @@ pub(super) const SPECS: [RetainedSurfaceSpec; 9] = [
         operation: RetainedSurfaceOperation::ProviderInspection,
         summary: "Inspect provider evidence",
         description: "Read bounded redacted provider evidence under a host-authorized namespace.",
-        example: "Inspect the receipt or influence of this provider source",
+        example: "Inspect the state summary or a maintenance receipt of this provider namespace",
         effect: EffectClass::Read,
         scope: PROVIDER_CONTROL_SCOPE,
         paginated: true,
@@ -2272,36 +1139,6 @@ pub(super) const SPECS: [RetainedSurfaceSpec; 9] = [
         summary: "Maintain provider state",
         description: "Run finite provider-local maintenance with explicit progress and receipts.",
         example: "Validate this provider namespace within bounded limits",
-        effect: EffectClass::Administrative,
-        scope: PROVIDER_CONTROL_SCOPE,
-        paginated: false,
-        surfaces: CURRENT_SURFACES,
-    },
-    RetainedSurfaceSpec {
-        operation: RetainedSurfaceOperation::ProviderSnapshotExport,
-        summary: "Export provider snapshot",
-        description: "Export a bounded consistent provider snapshot into host-retained snapshot storage.",
-        example: "Export this provider namespace snapshot",
-        effect: EffectClass::Read,
-        scope: PROVIDER_CONTROL_SCOPE,
-        paginated: false,
-        surfaces: CURRENT_SURFACES,
-    },
-    RetainedSurfaceSpec {
-        operation: RetainedSurfaceOperation::ProviderSnapshotRestore,
-        summary: "Restore provider snapshot",
-        description: "Restore one compatible host-retained snapshot after current disposition revalidation.",
-        example: "Restore this provider snapshot at the expected generation",
-        effect: EffectClass::Administrative,
-        scope: PROVIDER_CONTROL_SCOPE,
-        paginated: false,
-        surfaces: CURRENT_SURFACES,
-    },
-    RetainedSurfaceSpec {
-        operation: RetainedSurfaceOperation::ProviderReplay,
-        summary: "Replay canonical provider history",
-        description: "Replay host-retained canonical observations into the authorized provider namespace.",
-        example: "Replay these canonical observation receipts into this provider",
         effect: EffectClass::Administrative,
         scope: PROVIDER_CONTROL_SCOPE,
         paginated: false,
@@ -2322,27 +1159,26 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    fn source() -> Value {
-        json!({"trace_ref":"trace.retained", "item_ref":"item.rank.1", "observation_id":"observation.1"})
-    }
     fn state() -> Value {
         json!({"kind":"canonical_session", "provider_id":"native", "registration_revision":7, "canonical_provider_id":"claude", "session_id":"session-1"})
     }
     #[test]
-    fn final_public_selectors_use_existing_source_and_session_addresses() {
+    fn public_selectors_address_only_a_host_resolved_namespace() {
         let valid = [
-            json!({"view":"delivery_receipt","source":source()}),
+            json!({"view":"state_summary"}),
+            json!({"view":"capability_status"}),
             json!({"view":"maintenance_receipt","operation_id":"01993262-4d00-7000-8000-000000000001","idempotency_key":"b".repeat(64)}),
         ];
         for selection in valid {
-            let request: ProviderControlRequestV1 = serde_json::from_value(json!({"operation":"inspection","request":{"state":state(),"selection":selection,"maximum_items":10,"maximum_bytes":65536}})).expect("final producer request");
+            let request: ProviderControlRequestV1 = serde_json::from_value(json!({"operation":"inspection","request":{"state":state(),"selection":selection,"maximum_items":10,"maximum_bytes":65536}})).expect("state-only inspection");
             request
-                .validate_at(UtcMicros(10))
-                .expect("bounded final query");
+                .validate()
+                .expect("bounded state-only query");
         }
         for selection in [
-            json!({"view":"delivery_receipt","receipt_ref":"invented"}),
             json!({"view":"maintenance_receipt","receipt_ref":"invented"}),
+            json!({"view":"source_influence","source":{"trace_ref":"t","item_ref":"i","observation_id":"o"}}),
+            json!({"view":"snapshot_metadata","snapshot_ref":"snapshot.host.1"}),
         ] {
             assert!(
                 serde_json::from_value::<ProviderControlInspectionSelectorV1>(selection).is_err()
@@ -2355,24 +1191,21 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            serde_json::from_value::<ProviderControlCorrectionV1>(
-                json!({"kind":"replace_content","replacement_receipt_ref":"invented"})
-            )
-            .is_err()
-        );
-        let identity: ProviderControlSnapshotIdentityV1 =
-            serde_json::from_value(snapshot()).expect("opaque schema identity");
-        assert_eq!(identity.state_schema_version, "native-staged-v2");
-        let mut numeric = snapshot();
-        numeric["state_schema_version"] = json!(1);
-        assert!(serde_json::from_value::<ProviderControlSnapshotIdentityV1>(numeric).is_err());
+        for removed in ["feedback", "correction", "delete_by_source", "snapshot_export", "snapshot_restore", "replay"] {
+            assert!(
+                serde_json::from_value::<ProviderControlRequestV1>(
+                    json!({"operation":removed,"request":{"state":state()}})
+                )
+                .is_err(),
+                "{removed} is not a provider control"
+            );
+        }
     }
 
     #[test]
     fn provider_read_evidence_preserves_failure_payload_and_refuses_effect_family() {
         let mut value: ProviderControlResultV1 = serde_json::from_value(result_value(
-            &requests()[3],
+            &requests()[0],
             Value::Null,
             "provider_unavailable",
         ))
@@ -2391,7 +1224,7 @@ mod tests {
             matches!(retained, RetainedSurfaceResultV1::ProviderControl(actual) if actual == value)
         );
         let effect = RetainedSurfaceResultV1::ProviderControl(
-            serde_json::from_value(result_value(&requests()[0], successful_data(0), "success"))
+            serde_json::from_value(result_value(&requests()[2], successful_data(2), "success"))
                 .expect("actual mutation reply"),
         );
         assert_eq!(
@@ -2402,15 +1235,9 @@ mod tests {
 
     fn requests() -> Vec<ProviderControlRequestV1> {
         [
-            json!({"operation":"feedback","request":{"source":source(),"signal":"helpful","weight":"0.5","evidence_refs":["evidence.1"],"occurred_at":10}}),
-            json!({"operation":"correction","request":{"source":source(),"expected_source_revision":"revision.1","correction":{"kind":"replace_content","replacement_source":source()},"reason":"Retained correction evidence","evidence_refs":[]}}),
-            json!({"operation":"delete_by_source","request":{"source":source(),"mode":"remove_influence","expected_fence_revision":0,"include_snapshots":true}}),
             json!({"operation":"health","request":{"state":state(),"requested_checks":["state","privacy"]}}),
-            json!({"operation":"inspection","request":{"state":state(),"selection":{"view":"source_influence","source":source()},"maximum_items":10,"maximum_bytes":65536}}),
+            json!({"operation":"inspection","request":{"state":state(),"selection":{"view":"state_summary"},"maximum_items":10,"maximum_bytes":65536}}),
             json!({"operation":"maintenance","request":{"state":state(),"task":"validate_state","maximum_items":20,"maximum_bytes":65536,"maximum_duration_millis":1000,"dry_run":false}}),
-            json!({"operation":"snapshot_export","request":{"state":state(),"maximum_bytes":65536}}),
-            json!({"operation":"snapshot_restore","request":{"state":state(),"snapshot_ref":"snapshot.host.1","expected_state_generation":3}}),
-            json!({"operation":"replay","request":{"state":state(),"observation_batch_refs":["observation.batch.1"],"first_source_sequence":1,"last_source_sequence":1,"expected_state_generation":3,"expected_previous_acknowledged_sequence":0}}),
         ].into_iter().map(|value| serde_json::from_value(value).expect("typed request")).collect()
     }
     fn scope() -> ProviderControlScopeV1 {
@@ -2424,17 +1251,8 @@ mod tests {
             resolved_scope_digest: format!("sha256:{}", "1".repeat(64)),
         }
     }
-    fn source_identity() -> Value {
-        json!({"canonical_provider_id":"native","canonical_session_id":"session-1","source_key":"source.1","stable_record_id":null,"observation_id":"observation.1","source_revision":"revision.1","content_sha256":"a".repeat(64)})
-    }
-    fn target() -> Value {
-        json!({"stable_memory_ref":"provider.memory.1","source":source_identity()})
-    }
     fn receipt() -> Value {
         json!({"state_generation_before":3,"state_generation_after":4,"provider_receipt_digest":"b".repeat(64)})
-    }
-    fn snapshot() -> Value {
-        json!({"snapshot_id":"provider.snapshot.1","provider_id":"native","implementation_identity_digest":"a".repeat(64),"state_schema_version":"native-staged-v2","exact_scope_digest":scope().sha256(),"state_generation":3,"observation_sequence":1,"parent_snapshot_id":null,"content_sha256":"c".repeat(64),"byte_length":128,"created_at":"2026-09-10T00:00:00.123456789Z"})
     }
     fn none_effect() -> Value {
         json!({"state":"none","committed_boundary":null,"state_generation_before":null,"state_generation_after":null,"committed_item_refs":[],"uncommitted_item_refs":[],"provider_receipt_digest":null,"reconciliation_action":null,"verification_digest":null,"duplicate_of_idempotency_key":null,"duplicate_of_operation_id":null})
@@ -2453,140 +1271,25 @@ mod tests {
         let mutation = crate::retained_surface_operation_is_effect(request.operation());
         json!({"provider_id":"native","registration_revision":7,"scope":scope(),"operation_id":"018f22c2-77cd-7000-8000-000000000001","idempotency_key":mutation.then(||"d".repeat(64)),"terminal":terminal,"domain_detail":null,"effect":if mutation && terminal=="success" { committed_effect() } else { none_effect() },"result":{"operation":operation,"data":data},"warnings":[]})
     }
-    fn host_receipt() -> crate::EffectReceipt {
-        use tracedecay_domain::{ActorId, ManifestDigest, ProjectId, RepositoryId, WorktreeId};
-        let digest = || ManifestDigest::new(format!("sha256:{}", "a".repeat(64))).expect("digest");
-        crate::EffectReceipt {
-            operation: tracedecay_tool_catalog::UseCaseId::new(
-                "use-case.application.retained.provider-delete-by-source",
-            )
-            .expect("operation"),
-            request_id: crate::RequestId::new("request.delete").expect("request"),
-            actor: ActorId::new("actor.delete").expect("actor"),
-            scope: crate::ResolvedScope::new(
-                ProjectId::new("project-1").expect("project"),
-                RepositoryId::new("repo-1").expect("repo"),
-                WorktreeId::new("worktree-1").expect("worktree"),
-                None,
-            )
-            .expect("scope"),
-            effect_class: EffectClass::Administrative,
-            idempotency_key: crate::IdempotencyKey::new("host.delete.key").expect("key"),
-            input_digest: digest(),
-            expected_state: digest(),
-            policy_digest: digest(),
-            configuration_digest: digest(),
-            catalog_digest: digest(),
-            privacy_digest: digest(),
-            outcome: crate::EffectTermination::Completed,
-            committed_state: Some(digest()),
-            external_proof: None,
-        }
-    }
     fn successful_data(index: usize) -> Value {
         match index {
             0 => {
-                json!({"source":source(),"target":target(),"target_digest":"a".repeat(64),"signal":"helpful","applied_effect":{"feedback_recorded":true},"receipt":receipt()})
-            }
-            1 => {
-                json!({"source":source(),"target":target(),"target_digest":"a".repeat(64),"correction_kind":"replace_content","affected_provider_effects":1,"receipt":receipt()})
-            }
-            2 => {
-                json!({"source":source(),"target":target(),"mode":"remove_influence","include_snapshots":true,"host_snapshot_cleanup":{"state":"complete","removed_snapshot_refs":[],"matched_count":0,"unverifiable_count":0},"intent":{"fence_revision_before":0,"fence_revision_after":1,"host_receipt":host_receipt()},"erasure":{"state":"verified","postcondition":{"matched_effects":1,"removed_effects":1,"anonymized_effects":0,"retained_under_lock":0,"remaining_influence_count":0,"snapshots_examined":0,"snapshots_rewritten":0,"verification_query_digest":"a".repeat(64),"verification_state":"verified_absent"},"receipt":receipt()}})
-            }
-            3 => {
                 json!({"provider_instance_id":"instance.1","implementation_identity_digest":"a".repeat(64),"state_identity_digest":"b".repeat(64),"state_generation":3,"scope_digest":scope().sha256(),"readiness":"ready","capability_states":[{"capability_id":"provider.health.v1","state":"available"}],"effective_limits_digest":"c".repeat(64),"backlog":0,"recovery_state":"ready"})
             }
-            4 => {
-                json!({"selection":{"view":"source_influence","source":source()},"items":{"view":"source_influence","items":[{"target":target(),"active":true,"disposition":"available","settled_feedback":{"helpful":1,"harmful":0,"ignored":0,"corrected":0,"superseded":0},"last_feedback_receipt":"receipt.feedback","provider_local_effect_summary":"Recorded one provider-local feedback signal"}]},"coverage":"complete","next_cursor":null,"redactions":[],"evidence_origin":{"kind":"provider_runtime"},"state_generation":3})
+            1 => {
+                json!({"selection":{"view":"state_summary"},"items":{"view":"state_summary","items":[{"records":4}]},"coverage":"complete","next_cursor":null,"redactions":[],"state_generation":3})
             }
-            5 => {
+            2 => {
                 json!({"task":"validate_state","dry_run":false,"scanned_items":1,"changed_items":1,"removed_items":0,"partial":false,"resume_cursor":null,"receipt":receipt()})
-            }
-            6 => json!({"snapshot_ref":"snapshot.host.1","identity":snapshot()}),
-            7 => {
-                json!({"snapshot_ref":"snapshot.host.1","snapshot_id":"provider.snapshot.1","restored_observation_sequence":1,"receipt":receipt()})
-            }
-            8 => {
-                json!({"first_source_sequence":1,"last_source_sequence":1,"acknowledged_sequence":1,"resolved_observations":1,"applied_observations":1,"duplicate_observations":0,"sources_already_applied":0,"rejected_observations":0,"effect_unknown_observations":0,"partial":false,"receipt":receipt()})
             }
             _ => unreachable!(),
         }
     }
 
     #[test]
-    fn host_metadata_reports_export_evidence_without_current_runtime_claims() {
-        let mut request = requests().remove(4);
-        let ProviderControlRequestV1::Inspection(public) = &mut request else {
-            panic!("inspection")
-        };
-        public.selection = ProviderControlInspectionSelectorV1::SnapshotMetadata {
-            snapshot_ref: "snapshot.host.1".to_owned(),
-        };
-        let data = json!({
-            "selection": {"view":"snapshot_metadata","snapshot_ref":"snapshot.host.1"},
-            "evidence_origin":{"kind":"host_snapshot_artifact","snapshot_ref":"snapshot.host.1","export_registration_revision":7},
-            "items":{"view":"snapshot_metadata","items":[snapshot()]},
-            "coverage":"complete","next_cursor":null,"redactions":[],"state_generation":null
-        });
-        let actual = result_value(&request, data, "success");
-        let result: ProviderControlResultV1 =
-            serde_json::from_value(actual.clone()).expect("host artifact");
-        result
-            .validate_for(&request)
-            .expect("historical export owner and unknown current generation");
-        for (pointer, replacement) in [
-            ("/result/data/state_generation", json!(0)),
-            (
-                "/result/data/evidence_origin/export_registration_revision",
-                json!(8),
-            ),
-            (
-                "/result/data/evidence_origin/snapshot_ref",
-                json!("snapshot.other"),
-            ),
-            ("/result/data/items/items", json!([])),
-            ("/result/data/items/items", json!([snapshot(), snapshot()])),
-            ("/effect/state_generation_before", json!(3)),
-            ("/effect/state_generation_after", json!(3)),
-            ("/warnings", json!(["provider ready"])),
-        ] {
-            let mut changed = actual.clone();
-            *changed.pointer_mut(pointer).expect("fixture field") = replacement;
-            assert!(
-                serde_json::from_value::<ProviderControlResultV1>(changed)
-                    .expect("typed malformed evidence")
-                    .validate_for(&request)
-                    .is_err(),
-                "{pointer}"
-            );
-        }
-        let ProviderControlRequestV1::Inspection(public) = &mut request else {
-            unreachable!()
-        };
-        public.cursor = Some("stale.page".to_owned());
-        assert!(result.validate_for(&request).is_err());
-        let runtime_request = requests().remove(4);
-        let mut runtime = result_value(&runtime_request, successful_data(4), "success");
-        runtime["result"]["data"]["state_generation"] = Value::Null;
-        assert!(
-            serde_json::from_value::<ProviderControlResultV1>(runtime)
-                .expect("runtime")
-                .validate()
-                .is_err()
-        );
-        let mut missing_origin = actual;
-        missing_origin["result"]["data"]
-            .as_object_mut()
-            .expect("data")
-            .remove("evidence_origin");
-        assert!(serde_json::from_value::<ProviderControlResultV1>(missing_origin).is_err());
-    }
-
-    #[test]
     fn maintenance_state_comparison_is_optional_and_independent_of_item_counts() {
-        let request = requests().remove(5);
-        let mut raw = result_value(&request, successful_data(5), "success");
+        let request = requests().remove(2);
+        let mut raw = result_value(&request, successful_data(2), "success");
         raw["result"]["data"]["changed_items"] = json!(0);
         for comparison in [None, Some(false), Some(true)] {
             let mut value = raw.clone();
@@ -2615,67 +1318,15 @@ mod tests {
     }
 
     #[test]
-    fn partial_host_snapshot_cleanup_survives_provider_offline_without_proving_erasure() {
-        let request = requests().remove(2);
-        let mut data = successful_data(2);
-        data["erasure"] = json!({"state":"pending","reason_code":"provider_offline"});
-        data["host_snapshot_cleanup"] = json!({"state":"partial","removed_snapshot_refs":["snapshot.removed.1"],"matched_count":2,"unverifiable_count":1});
-        let raw = result_value(&request, data, "provider_unavailable");
-        let result: ProviderControlResultV1 =
-            serde_json::from_value(raw.clone()).expect("offline cleanup");
-        result
-            .validate_for(&request)
-            .expect("actual removal independent from provider availability");
-        let ProviderControlOperationResultV1::DeleteBySource(Some(data)) = result.result else {
-            panic!("deletion")
-        };
-        assert_eq!(
-            data.host_snapshot_cleanup.removed_snapshot_refs,
-            vec!["snapshot.removed.1"]
-        );
-        assert!(matches!(
-            data.erasure,
-            ProviderControlErasureV1::Pending { .. }
-        ));
-        let mut contradictory = raw;
-        contradictory["result"]["data"]["host_snapshot_cleanup"]["state"] = json!("complete");
-        assert!(
-            serde_json::from_value::<ProviderControlResultV1>(contradictory)
-                .expect("contradiction")
-                .validate()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn requested_host_cleanup_cannot_be_reported_as_not_requested_after_the_fence() {
-        let request = requests().remove(2);
-        let mut data = successful_data(2);
-        data["host_snapshot_cleanup"] = json!({"state":"not_requested","removed_snapshot_refs":[],"matched_count":0,"unverifiable_count":0});
-        let invalid: ProviderControlResultV1 =
-            serde_json::from_value(result_value(&request, data.clone(), "success"))
-                .expect("typed cleanup");
-        assert!(invalid.validate_for(&request).is_err());
-        data["erasure"] = json!({"state":"pending","reason_code":"provider_offline"});
-        data["host_snapshot_cleanup"] = json!({"state":"unverifiable","removed_snapshot_refs":[],"matched_count":0,"unverifiable_count":1});
-        let actual: ProviderControlResultV1 =
-            serde_json::from_value(result_value(&request, data, "provider_unavailable"))
-                .expect("unstarted requested cleanup");
-        actual
-            .validate_for(&request)
-            .expect("actual inability to start requested cleanup");
-    }
-
-    #[test]
     fn maintenance_resume_cursor_is_optional_bounded_and_preserved() {
-        let mut request = requests().remove(5);
+        let mut request = requests().remove(2);
         let ProviderControlRequestV1::Maintenance(data) = &mut request else {
             panic!("maintenance fixture")
         };
         assert_eq!(data.resume_cursor, None);
         data.resume_cursor = Some("native.scope:decay:17".to_owned());
         request
-            .validate_at(UtcMicros(20))
+            .validate()
             .expect("opaque continuation");
         assert_eq!(
             serde_json::to_value(&request).expect("request")["request"]["resume_cursor"],
@@ -2686,18 +1337,14 @@ mod tests {
                 panic!("maintenance fixture")
             };
             data.resume_cursor = Some(invalid);
-            assert!(request.validate_at(UtcMicros(20)).is_err());
+            assert!(request.validate().is_err());
         }
     }
 
     #[test]
     fn optional_provider_counts_preserve_native_values_and_ncm_omissions() {
         let requests = requests();
-        for (index, field, count) in [
-            (3, "staged_rows", 9_u64),
-            (5, "proposed_changes", 3),
-            (7, "restored_rows", 2),
-        ] {
+        for (index, field, count) in [(0, "staged_rows", 9_u64), (2, "proposed_changes", 3)] {
             for actual in [None, Some(0), Some(count)] {
                 let mut data = successful_data(index);
                 if let Some(count) = actual {
@@ -2734,11 +1381,10 @@ mod tests {
     #[test]
     fn provider_control_requests_are_closed_bounded_and_keep_host_authority_out() {
         for request in requests() {
-            request.validate_at(UtcMicros(20)).expect("valid request");
+            request.validate().expect("valid request");
             for field in [
                 "exact_scope_identity",
                 "history_grant",
-                "canonical_outcome_receipt",
                 "ready_receipt_digest",
                 "operation_id",
                 "idempotency_key",
@@ -2754,55 +1400,32 @@ mod tests {
                 );
             }
         }
-        for field in ["trace_ref", "item_ref", "observation_id"] {
-            let mut value = source();
-            value.as_object_mut().expect("source").remove(field);
-            assert!(serde_json::from_value::<ProviderControlSourceSelectorV1>(value).is_err());
-        }
-        assert!(
-            serde_json::from_value::<ProviderControlSourceSelectorV1>(
-                json!({"stable_memory_ref":"provider.memory.1"})
-            )
-            .is_err()
-        );
-        let mut deletion = serde_json::to_value(&requests()[2]).expect("delete");
-        deletion["request"]["sources"] = json!([source()]);
-        assert!(serde_json::from_value::<ProviderControlRequestV1>(deletion).is_err());
-        for weight in ["NaN", "1.01", "-0.1", "1e-2", "01", " 0.5", "0.", ".5"] {
-            let mut value = serde_json::to_value(&requests()[0]).expect("feedback");
-            value["request"]["weight"] = json!(weight);
-            let request: ProviderControlRequestV1 =
-                serde_json::from_value(value).expect("typed weight");
-            assert!(request.validate_at(UtcMicros(20)).is_err());
-        }
-        assert!(requests()[0].validate_at(UtcMicros(9)).is_err());
         for (index, field, value) in [
-            (3, "requested_checks", json!(["state", "state"])),
-            (4, "maximum_items", json!(100001)),
-            (5, "maximum_duration_millis", json!(0)),
-            (6, "maximum_bytes", json!(1073741825_u64)),
-            (8, "observation_batch_refs", json!(["same", "same"])),
-            (8, "last_source_sequence", json!(0)),
+            (0, "requested_checks", json!(["state", "state"])),
+            (0, "requested_checks", json!([])),
+            (1, "maximum_items", json!(100001)),
+            (1, "maximum_bytes", json!(33554433_u64)),
+            (2, "maximum_duration_millis", json!(0)),
+            (2, "maximum_bytes", json!(1073741825_u64)),
         ] {
             let mut request = serde_json::to_value(&requests()[index]).expect("request");
             request["request"][field] = value;
             let request: ProviderControlRequestV1 =
                 serde_json::from_value(request).expect("typed bad bound");
             assert!(
-                request.validate_at(UtcMicros(20)).is_err(),
+                request.validate().is_err(),
                 "accepted {field}"
             );
         }
-        let mut correction = serde_json::to_value(&requests()[1]).expect("correction");
-        correction["request"]["correction"] =
-            json!({"kind":"change_validity","valid_from":20,"valid_until":20});
-        let correction: ProviderControlRequestV1 =
-            serde_json::from_value(correction).expect("typed validity");
-        assert!(correction.validate_at(UtcMicros(20)).is_err());
+        let mut blank_session = serde_json::to_value(&requests()[0]).expect("health");
+        blank_session["request"]["state"]["session_id"] = json!(" session-1");
+        let blank_session: ProviderControlRequestV1 =
+            serde_json::from_value(blank_session).expect("typed selector");
+        assert!(blank_session.validate().is_err());
     }
 
     #[test]
-    fn nine_provider_controls_have_distinct_catalog_schemas_and_sdk_controls() {
+    fn provider_controls_have_distinct_catalog_schemas_and_sdk_controls() {
         let catalog = retained_surface_catalog_contribution().expect("catalog");
         for request in requests() {
             let operation = request.operation();
@@ -2848,6 +1471,11 @@ mod tests {
                 }
             );
         }
+        let provider_operations = RetainedSurfaceOperation::ALL
+            .iter()
+            .filter(|operation| operation.as_str().starts_with("provider_"))
+            .count();
+        assert_eq!(provider_operations, requests().len());
         assert_eq!(
             scope().sha256(),
             "2f525c8c3d59bfa3d9729405c4f3f1307fade77494b6ddf251c89abc490f0a52"
@@ -2879,27 +1507,9 @@ mod tests {
                 .expect("truthful unavailable");
             let mut changed = result.clone();
             changed.registration_revision = 8;
-            if request.state_selector().is_some() {
-                assert!(changed.validate_for(request).is_err());
-            }
+            assert!(changed.validate_for(request).is_err());
         }
-        let mut bad = result_value(&requests[1], successful_data(1), "success");
-        bad["result"]["data"]["target"]["source"]["source_revision"] = json!("other");
-        assert!(
-            serde_json::from_value::<ProviderControlResultV1>(bad)
-                .expect("revision result")
-                .validate_for(&requests[1])
-                .is_err()
-        );
-        let mut bad = result_value(&requests[0], successful_data(0), "success");
-        bad["result"]["data"]["source"]["observation_id"] = json!("other");
-        assert!(
-            serde_json::from_value::<ProviderControlResultV1>(bad)
-                .expect("source result")
-                .validate_for(&requests[0])
-                .is_err()
-        );
-        let mut bad = result_value(&requests[1], successful_data(1), "success");
+        let mut bad = result_value(&requests[2], successful_data(2), "success");
         bad["effect"] = none_effect();
         bad["result"]["data"]["receipt"]["state_generation_after"] = json!(3);
         assert!(
@@ -2908,11 +1518,19 @@ mod tests {
                 .validate()
                 .is_err()
         );
+        let mut bad = result_value(&requests[0], successful_data(0), "success");
+        bad["result"]["data"]["scope_digest"] = json!("e".repeat(64));
+        assert!(
+            serde_json::from_value::<ProviderControlResultV1>(bad)
+                .expect("health for another namespace")
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
     fn retained_host_unknown_without_provider_receipt_cannot_claim_commit_evidence() {
-        let request = &requests()[5];
+        let request = &requests()[2];
         let mut value = result_value(request, Value::Null, "effect_unknown");
         value["effect"]["state"] = json!("unknown");
         value["effect"]["reconciliation_action"] = json!("reconcile_same_operation");
@@ -3007,8 +1625,8 @@ mod tests {
 
     #[test]
     fn provider_effects_preserve_duplicates_partitions_and_unknown_reconciliation() {
-        let request = &requests()[0];
-        let mut value = result_value(request, successful_data(0), "success");
+        let request = &requests()[2];
+        let mut value = result_value(request, successful_data(2), "success");
         value["effect"] = none_effect();
         value["effect"]["state"] = json!("duplicate");
         value["effect"]["state_generation_before"] = json!(4);
@@ -3069,47 +1687,39 @@ mod tests {
     }
 
     #[test]
-    fn deletion_intent_is_not_erasure_and_pinned_inspection_shapes_remain_closed() {
-        let request = &requests()[2];
-        let mut data = successful_data(2);
-        data["erasure"] = json!({"state":"pending","reason_code":"provider_offline"});
-        let pending: ProviderControlResultV1 =
-            serde_json::from_value(result_value(request, data, "provider_unavailable"))
-                .expect("offline intent");
-        pending
-            .validate_for(request)
-            .expect("durable intent with erasure pending");
-        let mut forged = serde_json::to_value(&pending).expect("pending");
-        forged["terminal"] = json!("success");
+    fn pinned_inspection_shapes_remain_closed_and_bounded() {
+        let request = &requests()[1];
+        let result: ProviderControlResultV1 =
+            serde_json::from_value(result_value(request, successful_data(1), "success"))
+                .expect("state summary");
+        result.validate_for(request).expect("provider state summary");
+        let mut mismatched = result_value(request, successful_data(1), "success");
+        mismatched["result"]["data"]["items"] = json!({"view":"capability_status","items":[]});
         assert!(
-            serde_json::from_value::<ProviderControlResultV1>(forged)
-                .expect("false success")
+            serde_json::from_value::<ProviderControlResultV1>(mismatched)
+                .expect("typed mismatched view")
                 .validate()
                 .is_err()
         );
-        let mut verified = result_value(request, successful_data(2), "success");
-        verified["result"]["data"]["erasure"]["postcondition"]["remaining_influence_count"] =
-            json!(1);
+        let mut unevidenced = result_value(request, successful_data(1), "success");
+        unevidenced["result"]["data"]["state_generation"] = Value::Null;
+        assert!(serde_json::from_value::<ProviderControlResultV1>(unevidenced).is_err());
+        let mut uncursored = result_value(request, successful_data(1), "success");
+        uncursored["result"]["data"]["next_cursor"] = json!("page.2");
         assert!(
-            serde_json::from_value::<ProviderControlResultV1>(verified)
-                .expect("residual influence")
+            serde_json::from_value::<ProviderControlResultV1>(uncursored)
+                .expect("cursor with complete coverage")
                 .validate()
                 .is_err()
         );
-        let request = &requests()[4];
-        let mut inspection = result_value(request, successful_data(4), "success");
-        inspection["result"]["data"]["items"]["items"][0]["provider_local_effect_summary"] =
-            json!({"ranking_bias":1});
-        assert!(serde_json::from_value::<ProviderControlResultV1>(inspection).is_err());
-        let mut trace:ProviderControlInspectionItemsV1=serde_json::from_value(json!({"view":"trace","items":[{"stable_memory_ref":"provider.memory.1","content":null,"content_sha256":null,"original_source":null}]})).expect("private trace");
-        trace
-            .validate_for("native", &scope())
-            .expect("privacy withholding");
-        if let ProviderControlInspectionItemsV1::Trace(items) = &mut trace {
-            items[0].original_source =
-                Some(serde_json::from_value(source_identity()).expect("source"));
-        }
-        assert!(trace.validate_for("native", &scope()).is_err());
+        let receipt = json!({"view":"maintenance_receipt","items":[{"operation_id":"operation.1","idempotency_key":"key.1","outcome":successful_data(2)}]});
+        serde_json::from_value::<ProviderControlInspectionItemsV1>(receipt.clone())
+            .expect("closed maintenance receipt")
+            .validate()
+            .expect("provider maintenance receipt");
+        let mut widened = receipt;
+        widened["items"][0]["stable_memory_ref"] = json!("invented");
+        assert!(serde_json::from_value::<ProviderControlInspectionItemsV1>(widened).is_err());
         assert!(
             serde_json::from_value::<ProviderControlEvidenceV1>(json!("x".repeat(8193))).is_err()
         );
@@ -3121,159 +1731,25 @@ mod tests {
     }
 
     #[test]
-    fn verified_deletion_requires_consistent_provider_proof_and_preserves_real_no_ops() {
-        let request = &requests()[2];
-        let mut no_op = result_value(request, successful_data(2), "success");
-        no_op["effect"] = none_effect();
-        no_op["result"]["data"]["erasure"]["receipt"]["state_generation_after"] = json!(3);
-        no_op["result"]["data"]["erasure"]["postcondition"]["removed_effects"] = json!(0);
-        no_op["result"]["data"]["erasure"]["postcondition"]["matched_effects"] = json!(0);
-        serde_json::from_value::<ProviderControlResultV1>(no_op.clone())
-            .expect("verified zero change")
-            .validate_for(request)
-            .expect("actual absence verification is a provider no-op");
-        let mut retained = no_op.clone();
-        retained["result"]["data"]["erasure"]["state"] = json!("retained_under_lock");
-        retained["result"]["data"]["erasure"]["retention_lock_receipt"] = json!("lock.explicit.1");
-        retained["result"]["data"]["erasure"]["postcondition"]["verification_state"] =
-            json!("retained_under_explicit_lock");
-        retained["result"]["data"]["erasure"]["postcondition"]["matched_effects"] = json!(1);
-        retained["result"]["data"]["erasure"]["postcondition"]["retained_under_lock"] = json!(1);
-        retained["result"]["data"]["erasure"]["postcondition"]["remaining_influence_count"] =
-            json!(1);
-        serde_json::from_value::<ProviderControlResultV1>(retained.clone())
-            .expect("retained zero change")
-            .validate_for(request)
-            .expect("explicit lock verification is a provider no-op");
-        for base in [&no_op, &retained] {
-            for count in [
-                "removed_effects",
-                "anonymized_effects",
-                "snapshots_rewritten",
-            ] {
-                let mut contradiction = base.clone();
-                contradiction["result"]["data"]["erasure"]["postcondition"]["matched_effects"] =
-                    json!(2);
-                contradiction["result"]["data"]["erasure"]["postcondition"]["snapshots_examined"] =
-                    json!(1);
-                contradiction["result"]["data"]["erasure"]["postcondition"][count] = json!(1);
-                assert!(
-                    serde_json::from_value::<ProviderControlResultV1>(contradiction)
-                        .expect("typed contradictory count")
-                        .validate()
-                        .is_err(),
-                    "accepted no-effect {count}"
-                );
-            }
-            for terminal in [
-                "provider_unavailable",
-                "effect_unknown",
-                "internal_failure",
-                "contract_violation",
-                "cancelled",
-                "partial",
-            ] {
-                let mut contradiction = base.clone();
-                contradiction["terminal"] = json!(terminal);
-                if terminal == "effect_unknown" {
-                    contradiction["effect"]["state"] = json!("unknown");
-                    contradiction["effect"]["provider_receipt_digest"] = json!("b".repeat(64));
-                    contradiction["effect"]["reconciliation_action"] =
-                        json!("Inspect the actual provider receipt");
-                }
-                assert!(
-                    serde_json::from_value::<ProviderControlResultV1>(contradiction)
-                        .expect("typed contradictory terminal")
-                        .validate()
-                        .is_err(),
-                    "accepted verified {terminal}"
-                );
-            }
-            let mut missing = base.clone();
-            missing["result"]["data"]["erasure"]
-                .as_object_mut()
-                .expect("erasure object")
-                .remove("receipt");
-            assert!(serde_json::from_value::<ProviderControlResultV1>(missing).is_err());
-        }
-        let mut partial = result_value(request, successful_data(2), "partial_effect");
-        partial["effect"] = committed_effect();
-        partial["effect"]["state"] = json!("partial");
-        partial["effect"]["committed_boundary"] = json!("effect.1");
-        partial["effect"]["committed_item_refs"] = json!(["effect.1"]);
-        partial["effect"]["uncommitted_item_refs"] = json!(["effect.2"]);
-        partial["effect"]["reconciliation_action"] = json!("Inspect remaining provider effects");
-        assert!(
-            serde_json::from_value::<ProviderControlResultV1>(partial)
-                .expect("valid partial effect shape")
-                .validate()
-                .is_err()
-        );
-        let committed = result_value(request, successful_data(2), "success");
-        for pointer in [
-            "/effect/provider_receipt_digest",
-            "/effect/verification_digest",
-        ] {
-            let mut missing = committed.clone();
-            *missing.pointer_mut(pointer).expect("proof pointer") = Value::Null;
-            assert!(
-                serde_json::from_value::<ProviderControlResultV1>(missing)
-                    .expect("typed missing proof")
-                    .validate()
-                    .is_err()
-            );
-        }
-        for pointer in [
-            "/result/data/erasure/receipt/provider_receipt_digest",
-            "/result/data/erasure/postcondition/verification_query_digest",
-        ] {
-            let mut contradiction = committed.clone();
-            *contradiction.pointer_mut(pointer).expect("proof pointer") =
-                json!(if pointer.contains("verification_query") {
-                    "".to_owned()
-                } else {
-                    "e".repeat(64)
-                });
-            assert!(
-                serde_json::from_value::<ProviderControlResultV1>(contradiction)
-                    .expect("typed contradictory proof")
-                    .validate()
-                    .is_err()
-            );
-        }
-        let mut maintenance_request = requests()[5].clone();
+    fn dry_run_maintenance_is_a_verified_provider_no_op() {
+        let mut maintenance_request = requests()[2].clone();
         if let ProviderControlRequestV1::Maintenance(request) = &mut maintenance_request {
             request.dry_run = true;
         }
-        let mut dry_run = result_value(&maintenance_request, successful_data(5), "success");
+        let mut dry_run = result_value(&maintenance_request, successful_data(2), "success");
         dry_run["effect"] = none_effect();
         dry_run["result"]["data"]["dry_run"] = json!(true);
         dry_run["result"]["data"]["changed_items"] = json!(0);
         dry_run["result"]["data"]["removed_items"] = json!(0);
         dry_run["result"]["data"]["receipt"]["state_generation_after"] = json!(3);
-        serde_json::from_value::<ProviderControlResultV1>(dry_run)
+        serde_json::from_value::<ProviderControlResultV1>(dry_run.clone())
             .expect("dry-run maintenance")
             .validate_for(&maintenance_request)
             .expect("actual dry-run no-op");
-    }
-
-    #[test]
-    fn replay_partition_and_restore_generation_cannot_claim_incomplete_success() {
-        let requests = requests();
-        let mut replay = result_value(&requests[8], successful_data(8), "success");
-        replay["result"]["data"]["duplicate_observations"] = json!(1);
+        dry_run["result"]["data"]["receipt"]["state_generation_after"] = json!(4);
         assert!(
-            serde_json::from_value::<ProviderControlResultV1>(replay)
-                .expect("wrong partition")
-                .validate()
-                .is_err()
-        );
-        let mut restore = result_value(&requests[7], successful_data(7), "success");
-        restore["effect"]["state_generation_after"] = json!(3);
-        restore["result"]["data"]["receipt"]["state_generation_after"] = json!(3);
-        assert!(
-            serde_json::from_value::<ProviderControlResultV1>(restore)
-                .expect("no generation advance")
+            serde_json::from_value::<ProviderControlResultV1>(dry_run)
+                .expect("dry-run with a generation advance")
                 .validate()
                 .is_err()
         );
@@ -3281,7 +1757,7 @@ mod tests {
 
     #[test]
     fn diagnostic_reference_is_optional_lossless_and_uses_the_generated_bound() {
-        let request = &requests()[3];
+        let request = &requests()[0];
         let absent = result_value(request, Value::Null, "provider_unavailable");
         let result: ProviderControlResultV1 =
             serde_json::from_value(absent).expect("legacy omitted diagnostic remains valid");
@@ -3318,19 +1794,6 @@ mod tests {
     #[test]
     fn serde_enums_and_terminal_effect_policy_match_generated_wire_contract() {
         for value in [
-            ProviderControlFeedbackSignalV1::Helpful,
-            ProviderControlFeedbackSignalV1::Harmful,
-            ProviderControlFeedbackSignalV1::Ignored,
-            ProviderControlFeedbackSignalV1::Corrected,
-            ProviderControlFeedbackSignalV1::Superseded,
-        ] {
-            let text = serde_json::to_value(value).expect("signal");
-            assert!(
-                generated_contract::FeedbackSignal::from_wire(text.as_str().expect("wire string"))
-                    .is_some()
-            );
-        }
-        for value in [
             ProviderControlMaintenanceTaskV1::Consolidate,
             ProviderControlMaintenanceTaskV1::Decay,
             ProviderControlMaintenanceTaskV1::PruneExpired,
@@ -3342,16 +1805,6 @@ mod tests {
             assert!(
                 generated_contract::MaintenanceTask::from_wire(text.as_str().expect("wire"))
                     .is_some()
-            );
-        }
-        for value in [
-            ProviderControlDeletionModeV1::RemoveInfluence,
-            ProviderControlDeletionModeV1::HardDelete,
-            ProviderControlDeletionModeV1::Anonymize,
-        ] {
-            let text = serde_json::to_value(value).expect("mode");
-            assert!(
-                generated_contract::DeletionMode::from_wire(text.as_str().expect("wire")).is_some()
             );
         }
         let states = [

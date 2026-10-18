@@ -20,7 +20,6 @@ test-helpers = []
 # it pull no provider code or NCM runtime.
 memory-provider-host = [
     "dep:chrono",
-    "dep:fs2",
     "dep:hmac",
     "dep:rusqlite",
     "dep:zeroize",
@@ -52,7 +51,6 @@ tracedecay-code-index-retention = { path = "../tracedecay-code-index-retention" 
 tracedecay-session-runtime = { path = "../tracedecay-session-runtime" }
 axum = "0.8"
 chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
-fs2 = { version = "0.4", optional = true }
 getrandom = "0.2"
 hex = "0.4"
 hmac = { version = "0.13.0", features = ["zeroize"], optional = true }

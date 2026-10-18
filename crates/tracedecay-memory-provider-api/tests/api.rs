@@ -386,10 +386,22 @@ fn descriptor_requires_all_mandatory_capabilities() -> Result<(), ApiError> {
     );
     assert!(matches!(
         result,
-        Err(ApiError::MandatoryCapabilityMissing(
-            "observation.accept.v1"
-        ))
+        Err(ApiError::MandatoryCapabilityMissing("recall.query.v1"))
     ));
+    // Health and recall are complete: observation is an optional capability
+    // that only observation delivery requires.
+    let recall_only = ProviderDescriptor::new(
+        provider_id()?,
+        DIGEST,
+        "state.v1",
+        0,
+        [
+            capability("provider.health.v1")?,
+            capability("recall.query.v1")?,
+        ],
+        limits(),
+    )?;
+    assert!(!recall_only.supports("observation.accept.v1"));
     Ok(())
 }
 

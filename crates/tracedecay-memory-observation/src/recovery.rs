@@ -420,10 +420,12 @@ impl StateIncompatibilityV1 {
             Self::StateSchemaChanged { .. } | Self::ImplementationIdentityChanged { .. } => {
                 RepairActionV1::MigrateProviderState
             }
-            Self::StateGenerationRegressed { .. } => RepairActionV1::ResetProviderState,
-            Self::AcknowledgedSequenceRegressed { .. } | Self::ReplayPositionAbandoned { .. } => {
-                RepairActionV1::RestoreProviderSnapshot
-            }
+            // Provider state that lost acknowledged effects is rebuilt, never
+            // restored: the canonical journal is the only history the host
+            // replays, and no provider snapshot surface exists.
+            Self::StateGenerationRegressed { .. }
+            | Self::AcknowledgedSequenceRegressed { .. }
+            | Self::ReplayPositionAbandoned { .. } => RepairActionV1::ResetProviderState,
             Self::ProviderAheadOfJournal { .. } | Self::ReplayPositionUnreadable => {
                 RepairActionV1::OperatorInvestigation
             }
@@ -436,8 +438,6 @@ impl StateIncompatibilityV1 {
 pub enum RepairActionV1 {
     /// Migrate the provider-local state to the schema this build speaks.
     MigrateProviderState,
-    /// Restore the provider from a snapshot covering the acknowledged history.
-    RestoreProviderSnapshot,
     /// Reset the provider-local state and re-register it, accepting the loss
     /// of provider-local memory the host never owned.
     ResetProviderState,
@@ -452,7 +452,6 @@ impl RepairActionV1 {
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::MigrateProviderState => "migration_required",
-            Self::RestoreProviderSnapshot => "snapshot_restore_required",
             Self::ResetProviderState => "reset_required",
             Self::OperatorInvestigation => "operator_investigation_required",
         }

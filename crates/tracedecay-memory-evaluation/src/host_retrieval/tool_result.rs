@@ -716,7 +716,7 @@ fn validate_bound_join(data: &Value, evidence: &Value, emitted: &Value) -> Resul
             && number(&trace["registration_revision"])?
                 == number(&retained["registration_revision"])?
             && trace["registration_revision"] == advisory["registration_revision"]
-            && retained["delivery_scope"] == advisory["canonical_history_replay"]["delivery_scope"]
+            && retained["delivery_scope"].is_object()
             && retained["store_evidence"].is_object()
             && retained["daemon_identity"].is_object(),
         "retained request/provider/revision/scope mismatch",

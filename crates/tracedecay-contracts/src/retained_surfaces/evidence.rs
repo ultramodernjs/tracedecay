@@ -480,18 +480,7 @@ fn provider_control_facts(
             }
             facts
         }
-        ProviderControlOperationResultV1::SnapshotExport(data) => {
-            RetainedSurfaceEvidenceFactsV1::unknown_singleton(
-                EvidenceDomain::Operational,
-                data.is_some(),
-            )?
-        }
-        ProviderControlOperationResultV1::Feedback(_)
-        | ProviderControlOperationResultV1::Correction(_)
-        | ProviderControlOperationResultV1::DeleteBySource(_)
-        | ProviderControlOperationResultV1::Maintenance(_)
-        | ProviderControlOperationResultV1::SnapshotRestore(_)
-        | ProviderControlOperationResultV1::Replay(_) => {
+        ProviderControlOperationResultV1::Maintenance(_) => {
             return Err(RetainedSurfaceEvidenceTerminalV1::Effect);
         }
     };

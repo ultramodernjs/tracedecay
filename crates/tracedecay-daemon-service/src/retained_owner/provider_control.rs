@@ -1,37 +1,30 @@
 //! Authenticated retained provider-control execution over existing project mounts.
 //!
-//! Public references select retained host evidence. They never supply provider
-//! authority, a replacement scope, or a provider common request header.
+//! Public references select a retained host namespace. They never supply
+//! provider authority, a replacement scope, or a provider common request header.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde_json::Value;
 use tracedecay_contracts::retained_surfaces::{
-    ProviderControlRequestV1, ProviderControlResultV1, ProviderControlSourceSelectorV1,
-    ProviderControlStateSelectorV1, RetainedProviderControlExecutionPortV1,
-    RetainedSurfaceOperation,
+    ProviderControlRequestV1, ProviderControlResultV1, ProviderControlStateSelectorV1,
+    RetainedProviderControlExecutionPortV1, RetainedSurfaceOperation,
 };
 use tracedecay_contracts::{
-    EffectReceipt, ResolvedScope, RetainedSurfaceExecutionContextV1,
-    RetainedSurfaceExecutionErrorV1, RetainedSurfaceExecutionFutureV1,
+    ResolvedScope, RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
+    RetainedSurfaceExecutionFutureV1,
 };
 use tracedecay_domain::{ManifestDigest, ProjectId, UserProfileId, canonical_json_bytes};
-use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_memory_provider_registry::{
-    GrantedHistorySource, HistoryGrant, LifecycleTarget, LifecycleTargetReference,
-    OperationControl, OwnedProviderId, ProjectMemoryProviderComposition, ProviderOperation,
-    TerminalCode,
+    OperationControl, OwnedProviderId, ProviderOperation, TerminalCode,
 };
-use tracedecay_runtime_core::db::Database;
 
 use super::cognitive_recall::{
     RecallAdmissionLedgerV1,
     control_attribution::{
-        RecallControlAttributionErrorV1, RecallControlItemRefV1, RecallControlTraceRefV1,
-        RetainedRecallControlScopeV1,
+        RecallControlAttributionErrorV1, RecallControlTraceRefV1, RetainedRecallControlScopeV1,
     },
 };
 use super::observation_journey::{
@@ -41,15 +34,11 @@ use super::observation_journey::{
         JourneyControlDispatchRequestV1, JourneyControlNotDispatchedV1,
     },
 };
-use super::provider_history::ProviderHistoryErrorV1;
-use authority::{AuthorizedRetainedControlSourceV1, ProviderControlAuthorityV1};
+use authority::{ControlAuthorityErrorV1, ProviderControlAuthorityV1};
 
 pub(crate) mod authority;
-mod feedback_receipt;
 mod outcome;
-pub(crate) mod portability;
 mod projection;
-mod source_controls;
 mod state_controls;
 
 /// Revision of the built-in host provider-control admission and redaction rules.
@@ -60,15 +49,11 @@ pub(super) type ControlResult<T> = Result<T, ControlFailureV1>;
 /// Actual mounted project authorities, assembled once during full project open.
 pub(crate) struct ProviderControlMountInputsV1 {
     pub(crate) authority: Option<Arc<ProviderControlAuthorityV1>>,
-    pub(crate) composition: Arc<ProjectMemoryProviderComposition>,
     pub(crate) journeys: Vec<Arc<ProjectObservationJourneyV1>>,
     pub(crate) profile_id: UserProfileId,
     pub(crate) mounted_scope: ResolvedScope,
     pub(crate) authoritative_project_id: ProjectId,
-    pub(crate) project_root: PathBuf,
     pub(crate) configuration_digest: ManifestDigest,
-    pub(crate) canonical_session_db: RegisteredGlobalDbLeaseV1,
-    pub(crate) canonical_dispositions: Arc<Database>,
 }
 
 pub(super) struct ProjectProviderControlPortV1 {
@@ -81,8 +66,7 @@ pub(crate) fn project_provider_control_port(
     Arc::new(ProjectProviderControlPortV1 { inputs })
 }
 
-/// Provider-only attempts get a UUIDv7. Durable source commands instead pass
-/// their accepted command identity unchanged into dispatch.
+/// Every provider control attempt gets a host-minted UUIDv7 operation identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ControlOperationIdentityV1 {
     pub(super) operation_id: String,
@@ -91,20 +75,17 @@ pub(super) struct ControlOperationIdentityV1 {
 
 pub(super) struct CompletedProviderControlV1 {
     pub(super) result: ProviderControlResultV1,
-    /// The actual host deletion fence receipt, never a provider-effect guess.
-    pub(super) host_receipt: Option<EffectReceipt>,
 }
 
 pub(super) struct ControlFailureV1 {
     pub(super) stage: ControlFailureStageV1,
-    pub(super) host_receipt: Option<EffectReceipt>,
 }
 
 /// Preserve post-contact evidence until the outer outcome owner interprets it.
 pub(super) enum ControlFailureStageV1 {
     Request(RetainedSurfaceExecutionErrorV1),
     Attribution(RecallControlAttributionErrorV1),
-    Authority(ProviderHistoryErrorV1),
+    Authority(ControlAuthorityErrorV1),
     Control(TerminalCode),
     InvalidBinding(&'static str),
     MissingAuthority(&'static str),
@@ -113,12 +94,6 @@ pub(super) enum ControlFailureStageV1 {
         state: RetainedRecallControlScopeV1,
         identity: ControlOperationIdentityV1,
         reason: &'static str,
-    },
-    /// A host intent write was attempted, but no durable outcome was confirmed.
-    HostIntentUnknown {
-        state: RetainedRecallControlScopeV1,
-        identity: ControlOperationIdentityV1,
-        detail: &'static str,
     },
     Dispatch {
         state: RetainedRecallControlScopeV1,
@@ -130,12 +105,6 @@ pub(super) enum ControlFailureStageV1 {
         state: RetainedRecallControlScopeV1,
         identity: ControlOperationIdentityV1,
     },
-    /// A verified provider reply preceded a host artifact retention failure.
-    /// Preserve both pieces of evidence for the outer durability outcome.
-    PortabilityArtifact {
-        error: portability::PortabilityErrorV1,
-        dispatched: JourneyControlDispatchReplyV1,
-    },
     Projection {
         field: &'static str,
         dispatched: JourneyControlDispatchReplyV1,
@@ -144,40 +113,32 @@ pub(super) enum ControlFailureStageV1 {
 
 impl std::fmt::Debug for ControlFailureV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stage = match &self.stage {
-            ControlFailureStageV1::Request(_) => "request",
-            ControlFailureStageV1::Attribution(_) => "attribution",
-            ControlFailureStageV1::Authority(_) => "authority",
-            ControlFailureStageV1::Control(_) => "control",
-            ControlFailureStageV1::InvalidBinding(_) => "binding",
-            ControlFailureStageV1::MissingAuthority(_) => "missing_authority",
-            ControlFailureStageV1::BlockingRead(_) => "blocking_read",
-            ControlFailureStageV1::Offline { .. } => "offline",
-            ControlFailureStageV1::HostIntentUnknown { .. } => "host_intent_unknown",
-            ControlFailureStageV1::Dispatch { .. } => "dispatch",
-            ControlFailureStageV1::DispatchWorker { .. } => "dispatch_worker",
-            ControlFailureStageV1::PortabilityArtifact { .. } => "portability_artifact",
-            ControlFailureStageV1::Projection { .. } => "projection",
+        // Stage names and host-owned static details only: no provider reply,
+        // request body or retained source value is formatted here.
+        let (stage, detail) = match &self.stage {
+            ControlFailureStageV1::Request(_) => ("request", None),
+            ControlFailureStageV1::Attribution(_) => ("attribution", None),
+            ControlFailureStageV1::Authority(_) => ("authority", None),
+            ControlFailureStageV1::Control(_) => ("control", None),
+            ControlFailureStageV1::InvalidBinding(detail) => ("binding", Some(*detail)),
+            ControlFailureStageV1::MissingAuthority(detail) => ("missing_authority", Some(*detail)),
+            ControlFailureStageV1::BlockingRead(detail) => ("blocking_read", Some(*detail)),
+            ControlFailureStageV1::Offline { reason, .. } => ("offline", Some(*reason)),
+            ControlFailureStageV1::Dispatch { .. } => ("dispatch", None),
+            ControlFailureStageV1::DispatchWorker { .. } => ("dispatch_worker", None),
+            ControlFailureStageV1::Projection { field, .. } => ("projection", Some(*field)),
         };
         formatter
             .debug_struct("ControlFailureV1")
             .field("stage", &stage)
-            .field("has_host_receipt", &self.host_receipt.is_some())
+            .field("detail", &detail)
             .finish()
     }
 }
 
 impl ControlFailureV1 {
     pub(super) fn new(stage: ControlFailureStageV1) -> Self {
-        Self {
-            stage,
-            host_receipt: None,
-        }
-    }
-
-    pub(super) fn with_host_receipt(mut self, receipt: EffectReceipt) -> Self {
-        self.host_receipt = Some(receipt);
-        self
+        Self { stage }
     }
 }
 
@@ -193,8 +154,8 @@ impl From<RecallControlAttributionErrorV1> for ControlFailureV1 {
     }
 }
 
-impl From<ProviderHistoryErrorV1> for ControlFailureV1 {
-    fn from(error: ProviderHistoryErrorV1) -> Self {
+impl From<ControlAuthorityErrorV1> for ControlFailureV1 {
+    fn from(error: ControlAuthorityErrorV1) -> Self {
         Self::new(ControlFailureStageV1::Authority(error))
     }
 }
@@ -202,35 +163,6 @@ impl From<ProviderHistoryErrorV1> for ControlFailureV1 {
 pub(super) struct ResolvedControlStateV1 {
     pub(super) retained: RetainedRecallControlScopeV1,
     pub(super) journey: Option<Arc<ProjectObservationJourneyV1>>,
-}
-
-pub(super) struct AuthorizedControlSourceV1 {
-    pub(super) authorized: AuthorizedRetainedControlSourceV1,
-    pub(super) target: LifecycleTarget,
-}
-
-impl AuthorizedControlSourceV1 {
-    pub(super) fn granted_source(&self) -> ControlResult<&GrantedHistorySource> {
-        let [source] = self.authorized.grant.sources.as_slice() else {
-            return Err(ControlFailureV1::new(
-                ControlFailureStageV1::InvalidBinding("one authorized original source"),
-            ));
-        };
-        Ok(source)
-    }
-
-    pub(super) fn projection_evidence<'a>(
-        &'a self,
-        selector: &'a ProviderControlSourceSelectorV1,
-    ) -> ControlResult<projection::ResolvedControlSourceV1<'a>> {
-        let source = self.granted_source()?;
-        Ok(projection::ResolvedControlSourceV1 {
-            selector,
-            target: &self.target,
-            original_attribution: &source.attribution,
-            current_disposition: &source.current_disposition,
-        })
-    }
 }
 
 #[repr(u8)]
@@ -260,7 +192,7 @@ impl<'a, 'context> ControlInvocationV1<'a, 'context> {
         context.request_context.validate().map_err(|_| {
             ControlFailureV1::new(ControlFailureStageV1::InvalidBinding("request context"))
         })?;
-        request.validate_at(context.observed_at).map_err(|_| {
+        request.validate().map_err(|_| {
             ControlFailureV1::new(ControlFailureStageV1::Request(
                 RetainedSurfaceExecutionErrorV1::InvalidRequest,
             ))
@@ -350,7 +282,7 @@ impl<'a, 'context> ControlInvocationV1<'a, 'context> {
                 | ControlFailureStageV1::Attribution(RecallControlAttributionErrorV1::Control(
                     code,
                 ))
-                | ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(code)) => {
+                | ControlFailureStageV1::Authority(ControlAuthorityErrorV1::Control(code)) => {
                     Some(code)
                 }
                 ControlFailureStageV1::Dispatch {
@@ -444,15 +376,9 @@ fn provider_mutation_key(
 
 fn provider_operation(operation: RetainedSurfaceOperation) -> ControlResult<ProviderOperation> {
     Ok(match operation {
-        RetainedSurfaceOperation::ProviderFeedback => ProviderOperation::Feedback,
-        RetainedSurfaceOperation::ProviderCorrection => ProviderOperation::Correction,
-        RetainedSurfaceOperation::ProviderDeleteBySource => ProviderOperation::DeleteBySource,
         RetainedSurfaceOperation::ProviderHealth => ProviderOperation::Health,
         RetainedSurfaceOperation::ProviderInspection => ProviderOperation::Inspection,
         RetainedSurfaceOperation::ProviderMaintenance => ProviderOperation::Maintenance,
-        RetainedSurfaceOperation::ProviderSnapshotExport => ProviderOperation::SnapshotExport,
-        RetainedSurfaceOperation::ProviderSnapshotRestore => ProviderOperation::SnapshotRestore,
-        RetainedSurfaceOperation::ProviderReplay => ProviderOperation::Replay,
         _ => {
             return Err(ControlFailureV1::new(
                 ControlFailureStageV1::InvalidBinding("provider operation"),
@@ -477,7 +403,7 @@ impl ProjectProviderControlPortV1 {
     pub(super) fn authority(&self) -> ControlResult<&Arc<ProviderControlAuthorityV1>> {
         self.inputs.authority.as_ref().ok_or_else(|| {
             ControlFailureV1::new(ControlFailureStageV1::MissingAuthority(
-                "original source authority",
+                "retained control authority",
             ))
         })
     }
@@ -507,28 +433,19 @@ impl ProjectProviderControlPortV1 {
                 ControlFailureStageV1::InvalidBinding("duplicate mounted provider owner"),
             ));
         }
-        if let Some(journey) = &journey {
-            journey
-                .validate_history_mount(
-                    &retained.provider_id,
-                    retained.registration_revision,
-                    &self.inputs.profile_id,
-                    &self.inputs.mounted_scope,
-                )
-                .map_err(|_| {
-                    ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
-                        "provider journey mount",
-                    ))
-                })?;
+        if let Some(journey) = &journey
+            && !journey.is_mounted_for(
+                &retained.provider_id,
+                retained.registration_revision,
+                &self.inputs.profile_id,
+                &self.inputs.mounted_scope,
+            )
+        {
+            return Err(ControlFailureV1::new(
+                ControlFailureStageV1::InvalidBinding("provider journey mount"),
+            ));
         }
         Ok(ResolvedControlStateV1 { retained, journey })
-    }
-
-    pub(super) fn resolved_state_for_source(
-        &self,
-        source: &AuthorizedControlSourceV1,
-    ) -> ControlResult<ResolvedControlStateV1> {
-        self.mount_for(source.authorized.retained.scope.clone())
     }
 
     pub(super) async fn resolve_state(
@@ -566,14 +483,7 @@ impl ProjectProviderControlPortV1 {
                         .map_err(ControlFailureV1::from)
                     })
                     .await?;
-                invocation
-                    .run_controlled(async {
-                        authority
-                            .authorize_scope(&retained, &invocation.control)
-                            .await
-                            .map_err(ControlFailureV1::from)
-                    })
-                    .await?
+                authority.authorize_scope(&retained, &invocation.control)?
             }
             ProviderControlStateSelectorV1::CanonicalSession {
                 provider_id,
@@ -582,7 +492,7 @@ impl ProjectProviderControlPortV1 {
                 session_id,
             } => {
                 // The canonical session is an untrusted lookup key. The mounted
-                // authority must prove its session and hook-origin boundary.
+                // authority must find it registered in this project's session store.
                 let provider_id = OwnedProviderId::new(provider_id.clone()).map_err(|_| {
                     ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
                         "provider identity",
@@ -608,121 +518,6 @@ impl ProjectProviderControlPortV1 {
         Ok(retained)
     }
 
-    pub(super) async fn resolve_source(
-        &self,
-        selector: &ProviderControlSourceSelectorV1,
-        include_unavailable: bool,
-        control: &OperationControl,
-    ) -> ControlResult<AuthorizedControlSourceV1> {
-        let authority = self.authority()?;
-        let trace = RecallControlTraceRefV1::parse(&selector.trace_ref)?;
-        let item = RecallControlItemRefV1::parse(&selector.item_ref)?;
-        let ledger = self.ledger()?;
-        let observation_id = selector.observation_id.clone();
-        let read_control = control.clone();
-        let retained = tokio::task::spawn_blocking(move || {
-            ledger.read_retained_control_source(&trace, &item, &observation_id, &read_control)
-        })
-        .await
-        .map_err(|_| {
-            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-                "retained control source",
-            ))
-        })??;
-        let authorized = authority
-            .authorize_source(&retained, include_unavailable, control)
-            .await?;
-        let [granted] = authorized.grant.sources.as_slice() else {
-            return Err(ControlFailureV1::new(
-                ControlFailureStageV1::InvalidBinding("one authorized original source"),
-            ));
-        };
-        if authorized.grant.destination_scope != authorized.retained.scope.delivery_scope {
-            return Err(ControlFailureV1::new(
-                ControlFailureStageV1::InvalidBinding("fresh retained source binding"),
-            ));
-        }
-        // The retained row carries only an opaque source locator. Build the
-        // provider target from the fresh canonical grant returned by the host
-        // authority; the opaque value remains a handle for the provider-local
-        // reference until that provider resolves its lifecycle target.
-        let original = &granted.attribution;
-        let target = LifecycleTarget {
-            provider_id: authorized.retained.scope.provider_id.clone(),
-            registration_revision: authorized.retained.scope.registration_revision,
-            original_scope: original.origin_scope.clone(),
-            delivery_scope: authorized.retained.scope.delivery_scope.clone(),
-            source: original.source.clone(),
-            reference: LifecycleTargetReference::RetainedSourceLocator(
-                authorized.retained.stable_memory_ref.clone(),
-            ),
-        };
-        target.validate().map_err(|_| {
-            ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
-                "provider lifecycle target",
-            ))
-        })?;
-        let source = AuthorizedControlSourceV1 { authorized, target };
-        validate_source_grant_binding(&source)?;
-        Ok(source)
-    }
-
-    /// Resolve a source for a control that will use the mounted provider.
-    ///
-    /// Source-only public requests carry no namespace selector. Bind the
-    /// freshly authorized source grant to the host's current exact session
-    /// before the caller can accept a feedback/deletion command or dispatch a
-    /// provider operation. The untrusted selector, retained locator and
-    /// provider reply never choose this namespace.
-    pub(super) async fn resolve_source_for_invocation(
-        &self,
-        selector: &ProviderControlSourceSelectorV1,
-        include_unavailable: bool,
-        invocation: &ControlInvocationV1<'_, '_>,
-    ) -> ControlResult<AuthorizedControlSourceV1> {
-        self.validate_invocation(invocation)?;
-        let source = self
-            .resolve_source(selector, include_unavailable, &invocation.control)
-            .await?;
-        let granted = source.granted_source()?;
-        validate_source_grant_binding(&source)?;
-        let current_scope = self
-            .authority()?
-            .current_destination_scope(
-                granted.attribution.source.canonical_provider_id.as_str(),
-                &invocation.control,
-            )
-            .await?;
-        if current_scope != source.authorized.grant.destination_scope {
-            return Err(ControlFailureV1::new(
-                ControlFailureStageV1::InvalidBinding("current source delivery scope"),
-            ));
-        }
-        invocation.check()?;
-        Ok(source)
-    }
-
-    pub(super) fn require_same_state(
-        &self,
-        expected: &ResolvedControlStateV1,
-        source: &AuthorizedControlSourceV1,
-    ) -> ControlResult<()> {
-        require_same_producer_scope(&expected.retained, &source.authorized.retained.scope)
-    }
-
-    pub(super) fn unavailable_for(
-        &self,
-        invocation: &ControlInvocationV1<'_, '_>,
-        state: &ResolvedControlStateV1,
-        reason: &'static str,
-    ) -> ControlFailureV1 {
-        ControlFailureV1::new(ControlFailureStageV1::Offline {
-            state: state.retained.clone(),
-            identity: invocation.identity.clone(),
-            reason,
-        })
-    }
-
     pub(super) async fn dispatch(
         &self,
         invocation: &ControlInvocationV1<'_, '_>,
@@ -730,28 +525,6 @@ impl ProjectProviderControlPortV1 {
         operation_body: Value,
         identity: &ControlOperationIdentityV1,
         expected_state_generation: Option<u64>,
-    ) -> ControlResult<JourneyControlDispatchReplyV1> {
-        self.dispatch_with_source_grant(
-            invocation,
-            state,
-            operation_body,
-            identity,
-            expected_state_generation,
-            None,
-        )
-        .await
-    }
-
-    /// Carry source-grant claims through the private dispatch seam for
-    /// downstream revalidation without adding them to the public operation body.
-    pub(super) async fn dispatch_with_source_grant(
-        &self,
-        invocation: &ControlInvocationV1<'_, '_>,
-        state: &ResolvedControlStateV1,
-        operation_body: Value,
-        identity: &ControlOperationIdentityV1,
-        expected_state_generation: Option<u64>,
-        history_grant: Option<HistoryGrant>,
     ) -> ControlResult<JourneyControlDispatchReplyV1> {
         self.validate_invocation(invocation)?;
         let Some(journey) = state.journey.as_ref().cloned() else {
@@ -775,7 +548,6 @@ impl ProjectProviderControlPortV1 {
             operation_id: identity.operation_id.clone(),
             idempotency_key: identity.idempotency_key.clone(),
             operation_body,
-            history_grant,
             policy_revision: PROVIDER_CONTROL_POLICY_REVISION_V1,
             control: invocation.control.clone(),
             expected_state_generation,
@@ -803,7 +575,7 @@ impl ProjectProviderControlPortV1 {
             .await
     }
 
-    pub(super) fn project(
+    fn project(
         &self,
         invocation: &ControlInvocationV1<'_, '_>,
         dispatched: JourneyControlDispatchReplyV1,
@@ -817,10 +589,7 @@ impl ProjectProviderControlPortV1 {
             },
             evidence,
         ) {
-            Ok(result) => Ok(CompletedProviderControlV1 {
-                result,
-                host_receipt: None,
-            }),
+            Ok(result) => Ok(CompletedProviderControlV1 { result }),
             Err(error) => {
                 let field = error.field;
                 Err(ControlFailureV1::new(ControlFailureStageV1::Projection {
@@ -830,60 +599,6 @@ impl ProjectProviderControlPortV1 {
             }
         }
     }
-}
-
-/// Check the immutable relationship between the retained selector evidence,
-/// the fresh host grant, and the private lifecycle target. Every source use
-/// must carry the same provider revision, exact delivery/origin scopes, source
-/// sequence, and complete original identity; a selector or stale grant cannot
-/// rewrite one of those fields after authorization.
-fn validate_source_grant_binding(source: &AuthorizedControlSourceV1) -> ControlResult<()> {
-    let granted = source.granted_source()?;
-    let retained_attribution = source
-        .authorized
-        .retained
-        .original_source
-        .to_owned_attribution()
-        .map_err(|_| {
-            ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
-                "retained source attribution",
-            ))
-        })?;
-    if source.authorized.grant.destination_scope != source.authorized.retained.scope.delivery_scope
-        || source.target.provider_id != source.authorized.retained.scope.provider_id
-        || source.target.registration_revision
-            != source.authorized.retained.scope.registration_revision
-        || source.target.delivery_scope != source.authorized.retained.scope.delivery_scope
-        || source.target.original_scope != granted.attribution.origin_scope
-        || source.target.source != granted.attribution.source
-        || retained_attribution != granted.attribution
-    {
-        return Err(ControlFailureV1::new(
-            ControlFailureStageV1::InvalidBinding("source grant at use"),
-        ));
-    }
-    match &source.target.reference {
-        LifecycleTargetReference::RetainedSourceLocator(reference)
-            if reference == &source.authorized.retained.stable_memory_ref =>
-        {
-            Ok(())
-        }
-        _ => Err(ControlFailureV1::new(
-            ControlFailureStageV1::InvalidBinding("source locator at use"),
-        )),
-    }
-}
-
-fn require_same_producer_scope(
-    expected: &RetainedRecallControlScopeV1,
-    actual: &RetainedRecallControlScopeV1,
-) -> ControlResult<()> {
-    if expected != actual {
-        return Err(ControlFailureV1::new(
-            ControlFailureStageV1::InvalidBinding("source inspection state"),
-        ));
-    }
-    Ok(())
 }
 
 impl RetainedProviderControlExecutionPortV1 for ProjectProviderControlPortV1 {
@@ -899,15 +614,6 @@ impl RetainedProviderControlExecutionPortV1 for ProjectProviderControlPortV1 {
                 invocation
                     .run_controlled(async {
                         match request {
-                            ProviderControlRequestV1::Feedback(request) => {
-                                source_controls::feedback(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::Correction(request) => {
-                                source_controls::correction(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::DeleteBySource(request) => {
-                                source_controls::delete_by_source(self, &invocation, request).await
-                            }
                             ProviderControlRequestV1::Health(request) => {
                                 state_controls::health(self, &invocation, request).await
                             }
@@ -916,15 +622,6 @@ impl RetainedProviderControlExecutionPortV1 for ProjectProviderControlPortV1 {
                             }
                             ProviderControlRequestV1::Maintenance(request) => {
                                 state_controls::maintenance(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::SnapshotExport(request) => {
-                                portability::snapshot_export(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::SnapshotRestore(request) => {
-                                portability::snapshot_restore(self, &invocation, request).await
-                            }
-                            ProviderControlRequestV1::Replay(request) => {
-                                portability::replay(self, &invocation, request).await
                             }
                         }
                     })
@@ -1054,12 +751,6 @@ mod tests {
                 Some(key.as_str())
             );
         }
-        assert_ne!(
-            provider_mutation_key(&original, RetainedSurfaceOperation::ProviderReplay)
-                .unwrap()
-                .as_deref(),
-            Some(key.as_str())
-        );
         assert!(
             provider_mutation_key(&original, RetainedSurfaceOperation::ProviderHealth)
                 .unwrap()
@@ -1161,13 +852,13 @@ mod tests {
         invocation.stop(ControlStopCauseV1::Deadline);
         let refusal: ControlResult<()> = invocation.normalize_control_refusal(Err(
             ControlFailureV1::new(ControlFailureStageV1::Authority(
-                ProviderHistoryErrorV1::Control(TerminalCode::Cancelled),
+                ControlAuthorityErrorV1::Control(TerminalCode::Cancelled),
             )),
         ));
         assert!(matches!(
             refusal,
             Err(ControlFailureV1 {
-                stage: ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
+                stage: ControlFailureStageV1::Authority(ControlAuthorityErrorV1::Control(
                     TerminalCode::Cancelled
                 )),
                 ..
@@ -1206,7 +897,7 @@ mod tests {
                 settled.store(true, Ordering::Release);
                 if refuse {
                     Err(ControlFailureV1::new(ControlFailureStageV1::Authority(
-                        ProviderHistoryErrorV1::Control(TerminalCode::Cancelled),
+                        ControlAuthorityErrorV1::Control(TerminalCode::Cancelled),
                     )))
                 } else {
                     Ok("actual settled result")
@@ -1230,7 +921,7 @@ mod tests {
                 assert!(matches!(
                     result,
                     Err(ControlFailureV1 {
-                        stage: ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
+                        stage: ControlFailureStageV1::Authority(ControlAuthorityErrorV1::Control(
                             TerminalCode::DeadlineExceeded
                         )),
                         ..

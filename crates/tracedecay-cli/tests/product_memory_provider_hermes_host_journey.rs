@@ -352,17 +352,9 @@ impl HermesJourney {
         let result = self.tool_result_at(
             project_root,
             "tracedecay_context",
-            &json!({ "task": task, "format": "json", "_meta": { "session_id": SESSION_ID } }),
+            &json!({ "task": task, "format": "json" }),
         );
         content_json(&result).unwrap_or(result)
-    }
-
-    fn analytics_diagnostics(&self) -> Value {
-        let bytes = run_ok(
-            &mut self.cli(&["analytics", "diagnostics", "--no-sync"]),
-            "analytics diagnostics",
-        );
-        serde_json::from_slice(&bytes).expect("analytics diagnostics JSON")
     }
 
     fn install_hermes_plugin(&self) {
@@ -502,15 +494,48 @@ impl Drop for HermesJourney {
     }
 }
 
+/// Native selected: Native is upstream memory and observes nothing. The
+/// installed Hermes provider's callbacks still reach this project's canonical
+/// route, while `tracedecay_context` carries no provider lane and no
+/// observation journal exists anywhere in the profile.
 #[test]
-fn installed_hermes_provider_scopes_native_observations_and_recall_to_the_project() {
-    assert_hermes_provider_journey(ActiveProvider::Native);
+fn installed_hermes_provider_with_native_selected_is_upstream_memory() {
+    let mut journey = HermesJourney::new(ActiveProvider::Native);
+    journey.install_hermes_plugin();
+    journey.start_daemon();
+    journey.init_project();
+    let project_id = journey.project_id();
+    journey.configure_provider(&project_id);
+    journey.stop_daemon();
+    journey.start_daemon();
+    journey.init_project_at(&journey.foreign_project);
+
+    let baseline = journey.context("hermes quartz project provider baseline");
+    assert_no_provider_lane(&baseline);
+    let original = journey.run_provider_fixture("original", replay_timestamp_ns());
+    assert_original_fixture(&original);
+    assert_no_provider_lane(&journey.context(RECALL_QUERY));
+    assert_no_provider_lane(&journey.context_at(&journey.foreign_project, FOREIGN_RECALL_QUERY));
+    assert!(
+        find_file(&journey.profile, JOURNAL_FILE_NAME).is_none()
+            && find_file(&journey.profile, NCM_JOURNAL_FILE_NAME).is_none(),
+        "Native observes nothing: no provider journal may exist"
+    );
+    assert_project_hook_route(&journey);
+}
+
+fn assert_no_provider_lane(answer: &Value) {
+    assert!(
+        answer
+            .get("advisory_provider_memory")
+            .is_none_or(Value::is_null),
+        "Native-selected context carries no provider lane: {answer}"
+    );
 }
 
 /// The real worker/model path is deliberately opt-in: CI and ordinary test
-/// runs stay offline, while a pinned installation can prove the same Hermes
-/// admission and receipt contract against the NCM provider.
-#[cfg(unix)]
+/// runs stay offline, while a pinned installation proves the Hermes
+/// admission, receipt, restart and recall contract against the NCM provider.
 #[test]
 #[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with a pinned offline model"]
 fn real_ncm_hermes_provider_reopens_and_recalls_with_native_disabled() {
@@ -659,28 +684,37 @@ fn assert_hermes_provider_journey(active_provider: ActiveProvider) {
     let answer = journey.context(RECALL_QUERY);
     assert_answered_recall(&answer, active_provider);
 
-    // Keep the existing hook analytics assertion as a separate route proof:
-    // the provider callbacks carry the resolved project and leave evidence in
-    // this project's analytics store, while the foreign context above cannot
-    // see that route.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    assert_project_hook_route(&journey);
+}
+
+/// The provider callbacks carry the resolved project: Hermes turns are
+/// admitted through the canonical observation authority and projected into
+/// upstream session history, where `tracedecay_message_search` recalls them.
+/// A route proof independent of any memory provider.
+fn assert_project_hook_route(journey: &HermesJourney) {
+    let deadline = Instant::now() + SETTLEMENT_BUDGET;
     loop {
-        let diagnostics = journey.analytics_diagnostics();
-        if diagnostics["hook_call_count"].as_i64().unwrap_or_default() > 0
-            && diagnostics["by_event_kind"]
-                .as_array()
-                .is_some_and(|events| {
-                    events.iter().any(|event| {
-                        event["event_kind"] == "hook_route"
-                            && event["count"].as_i64().unwrap_or_default() > 0
-                    })
-                })
-        {
-            break;
+        let result = journey.tool_result(
+            "tracedecay_message_search",
+            &json!({ "query": PROJECT_TERM, "format": "json" }),
+        );
+        let envelope = content_json(&result).unwrap_or(result);
+        let payload = envelope
+            .pointer("/outcome/value/payload")
+            .cloned()
+            .unwrap_or(envelope);
+        if payload["results"].as_array().is_some_and(|results| {
+            results.iter().any(|entry| {
+                entry["message"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(PROJECT_TERM))
+            })
+        }) {
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "Hermes project callback did not leave project-scoped hook analytics: {diagnostics}"
+            "Hermes project callbacks never reached this project's session history: {payload}"
         );
         std::thread::sleep(JOURNAL_POLL_INTERVAL);
     }
@@ -798,7 +832,13 @@ fn capture_admissions(
             );
             assert!(
                 payload.get("history_grant").is_none(),
-                "Hermes history/control is explicitly unsupported until its host origin is mapped"
+                "the host never dispatches provider history"
+            );
+            assert_eq!(
+                payload["source_identity"]["original_source"]["source"]["observation_id"]
+                    .as_str(),
+                Some(admitted.source.source_event_id.as_str()),
+                "each delivery carries the host attribution of its own canonical record"
             );
             admitted
         })

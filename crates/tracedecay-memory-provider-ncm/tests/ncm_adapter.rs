@@ -1108,27 +1108,7 @@ fn namespace_is_deterministic_and_opaque() {
 }
 
 #[test]
-fn namespace_isolates_worktree_branch_and_session() {
-    let original = scope();
-    let mut changed_worktree = original.clone();
-    changed_worktree.worktree_identity = "worktree-b".to_owned();
-    let mut changed_branch = original.clone();
-    changed_branch.branch_identity = "refs/heads/feature".to_owned();
-    let mut changed_session = original.clone();
-    changed_session.agent_session_id = "session-b".to_owned();
-    let values = [
-        NcmNamespace::from_exact_scope(&original),
-        NcmNamespace::from_exact_scope(&changed_worktree),
-        NcmNamespace::from_exact_scope(&changed_branch),
-        NcmNamespace::from_exact_scope(&changed_session),
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    assert_eq!(values.len(), 4);
-}
-
-#[test]
-fn namespace_isolates_profile_project_repository_and_resolved_scope_digest() {
+fn namespace_isolates_every_checkout_field() {
     let original = scope();
     let mut changed_profile = original.clone();
     changed_profile.profile_id = "profile-b".to_owned();
@@ -1136,18 +1116,36 @@ fn namespace_isolates_profile_project_repository_and_resolved_scope_digest() {
     changed_project.project_id = "project-b".to_owned();
     let mut changed_repository = original.clone();
     changed_repository.repository_identity = "repository-b".to_owned();
-    let mut changed_resolved_scope = original.clone();
-    changed_resolved_scope.resolved_scope_digest = format!("sha256:{PROVIDER_RECEIPT_SHA}");
+    let mut changed_worktree = original.clone();
+    changed_worktree.worktree_identity = "worktree-b".to_owned();
+    let mut changed_branch = original.clone();
+    changed_branch.branch_identity = "refs/heads/feature".to_owned();
     let values = [
         NcmNamespace::from_exact_scope(&original),
         NcmNamespace::from_exact_scope(&changed_profile),
         NcmNamespace::from_exact_scope(&changed_project),
         NcmNamespace::from_exact_scope(&changed_repository),
-        NcmNamespace::from_exact_scope(&changed_resolved_scope),
+        NcmNamespace::from_exact_scope(&changed_worktree),
+        NcmNamespace::from_exact_scope(&changed_branch),
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
-    assert_eq!(values.len(), 5);
+    assert_eq!(values.len(), 6);
+}
+
+#[test]
+fn namespace_is_shared_by_every_session_and_resolution_of_one_checkout() {
+    let original = scope();
+    let mut changed_session = original.clone();
+    changed_session.agent_session_id = "session-b".to_owned();
+    let mut changed_resolved_scope = original.clone();
+    changed_resolved_scope.resolved_scope_digest = format!("sha256:{PROVIDER_RECEIPT_SHA}");
+    let namespace = NcmNamespace::from_exact_scope(&original);
+    assert_eq!(NcmNamespace::from_exact_scope(&changed_session), namespace);
+    assert_eq!(
+        NcmNamespace::from_exact_scope(&changed_resolved_scope),
+        namespace
+    );
 }
 
 #[test]

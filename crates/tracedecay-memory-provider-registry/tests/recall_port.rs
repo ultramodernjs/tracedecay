@@ -2405,37 +2405,22 @@ fn compose_profile_fixture(
     (composition, fixture)
 }
 
-/// Host-dispatched canonical history fixture. The registry checks membership;
-/// the production host separately revalidates disposition before hydration.
-fn dispatched_history_fixture(
-    exact: &OwnedExactScope,
-    source: &serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "authorization_ref": "host.history.fixture", "policy_revision": 1,
-        "destination_scope": scope_value(exact), "relation": "exact_scope",
-        "sources": [{ "attribution": source, "current_disposition": {
-            "state": "available", "authority_ref": "host.disposition.fixture",
-            "authority_revision": 1, "checked_at": EVALUATION_TIME,
-        }}],
-        "disposition_checkpoint": { "exact_scope": scope_value(exact),
-            "authority_ref": "host.checkpoint.fixture", "authority_revision": 1,
-            "checked_at": EVALUATION_TIME,
-        },
-    })
-}
-
 #[tokio::test]
-async fn common_profile_denies_fact_projection_and_ungranted_sources_before_selection() {
+async fn common_profile_admits_any_session_of_the_checkout_and_denies_everything_else() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
     let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
-    let source = canonical_observation_source(&exact);
+    // Recorded by another agent session of the same checkout: NCM answers
+    // one session from what another observed, so this source is admitted.
+    let mut earlier_session = exact.clone();
+    earlier_session.agent_session_id = "agent-session-earlier".to_owned();
+    let source = canonical_observation_source(&earlier_session);
     for defect in [
         "project_fact",
         "profile_fact",
         "exact_scope_fact",
         "missing_sources",
-        "ungranted_revision",
+        "foreign_branch_origin",
+        "ingestion_only_origin",
     ] {
         let mut denied = observation_candidate_fields(&source, &exact);
         match defect {
@@ -2458,9 +2443,14 @@ async fn common_profile_denies_fact_projection_and_ungranted_sources_before_sele
                     .unwrap()
                     .remove("original_sources");
             }
-            "ungranted_revision" => {
-                denied["provenance"]["original_sources"][0]["source"]["source_revision"] =
-                    serde_json::json!("revision-not-granted");
+            "foreign_branch_origin" => {
+                denied["provenance"]["original_sources"][0]["origin_scope"]
+                    ["exact_scope_identity"]["branch_identity"] =
+                    serde_json::json!("refs/heads/another-checkout");
+            }
+            "ingestion_only_origin" => {
+                denied["provenance"]["original_sources"][0]["origin_scope"] =
+                    serde_json::json!({"state": "ingestion_only"});
             }
             _ => unreachable!(),
         }
@@ -2491,11 +2481,7 @@ async fn common_profile_denies_fact_projection_and_ungranted_sources_before_sele
         .unwrap()
         .with_selection_policy(RecallSelectionPolicyV1::new(1).unwrap());
         let outcome = port
-            .recall_admitted_with_history(
-                request(scope.clone(), 60_000_000, false),
-                &live_signal(),
-                Some(dispatched_history_fixture(&exact, &source)),
-            )
+            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
             .await
             .unwrap();
         assert_eq!(
@@ -2571,15 +2557,16 @@ async fn common_profile_denies_fact_projection_and_ungranted_sources_before_sele
 }
 
 #[tokio::test]
-async fn registration_profile_controls_capability_projection_and_grant_admission() {
+async fn registration_profile_controls_capability_projection_and_source_admission() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
     let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
     let source = canonical_observation_source(&exact);
-    // The common registration cannot escape its policy when no grant exists.
+    // The common registration admits an observation recorded in the
+    // dispatched checkout without any host-dispatched history.
     let mut common = RecallFixturePort::new();
     common.candidate_contents = Some(vec![(
         "observation".to_owned(),
-        "ungranted observation".to_owned(),
+        "checkout observation".to_owned(),
     )]);
     common.candidate_overrides.insert(
         "observation".to_owned(),
@@ -2597,13 +2584,14 @@ async fn registration_profile_controls_capability_projection_and_grant_admission
         .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
         .await
         .unwrap();
-    assert!(outcome.result.candidates().is_empty());
-    assert!(matches!(
-        outcome.report.unwrap().denied[0].reason,
-        RecallDenialReason::InvalidSourceAttribution { .. }
-    ));
+    assert_eq!(outcome.result.candidates().len(), 1, "{:?}", outcome.report);
+    assert!(outcome.report.as_ref().unwrap().denied.is_empty());
+    assert_eq!(
+        serde_json::to_value(&outcome.original_sources["observation"]).unwrap(),
+        serde_json::json!([source.clone()])
+    );
     // The legacy registration keeps fact extension bindings even with the
-    // same declared capabilities and a real-shaped host history grant present.
+    // same declared capabilities.
     let mut legacy = RecallFixturePort::new();
     legacy.candidate_contents = Some(vec![(
         "legacy-fact".to_owned(),
@@ -2636,11 +2624,7 @@ async fn registration_profile_controls_capability_projection_and_grant_admission
     assert_eq!(common_descriptor.limits, legacy_descriptor.limits);
     let port = mount(legacy_composition, Arc::new(LedgerObserver::default())).unwrap();
     let outcome = port
-        .recall_admitted_with_history(
-            request(scope, 60_000_000, false),
-            &live_signal(),
-            Some(dispatched_history_fixture(&exact, &source)),
-        )
+        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
         .await
         .unwrap();
     assert_eq!(outcome.result.candidates().len(), 1, "{:?}", outcome.report);
@@ -2671,7 +2655,7 @@ async fn registration_profile_controls_capability_projection_and_grant_admission
             (ProviderOperation::Handshake, common_capabilities.clone()),
             (ProviderOperation::Recall, common_capabilities.clone()),
         ],
-        "the pinned common profile must reach both dispatch envelopes even without a grant"
+        "the pinned common profile must reach both dispatch envelopes"
     );
     assert_eq!(
         *common_recording.payload_capabilities.lock().unwrap(),
@@ -2685,7 +2669,7 @@ async fn registration_profile_controls_capability_projection_and_grant_admission
             (ProviderOperation::Handshake, legacy_capabilities.clone()),
             (ProviderOperation::Recall, legacy_capabilities.clone()),
         ],
-        "an otherwise equivalent legacy registration with a grant remains recall-only"
+        "an otherwise equivalent legacy registration remains recall-only"
     );
     assert_eq!(
         *legacy_recording.payload_capabilities.lock().unwrap(),

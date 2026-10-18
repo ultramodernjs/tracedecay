@@ -31,7 +31,7 @@ fn health_request(
     control: OperationControl,
 ) -> JourneyControlDispatchRequestV1 {
     JourneyControlDispatchRequestV1 {
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("original provider"),
+        provider_id: OwnedProviderId::new(FIXTURE_OBSERVER_ID).expect("original provider"),
         registration_revision: 1,
         exact_scope: exact_scope_for_session(
             &fixture.profile_id,
@@ -44,7 +44,6 @@ fn health_request(
         operation_id: "control-shutdown-operation".to_owned(),
         idempotency_key: None,
         operation_body: serde_json::json!({"requested_checks": ["state"]}),
-        history_grant: None,
         policy_revision: 7,
         control,
         expected_state_generation: None,
@@ -54,7 +53,7 @@ fn health_request(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_cancels_an_in_flight_control_and_retains_its_worker_until_return() {
     let temp = TempDir::new().expect("temporary journey root");
-    let port = Arc::new(JourneyNativePort::new());
+    let port = Arc::new(JourneyObserverPort::new());
     let fixture = mount_journey_over_port(
         &temp,
         "project.control-shutdown",
@@ -157,7 +156,7 @@ async fn shutdown_cancels_an_in_flight_control_and_retains_its_worker_until_retu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_headers_and_oversized_bodies_are_refused_before_provider_contact() {
     let temp = TempDir::new().expect("temporary journey root");
-    let port = Arc::new(JourneyNativePort::new());
+    let port = Arc::new(JourneyObserverPort::new());
     let fixture = mount_journey_over_port(
         &temp,
         "project.control-preflight",
@@ -239,7 +238,7 @@ async fn injected_headers_and_oversized_bodies_are_refused_before_provider_conta
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_health_header_uses_actual_guard_call_and_original_control() {
     let temp = TempDir::new().expect("temporary journey root");
-    let port = Arc::new(JourneyNativePort::with_state_generation(5));
+    let port = Arc::new(JourneyObserverPort::with_state_generation(5));
     let fixture = mount_journey_over_port(
         &temp,
         "project.control-header",
@@ -257,33 +256,12 @@ async fn canonical_health_header_uses_actual_guard_call_and_original_control() {
     let mut request = health_request(&fixture, original_control.clone());
     request.operation_body = serde_json::json!({"requested_checks": ["scope", "state"]});
     let original_body = request.operation_body.clone();
-    // An intentionally untrusted claim exercises only transport on this health
-    // fixture; an installed history authority still owns source authorization.
-    let claim = tracedecay_memory_provider_registry::HistoryGrant {
-        authorization_ref: "untrusted-control-claim".to_owned(),
-        policy_revision: 7,
-        destination_scope: request.exact_scope.clone(),
-        relation: tracedecay_memory_provider_registry::HistoryRelation::ExactScope,
-        sources: Vec::new(),
-        disposition_checkpoint: tracedecay_memory_provider_registry::RestoreDispositionCheckpoint {
-            exact_scope: request.exact_scope.clone(),
-            authority_ref: "untrusted-checkpoint".to_owned(),
-            authority_revision: Some(7),
-            checked_at_utc_nanos: 100,
-        },
-    };
-    request.history_grant = Some(claim.clone());
-    let expected_claim = claim.clone();
-    port.on_health(move |call| {
-        assert_eq!(call.history_grant(), Some(&expected_claim));
-        successful_health_reply(call)
-    });
+    port.on_health(successful_health_reply);
     let journey = Arc::clone(&fixture.journey);
     let dispatched = tokio::task::spawn_blocking(move || journey.dispatch_control(request))
         .await
         .expect("health caller")
         .expect("actual health dispatch");
-    assert_eq!(dispatched.call.history_grant(), Some(&claim));
     let payload: Value =
         serde_json::from_slice(&dispatched.call.payload.bytes).expect("canonical health payload");
     let header = &payload["common_request"];
@@ -353,13 +331,13 @@ async fn canonical_health_header_uses_actual_guard_call_and_original_control() {
 fn witnessed_committed_control_answer_survives_caller_cancellation_and_journey_stop() {
     let original_reply = ProviderReply {
         terminal: TerminalRecord::new(
-            ProviderOperation::Feedback,
-            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("original provider"),
+            ProviderOperation::Maintenance,
+            OwnedProviderId::new(FIXTURE_OBSERVER_ID).expect("original provider"),
             TerminalCode::Success,
             CommittedEffectEvidence::committed(
                 5,
                 6,
-                vec!["feedback:committed-control".to_owned()],
+                vec!["maintenance:committed-control".to_owned()],
                 PROVIDER_RECEIPT,
                 EFFECT_DIGEST,
             )
@@ -369,7 +347,7 @@ fn witnessed_committed_control_answer_survives_caller_cancellation_and_journey_s
             "4".repeat(64),
             None,
         )
-        .expect("committed feedback terminal"),
+        .expect("committed maintenance terminal"),
         payload: None,
         warnings: vec!["committed-control-warning".to_owned()],
         extensions: Vec::new(),

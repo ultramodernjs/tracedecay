@@ -672,7 +672,7 @@ mod enabled {
                 &recall,
                 &temporal,
                 4,
-                &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+                &RecallScopeBindingsV1::new([ScopeBinding::CheckoutObservations]),
                 &reply,
             )
             .unwrap();
@@ -756,7 +756,7 @@ mod enabled {
                 &recall,
                 &before,
                 4,
-                &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+                &RecallScopeBindingsV1::new([ScopeBinding::CheckoutObservations]),
                 &reply,
             )
             .unwrap();

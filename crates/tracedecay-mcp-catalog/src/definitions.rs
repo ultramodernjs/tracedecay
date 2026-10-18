@@ -409,15 +409,9 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
     ];
     definitions.extend(memory::memory_definitions(&request_schema)?);
     definitions.extend([
-        provider_definition(RetainedSurfaceOperation::ProviderFeedback)?,
-        provider_definition(RetainedSurfaceOperation::ProviderCorrection)?,
-        provider_definition(RetainedSurfaceOperation::ProviderDeleteBySource)?,
         provider_definition(RetainedSurfaceOperation::ProviderHealth)?,
         provider_definition(RetainedSurfaceOperation::ProviderInspection)?,
         provider_definition(RetainedSurfaceOperation::ProviderMaintenance)?,
-        provider_definition(RetainedSurfaceOperation::ProviderSnapshotExport)?,
-        provider_definition(RetainedSurfaceOperation::ProviderSnapshotRestore)?,
-        provider_definition(RetainedSurfaceOperation::ProviderReplay)?,
         def_automation_run_list(),
         def_automation_run_view(),
         def_automation_run_artifact_view(),
@@ -735,15 +729,9 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_fact_store_supersede",
     "tracedecay_fact_store_list",
     "tracedecay_fact_feedback",
-    "tracedecay_provider_feedback",
-    "tracedecay_provider_correction",
-    "tracedecay_provider_delete_by_source",
     "tracedecay_provider_health",
     "tracedecay_provider_inspection",
     "tracedecay_provider_maintenance",
-    "tracedecay_provider_snapshot_export",
-    "tracedecay_provider_snapshot_restore",
-    "tracedecay_provider_replay",
     // workflow
     "tracedecay_diagnose",
     "tracedecay_run_affected_tests",

@@ -16,10 +16,10 @@
 //!
 //! Process death is injected at the two seams the *composition root itself*
 //! hands the journey — the canonical observation store it replays from, and
-//! the Native application port the provider composition dispatches to. Both
-//! are production arguments, not test hooks: the mount takes an
-//! `ObservationAdmissionPort` by value and a `NativeMemoryApplicationPort`
-//! inside the composition, exactly as the daemon does. The journey itself is
+//! the observing provider the composition dispatches to. Both are production
+//! arguments, not test hooks: the mount takes an `ObservationAdmissionPort` by
+//! value and a registered observer inside the composition, exactly as the
+//! daemon does for NCM. The journey itself is
 //! untouched, and no `#[cfg(test)]` seam is compiled into it.
 //!
 //! | boundary | where this driver stands | what the parent proves after the kill |
@@ -452,10 +452,10 @@ fn write_refusals(path: &Path, positions: &BTreeSet<u64>) {
     file.sync_all().expect("refusal policy fsync");
 }
 
-/// The Native application port the composition dispatches to: a provider with
-/// a durable, deduplicating ledger, a permanent refusal set, and four of the
-/// six boundaries.
-struct FuzzNativePortV1 {
+/// The observing provider the composition dispatches to: a provider with a
+/// durable, deduplicating ledger, a permanent refusal set, and four of the six
+/// boundaries.
+struct FuzzObserverPortV1 {
     descriptor: ProviderDescriptor,
     ledger: ProviderLedgerV1,
     refused: BTreeSet<u64>,
@@ -467,7 +467,7 @@ struct FuzzNativePortV1 {
     entries: PathBuf,
 }
 
-impl FuzzNativePortV1 {
+impl FuzzObserverPortV1 {
     fn new(paths: &JourneyPathsV1, hooks: Arc<HooksV1>, entries: PathBuf) -> Self {
         let capabilities = BTreeSet::from([
             OwnedVersionedId::new("provider.health.v1").expect("health capability"),
@@ -475,12 +475,12 @@ impl FuzzNativePortV1 {
             OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
         ]);
         let descriptor = ProviderDescriptor::new(
-            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+            OwnedProviderId::new(FIXTURE_OBSERVER_ID).expect("fixture observer"),
             "0".repeat(64),
             "crash-fuzz-v1",
             0,
             capabilities,
-            crate::retained_owner::native_provider::native_provider_limits(),
+            fixture_observer_limits(),
         )
         .expect("provider descriptor");
         Self {
@@ -512,7 +512,7 @@ impl FuzzNativePortV1 {
     }
 }
 
-impl NativeMemoryApplicationPort for FuzzNativePortV1 {
+impl MemoryProviderV1 for FuzzObserverPortV1 {
     fn descriptor(&self) -> ProviderDescriptor {
         self.descriptor.clone()
     }
@@ -543,10 +543,8 @@ impl NativeMemoryApplicationPort for FuzzNativePortV1 {
             )
             .expect("handshake terminal"),
             descriptor: Some(self.descriptor.clone()),
-            provider_instance_id: Some(
-                crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
-            ),
-            state_namespace: Some("tracedecay.native.crash-fuzz".to_owned()),
+            provider_instance_id: Some(FIXTURE_OBSERVER_INSTANCE_ID.to_owned()),
+            state_namespace: Some(format!("{FIXTURE_OBSERVER_ID}.crash-fuzz")),
             accepted_scope: Some(request.exact_scope.clone()),
             effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
             ready_receipt_sha256: Some(READY_RECEIPT.to_owned()),
@@ -554,13 +552,120 @@ impl NativeMemoryApplicationPort for FuzzNativePortV1 {
         }
     }
 
-    fn health(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        match call.operation {
+            ProviderOperation::Observe => self.observe(call),
+            _ => Self::unexpected(),
+        }
+    }
+}
+
+impl FuzzObserverPortV1 {
+    fn observe(&self, call: &ProviderCall) -> ProviderReply {
+        let sequence = self.position_of(call);
+        let key = call
+            .idempotency_key
+            .clone()
+            .expect("an observation call carries an idempotency key");
+
+        // Durable, fsync'd, and taken under the same gate the
+        // never-entered boundary seals: after this line no life can claim the
+        // provider was not asked about this row, and before it no entry can
+        // slip past a seal that has already been taken.
+        self.hooks.record_entry(&self.entries, &key);
+
+        // The row is leased, the provider has been entered, and it has not
+        // touched its ledger.
+        self.hooks
+            .check(HookPointV1::AtProviderEntry, |target| sequence == target);
+
+        if self.refused.contains(&sequence) {
+            return ProviderReply {
+                terminal: TerminalRecord::new(
+                    ProviderOperation::Observe,
+                    call.provider_id.clone(),
+                    TerminalCode::ContractViolation,
+                    CommittedEffectEvidence::none(Some(call.expected_state_generation)),
+                    FallbackDirective::forbidden(),
+                    call.operation_id.clone(),
+                    call.exact_scope.exact_scope_sha256(),
+                    Some("observation-refused-by-contract".to_owned()),
+                )
+                .expect("refusal terminal"),
+                payload: None,
+                warnings: Vec::new(),
+                extensions: call.extensions.clone(),
+                state_generation: call.expected_state_generation,
+            };
+        }
+
+        if self.ledger.holds(&key) {
+            // The provider recognises its own key. This is the path a
+            // redelivery after a lost answer must take, and the only reason
+            // redelivery is safe at all.
+            return ProviderReply {
+                terminal: TerminalRecord::new(
+                    ProviderOperation::Observe,
+                    call.provider_id.clone(),
+                    TerminalCode::Success,
+                    CommittedEffectEvidence::duplicate(
+                        call.expected_state_generation,
+                        key.clone(),
+                        call.operation_id.clone(),
+                        PROVIDER_RECEIPT,
+                    )
+                    .expect("duplicate evidence"),
+                    FallbackDirective::forbidden(),
+                    call.operation_id.clone(),
+                    call.exact_scope.exact_scope_sha256(),
+                    None,
+                )
+                .expect("duplicate terminal"),
+                payload: Some(call.payload.clone()),
+                warnings: Vec::new(),
+                extensions: call.extensions.clone(),
+                state_generation: call.expected_state_generation,
+            };
+        }
+
+        self.ledger.commit(&key);
+        // The effect is durable and the answer does not exist yet.
+        self.hooks
+            .check(HookPointV1::AfterEffectBeforeAnswer, |target| {
+                sequence == target
+            });
+
+        let reply = ProviderReply {
+            terminal: TerminalRecord::new(
+                ProviderOperation::Observe,
+                call.provider_id.clone(),
+                TerminalCode::Success,
+                CommittedEffectEvidence::committed(
+                    call.expected_state_generation,
+                    call.expected_state_generation,
+                    vec![format!("observation:{sequence}")],
+                    PROVIDER_RECEIPT,
+                    EFFECT_DIGEST,
+                )
+                .expect("committed effect"),
+                FallbackDirective::forbidden(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("observation terminal"),
+            payload: Some(call.payload.clone()),
+            warnings: Vec::new(),
+            extensions: call.extensions.clone(),
+            state_generation: call.expected_state_generation,
+        };
+        // The answer above is complete. The provider records that fact, then
+        // returns normally. The host-owned journal observer takes the crash
+        // boundary later, at entry to `record_attempt`.
+        self.hooks.seal_answer(sequence, &self.answers, &key);
+        reply
     }
 
-    fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
 }
 
 // ------------------------------------------------------------- crash hooks --
@@ -990,20 +1095,17 @@ async fn mount_life(
 ) -> Arc<ProjectObservationJourneyV1> {
     fs::create_dir_all(&paths.root).expect("journal root");
     let project_id = ProjectId::new(PROJECT).expect("project id");
-    let port = Arc::new(FuzzNativePortV1::new(paths, Arc::clone(&hooks), entries));
+    let port = Arc::new(FuzzObserverPortV1::new(paths, Arc::clone(&hooks), entries));
     let committed = CanonicalStreamV1::new(paths.canonical.clone()).committed();
     let store = FuzzCanonicalPortV1::over(paths, &committed, hooks);
     mount_and_replay(
         ObservationJourneyMountInputsV1 {
-            composition: composition(port as Arc<dyn NativeMemoryApplicationPort>),
+            composition: composition(port as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new(PROFILE).expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
-            provider: crate::retained_owner::native_observation_mount(
-                &(paths.root.clone()),
-                REGISTRATION_REVISION,
-            )
-            .expect("native mount metadata"),
+            provider: fixture_observer_mount(&(paths.root.clone()), REGISTRATION_REVISION)
+                .expect("fixture observer mount metadata"),
             store_data_root: paths.root.clone(),
             policy: fuzz_policy(),
         },

@@ -11,7 +11,10 @@ directory (default ``target/ncm-bundle/<triple>/``) containing:
 The checked-in ``product/ncm/reference/worker-manifest.json`` pins no worker,
 so host binaries only admit a worker when they are built with
 ``TRACEDECAY_NCM_WORKER_MANIFEST`` naming a pinned manifest. This script prints
-that assignment. For a multi-platform release, build one bundle per target,
+that assignment as its last line; build mode first prints
+``TRACEDECAY_NCM_WORKER=<bundle worker>``. Printed paths are absolute and use
+forward slashes on every host (``D:/a/...`` on Windows), which Rust, Python,
+and the POSIX shells CI steps run under all accept. For a multi-platform release, build one bundle per target,
 merge their manifests with ``--merge a.json b.json ... -o merged.json``, build
 every host binary with the merged manifest, and ship the merged manifest as the
 ``worker-manifest.json`` of every sidecar: the runtime requires the sidecar
@@ -27,7 +30,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import subprocess
 import sys
 import tempfile
@@ -41,6 +44,7 @@ WORKER_NAME = "tracedecay-ncm-worker"
 WORKER_MANIFEST_NAME = "worker-manifest.json"
 MODEL_ACQUISITION_MANIFEST_NAME = "model-acquisition-manifest.json"
 WORKER_MANIFEST_ENV = "TRACEDECAY_NCM_WORKER_MANIFEST"
+WORKER_ENV = "TRACEDECAY_NCM_WORKER"
 HEADER_FIELDS = ("schema_version", "worker", "protocol_version", "protocol_identity")
 TARGET_FIELDS = {"triple", "os", "arch", "family", "bytes", "sha256"}
 
@@ -175,6 +179,17 @@ def merge_manifests(manifests: list[dict[str, Any]], *, header: dict[str, Any]) 
     return merged
 
 
+def assignment(variable: str, path: PurePath) -> str:
+    """Render ``variable=<path>`` with forward slashes on every host.
+
+    A Windows path printed with backslashes is mangled by the POSIX shells CI
+    steps use (``dirname``, ``sed``), while ``D:/a/...`` is an absolute path to
+    Rust's ``Path::is_absolute``, Python, and Git Bash alike.
+    """
+
+    return f"{variable}={path.as_posix()}"
+
+
 def encode_manifest(manifest: dict[str, Any]) -> bytes:
     return (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
 
@@ -295,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("-o", "--merge-output", type=Path, help="merged manifest path")
     arguments = parser.parse_args(argv)
+    assignments: list[str] = []
     try:
         header = manifest_header(_load_json(REFERENCE_WORKER_MANIFEST, "reference worker manifest"))
         if arguments.merge is not None:
@@ -321,10 +337,14 @@ def main(argv: list[str] | None = None) -> int:
                 header=header,
                 model_manifest=MODEL_ACQUISITION_MANIFEST.read_bytes(),
             )
+            assignments.append(
+                assignment(WORKER_ENV, manifest_path.parent / worker_executable_name(triple))
+            )
     except (BundleError, OSError, json.JSONDecodeError) as error:
         print(f"NCM worker bundle failed: {error}", file=sys.stderr)
         return 2
-    print(f"{WORKER_MANIFEST_ENV}={manifest_path}")
+    assignments.append(assignment(WORKER_MANIFEST_ENV, manifest_path))
+    print("\n".join(assignments))
     return 0
 
 

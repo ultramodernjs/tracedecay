@@ -10,17 +10,12 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracedecay_domain::{
-    CodeGenerationId, CommitId, ComplexityAnalysisV1, FactAssertionId, FactEventId, FactId,
-    ManifestDigest, ProjectId, ProviderId, RepositoryId, SourceSpan, SymbolOccurrenceId, UtcMicros,
-    WorktreeId,
+    CodeGenerationId, CommitId, ComplexityAnalysisV1, ManifestDigest, ProjectId, ProviderId,
+    RepositoryId, SourceSpan, SymbolOccurrenceId, WorktreeId,
 };
 
 use crate::code_index_freshness::{CodeIndexConvergenceParkedV1, CodeIndexStalenessStateV1};
-use crate::error::ApplicationContractError;
-use crate::memory::{
-    CognitiveRecallExclusions, CognitiveRecallTemporalMode, CognitiveRecallTemporalQuery,
-    FactCommitOwnerV1, FactIdentitySourceResultV1, FactSearchGraphCoverageV1, FactSearchHitV1,
-};
+use crate::memory::{FactSearchGraphCoverageV1, FactSearchHitV1};
 
 pub const MAX_REDUNDANCY_FAMILIES_V1: u32 = 100;
 pub const MAX_REDUNDANCY_PULL_REQUEST_PATHS_V1: usize = 256;
@@ -54,13 +49,6 @@ pub struct ContextSurfaceRequestV1 {
     pub include_memory: Option<bool>,
     pub memory_limit: Option<u32>,
     pub memory_min_trust: Option<f64>,
-    /// Exact caller-supplied memory temporal policy, validated at host admission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temporal_query: Option<CognitiveRecallTemporalQuery>,
-    /// Memory exclusions preserved for the host's advisory admission; these do
-    /// not invent a mapping from provider references to canonical fact identities.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exclusions: Option<CognitiveRecallExclusions>,
     /// Exact identifiers or technical terms the answer must be about. Each
     /// runs as its own lexical route: hits carrying an anchor outrank hits
     /// carrying none, exact hits included, every anchor with matches keeps at
@@ -73,143 +61,6 @@ pub struct ContextSurfaceRequestV1 {
     /// Add a symbol-name lexical route for the identifier-shaped words of the
     /// task text.
     pub prefer_symbol: Option<bool>,
-}
-
-impl ContextSurfaceRequestV1 {
-    /// Validates memory policy against one actual host admission clock without
-    /// changing the supplied query, exclusions, or disabled-memory preference.
-    pub fn validate_memory_policy_at(
-        &self,
-        now: UtcMicros,
-    ) -> Result<(), ApplicationContractError> {
-        if let Some(temporal) = &self.temporal_query {
-            temporal.validate_at(now)?;
-        }
-        if let Some(exclusions) = &self.exclusions {
-            exclusions.validate()?;
-        }
-        Ok(())
-    }
-}
-
-/// Existing maximum canonical fact hits returned by a context memory read.
-pub const MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS: usize = 10;
-
-/// Explicit withholding by the current-only canonical fact search lane.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ContextMemoryTemporalCoverageV1 {
-    /// No current facts were searched or substituted for the requested history.
-    WithheldCurrentOnly {
-        /// Exact non-current mode that the canonical fact search cannot serve.
-        requested_mode: CognitiveRecallTemporalMode,
-    },
-}
-
-/// Identity metadata for a canonical fact that actually contributed to context.
-/// The revision identity is `(owner, fact_id, last_event_id)`; assertion identity
-/// remains separate. No fact payload, tags, telemetry, or metadata is copied.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextMemoryFactIdentityV1 {
-    pub owner: FactCommitOwnerV1,
-    pub fact_id: FactId,
-    pub last_event_id: FactEventId,
-    pub active_assertion_id: FactAssertionId,
-    /// Exact typed canonical source evidence. An anchor or stable key does not
-    /// establish an original observation revision or authorize history access.
-    pub source: FactIdentitySourceResultV1,
-}
-
-impl From<&FactSearchHitV1> for ContextMemoryFactIdentityV1 {
-    fn from(hit: &FactSearchHitV1) -> Self {
-        Self {
-            owner: hit.fact.owner.clone(),
-            fact_id: hit.fact.fact_id.clone(),
-            last_event_id: hit.fact.last_event_id.clone(),
-            active_assertion_id: hit.fact.active_assertion_id.clone(),
-            source: hit.fact.source.clone(),
-        }
-    }
-}
-
-/// Internal typed contribution carried past context rendering into host recall.
-/// This has no serialized form. Policy is validated at the same captured clock
-/// used for request admission and remains available when canonical memory is off.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextMemoryContributionV1 {
-    facts: Vec<ContextMemoryFactIdentityV1>,
-    graph_coverage: Option<FactSearchGraphCoverageV1>,
-    temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
-    temporal_query: Option<CognitiveRecallTemporalQuery>,
-    exclusions: Option<CognitiveRecallExclusions>,
-}
-
-impl ContextMemoryContributionV1 {
-    /// Preserves metadata from the actual canonical hits without parsing rendered
-    /// output or inferring source identities. `admitted_at` is the request's one
-    /// captured host clock, reused after retrieval completes.
-    pub fn from_matches(
-        request: &ContextSurfaceRequestV1,
-        hits: &[FactSearchHitV1],
-        graph_coverage: Option<FactSearchGraphCoverageV1>,
-        temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
-        admitted_at: UtcMicros,
-    ) -> Result<Self, ApplicationContractError> {
-        request.validate_memory_policy_at(admitted_at)?;
-        if hits.len() > MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS {
-            return Err(ApplicationContractError::InvalidRange {
-                field: "context memory contribution facts",
-            });
-        }
-        let expected_coverage = request.temporal_query.as_ref().and_then(|query| {
-            (request.include_memory.unwrap_or(true)
-                && query.mode() != CognitiveRecallTemporalMode::Current)
-                .then_some(ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
-                    requested_mode: query.mode(),
-                })
-        });
-        if temporal_coverage != expected_coverage
-            || (temporal_coverage.is_some() && (!hits.is_empty() || graph_coverage.is_some()))
-            || (!request.include_memory.unwrap_or(true)
-                && (!hits.is_empty() || graph_coverage.is_some()))
-        {
-            return Err(ApplicationContractError::Inconsistent {
-                field: "context memory temporal coverage",
-            });
-        }
-        Ok(Self {
-            facts: hits.iter().map(ContextMemoryFactIdentityV1::from).collect(),
-            graph_coverage,
-            temporal_coverage,
-            temporal_query: request.temporal_query.clone(),
-            exclusions: request.exclusions.clone(),
-        })
-    }
-
-    /// Canonical fact identities that actually contributed to rendered context.
-    pub fn facts(&self) -> &[ContextMemoryFactIdentityV1] {
-        &self.facts
-    }
-
-    /// Coverage from the canonical fact read, absent when it was not attempted.
-    pub fn graph_coverage(&self) -> Option<&FactSearchGraphCoverageV1> {
-        self.graph_coverage.as_ref()
-    }
-
-    /// Explicit temporal withholding by the current-only canonical fact lane.
-    pub fn temporal_coverage(&self) -> Option<&ContextMemoryTemporalCoverageV1> {
-        self.temporal_coverage.as_ref()
-    }
-
-    /// Exact validated caller policy, retained even when canonical memory is disabled.
-    pub fn temporal_query(&self) -> Option<&CognitiveRecallTemporalQuery> {
-        self.temporal_query.as_ref()
-    }
-
-    /// Exact validated exclusions for the host advisory consumer.
-    pub fn exclusions(&self) -> Option<&CognitiveRecallExclusions> {
-        self.exclusions.as_ref()
-    }
 }
 
 /// Whether the served code generation is known current at serve time.
@@ -559,9 +410,6 @@ pub struct ContextResultV1 {
     pub memory_matches: Vec<FactSearchHitV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_graph_coverage: Option<FactSearchGraphCoverageV1>,
-    /// Present only when a non-current policy withheld current-only fact search.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_matches_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1004,159 +852,6 @@ mod tests {
     use crate::code_index_freshness::CodeIndexStalenessStateV1;
     use crate::memory::{FactSearchGraphCoverageV1, FactSearchGraphDegradationV1};
 
-    #[test]
-    fn context_memory_policy_is_optional_preserved_and_validated_at_admission() {
-        use crate::memory::{CognitiveRecallExclusions, CognitiveRecallTemporalQuery};
-        use tracedecay_domain::UtcMicros;
-
-        let absent: ContextSurfaceRequestV1 =
-            serde_json::from_value(json!({"task": "default"})).expect("old context request");
-        absent
-            .validate_memory_policy_at(UtcMicros(100))
-            .expect("absent policy");
-        let encoded = serde_json::to_value(&absent).expect("request JSON");
-        assert!(encoded.get("temporal_query").is_none());
-        assert!(encoded.get("exclusions").is_none());
-
-        let temporal = CognitiveRecallTemporalQuery::current(UtcMicros(50))
-            .with_as_of(UtcMicros(20))
-            .expect("historical policy");
-        let exclusions = CognitiveRecallExclusions {
-            observation_ids: vec!["original-observation".to_owned()],
-            ..CognitiveRecallExclusions::default()
-        };
-        let request: ContextSurfaceRequestV1 = serde_json::from_value(json!({
-            "task": "historical context", "temporal_query": temporal, "exclusions": exclusions
-        }))
-        .expect("explicit policy decodes");
-        request
-            .validate_memory_policy_at(UtcMicros(100))
-            .expect("admitted policy");
-        assert_eq!(request.temporal_query.as_ref(), Some(&temporal));
-        assert_eq!(request.exclusions.as_ref(), Some(&exclusions));
-        assert!(request.validate_memory_policy_at(UtcMicros(49)).is_err());
-
-        let mut malformed = request.clone();
-        malformed
-            .exclusions
-            .as_mut()
-            .expect("exclusions")
-            .observation_ids
-            .push("original-observation".to_owned());
-        assert!(malformed.validate_memory_policy_at(UtcMicros(100)).is_err());
-        malformed
-            .exclusions
-            .as_mut()
-            .expect("exclusions")
-            .observation_ids
-            .clear();
-        malformed
-            .exclusions
-            .as_mut()
-            .expect("exclusions")
-            .content_sha256
-            .push("bad digest".to_owned());
-        assert!(malformed.validate_memory_policy_at(UtcMicros(100)).is_err());
-
-        let mut bad_temporal = serde_json::to_value(&request).expect("request JSON");
-        bad_temporal["temporal_query"]["as_of"] = json!(60);
-        let malformed: ContextSurfaceRequestV1 =
-            serde_json::from_value(bad_temporal).expect("typed but invalid bounds");
-        assert!(malformed.validate_memory_policy_at(UtcMicros(100)).is_err());
-        let schema =
-            serde_json::to_value(schema_for!(ContextSurfaceRequestV1)).expect("request schema");
-        for field in ["temporal_query", "exclusions"] {
-            assert!(schema["properties"][field].is_object());
-            assert!(
-                schema["required"]
-                    .as_array()
-                    .is_none_or(|required| !required.contains(&json!(field)))
-            );
-        }
-    }
-
-    #[test]
-    fn context_memory_contribution_rejects_inconsistent_withheld_or_disabled_coverage() {
-        use super::{ContextMemoryContributionV1, ContextMemoryTemporalCoverageV1};
-        use crate::memory::{CognitiveRecallTemporalMode, CognitiveRecallTemporalQuery};
-        use tracedecay_domain::UtcMicros;
-
-        let mut request: ContextSurfaceRequestV1 = serde_json::from_value(json!({
-            "task": "history", "temporal_query": CognitiveRecallTemporalQuery::current(UtcMicros(10)).with_history()
-        })).expect("request");
-        let withheld = Some(ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
-            requested_mode: CognitiveRecallTemporalMode::History,
-        });
-        assert!(
-            ContextMemoryContributionV1::from_matches(&request, &[], None, withheld, UtcMicros(20))
-                .is_ok()
-        );
-        assert!(
-            ContextMemoryContributionV1::from_matches(&request, &[], None, None, UtcMicros(20))
-                .is_err()
-        );
-        assert!(
-            ContextMemoryContributionV1::from_matches(
-                &request,
-                &[],
-                Some(FactSearchGraphCoverageV1::NotMounted),
-                withheld,
-                UtcMicros(20)
-            )
-            .is_err()
-        );
-        request.include_memory = Some(false);
-        let contribution =
-            ContextMemoryContributionV1::from_matches(&request, &[], None, None, UtcMicros(20))
-                .expect("disabled lane");
-        assert_eq!(
-            contribution.temporal_query(),
-            request.temporal_query.as_ref()
-        );
-        assert!(
-            ContextMemoryContributionV1::from_matches(&request, &[], None, withheld, UtcMicros(20))
-                .is_err()
-        );
-        assert!(
-            ContextMemoryContributionV1::from_matches(
-                &request,
-                &[],
-                Some(FactSearchGraphCoverageV1::NotMounted),
-                None,
-                UtcMicros(20)
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn context_memory_temporal_coverage_is_optional_and_explicit() {
-        use super::ContextMemoryTemporalCoverageV1;
-        use crate::memory::CognitiveRecallTemporalMode;
-
-        let mut result = context_result();
-        assert!(
-            serde_json::to_value(&result)
-                .expect("default result")
-                .get("memory_temporal_coverage")
-                .is_none()
-        );
-        result.memory_temporal_coverage =
-            Some(ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
-                requested_mode: CognitiveRecallTemporalMode::History,
-            });
-        assert_eq!(
-            serde_json::to_value(result).expect("withheld result")["memory_temporal_coverage"],
-            json!({"kind": "withheld_current_only", "requested_mode": "history"})
-        );
-        let schema = serde_json::to_value(schema_for!(ContextResultV1)).expect("result schema");
-        assert!(
-            schema["required"]
-                .as_array()
-                .is_none_or(|required| !required.contains(&json!("memory_temporal_coverage")))
-        );
-    }
-
     fn context_result() -> ContextResultV1 {
         ContextResultV1 {
             task: "explain memory".to_owned(),
@@ -1179,7 +874,6 @@ mod tests {
             },
             memory_matches: vec![],
             memory_graph_coverage: None,
-            memory_temporal_coverage: None,
             memory_matches_error: None,
             verified_graph_evidence: None,
             plan: None,

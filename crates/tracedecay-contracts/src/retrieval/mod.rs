@@ -145,8 +145,6 @@ pub use primitive_surface::{
     SimilarCoverageV1, SimilarFamilyV1, SimilarMatchClassV1, SimilarOccurrenceV1, SimilarResultV1,
     SimilarSurfaceRequestV1, SimilarTargetV1, TodoMarkerV1, TodosResultV1, TodosSurfaceRequestV1,
 };
-// Non-serialized context sidecar read by the memory-provider host advisory lane.
-pub use primitive_surface::ContextMemoryContributionV1;
 pub use requests::{
     AffectedTestAttributionV1, AffectedTestsRequest, AffectedTestsResult, AnchorExpandRequest,
     AnchorExpandResult, CallChainPrimitiveRequest, CallChainPrimitiveResult,

@@ -6,7 +6,7 @@ use tracedecay_memory_provider_ncm::{
     RustNcmWorkerOwner, StateRoot, WorkerOptions,
 };
 use tracedecay_memory_provider_registry::{
-    EnabledProviderMode, FabricConfig, NativeProvider, ObservationInstanceProofV1,
+    EnabledProviderMode, FabricConfig, ObservationInstanceProofV1,
     ObservationProviderMountV1, ObservationStateNamespacePolicyV1, ObserverProviderRegistration,
     PayloadSanitizationReceiptParts, ProjectMemoryProviderComposition, ProviderExecutionShapeV1,
     ProviderLifecycleOwnershipV1, ProviderRegistrationV1, RecallBudgetsV1, RecallScopeBindingsV1,
@@ -134,7 +134,7 @@ async fn real_ncm_observer_replays_independently_after_native_restart() {
         .observation_store();
     let journal_root = temp.path().join("journey");
     std::fs::create_dir_all(&journal_root).unwrap();
-    let port = Arc::new(JourneyNativePort::new());
+    let port = Arc::new(JourneyObserverPort::new());
     let inputs = |composition, provider| ObservationJourneyMountInputsV1 {
         composition,
         profile_id: profile_id.clone(),
@@ -145,7 +145,7 @@ async fn real_ncm_observer_replays_independently_after_native_restart() {
         policy: ObservationJourneyPolicyV1::project_default(),
     };
     let native_metadata =
-        crate::retained_owner::native_observation_mount(&journal_root, 1).unwrap();
+        fixture_observer_mount(&journal_root, 1).unwrap();
     let native = mount_project_observation_journey(inputs(
         composition(port.clone()),
         native_metadata.clone(),
@@ -208,17 +208,20 @@ async fn real_ncm_observer_replays_independently_after_native_restart() {
             worker_owner,
         } = fixture;
         let composition = Arc::new(
-            ProjectMemoryProviderComposition::compose_with_observers(
-                NativeProviderActivation::Enabled {
+            ProjectMemoryProviderComposition::compose_selected(
+                SelectedProviderActivationV1::ObserversOnly {
                     fabric_config: FabricConfig {
                         max_registered_providers: 2,
                         max_in_flight: 1,
                     },
-                    port: port.clone(),
-                    registration_revision: 1,
-                    mode: EnabledProviderMode::Observer,
                 },
-                vec![observer],
+                vec![
+                    ObserverProviderRegistration {
+                        provider: port.clone(),
+                        registration_revision: 1,
+                    },
+                    observer,
+                ],
             )
             .unwrap(),
         );
@@ -647,7 +650,7 @@ fn real_ncm_admitted_recall(
         call,
         temporal,
         4,
-        &RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope]),
+        &RecallScopeBindingsV1::new([ScopeBinding::CheckoutObservations]),
         reply,
     )
     .expect("admit NCM recall outcome");
@@ -694,7 +697,7 @@ fn real_ncm_assert_top(
     );
     assert_eq!(
         candidate.exact_scope_identity.scope_binding,
-        ScopeBinding::ExactCodingScope
+        ScopeBinding::CheckoutObservations
     );
     assert_eq!(
         candidate.exact_scope_identity.project_id,
@@ -712,13 +715,14 @@ fn real_ncm_assert_top(
         candidate.exact_scope_identity.branch_identity,
         exact_scope.branch_identity
     );
-    assert_eq!(
-        candidate.exact_scope_identity.agent_session_id,
-        exact_scope.agent_session_id
-    );
-    assert_eq!(
-        candidate.exact_scope_identity.resolved_scope_digest,
-        exact_scope.resolved_scope_digest
+    // Checkout observations bind the checkout; the session and resolution
+    // are per-delivery evidence the binding forbids a candidate to claim.
+    assert!(candidate.exact_scope_identity.agent_session_id.is_empty());
+    assert!(
+        candidate
+            .exact_scope_identity
+            .resolved_scope_digest
+            .is_empty()
     );
     assert_eq!(
         candidate.provenance["original_sources"][0]["source"]["source_key"],
@@ -747,7 +751,7 @@ fn real_ncm_assert_immutable_descriptor(
 
 fn compose_real_ncm_with_native_observer(
     fixture: &NcmObserverFixture,
-    port: Arc<JourneyNativePort>,
+    port: Arc<JourneyObserverPort>,
 ) -> Arc<ProjectMemoryProviderComposition> {
     let ncm_registration = ProviderRegistrationV1 {
         provider_id: fixture.mount.provider_id.clone(),
@@ -755,7 +759,7 @@ fn compose_real_ncm_with_native_observer(
         registration_revision: fixture.mount.registration_revision,
         mode: EnabledProviderMode::Active,
         execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
-        recall_scope_bindings: RecallScopeBindingsV1::from_wire(["exact_coding_scope"])
+        recall_scope_bindings: RecallScopeBindingsV1::from_wire(["checkout_observations"])
             .expect("NCM recall scope binding"),
         lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
     };
@@ -769,7 +773,7 @@ fn compose_real_ncm_with_native_observer(
                 registration: ncm_registration,
             },
             vec![ObserverProviderRegistration {
-                provider: Arc::new(NativeProvider::new(port).expect("Native observer adapter")),
+                provider: port,
                 registration_revision: 1,
             }],
         )
@@ -848,9 +852,9 @@ async fn real_ncm_replacement_acceptance_preserves_identity_recall_and_deletion_
         .observation_store();
     let journal_root = temp.path().join("journey");
     std::fs::create_dir_all(&journal_root).expect("journey journal root");
-    let port = Arc::new(JourneyNativePort::new());
+    let port = Arc::new(JourneyObserverPort::new());
     let native_metadata =
-        crate::retained_owner::native_observation_mount(&journal_root, 1).expect("Native mount");
+        fixture_observer_mount(&journal_root, 1).expect("Native mount");
     let session_id = SessionId::new("session.real-ncm-control-source").expect("session id");
     let cancellation = HostCancellationToken::new();
     let inputs = |composition, provider| ObservationJourneyMountInputsV1 {
@@ -877,7 +881,7 @@ async fn real_ncm_replacement_acceptance_preserves_identity_recall_and_deletion_
     .expect("construct foreign-scope NCM surface");
     let foreign_owner = foreign_fixture.worker_owner.clone();
     let foreign_composition =
-        compose_real_ncm_with_native_observer(&foreign_fixture, Arc::new(JourneyNativePort::new()));
+        compose_real_ncm_with_native_observer(&foreign_fixture, Arc::new(JourneyObserverPort::new()));
     drop(foreign_fixture);
     let foreign_registry = foreign_composition
         .registry()
@@ -940,7 +944,7 @@ async fn real_ncm_replacement_acceptance_preserves_identity_recall_and_deletion_
         .registry()
         .expect("enabled provider composition");
     let ncm_id = OwnedProviderId::new(NCM_PROVIDER_ID).expect("NCM provider id");
-    let native_id = OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("Native provider id");
+    let native_id = OwnedProviderId::new(FIXTURE_OBSERVER_ID).expect("fixture observer id");
     assert_eq!(
         registry
             .selected_registration()
@@ -1511,19 +1515,22 @@ async fn unavailable_ncm_observer_preserves_native_canonical_acknowledgement() {
         worker_owner,
     } = fixture;
     assert!(metadata.provider_instance_id.is_none());
-    let port = Arc::new(JourneyNativePort::new());
+    let port = Arc::new(JourneyObserverPort::new());
     let composition = Arc::new(
-        ProjectMemoryProviderComposition::compose_with_observers(
-            NativeProviderActivation::Enabled {
+        ProjectMemoryProviderComposition::compose_selected(
+            SelectedProviderActivationV1::ObserversOnly {
                 fabric_config: FabricConfig {
                     max_registered_providers: 2,
                     max_in_flight: 1,
                 },
-                port: port.clone(),
-                registration_revision: 1,
-                mode: EnabledProviderMode::Observer,
             },
-            vec![observer],
+            vec![
+                ObserverProviderRegistration {
+                    provider: port.clone(),
+                    registration_revision: 1,
+                },
+                observer,
+            ],
         )
         .unwrap(),
     );
@@ -1537,7 +1544,7 @@ async fn unavailable_ncm_observer_preserves_native_canonical_acknowledgement() {
         policy: ObservationJourneyPolicyV1::project_default(),
     };
     let native = mount_project_observation_journey(inputs(
-        crate::retained_owner::native_observation_mount(&root, 1).unwrap(),
+        fixture_observer_mount(&root, 1).unwrap(),
     ))
     .unwrap();
     let ncm = mount_project_observation_journey(inputs(metadata)).unwrap();
