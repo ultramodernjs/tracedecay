@@ -623,7 +623,7 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
         0,
         "an unknown failed projection frontier must withhold full summary admission"
     );
-    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
+    assert_eq!(ingestor.passes.get(), 1);
 
     authority
         .database()
@@ -639,7 +639,7 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
         pages.load(Ordering::Acquire) > 0,
         "restoring the discovery table must admit convergence and prove the census is live"
     );
-    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
+    assert_eq!(ingestor.passes.get(), 1);
     registry.shutdown().await;
     assert_eq!(registry.profile_worker_count().await, 0);
     assert!(
@@ -1154,7 +1154,7 @@ async fn blocked_cursor_failure_projects_healthy_provider_progress_once_across_r
     );
     assert_eq!(ingestor.committed.load(Ordering::Acquire), 2);
     assert_eq!(ingestor.duplicates.load(Ordering::Acquire), 2);
-    assert_eq!(ingestor.passes.load(Ordering::Acquire), 2);
+    assert_eq!(ingestor.passes.get(), 2);
 
     restarted.shutdown().await;
 }
@@ -1249,7 +1249,7 @@ async fn convergence_is_published_only_after_the_last_owed_projection_commits() 
         .await;
     assert!(wake.same_route(&deferred_wake));
     assert_eq!(
-        ingestor.0.passes.load(Ordering::Acquire),
+        ingestor.0.passes.get(),
         1,
         "an explicit history wake must wait behind the held publication"
     );
@@ -1260,7 +1260,7 @@ async fn convergence_is_published_only_after_the_last_owed_projection_commits() 
         "settling the owed projection publishes one convergence event"
     );
     assert_eq!(
-        ingestor.0.passes.load(Ordering::Acquire),
+        ingestor.0.passes.get(),
         2,
         "the history wake deferred during publication must run exactly once"
     );
