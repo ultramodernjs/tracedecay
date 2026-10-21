@@ -30,7 +30,8 @@ pub mod runtime_ledger {
     pub use crate::ledger::{RETIRE_RUNTIME_EFFECTS_V1, RUNTIME_LEDGER_SCHEMA};
     pub use crate::writer::ledger_maintenance::{
         WRITER_LEDGER_DRAIN_INTERVAL, WriterLedgerDrainOutcome, WriterLedgerMaintenance,
-        WriterLedgerMaintenanceReport, drain_retired_writer_ledger_page, drain_writer_ledger_page,
+        WriterLedgerMaintenanceReport, WriterLedgerMaintenanceStatus,
+        drain_retired_writer_ledger_page, drain_writer_ledger_page,
     };
 }
 pub mod native_runtime;

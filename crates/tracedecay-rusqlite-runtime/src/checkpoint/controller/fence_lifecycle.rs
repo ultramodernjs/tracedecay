@@ -36,7 +36,9 @@ impl WriterCheckpointController {
             Drain::Open if sample.bytes >= self.config.hard_wal_bytes => {
                 Drain::Fenced { since: now }
             }
-            Drain::Expired { retry_at, backoff, .. } => Drain::Expired {
+            Drain::Expired {
+                retry_at, backoff, ..
+            } => Drain::Expired {
                 retry_at,
                 backoff,
                 wal_bytes: sample.bytes,

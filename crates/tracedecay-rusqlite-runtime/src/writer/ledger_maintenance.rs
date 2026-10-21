@@ -116,11 +116,17 @@ pub struct WriterLedgerMaintenanceReport {
     pub handover_blocker: Option<&'static str>,
 }
 
+/// Latest writer-owned maintenance observation. A rotation signal is not an
+/// authorization to release consumers or discard their standing replay epoch.
+#[derive(Clone, Debug, Default)]
+pub struct WriterLedgerMaintenanceStatus {
+    pub latest: Option<WriterLedgerMaintenanceReport>,
+    pub last_error: Option<String>,
+}
+
 /// One controller per exact writer. Each tick yields after one page; independent
 /// writers/stores keep their own schedules instead of draining one store to
 /// exhaustion. Errors also defer the next attempt, preventing an idle spin.
-/// The controller is opt-in until the database-map owner supplies authority and
-/// the worker wires its deadline into the wakeup path.
 pub struct WriterLedgerMaintenance {
     binding: StoreRuntimeBindingV1,
     replay_window: WriterReplayWindow,

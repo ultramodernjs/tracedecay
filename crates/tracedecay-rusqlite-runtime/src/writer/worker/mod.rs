@@ -349,6 +349,8 @@ pub(super) struct Worker {
     pub(super) watermark_publisher: CommittedWatermarkPublisher,
     pub(super) checkpoint_status: watch::Sender<CheckpointStatus>,
     pub(super) checkpoint_pressure: watch::Sender<CheckpointPressure>,
+    pub(super) ledger_status:
+        watch::Sender<super::ledger_maintenance::WriterLedgerMaintenanceStatus>,
     pub(super) checkpoint_blockers: Arc<dyn CheckpointBlockerSource>,
     pub(super) on_file_lost: Option<super::FileLossNotice>,
     pub(super) started: SyncSender<Result<Option<u64>, WriterStartError>>,
@@ -371,6 +373,33 @@ impl FileProbe {
         }
         self.due = now + FILE_PROBE_INTERVAL;
         self.file.is_lost(&self.path)
+    }
+}
+
+/// The actor's originating writer capability, not authority reacquired by
+/// pathname. The pinned descriptor and lifecycle must still be live at every
+/// cleanup boundary. Epoch release/rebind is deliberately not manufactured here.
+struct PinnedWriterLedgerAuthority<'a> {
+    state: &'a AtomicU8,
+    shutdown: &'a AtomicBool,
+    file: Option<&'a OpenedDatabaseFile>,
+    path: &'a std::path::Path,
+}
+
+impl crate::RuntimeWriteAuthority for PinnedWriterLedgerAuthority<'_> {
+    fn verify(
+        &self,
+        _stage: RuntimeWriteAuthorityStage,
+    ) -> Result<(), crate::RuntimeWriteAuthorityError> {
+        if self.state.load(Ordering::Acquire) != WriterState::Ready as u8
+            || self.shutdown.load(Ordering::Acquire)
+            || self.file.is_some_and(|file| file.is_lost(self.path))
+        {
+            return Err(crate::RuntimeWriteAuthorityError::denied(
+                "originating writer no longer owns a ready, pinned file",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -547,6 +576,13 @@ impl Worker {
         let mut next_auxiliary = AuxiliaryWork::IncrementalVacuum;
         let mut hard_checkpoint_retry_due = None;
         let mut checkpoint_recovery = retention_writer_recovery::CheckpointFailurePolicy::default();
+        let mut ledger_maintenance = super::ledger_maintenance::WriterLedgerMaintenance::new(
+            self.binding.clone(),
+            crate::runtime_ledger::WriterReplayWindowPolicy::default(),
+            256,
+            Instant::now(),
+        )
+        .expect("fixed writer ledger maintenance budgets are valid");
         #[cfg(unix)]
         let probe_path = self.canonical_path.clone();
         #[cfg(not(unix))]
@@ -712,6 +748,64 @@ impl Worker {
                 continue;
             }
             hard_checkpoint_retry_due = None;
+            // One bounded page between transactions, including idle stores.
+            // Faulted writers, hard drains and shutdown never enter this path.
+            if self.state.load(Ordering::Acquire) == WriterState::Ready as u8 {
+                let authority = PinnedWriterLedgerAuthority {
+                    state: &self.state,
+                    shutdown: &self.shutdown_requested,
+                    file: self._opened_database.as_deref(),
+                    #[cfg(unix)]
+                    path: &self.canonical_path,
+                    #[cfg(not(unix))]
+                    path: &self.path,
+                };
+                match ledger_maintenance.tick(
+                    checkpoint.connection_mut(),
+                    &authority,
+                    &self.shutdown_requested,
+                    tracedecay_contracts::now_micros().0,
+                    Instant::now(),
+                ) {
+                    Ok(Some(report)) => {
+                        if report.replay_window.rotation_required {
+                            tracing::warn!(path = %self.path.display(),
+                                rotation_required = true,
+                                blocker = report.handover_blocker,
+                                "writer replay window needs owner-coordinated rotation; live receipts retained");
+                        }
+                        let wrote = report.drain.deleted_rows > 0;
+                        let _ = self.ledger_status.send(
+                            super::ledger_maintenance::WriterLedgerMaintenanceStatus {
+                                latest: Some(report),
+                                last_error: None,
+                            },
+                        );
+                        if wrote {
+                            self.run_scheduled_checkpoint(
+                                &mut checkpoint,
+                                &mut checkpoint_recovery,
+                            );
+                        }
+                        // Cleanup can itself cross the WAL pressure threshold.
+                        if checkpoint.hard_drain_required() {
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(path = %self.path.display(), error = %error,
+                            "writer ledger maintenance degraded; retry on next idle deadline");
+                        let latest = self.ledger_status.borrow().latest.clone();
+                        let _ = self.ledger_status.send(
+                            super::ledger_maintenance::WriterLedgerMaintenanceStatus {
+                                latest,
+                                last_error: Some(error.to_string()),
+                            },
+                        );
+                    }
+                }
+            }
             if let Some(auxiliary) = select_auxiliary_work(
                 !exact_sql_queue.is_empty(),
                 !incremental_vacuum_queue.is_empty(),
@@ -803,7 +897,14 @@ impl Worker {
                     exact_sql_closed,
                     incremental_vacuum_closed,
                     checkpoint_closed,
-                    earliest(checkpoint_retry, probe.as_ref()),
+                    earliest(
+                        Some(
+                            checkpoint_retry.map_or(ledger_maintenance.next_due(), |retry| {
+                                retry.min(ledger_maintenance.next_due())
+                            }),
+                        ),
+                        probe.as_ref(),
+                    ),
                 )
                 .await;
                 if matches!(wake, WorkerWake::CheckpointRetry) {
@@ -1055,7 +1156,8 @@ impl Worker {
                 }
                 Err(error) => {
                     if recovery.record_failure(&self.path, "wal_pressure_sample", &error, now) {
-                        self.state.store(WriterState::Faulted as u8, Ordering::Release);
+                        self.state
+                            .store(WriterState::Faulted as u8, Ordering::Release);
                     }
                 }
             }

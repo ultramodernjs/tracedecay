@@ -154,6 +154,90 @@ fn writer_owned_drain_keeps_reporting_rotation_after_historical_cleanup_finishes
 }
 
 #[test]
+fn idle_writer_drains_historical_receipts_without_another_submission() {
+    use crate::{ExactSqlOnlyStorageOperationV1, ExistingWriterLocator, PersistentWriter};
+    use tracedecay_store::{AdmissionConfigV1, LocatorDigest, VerifiedStoreLocatorV1};
+
+    let directory = super::ledger_test_directory();
+    let path = directory.path().join("sessions.db");
+    let live = at_authority("operation.idle.live", "key.idle.live", 'b', 1, 8);
+    let binding = binding(&live);
+    let mut connection = Connection::open(&path).unwrap();
+    {
+        let transaction = connection.transaction().unwrap();
+        initialize_schema(&transaction).unwrap();
+        for index in 0..279 {
+            commit(
+                &transaction,
+                &at_authority(
+                    &format!("operation.idle.old.{index}"),
+                    &format!("key.idle.old.{index}"),
+                    'a',
+                    1,
+                    7,
+                ),
+            );
+        }
+        commit(&transaction, &live);
+        transaction.execute(
+            "UPDATE td_runtime_writer_idempotency_v2 SET committed_at_micros = 1 WHERE authority_epoch = 8", [],
+        ).unwrap();
+        transaction.commit().unwrap();
+    }
+    let locator = VerifiedStoreLocatorV1::new(
+        binding.shard_id.clone(),
+        binding.incarnation,
+        LocatorDigest::new(format!("sha256:{}", "a".repeat(64))).unwrap(),
+    );
+    let writer = PersistentWriter::start(
+        &crate::native_runtime::handle().unwrap(),
+        ExistingWriterLocator::new(binding, locator, path).unwrap(),
+        AdmissionConfigV1::default(),
+        ExactSqlOnlyStorageOperationV1,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM td_runtime_writer_idempotency_v2 WHERE authority_epoch = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle writer must schedule ledger maintenance without foreground work; {remaining} historical receipts remain"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    loop {
+        if let Some(report) = writer.ledger_maintenance_status().latest {
+            assert_eq!(report.drain.deleted_rows, 23);
+            assert!(report.replay_window.rotation_required);
+            assert!(report.handover_blocker.is_some());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle maintenance must publish its rotation signal"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let transaction = connection.transaction().unwrap();
+    assert!(
+        lookup_receipt(&transaction, writer.binding(), &live.idempotency)
+            .unwrap()
+            .is_some()
+    );
+    transaction.rollback().unwrap();
+    writer.shutdown_and_join().unwrap();
+}
+
+#[test]
 fn retired_drain_revalidates_owner_fence_before_commit_and_resumes_without_new_writes() {
     let directory = super::ledger_test_directory();
     let path = directory.path().join("sessions.db");

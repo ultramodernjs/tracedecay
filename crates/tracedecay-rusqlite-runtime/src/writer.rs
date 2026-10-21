@@ -458,6 +458,7 @@ pub struct PersistentWriter {
     telemetry: WriterTelemetry,
     checkpoint_status: watch::Receiver<CheckpointStatus>,
     checkpoint_pressure: watch::Receiver<CheckpointPressure>,
+    ledger_status: watch::Receiver<ledger_maintenance::WriterLedgerMaintenanceStatus>,
     opened_file_identity: Option<u64>,
 }
 
@@ -547,6 +548,8 @@ impl PersistentWriter {
         let (checkpoint_status_tx, checkpoint_status) = watch::channel(CheckpointStatus::default());
         let (checkpoint_pressure_tx, checkpoint_pressure) =
             watch::channel(CheckpointPressure::Open);
+        let (ledger_status_tx, ledger_status) =
+            watch::channel(ledger_maintenance::WriterLedgerMaintenanceStatus::default());
         let (started_tx, started_rx) = std_mpsc::sync_channel(1);
         let cx = runtime
             .try_request_cx_with_budget(Budget::INFINITE)
@@ -572,6 +575,7 @@ impl PersistentWriter {
             watermark_publisher,
             checkpoint_status: checkpoint_status_tx,
             checkpoint_pressure: checkpoint_pressure_tx,
+            ledger_status: ledger_status_tx,
             checkpoint_blockers,
             on_file_lost,
             started: started_tx,
@@ -595,6 +599,7 @@ impl PersistentWriter {
                 telemetry,
                 checkpoint_status,
                 checkpoint_pressure,
+                ledger_status,
                 opened_file_identity,
             }),
             Ok(Err(error)) => {
@@ -641,6 +646,16 @@ impl PersistentWriter {
     }
     pub fn telemetry_snapshot(&self) -> WriterTelemetrySnapshot {
         self.telemetry.snapshot()
+    }
+
+    pub fn ledger_maintenance_status(&self) -> ledger_maintenance::WriterLedgerMaintenanceStatus {
+        self.ledger_status.borrow().clone()
+    }
+
+    pub fn ledger_maintenance_subscription(
+        &self,
+    ) -> watch::Receiver<ledger_maintenance::WriterLedgerMaintenanceStatus> {
+        self.ledger_status.clone()
     }
 
     pub fn checkpoint_handle(&self) -> CheckpointHandle {
