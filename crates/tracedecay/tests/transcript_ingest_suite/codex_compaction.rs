@@ -228,6 +228,7 @@ done
     let mut hook = tracedecay_command_with_home(&home);
     let child = hook
         .arg("hook-codex-post-compact")
+        .env("RUST_LOG", "warn")
         .current_dir(&project)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
