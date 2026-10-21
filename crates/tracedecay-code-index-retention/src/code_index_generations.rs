@@ -44,6 +44,7 @@ mod locking;
 mod receipt_store;
 mod scope_quarantine;
 mod scope_roots;
+mod segment_release;
 mod text_artifacts;
 pub use graph_replay_release::{
     CodeGenerationGraphReplayReleasePageV1, CodeGenerationGraphReplayReleaseV1,
@@ -1584,6 +1585,42 @@ fn has_unreferenced_generation_segments(
 ) -> Result<bool, CodeGenerationRetentionErrorV1> {
     sweep_unreferenced_generation_segments(store_root, graph_replay_pool_root, false, is_cancelled)
         .map(|(found, _)| found)
+}
+
+/// Sweep only orphaned shared segments after replay sources have been released.
+/// This administrative continuation never collects a generation or text artifact.
+/// Each call advances at most 32 directory/read/sweep steps and reads at most
+/// 1 MiB of manifest payloads. `true` includes an unfinished mark, not just a
+/// further deletion batch. Cancellation preserves the checked byte prefix.
+/// The conservative mark includes every tagged SHA-256 in each fully hashed
+/// manifest; unrelated digest values may retain extra segments, never omit a
+/// reference. Writers invalidate the reusable census before changing roots.
+/// The ordinary store -> shared segments -> replay pool lock order is kept,
+/// and no payload file or publication lock is retained between calls.
+pub fn sweep_released_code_generation_segments_cancellable(
+    store_root: &Path,
+    graph_replay_pool_root: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<bool, CodeGenerationRetentionErrorV1> {
+    if is_cancelled() {
+        return Err(CodeGenerationRetentionErrorV1::Cancelled);
+    }
+    let _store_lock = try_acquire_code_generation_store_lock(store_root)?
+        .ok_or(CodeGenerationRetentionErrorV1::GenerationStoreBusy)?;
+    let _segments_lock =
+        locking::acquire_generation_segments_census_lock_checked(store_root, is_cancelled)?;
+    let _pool_lock = acquire_graph_replay_pool_lock_checked(
+        graph_replay_pool_root,
+        Instant::now() + GRAPH_REPLAY_POOL_ACQUIRE_BUDGET,
+        is_cancelled,
+    )?;
+    if transaction_path(store_root).exists() || text_artifact_transaction_path(store_root).exists()
+    {
+        return Err(CodeGenerationRetentionErrorV1::UnsafeState(
+            "code-generation retention recovery is pending".to_owned(),
+        ));
+    }
+    segment_release::sweep(store_root, graph_replay_pool_root, is_cancelled)
 }
 
 fn collect_unreferenced_generation_segments(

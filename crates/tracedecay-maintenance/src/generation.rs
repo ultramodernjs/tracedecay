@@ -106,6 +106,7 @@ pub async fn run_project_generation_maintenance(
 )]
 pub async fn run_registered_project_generation_maintenance(
     store: &RegisteredProjectStoreV1,
+    lease: &ProjectStoreMaintenanceLeaseV1,
     mounted_store_roots: &BTreeSet<PathBuf>,
     code_index_schedulers: &tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
     profile_database: &tracedecay_global_db::RegisteredGlobalDb,
@@ -114,6 +115,7 @@ pub async fn run_registered_project_generation_maintenance(
 ) -> MaintenanceTickOutcome {
     let outcome = match run_registered_code_generation_retention(
         store,
+        lease,
         mounted_store_roots,
         code_index_schedulers,
         profile_database,

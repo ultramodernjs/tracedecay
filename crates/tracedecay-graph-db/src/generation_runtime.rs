@@ -1828,28 +1828,19 @@ impl GraphDb {
         locator: &GenerationLocator,
         check: &dyn Fn() -> Result<(), GraphDbError>,
     ) -> Result<GenerationContentsDeletion, GraphDbError> {
-        if matches!(
-            self.delete_staged_generation_rows(locator, check)?,
-            StagedGenerationRowsDeletion::RetentionPending
-        ) {
-            // The native rows wait for an engine that is already open, but
-            // the sealed artifact needs no engine: the generation is retired
-            // and nothing serves it, so its directory leaves the disk now
-            // instead of waiting, possibly forever, on a project that never
-            // publishes again, behind the deferred row delete.
-            self.retire_sealed_generation_store(locator);
-            return Ok(GenerationContentsDeletion::RetentionPending);
-        }
+        let deletion = self.delete_staged_generation_rows(locator, check)?;
         let mut state = self.wait_verified_generations_write()?;
         state.known.remove(locator);
         state.quarantined.remove(locator);
-        state.stored.remove(locator);
+        if matches!(deletion, StagedGenerationRowsDeletion::Deleted { .. }) {
+            state.stored.remove(locator);
+        }
         state.sealed_only.remove(locator);
         state.retiring.remove(locator);
         state.collected.insert(locator.clone());
-        // A retired projection head (a deleted code generation's own
-        // projection) must leave the installed-head cache with its rows, or
-        // the stale lease would keep retaining its dependency closure.
+        // Logical retirement fences recovery and detaches the unowned cache
+        // even while native cleanup waits for an already-open engine. Its
+        // tombstoned replay payload, not this installed pointer, owns that debt.
         if state
             .heads
             .get(&locator.projection)
@@ -1859,7 +1850,12 @@ impl GraphDb {
         }
         drop(state);
         self.retire_sealed_generation_store(locator);
-        Ok(GenerationContentsDeletion::Deleted)
+        Ok(match deletion {
+            StagedGenerationRowsDeletion::Deleted { .. } => GenerationContentsDeletion::Deleted,
+            StagedGenerationRowsDeletion::RetentionPending => {
+                GenerationContentsDeletion::RetentionPending
+            }
+        })
     }
 
     fn delete_staged_generation_rows(

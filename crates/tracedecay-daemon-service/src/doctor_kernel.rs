@@ -791,10 +791,19 @@ async fn live_sealed_generations(
                ON head.shard_id = replay.shard_id
               AND head.namespace = replay.namespace
               AND head.projection = replay.projection
-             WHERE head.replay_sequence IS NULL
-                OR replay.sequence >= head.replay_sequence
+             WHERE (head.replay_sequence IS NULL
+                OR replay.sequence >= head.replay_sequence)
+               AND NOT EXISTS (
+                   SELECT 1 FROM graph_publication_replay_tombstones_v1 AS retired
+                   WHERE retired.replay_sequence = replay.sequence
+               )
              UNION
-             SELECT generation FROM graph_publication_replay_dependencies_v1",
+             SELECT dependency.generation
+             FROM graph_publication_replay_dependencies_v1 AS dependency
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM graph_publication_replay_tombstones_v1 AS retired
+                 WHERE retired.replay_sequence = dependency.owner_replay_sequence
+             )",
             (),
         )
         .await
@@ -807,25 +816,18 @@ async fn live_sealed_generations(
 }
 
 /// Retirements the journal has linearized whose native rows are still in the
-/// live container: retirement tombstones awaiting their engine delete, plus
-/// replays behind an installed head that no active replay depends on and
-/// that retirement has not yet reached. `None` when the journal cannot be
-/// read.
+/// live container: only tombstones with a retained replay payload await native
+/// deletion. Payload-free tombstones are permanent idempotency evidence, not
+/// cleanup debt; unretired superseded replays are a separate backlog. `None`
+/// when the journal cannot be read.
 async fn deferred_native_retirements(graph: &tracedecay_runtime_core::db::Database) -> Option<u64> {
     let mut rows = graph
         .read_connection()
         .query(
-            "SELECT (SELECT COUNT(*) FROM graph_publication_replay_tombstones_v1)
-                  + (SELECT COUNT(*)
-                     FROM graph_publication_replay_v1 AS replay
-                     JOIN graph_verified_heads_v1 AS head
-                       ON head.shard_id = replay.shard_id
-                      AND head.namespace = replay.namespace
-                      AND head.projection = replay.projection
-                     WHERE replay.sequence < head.replay_sequence
-                       AND replay.generation NOT IN (
-                           SELECT generation FROM graph_publication_replay_dependencies_v1
-                       ))",
+            "SELECT COUNT(*)
+             FROM graph_publication_replay_tombstones_v1 AS retired
+             JOIN graph_publication_replay_v1 AS replay
+               ON replay.sequence = retired.replay_sequence",
             (),
         )
         .await

@@ -1249,17 +1249,11 @@ fn sealed_artifact_container_is_byte_identical_across_reopens() {
     );
 }
 
-/// Retirement of a deleted code generation must not lazily open a hibernated
-/// staging engine; it returns `RetentionPending` and retries once a later
-/// lease has opened the engine. The sealed artifact, which needs no engine,
-/// goes on the first pass.
-///
-/// Fails if `retire_one_code_generation_replay` calls `read_guard` /
-/// `ensure_opened` on the hibernated engine (`staging_engine_is_open` becomes
-/// true), if the deferred outcome is no longer `RetentionPending`, or if the
-/// sealed directory outlives the deferral.
+/// Logical retirement releases the replay source without hydrating staging.
+/// Native cleanup keeps its durable payload until an already-open engine can
+/// delete the rows, independently of the source-release queue.
 #[test]
-fn hibernated_engine_defers_retirement_without_opening() {
+fn hibernated_retirement_releases_source_but_preserves_native_cleanup_debt() {
     let temp = TempDir::new().unwrap();
     let registered = RegisteredGraph::new_mounted_lazy(temp.path()).unwrap();
     let mut authority = RelationalAuthority::default();
@@ -1297,6 +1291,16 @@ fn hibernated_engine_defers_retirement_without_opening() {
         SealedGraphStateDigest::try_from(format!("sha256:{}", "1".repeat(64))).unwrap();
     // Journaled sealed replay is the deleted code-generation identity the
     // production retention pass names.
+    assert!(matches!(
+        retire_code_generation(
+            &registered,
+            temp.path(),
+            &mut authority,
+            &code_generation,
+            &sealed_digest,
+        ),
+        GraphReplayCollectionOutcome::Retired(_)
+    ));
     assert_eq!(
         retire_code_generation(
             &registered,
@@ -1305,7 +1309,28 @@ fn hibernated_engine_defers_retirement_without_opening() {
             &code_generation,
             &sealed_digest,
         ),
-        GraphReplayCollectionOutcome::RetentionPending
+        GraphReplayCollectionOutcome::Absent,
+        "native cleanup debt must not retain an inactive replay source"
+    );
+    let (control, probe) = control_and_probe();
+    let context = GraphPublicationOperationContextV1::new(&control, &probe).unwrap();
+    assert!(
+        !registered
+            .registry
+            .finalize_one_code_generation_replay_cleanup(
+                registration(registered.binding.clone(), temp.path()),
+                &mut authority,
+                &context,
+                &code_generation,
+                &sealed_digest,
+            )
+            .unwrap(),
+        "sleeping staging must leave native cleanup debt durable"
+    );
+    assert!(
+        authority.retired[&record.publication.key]
+            .canonical_replay_source
+            .is_some()
     );
     assert_engine_hibernated(&registered, temp.path());
     // The rows wait for an open engine; the sealed artifact does not. A
@@ -1350,6 +1375,96 @@ fn hibernated_engine_defers_retirement_without_opening() {
     assert!(
         receipt_for_generation(temp.path(), "hibernate-retire-g1").is_none(),
         "completed retirement must delete the sealed directory"
+    );
+}
+
+#[test]
+fn headless_native_cleanup_survives_source_release_and_remount() {
+    let temp = TempDir::new().unwrap();
+    let registered = RegisteredGraph::new_mounted_lazy(temp.path()).unwrap();
+    let mut authority = RelationalAuthority::default();
+    let manifest = rich_manifest(
+        projection("code:gen-headless", "code"),
+        "headless-g1",
+        "debt",
+    );
+    let record = stage_sealed_manifest(
+        &mut authority,
+        &registered.binding,
+        &manifest,
+        "publish:headless-g1",
+        None,
+        '3',
+    );
+    stage_rows_before_publish(&registered, temp.path(), &manifest);
+    let commit = publish_sealed(&registered, temp.path(), &mut authority, &record, &manifest);
+    drop(commit);
+    assert_engine_hibernated(&registered, temp.path());
+    let generation = CodeGenerationId::new("code-generation.headless-g1").unwrap();
+    let digest = SealedGraphStateDigest::try_from(format!("sha256:{}", "3".repeat(64))).unwrap();
+    assert!(matches!(
+        retire_code_generation(
+            &registered,
+            temp.path(),
+            &mut authority,
+            &generation,
+            &digest,
+        ),
+        GraphReplayCollectionOutcome::Retired(_)
+    ));
+    assert_eq!(
+        retire_code_generation(
+            &registered,
+            temp.path(),
+            &mut authority,
+            &generation,
+            &digest,
+        ),
+        GraphReplayCollectionOutcome::Absent
+    );
+    assert!(authority.heads.is_empty());
+    assert!(
+        authority.retired[&record.publication.key]
+            .canonical_replay_source
+            .is_some()
+    );
+    assert_engine_hibernated(&registered, temp.path());
+    drop(registered);
+
+    let remounted = RegisteredGraph::new_mounted_lazy(temp.path()).unwrap();
+    let opener = probe_lease(&remounted, temp.path());
+    // Hydrate staging, then release the read snapshot gate before deletion.
+    // The operation lease alone keeps the lazy engine resident.
+    drop(opener.snapshot().unwrap());
+    assert!(opener.staging_engine_is_open());
+    assert_eq!(
+        opener
+            .staging_generation_row_counts(&manifest.identity())
+            .unwrap(),
+        (2, 1)
+    );
+    let (control, probe) = control_and_probe();
+    let context = GraphPublicationOperationContextV1::new(&control, &probe).unwrap();
+    remounted
+        .registry
+        .retire_superseded_projection_replays(
+            registration(remounted.binding.clone(), temp.path()),
+            &mut authority,
+            &context,
+            &record.publication.key.projection,
+        )
+        .unwrap();
+    assert_eq!(
+        opener
+            .staging_generation_row_counts(&manifest.identity())
+            .unwrap(),
+        (0, 0),
+        "headless native debt must drain after the source-release queue is gone"
+    );
+    assert!(
+        authority.retired[&record.publication.key]
+            .canonical_replay_source
+            .is_none()
     );
 }
 

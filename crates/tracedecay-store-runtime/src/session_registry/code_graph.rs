@@ -2721,6 +2721,64 @@ impl DaemonSessionRuntimeRegistryV1 {
         })
     }
 
+    /// Admit an existing project's SQL shard for source-release maintenance.
+    /// The caller retains the returned owner for the maintenance lease's whole
+    /// lifetime. This neither mounts a scheduler nor publishes a memory graph
+    /// owner/background reconciliation task, and never initializes a missing
+    /// store or opens native staging.
+    pub async fn admit_code_graph_maintenance_database(
+        &self,
+        project_id: ProjectId,
+        enrollment_roots: impl IntoIterator<Item = std::path::PathBuf>,
+    ) -> Result<(
+        tracedecay_runtime_core::db::DatabaseOwnerV1,
+        tracedecay_runtime_core::db::Database,
+    )> {
+        self.resolver
+            .register_project_authority(
+                crate::store_locator_resolver::LocalProjectEnrollmentAuthorityV1::new(
+                    project_id.clone(),
+                    enrollment_roots,
+                ),
+            )
+            .map_err(|error| {
+                session_registry_error(
+                    "admit graph replay maintenance authority",
+                    format!("{error:?}"),
+                )
+            })?;
+        let shard = StoreShardIdV1::project(
+            self.identity.brain_id().clone(),
+            self.identity.profile_id().clone(),
+            project_id,
+        );
+        let pin = self
+            .profile_authority_pin("admit graph replay maintenance")
+            .await?;
+        let runtime = super::open_runtime(
+            &self.registry,
+            self.resolver.as_ref(),
+            super::StoreRuntimeOpenSpec::new(
+                shard,
+                self.incarnation,
+                Some(pin),
+                None,
+                false,
+                "admit graph replay maintenance",
+            ),
+        )
+        .await?;
+        let owner = tracedecay_runtime_core::db::Database::publish_runtime(
+            runtime,
+            tracedecay_runtime_core::db::DatabaseAccessMode::ReadWrite,
+        )
+        .await?;
+        let database = owner.issue_lease().map_err(|error| {
+            session_registry_error("issue graph replay maintenance lease", format!("{error:?}"))
+        })?;
+        Ok((owner, database))
+    }
+
     pub async fn release_one_sealed_generation_staging_rows(
         &self,
         project_id: ProjectId,

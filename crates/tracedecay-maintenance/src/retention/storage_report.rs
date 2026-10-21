@@ -218,6 +218,11 @@ pub struct StorageReport {
     pub code_generation_retention: Vec<CodeGenerationRetentionDryRunEntry>,
     #[serde(default)]
     pub code_generation_retention_availability: Vec<CodeGenerationRetentionAvailabilityEntry>,
+    /// Durable source-release backlog, independent of collected generation
+    /// manifests. Each scope is a bounded queue page; authority and bytes stay
+    /// unknown until the production executor revalidates graph liveness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_replay_release: Vec<GraphReplayReleaseBacklogEntryV1>,
     pub unregistered_dir_count: usize,
     pub unregistered_bytes: u64,
     pub global_db_bytes: u64,
@@ -417,6 +422,88 @@ pub struct CodeGenerationRetentionAvailabilityEntry {
     pub state: StorageReportAvailabilityState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// A queue page is pending release evidence, never a census of live heads.
+/// Reclaimability remains unknown instead of summing overlapping manifest or
+/// hardlinked segment bytes as savings.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct GraphReplayReleaseBacklogEntryV1 {
+    pub project_id: String,
+    pub store_root: String,
+    /// Count on this bounded page, not the total backlog when a continuation
+    /// is present. `None` means the queue could not be validated.
+    pub pending_release_count: Option<usize>,
+    pub continuation: Option<String>,
+    pub source_liveness: crate::store_maintenance::GraphReplayReleaseAuthorityV1,
+    pub reclaimable_segment_bytes: Option<u64>,
+    pub plan: Option<crate::store_maintenance::GraphReplayReleasePlanV1>,
+    pub unavailable_reason: Option<String>,
+}
+
+fn graph_replay_release_backlog(
+    project_id: &str,
+    data_root: &Path,
+    canonical_root: &Path,
+) -> Vec<GraphReplayReleaseBacklogEntryV1> {
+    use crate::store_maintenance::{GraphReplayReleaseAuthorityV1, plan_graph_replay_releases};
+    use tracedecay_code_index_retention::code_index_generations::{
+        code_generation_graph_replay_release_page, code_index_scopes, code_index_store_root,
+    };
+    let scopes = match code_index_scopes(data_root) {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            return vec![GraphReplayReleaseBacklogEntryV1 {
+                project_id: project_id.to_owned(),
+                store_root: data_root.display().to_string(),
+                pending_release_count: None,
+                continuation: None,
+                source_liveness: GraphReplayReleaseAuthorityV1::Unvalidated,
+                reclaimable_segment_bytes: None,
+                plan: None,
+                unavailable_reason: Some(error.to_string()),
+            }];
+        }
+    };
+    scopes
+        .into_iter()
+        .map(|scope| {
+            let root = scope.recorded_root.or_else(|| {
+                (scope.store_root == code_index_store_root(data_root, canonical_root))
+                    .then(|| canonical_root.to_path_buf())
+            });
+            let mut entry = GraphReplayReleaseBacklogEntryV1 {
+                project_id: project_id.to_owned(),
+                store_root: scope.store_root.display().to_string(),
+                pending_release_count: None,
+                continuation: None,
+                source_liveness: GraphReplayReleaseAuthorityV1::Unvalidated,
+                reclaimable_segment_bytes: None,
+                plan: None,
+                unavailable_reason: None,
+            };
+            if let Some(root) = root {
+                match plan_graph_replay_releases(project_id, &scope.store_root, &root, None) {
+                    Ok(plan) => {
+                        entry.pending_release_count = Some(plan.releases.len());
+                        entry.continuation.clone_from(&plan.continuation);
+                        entry.plan = Some(plan);
+                    }
+                    Err(error) => entry.unavailable_reason = Some(error.to_string()),
+                }
+            } else {
+                match code_generation_graph_replay_release_page(&scope.store_root, None) {
+                    Ok(page) => {
+                        entry.pending_release_count = Some(page.releases.len());
+                        entry.continuation = page.continuation;
+                        entry.unavailable_reason = Some("scope_checkout_root_unproven".to_owned());
+                    }
+                    Err(error) => entry.unavailable_reason = Some(error.to_string()),
+                }
+            }
+            entry
+        })
+        .collect()
 }
 
 /// Sizes an offline profile without opening any SQLite family. Registry
@@ -710,6 +797,7 @@ async fn project_storage_report_page(
                 &mut report.stores,
                 &mut report.code_generation_retention,
                 &mut report.code_generation_retention_availability,
+                &mut report.graph_replay_release,
                 &session_handles,
             )?;
         }
@@ -901,6 +989,7 @@ fn build_project_storage_report_with_handles(
     let mut stores = Vec::new();
     let mut code_generation_retention = Vec::new();
     let mut code_generation_retention_availability = Vec::new();
+    let mut graph_replay_release = Vec::new();
     append_project_report(
         profile_root,
         project_id,
@@ -909,6 +998,7 @@ fn build_project_storage_report_with_handles(
         &mut stores,
         &mut code_generation_retention,
         &mut code_generation_retention_availability,
+        &mut graph_replay_release,
         session_handles,
     )?;
     let global_db_path = profile_root.join(GLOBAL_DB_FILENAME);
@@ -917,6 +1007,7 @@ fn build_project_storage_report_with_handles(
         stores,
         code_generation_retention,
         code_generation_retention_availability,
+        graph_replay_release,
         unregistered_dir_count: 0,
         unregistered_bytes: 0,
         global_db_bytes: database_family_bytes(&global_db_path),
@@ -941,9 +1032,15 @@ fn append_project_report(
     stores: &mut Vec<StoreSizeReportEntry>,
     code_generation_retention: &mut Vec<CodeGenerationRetentionDryRunEntry>,
     code_generation_retention_availability: &mut Vec<CodeGenerationRetentionAvailabilityEntry>,
+    graph_replay_release: &mut Vec<GraphReplayReleaseBacklogEntryV1>,
     session_handles: &SessionTelemetryHandles,
 ) -> tracedecay_domain::errors::Result<()> {
     let data_root = profile_root.join("projects").join(project_id);
+    graph_replay_release.extend(graph_replay_release_backlog(
+        project_id,
+        &data_root,
+        Path::new(canonical_root),
+    ));
     {
         let mut kinds = StoreKindBytesV1::default();
         let mut unavailable_entry_count = 0usize;
@@ -1236,6 +1333,64 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    #[test]
+    fn report_lists_release_backlog_for_collected_primary_and_linked_scopes() {
+        use tracedecay_code_index_retention::code_index_generations::fixture::write_generation_store_fixture;
+        use tracedecay_code_index_retention::code_index_generations::{
+            CodeGenerationRetentionModeV1, code_index_store_root,
+            execute_code_generation_retention, plan_code_generation_retention, record_scope_root,
+        };
+        let temp = tempfile::tempdir().expect("isolated report fixture");
+        let profile = temp.path().join("profile");
+        let checkout = temp.path().join("checkout");
+        let linked = temp.path().join("linked");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        let data = profile.join("projects").join("project.release-report");
+        let pool = data.join("tracedecay.graph-replay");
+        for root in [&checkout, &linked] {
+            let scope = code_index_store_root(&data, root);
+            write_generation_store_fixture(&scope, 2);
+            record_scope_root(&scope, root).unwrap();
+            let plan = plan_code_generation_retention(&scope, &BTreeSet::new()).unwrap();
+            execute_code_generation_retention(
+                &scope,
+                plan,
+                CodeGenerationRetentionModeV1::Apply,
+                tracedecay_domain::UtcMicros(2),
+                Some(&pool),
+            )
+            .expect("real queued release evidence");
+        }
+        let report = build_project_storage_report(
+            &profile,
+            "project.release-report",
+            &checkout,
+            Err(RETENTION_PROTECTION_UNRESOLVED),
+        )
+        .expect("read-only storage report");
+        assert_eq!(report.graph_replay_release.len(), 2);
+        for backlog in &report.graph_replay_release {
+            assert_eq!(backlog.pending_release_count, Some(1));
+            assert_eq!(
+                backlog.reclaimable_segment_bytes, None,
+                "collected manifests and queue receipts do not establish graph liveness"
+            );
+            assert_eq!(
+                backlog.source_liveness,
+                crate::store_maintenance::GraphReplayReleaseAuthorityV1::Unvalidated
+            );
+            let plan = backlog.plan.as_ref().expect("shared one-shot preview");
+            assert_eq!(plan.releases.len(), 1);
+            assert_eq!(plan.reclaimable_bytes, None);
+            assert!(
+                pool.join(&plan.releases[0].generation.generation_file)
+                    .exists(),
+                "reporting cannot acknowledge or unlink a replay source"
+            );
+        }
+    }
 
     fn store(project_id: &str, total_bytes: u64) -> StoreSizeReportEntry {
         StoreSizeReportEntry {

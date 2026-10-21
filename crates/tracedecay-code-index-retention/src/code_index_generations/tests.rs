@@ -6,6 +6,7 @@ use tracedecay_domain::sha256_hex_suffix;
 
 mod graph_replay_pool_lock_tests;
 mod graph_replay_release_tests;
+mod segment_release_bounds;
 
 /// Marks the newest `count` superseded fixture generations as vector-readable
 /// sources so a fixture keeps exactly one collectable generation: the exact
@@ -1738,6 +1739,33 @@ fn metadata_only_segment_census_distinguishes_empty_and_cancelled() {
     let error = store_may_hold_generation_segments(store.path(), &|| true)
         .expect_err("cancellation wins before an observed entry is accepted");
     assert!(matches!(error, CodeGenerationRetentionErrorV1::Cancelled));
+}
+
+#[test]
+fn release_continuation_sweeps_segments_without_collecting_generations() {
+    let store = tempfile::TempDir::new().expect("isolated generation store");
+    let pool = store.path().join("replay-pool");
+    tracedecay_private_fs::create_private_directory(&pool).expect("owner-private pool");
+    let segments = code_generation_segments_root(store.path());
+    std::fs::create_dir_all(&segments).expect("segment root");
+    let bytes = b"orphaned shared segment";
+    let digest = encode_lowercase_hex(&Sha256::digest(bytes));
+    let orphan = segments.join(format!("segment-{digest}.json"));
+    std::fs::write(&orphan, bytes).expect("segment");
+    assert!(matches!(
+        sweep_released_code_generation_segments_cancellable(store.path(), &pool, &|| true,),
+        Err(CodeGenerationRetentionErrorV1::Cancelled)
+    ));
+    assert!(orphan.exists(), "cancelled maintenance cannot sweep");
+    assert!(
+        !sweep_released_code_generation_segments_cancellable(store.path(), &pool, &|| false,)
+            .expect("bounded source-release continuation")
+    );
+    assert!(!orphan.exists());
+    assert!(
+        !store.path().join(ACTIVE_POINTER_FILE).exists(),
+        "segment-only apply does not publish or collect generations"
+    );
 }
 
 #[test]

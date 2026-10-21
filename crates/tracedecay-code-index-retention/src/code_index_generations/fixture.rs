@@ -30,6 +30,23 @@ pub fn write_generation_store_fixture(
     store_root: &Path,
     count: usize,
 ) -> Vec<GenerationStoreFixtureV1> {
+    write_generation_fixture(store_root, count, false)
+}
+
+/// Retention-shaped segmented manifests with one exclusive evidence pack per
+/// generation. These exercise authenticated marking, not the serving decoder.
+pub fn write_segmented_generation_store_fixture(
+    store_root: &Path,
+    count: usize,
+) -> Vec<GenerationStoreFixtureV1> {
+    write_generation_fixture(store_root, count, true)
+}
+
+fn write_generation_fixture(
+    store_root: &Path,
+    count: usize,
+    segmented: bool,
+) -> Vec<GenerationStoreFixtureV1> {
     let generations_root = store_root.join(GENERATIONS_DIRECTORY);
     std::fs::create_dir_all(&generations_root).expect("create generation directory");
     let mut generations = Vec::with_capacity(count);
@@ -38,15 +55,68 @@ pub fn write_generation_store_fixture(
         let generation_id = CodeGenerationId::new(format!("generation.v1.fixture.{sequence:08}"))
             .expect("valid generation id");
         let sealed_at = i64::try_from(sequence).expect("fixture sequence fits i64");
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "format_revision": SEALED_GENERATION_FORMAT_REVISION_V1,
-            "manifest": {
-                "generation_id": generation_id.as_str(),
-                "seal": { "sealed_at": sealed_at },
-            },
-            "chunks": [],
-        }))
-        .expect("serialize generation fixture");
+        let manifest = serde_json::json!({
+            "generation_id": generation_id.as_str(),
+            "seal": { "sealed_at": sealed_at },
+        });
+        let value = if segmented {
+            let pack = format!("generation evidence pack {sequence}").into_bytes();
+            let digest = encode_tagged_lowercase_hex("sha256:", &Sha256::digest(&pack));
+            let segments = super::code_generation_segments_root(store_root);
+            std::fs::create_dir_all(&segments).expect("fixture segment root");
+            std::fs::write(
+                segments.join(format!(
+                    "segment-{}.json",
+                    sha256_hex_suffix(&digest).expect("segment digest")
+                )),
+                &pack,
+            )
+            .expect("fixture evidence pack");
+            serde_json::json!({
+                "state_digest": format!("sha256:{}", "0".repeat(64)),
+                "generation": {
+                    "format_revision": SEALED_GENERATION_FORMAT_REVISION_V1,
+                    "manifest": manifest,
+                    "snapshot": { "files": [] },
+                    "file_segments": [],
+                    "file_evidence": [],
+                    "code_graph_pages": [],
+                    "generation_evidence": {
+                        "segment_digest": digest,
+                        "segment_size_bytes": pack.len(),
+                        "pages": [{
+                            "page_ordinal": 0,
+                            "page_digest": digest,
+                            "page_size_bytes": pack.len()
+                        }]
+                    },
+                    "resolution_index": {
+                        "definitions": [{
+                            "segment_digest": digest,
+                            "segment_size_bytes": pack.len(),
+                            "decoded_size_bytes": pack.len()
+                        }],
+                        "references": [{
+                            "segment_digest": digest,
+                            "segment_size_bytes": pack.len(),
+                            "decoded_size_bytes": pack.len()
+                        }],
+                        "import_aliases": {
+                            "segment_digest": digest,
+                            "segment_size_bytes": pack.len(),
+                            "decoded_size_bytes": pack.len()
+                        }
+                    }
+                }
+            })
+        } else {
+            serde_json::json!({
+                "format_revision": SEALED_GENERATION_FORMAT_REVISION_V1,
+                "manifest": manifest,
+                "chunks": [],
+            })
+        };
+        let bytes = serde_json::to_vec(&value).expect("serialize generation fixture");
         let state_digest = encode_tagged_lowercase_hex("sha256:", &Sha256::digest(&bytes));
         let file = format!(
             "generation-{}.json",
