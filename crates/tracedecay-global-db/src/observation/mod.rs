@@ -6,6 +6,7 @@ mod persist;
 mod refusal_census;
 pub mod retention;
 mod schema;
+pub mod unsupported_codex;
 
 pub use canonical_bodies::decode_observation_json;
 pub(crate) use canonical_bodies::{compact_lcm_bodies, converge_canonical_bodies};

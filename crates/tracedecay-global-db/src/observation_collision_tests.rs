@@ -3701,6 +3701,15 @@ async fn drain_keeps_corrupt_provenance_with_matching_output_a_hard_error() {
         .await
         .unwrap();
     let message_row = rows.next().await.unwrap().expect("projected message row");
+    // Export semantic receipts, not store-local dictionary references: the
+    // destination below intentionally starts with an independent dictionary.
+    let stored_metadata: Option<String> = message_row.get(12).unwrap();
+    let hydrated_metadata = tracedecay_lcm::raw::receipt_store::hydrate_metadata(
+        &scratch_snapshot,
+        stored_metadata.as_deref(),
+    )
+    .await
+    .unwrap();
     let projected_message: ProjectedMessageRow = (
         message_row.get(0).unwrap(),
         message_row.get(1).unwrap(),
@@ -3714,7 +3723,7 @@ async fn drain_keeps_corrupt_provenance_with_matching_output_a_hard_error() {
         message_row.get(9).unwrap(),
         message_row.get(10).unwrap(),
         message_row.get(11).unwrap(),
-        message_row.get(12).unwrap(),
+        hydrated_metadata,
         message_row.get(13).unwrap(),
     );
     drop(rows);

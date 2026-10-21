@@ -43,6 +43,8 @@ pub mod test_support {
 }
 
 #[cfg(test)]
+pub(crate) mod codex_scope_pending_tests;
+#[cfg(test)]
 mod quarantine_claude_tests;
 #[cfg(test)]
 mod quarantine_codex_tests;
