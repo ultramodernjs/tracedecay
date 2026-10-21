@@ -739,21 +739,77 @@ async fn reconstruct_occurrences(
     max_entities: usize,
     cancellation: &Arc<dyn GraphCancellation>,
 ) -> SessionStoreResult<Vec<CanonicalOccurrence>> {
-    query_occurrences(
-        conn,
-        &format!(
-            "SELECT {RELATION_OCCURRENCE_COLUMNS}
-             FROM session_occurrences AS occurrence
-             WHERE occurrence.session_id = ?1 AND +occurrence.generation <= ?2
-             ORDER BY occurrence.projection_output_ordinal, occurrence.occurrence_id
-             LIMIT ?3"
-        ),
-        session_id,
-        generation,
-        max_entities,
-        cancellation,
-    )
-    .await
+    const PAGE_ROWS: i64 = 512;
+    let select = format!(
+        "SELECT {RELATION_OCCURRENCE_COLUMNS}
+         FROM session_occurrences AS occurrence
+              INDEXED BY idx_session_occurrences_generation_order
+         WHERE occurrence.session_id = ?1 AND +occurrence.generation <= ?2"
+    );
+    let first_page = format!(
+        "{select}
+         ORDER BY occurrence.knowledge_at, occurrence.occurrence_id LIMIT ?3"
+    );
+    let next_page = format!(
+        "{select}
+           AND (occurrence.knowledge_at, occurrence.occurrence_id) > (?4, ?5)
+         ORDER BY occurrence.knowledge_at, occurrence.occurrence_id LIMIT ?3"
+    );
+    let generation = generation_i64(generation, RECONSTRUCT_OPERATION)?;
+    let mut occurrences: Vec<CanonicalOccurrence> = Vec::new();
+    loop {
+        let limit = bounded_query_limit(max_entities - occurrences.len())?.min(PAGE_ROWS);
+        let mut rows = match occurrences.last() {
+            None => {
+                conn.query(&first_page, params![session_id.as_str(), generation, limit])
+                    .await
+            }
+            Some(last) => {
+                conn.query(
+                    &next_page,
+                    params![
+                        session_id.as_str(),
+                        generation,
+                        limit,
+                        last.knowledge_at.0,
+                        last.occurrence_id.as_str()
+                    ],
+                )
+                .await
+            }
+        }
+        .map_err(|error| storage(RECONSTRUCT_OPERATION, error))?;
+        let mut page_rows = 0;
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|error| storage(RECONSTRUCT_OPERATION, error))?
+        {
+            require_not_cancelled(cancellation)?;
+            if occurrences.len() == max_entities {
+                return Err(storage(
+                    RECONSTRUCT_OPERATION,
+                    SessionRelationError::BudgetExhausted,
+                ));
+            }
+            occurrences.push(decode_occurrence(&row)?);
+            page_rows += 1;
+        }
+        if page_rows < limit {
+            break;
+        }
+        // The caller checks cancellation before reconstruction, and every
+        // decoded row checks it again. Paging adds only the between-page
+        // checkpoint, preserving the single-page completion's work budget.
+        require_not_cancelled(cancellation)?;
+    }
+    // Read in the existing temporal index's order, but retain the reducer's
+    // deterministic input order within the caller's entity budget.
+    occurrences.sort_unstable_by(|left, right| {
+        (left.ordinal, left.occurrence_id.as_str())
+            .cmp(&(right.ordinal, right.occurrence_id.as_str()))
+    });
+    Ok(occurrences)
 }
 
 async fn query_occurrences(

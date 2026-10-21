@@ -25,6 +25,8 @@ use tracedecay_store::{
 };
 use tracedecay_temporal_query::execution::ExecutionControl;
 
+mod reader_write_cost;
+
 use super::super::refresh::SessionRefreshRestartStateV1;
 use super::materialize::*;
 use super::record_canonical_observation_effect;

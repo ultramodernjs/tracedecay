@@ -18,6 +18,8 @@ mod lcm_schema;
 #[cfg(test)]
 mod payload_gc_cost;
 #[cfg(test)]
+mod projection_write_cost;
+#[cfg(test)]
 mod schema_install_cancellation;
 #[cfg(test)]
 mod session_sync;
