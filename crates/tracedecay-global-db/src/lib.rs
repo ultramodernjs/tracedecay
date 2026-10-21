@@ -41,6 +41,7 @@ pub use registered_maintenance::{
 };
 mod registered_provider_usage;
 mod registered_source_rewrite;
+pub mod session_sync_retention;
 pub use registered_source_rewrite::ObservationSourcePresenceV1;
 #[cfg(test)]
 mod stack_delivery_tests;

@@ -389,7 +389,11 @@ impl DaemonSessionSyncService {
             scope.project_id().as_str()
         );
         let operation_id = RequestId::new(stable.clone()).map_err(contract_error)?;
-        let idempotency_key = IdempotencyKey::new(stable.clone()).map_err(contract_error)?;
+        let idempotency_key = IdempotencyKey::new(format!(
+            "session-sync.startup.v2.{}",
+            scope.project_id().as_str()
+        ))
+        .map_err(contract_error)?;
         let cancellation =
             CancellationSignal::active(format!("{stable}.cancellation")).map_err(contract_error)?;
         let deadline = Deadline::new(UtcMicros(
@@ -398,14 +402,50 @@ impl DaemonSessionSyncService {
                 .saturating_add(SESSION_SYNC_STARTUP_DEADLINE_MICROS),
         ))
         .map_err(contract_error)?;
-        let request = SessionSyncRequestV1::new(
-            operation_id,
+        let mut request = SessionSyncRequestV1::new(
+            operation_id.clone(),
             idempotency_key,
-            scope,
-            deadline,
-            cancellation,
+            scope.clone(),
+            deadline.clone(),
+            cancellation.clone(),
             SessionSyncCommandV1::ImportTranscripts(SessionTranscriptImportV1::all_hosts()),
         );
+        // Registration holds the gate. A referenced or unprovable old slot is
+        // immutable evidence, not this run's import. Use the legacy per-run
+        // identity instead, and keep replaying it on same-run remounts even if
+        // the stable slot subsequently becomes renewable.
+        if !tracedecay_sessions::admission::session_ingest_disabled() {
+            let fallback = IdempotencyKey::new(stable).map_err(contract_error)?;
+            let snapshot = context.registry.read_snapshot().await?;
+            let mut rows = snapshot
+                .query(
+                    "SELECT EXISTS(SELECT 1 FROM session_backfill_meta WHERE key = ?1)",
+                    tracedecay_runtime_core::db::engine::params![journal_key(&scope, &fallback)],
+                )
+                .await?;
+            let fallback_exists = rows
+                .next()
+                .await?
+                .ok_or_else(|| contract_error("missing startup generation lookup"))?
+                .get::<i64>(0)?
+                != 0;
+            drop(rows);
+            drop(snapshot);
+            if fallback_exists
+                || !self
+                    .renew_startup_journal(&context.registry, &request)
+                    .await?
+            {
+                request = SessionSyncRequestV1::new(
+                    operation_id,
+                    fallback,
+                    scope,
+                    deadline,
+                    cancellation,
+                    SessionSyncCommandV1::ImportTranscripts(SessionTranscriptImportV1::all_hosts()),
+                );
+            }
+        }
         let outcome = self
             .execute_request_admitted(request, Arc::clone(context), project_sessions.clone())
             .await;
