@@ -372,6 +372,78 @@ fn offline_compaction_publication_failures_keep_verified_database_and_remove_sta
 }
 
 #[test]
+#[ignore = "subprocess helper for interruption recovery"]
+fn offline_compaction_interruption_child() {
+    let root = PathBuf::from(std::env::var_os("TRACEDECAY_TEST_COMPACTION_ROOT").unwrap());
+    let database = root.join("sessions.db");
+    let plan = inspect_compaction_candidate_v1(&root, &database, 100_000).unwrap();
+    compact_offline_v1(&root, &database, &plan.digest, 100_000).unwrap();
+}
+
+#[test]
+fn offline_compaction_recovers_its_staging_after_process_interruption() {
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let database = fixture(&root);
+    let original = std::fs::read(&database).unwrap();
+    let plan = inspect_compaction_candidate_v1(&root, &database, 100_000).unwrap();
+    let ready = root.join("child-ready");
+    let mut child = Reap(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "offline_compaction::tests::offline_compaction_interruption_child",
+            ])
+            .env("TRACEDECAY_TEST_COMPACTION_ROOT", &root)
+            .env("TRACEDECAY_TEST_COMPACTION_PAUSE", &ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "compaction child exited before its publication boundary"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "compaction child did not reach publication"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert_eq!(
+        std::fs::read(&database).unwrap(),
+        original,
+        "interruption must leave the active database intact"
+    );
+    compact_offline_v1(&root, &database, &plan.digest, 100_000).unwrap();
+    assert!(
+        !std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("offline-compact")
+        }),
+        "retry must reclaim the interrupted operation's staging before allocating another copy"
+    );
+}
+
+#[test]
 fn offline_compaction_preserves_or_refuses_shadowed_implicit_rowids() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();

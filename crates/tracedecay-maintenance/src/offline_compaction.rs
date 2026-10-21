@@ -22,6 +22,8 @@ use tracedecay_runtime_core::lifecycle_lease::{
 };
 use tracedecay_runtime_core::storage::reject_symlink_components;
 
+const STAGING_PREFIX: &str = ".td-offline-compact-";
+
 #[derive(Debug, Serialize)]
 pub struct OfflineCompactionPlanV1 {
     pub database: PathBuf,
@@ -116,6 +118,9 @@ pub fn compact_offline_v1(
     let parent = database
         .parent()
         .ok_or_else(|| io::Error::other("database has no parent"))?;
+    // The exclusive profile lease proves no other compaction is running, so any
+    // remaining staging belongs to an interrupted operation.
+    reclaim_interrupted_staging(parent)?;
     if tracedecay_private_fs::available_space(parent)? < plan.required_scratch_bytes {
         return Err(io::Error::other(
             "insufficient space for offline compaction",
@@ -127,7 +132,7 @@ pub fn compact_offline_v1(
     let original_metadata = fs::metadata(&database)?;
     let original_content = file_digest(&database)?;
     let operation = tempfile::Builder::new()
-        .prefix(".td-offline-compact-")
+        .prefix(STAGING_PREFIX)
         .tempdir_in(parent)?;
     let stage = operation.path().join("compacted.db");
     // Precreate owner-private, empty output: SQLite accepts a zero-byte file.
@@ -281,6 +286,24 @@ fn resolve_database(profile_root: &Path, database: &Path) -> io::Result<PathBuf>
         ));
     }
     Ok(path)
+}
+
+fn reclaim_interrupted_staging(parent: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_bytes()
+            .starts_with(STAGING_PREFIX.as_bytes())
+        {
+            continue;
+        }
+        // Never follow a planted link out of the profile.
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn refuse_sidecars(database: &Path) -> io::Result<()> {
@@ -526,6 +549,14 @@ fn inject_publish_fault(_phase: &str) -> io::Result<()> {
 
 #[cfg(test)]
 fn inject_publish_fault(phase: &str) -> io::Result<()> {
+    if phase == "before_replace"
+        && let Some(ready) = std::env::var_os("TRACEDECAY_TEST_COMPACTION_PAUSE")
+    {
+        fs::write(ready, b"staged and validated")?;
+        loop {
+            std::thread::park();
+        }
+    }
     if PUBLISH_FAULT.with(|fault| fault.get() == Some(phase)) {
         return Err(io::Error::other(format!(
             "injected publication failure: {phase}"
