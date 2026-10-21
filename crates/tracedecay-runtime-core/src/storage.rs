@@ -482,6 +482,7 @@ mod layout;
 mod manifest;
 mod paths_and_io;
 mod profile_identity;
+pub mod typescript_cache;
 
 #[cfg(any(test, feature = "test-helpers", feature = "test-transport"))]
 pub use identity::pin_fixture_repository_identity;

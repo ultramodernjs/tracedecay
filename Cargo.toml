@@ -114,6 +114,9 @@ debug-assertions = false
 overflow-checks = false
 incremental = false
 
+[profile.release]
+strip = "symbols"
+
 # panic stays unwind. Production catch_unwind recovers poisoned work.
 [profile.dist]
 inherits = "release"

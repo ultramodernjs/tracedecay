@@ -186,6 +186,25 @@ pub async fn run_typescript_producer_v1(
     )
     .await;
     record_producer_run(project_root, &run, checks);
+    let directory = build_info_dir.to_path_buf();
+    let sweep = native_runtime::spawn_blocking(move || {
+        tracedecay_runtime_core::storage::typescript_cache::sweep_build_info_cache_v1(
+            &directory,
+            tracedecay_runtime_core::storage::typescript_cache::BuildInfoCachePolicyV1::default(),
+            std::time::SystemTime::now(),
+            true,
+        )
+    })
+    .await;
+    match sweep {
+        Ok(Ok(report)) if report.inventory_complete && report.leased_bytes == 0 => {}
+        Ok(Ok(report)) => tracing::warn!(
+            inventory_complete = report.inventory_complete,
+            leased_bytes = report.leased_bytes,
+            "TypeScript cache budget deferred"
+        ),
+        outcome => tracing::warn!(?outcome, "TypeScript cache sweep failed"),
+    }
     run
 }
 
@@ -395,9 +414,29 @@ async fn check_projects(
                             reason: "the TypeScript check admission closed".to_owned(),
                         };
                     };
-                    match run_typescript_compiler(&compiler, &root, &tsconfig, Some(&build_info))
-                        .await
-                    {
+                    let leased_path = build_info.clone();
+                    let lease = match native_runtime::spawn_blocking(move || {
+                        tracedecay_runtime_core::storage::typescript_cache::acquire_build_info_lease_v1(&leased_path)
+                    }).await {
+                        Ok(Ok(lease)) => Arc::new(lease),
+                        outcome => return ProjectResult::Failed {
+                            reason: format!("cannot lease TypeScript build-info: {outcome:?}"),
+                        },
+                    };
+                    // The compiler supervisor must use spawn_owned_blocking so
+                    // its copy survives cancellation until kill/wait returns.
+                    // Preserve any enclosing owner as well as this cache lease.
+                    let owner: Arc<dyn Send + Sync> = Arc::new((
+                        native_runtime::BLOCKING_WORK_OWNER.try_with(Arc::clone).ok(),
+                        Arc::clone(&lease),
+                    ));
+                    let reported = native_runtime::BLOCKING_WORK_OWNER.scope(
+                        owner,
+                        run_typescript_compiler(&compiler, &root, &tsconfig, Some(&build_info)),
+                    ).await;
+                    // Keep the outer copy through synchronous build-info readback.
+                    let _lease = lease;
+                    match reported {
                         Ok(reported) => ProjectResult::Checked {
                             reported: reported.into_iter().map(compiler_diagnostic).collect(),
                             program: program_paths(&root, &build_info),
@@ -526,6 +565,8 @@ pub fn typescript_diagnostics_availability(
 
 #[cfg(test)]
 mod tests {
+    mod storage_hygiene;
+
     use std::collections::BTreeMap;
     use std::path::Path;
 
@@ -796,6 +837,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn only_projects_a_generation_changed_are_rechecked() {
+        storage_hygiene::install_native_runtime();
         let fixture = ProducerFixture::new();
         let mut state = TypeScriptProducerStateV1::default();
         let both = vec![
