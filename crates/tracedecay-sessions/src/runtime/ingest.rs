@@ -1,5 +1,6 @@
 pub mod authority;
 mod failure;
+pub mod profile_ownership;
 mod project;
 pub(in crate::runtime) mod project_provider;
 pub(crate) mod quarantine;

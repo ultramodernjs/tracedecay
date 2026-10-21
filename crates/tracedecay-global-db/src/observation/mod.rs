@@ -2,6 +2,7 @@ pub mod bookkeeping;
 mod canonical_bodies;
 pub mod canonical_lifecycle;
 mod codec;
+pub(crate) mod ownership_read;
 mod persist;
 mod refusal_census;
 pub mod retention;

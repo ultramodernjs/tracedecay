@@ -18,6 +18,9 @@ use super::failure::{
     ProviderRunFold, TranscriptCatchUpFailure, allocate_pass_byte_budgets,
     observation_catch_up_failure, scheduling_write_required, warn_transcript_catch_up_failure,
 };
+use super::profile_ownership::{
+    ProfileOwnershipAdmission, RegisteredRootsReader, SessionIngestRegistryRoots,
+};
 use super::quarantine::SourceSweep;
 use super::scheduler::{
     USER_CATCH_UP_PROVIDERS, USER_INGEST_PROVIDER_FRONTIER_KEY, default_ingest_pass_bounds,
@@ -451,40 +454,57 @@ pub async fn ingest_user_global_sources_for_provider_with_authorities_and_cancel
     provider: Option<SessionProvider>,
     cancellation: &ObservationCancellation,
 ) -> TranscriptIngestOutcome {
-    let registry_shard = &registry_db.shard_id();
+    ingest_user_global_sources_with_registry_bounded(
+        (brain_id, profile_id, registered, registry_db),
+        profile_root,
+        provider,
+        default_ingest_pass_bounds(),
+        cancellation,
+        None,
+    )
+    .await
+    .into_transcript_outcome()
+}
+
+/// Registry-aware bounded ingestion. Unlike the roots-only entry points,
+/// this revalidates ownership before every admission or source cursor write.
+pub async fn ingest_user_global_sources_with_registry_bounded<A: SessionIngestAuthority>(
+    authorities: (&BrainId, &UserProfileId, &A, &A),
+    profile_root: &Path,
+    provider: Option<SessionProvider>,
+    bounds: IngestPassBounds,
+    cancellation: &ObservationCancellation,
+    codex_discovery: Option<(&codex::CodexDiscoveryHub, &str)>,
+) -> IngestPassOutcome {
+    let (brain_id, profile_id, registered, registry_db) = authorities;
+    let registry_shard = registry_db.shard_id();
     if registry_shard.brain_id != *brain_id
         || registry_shard.profile_id != *profile_id
         || registry_shard.scope != StoreShardScopeV1::Profile
     {
-        return TranscriptIngestOutcome::new(
-            TranscriptIngestStats::default(),
-            vec![TranscriptCatchUpFailure::new(
-                provider.map_or("all", SessionProvider::id),
-                "project_registry",
-                "project_registry_authority_mismatch",
-                false,
-            )],
-        );
+        return IngestPassOutcome::failed(TranscriptCatchUpFailure::new(
+            provider.map_or("all", SessionProvider::id),
+            "project_registry",
+            "project_registry_authority_mismatch",
+            false,
+        ));
     }
     let Some(roots) = registered_project_roots_from(registry_db).await else {
-        return TranscriptIngestOutcome::new(
-            TranscriptIngestStats::default(),
-            vec![TranscriptCatchUpFailure::new(
-                provider.map_or("all", SessionProvider::id),
-                "project_registry",
-                "project_registry_unavailable",
-                true,
-            )],
-        );
+        return IngestPassOutcome::failed(TranscriptCatchUpFailure::new(
+            provider.map_or("all", SessionProvider::id),
+            "project_registry",
+            "project_registry_unavailable",
+            true,
+        ));
     };
-    ingest_user_global_sources_for_provider_with_roots_and_cancellation(
-        brain_id,
-        profile_id,
-        registered,
+    ingest_user_global_sources_for_provider_with_roots_bounded_inner(
+        (brain_id, profile_id, registered),
         profile_root,
         provider,
-        roots,
+        (roots, Some(&SessionIngestRegistryRoots(registry_db))),
+        bounds,
         cancellation,
+        codex_discovery,
     )
     .await
 }
@@ -527,7 +547,7 @@ pub async fn ingest_user_global_sources_for_provider_with_roots_bounded<
         registered,
         profile_root,
         provider,
-        roots,
+        (roots, None),
         bounds,
         cancellation,
         None,
@@ -550,7 +570,7 @@ pub(super) async fn ingest_user_global_sources_for_provider_with_roots_bounded_a
         registered,
         profile_root,
         provider,
-        roots,
+        (roots, None),
         bounds,
         cancellation,
         Some(codex_state),
@@ -565,11 +585,12 @@ async fn ingest_user_global_sources_for_provider_with_roots_bounded_inner<
     registered: (&BrainId, &UserProfileId, &A),
     profile_root: &Path,
     provider: Option<SessionProvider>,
-    roots: Vec<PathBuf>,
+    ownership: (Vec<PathBuf>, Option<&dyn RegisteredRootsReader>),
     bounds: IngestPassBounds,
     cancellation: &ObservationCancellation,
     codex_discovery: Option<(&codex::CodexDiscoveryHub, &str)>,
 ) -> IngestPassOutcome {
+    let (roots, registry) = ownership;
     let (brain_id, profile_id, registered) = registered;
     let shard = &registered.shard_id();
     if shard.brain_id != *brain_id
@@ -614,6 +635,11 @@ async fn ingest_user_global_sources_for_provider_with_roots_bounded_inner<
         profile_id,
     });
     let facade = facade.as_ref();
+    let guarded_facade =
+        registry.map(|registry| ProfileOwnershipAdmission::new(facade, registry, &roots));
+    let facade = guarded_facade
+        .as_ref()
+        .map_or(facade, |guarded| guarded as &dyn HostAdmission);
     let mut claude_projected_session_ids = BTreeSet::new();
 
     'providers: for &index in &plan.admitted_indices {

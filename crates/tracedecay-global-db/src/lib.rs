@@ -110,6 +110,7 @@ pub fn register_registered_schema_installer() {
 }
 
 mod session_handle;
+pub mod session_ownership;
 mod session_temporal_handle;
 mod session_temporal_schema;
 mod sqlite_persist;
