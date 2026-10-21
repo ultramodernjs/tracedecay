@@ -374,6 +374,8 @@ pub struct AdminCliStorageReportV1 {
     pub stores: Vec<Value>,
     pub code_generation_retention: Vec<Value>,
     pub code_generation_retention_availability: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_replay_release: Vec<Value>,
     pub unregistered_dir_count: usize,
     pub unregistered_bytes: u64,
     pub global_db_bytes: u64,

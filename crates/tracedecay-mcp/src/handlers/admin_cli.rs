@@ -1084,6 +1084,18 @@ mod tests {
             unregistered_dir_count: 3,
             unregistered_bytes: 4096,
             global_db_bytes: 8192,
+            graph_replay_release: vec![
+                tracedecay_maintenance::retention::storage_report::GraphReplayReleaseBacklogEntryV1 {
+                    project_id: "project.gone".to_owned(),
+                    store_root: "/profile/projects/project.gone/code-index-v1/scope".to_owned(),
+                    pending_release_count: Some(2),
+                    continuation: Some("next-release".to_owned()),
+                    source_liveness: tracedecay_maintenance::store_maintenance::GraphReplayReleaseAuthorityV1::Unvalidated,
+                    reclaimable_segment_bytes: None,
+                    plan: None,
+                    unavailable_reason: None,
+                },
+            ],
             ..Default::default()
         };
         storage.full_profile_size = Some(
