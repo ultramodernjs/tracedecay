@@ -102,6 +102,7 @@ async fn handle_projects_forget(
             ),
         });
     }
+    require_forget_profile_sessions(keep_store)?;
     let profile_root = profile.data_dir().to_path_buf();
     let profile_offline = take_profile_offline(profile, &profile_root, "projects forget")?;
     let outcome = forget_under_profile_offline(
@@ -119,6 +120,15 @@ async fn handle_projects_forget(
         outcome,
         restore,
     )
+}
+
+// Keep this preflight before taking the service offline or mutating registry
+// identity. --keep-store explicitly preserves the independent session archive.
+fn require_forget_profile_sessions(keep_store: bool) -> Result<()> {
+    if keep_store {
+        return Ok(());
+    }
+    tracedecay_global_db::profile_session_prune::require_profile_session_prune_admission()
 }
 
 /// The destructive forget body, run inside the profile-offline window. The
@@ -207,8 +217,16 @@ async fn preview_projects_forget(
             println!("  would delete store {}", data_root.display());
         }
     }
-    println!("Re-run with --yes (without --dry-run) to apply.");
+    println!("{}", forget_profile_session_preview(keep_store));
     Ok(())
+}
+
+fn forget_profile_session_preview(keep_store: bool) -> &'static str {
+    if keep_store {
+        "Profile-session evidence will be retained (--keep-store). Re-run with --yes (without --dry-run) to retire only registry identity."
+    } else {
+        "Apply is disabled: matching profile-session evidence requires integrated retirement and replay suppression first. No registry rows or stores will be removed."
+    }
 }
 
 fn forget_selector_not_found(selector: &str) -> TraceDecayError {
@@ -368,6 +386,48 @@ mod tests {
         CodeProjectRecord, GraphScopeRecord, ProjectAliasRecord, ProjectRegistryContext,
         ProjectStoreContext, StoreArtifactRecord, StoreInstanceRecord,
     };
+
+    #[test]
+    fn forget_requires_profile_session_integration_unless_keep_store_is_explicit() {
+        assert!(
+            require_forget_profile_sessions(false).is_err(),
+            "forget must not discard registry identity before profile-session retirement is integrated"
+        );
+        assert!(
+            require_forget_profile_sessions(true).is_ok(),
+            "--keep-store explicitly preserves profile-session evidence"
+        );
+    }
+
+    #[asupersync::test]
+    async fn confirmed_forget_refuses_before_offline_or_registry_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = ProfileRoot::new(directory.path());
+        let canary = directory.path().join("registry-canary");
+        std::fs::write(&canary, b"keep registry identity and retry intent").unwrap();
+        let error = handle_projects_forget(&profile, "proj_fixture", false, true, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("admission"), "{error}");
+        assert_eq!(
+            std::fs::read(&canary).unwrap(),
+            b"keep registry identity and retry intent"
+        );
+        assert!(
+            !directory.path().join("lifecycle.lock").exists(),
+            "refusal must precede the offline lifecycle window"
+        );
+    }
+
+    #[test]
+    fn forget_preview_explains_profile_session_retention_or_blocker() {
+        assert!(forget_profile_session_preview(true).contains("retained (--keep-store)"));
+        assert!(forget_profile_session_preview(false).contains("Apply is disabled"));
+        assert!(
+            forget_profile_session_preview(false)
+                .contains("No registry rows or stores will be removed")
+        );
+    }
 
     const CREDENTIAL_REMOTE_URL: &str =
         "https://user:sekret-token@github.com/example/private-repo.git";

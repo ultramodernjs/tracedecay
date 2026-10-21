@@ -44,6 +44,7 @@ use tracedecay_store::{
 };
 
 use crate::RegisteredGlobalDb;
+use crate::profile_session_prune::ProjectPruneAuthorization;
 
 const MAX_IDS: usize = 128;
 const MAX_ROWS: usize = 4096;
@@ -60,7 +61,8 @@ pub enum ObservationRetirementReason {
 }
 
 /// Same typed document and key derivation consumed by profile-session exclusion
-/// admission. `approved_plan_digest` is B5's independently reviewed selection.
+/// admission. This is metadata, NOT deletion authority. Public retirement APIs
+/// reject it; B5 must supply its sealed, store-bound lifecycle capability.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectPruneMarker {
     pub source: ObservationSourceIdentityV1,
@@ -675,6 +677,9 @@ async fn plan_on(
     {
         return refused();
     }
+    // Guard even candidates with no anchors. An absent occurrence otherwise
+    // costs a whole-table scan per ID, including under the apply writer.
+    require_index(conn, "session_occurrences", "source_observation_id", "").await?;
     let guards = read_guards(conn).await?;
     let mut plan = ObservationRetirementPlan {
         ids,
@@ -998,6 +1003,37 @@ impl RegisteredGlobalDb {
         ids: &[CanonicalObservationIdV1],
         authorization: ObservationRetirementAuthorization,
     ) -> ProjectionStoreResult<ObservationRetirementPlan> {
+        if matches!(
+            authorization,
+            ObservationRetirementAuthorization::OperatorProjectPrune(_)
+        ) {
+            return refused();
+        }
+        self.plan_retirement_authorized(ids, authorization).await
+    }
+
+    pub(crate) async fn plan_project_prune_retirement(
+        &self,
+        ids: &[CanonicalObservationIdV1],
+        authorization: &ProjectPruneAuthorization<'_>,
+    ) -> ProjectionStoreResult<ObservationRetirementPlan> {
+        if !authorization.authorizes(self, authorization.marker()) {
+            return refused();
+        }
+        self.plan_retirement_authorized(
+            ids,
+            ObservationRetirementAuthorization::OperatorProjectPrune(
+                authorization.marker().clone(),
+            ),
+        )
+        .await
+    }
+
+    async fn plan_retirement_authorized(
+        &self,
+        ids: &[CanonicalObservationIdV1],
+        authorization: ObservationRetirementAuthorization,
+    ) -> ProjectionStoreResult<ObservationRetirementPlan> {
         let mut ids = ids.to_vec();
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let snapshot = self.read_snapshot().await.map_err(storage)?;
@@ -1025,6 +1061,33 @@ impl RegisteredGlobalDb {
         confirmed_digest: &str,
         validator: &impl HandoffProofValidator,
     ) -> ProjectionStoreResult<ObservationRetirementOutcome> {
+        self.apply_retirement_authorized(plan, confirmed_digest, validator, None)
+            .await
+    }
+
+    pub(crate) async fn apply_project_prune_retirement(
+        &self,
+        plan: &ObservationRetirementPlan,
+        confirmed_digest: &str,
+        authorization: &ProjectPruneAuthorization<'_>,
+    ) -> ProjectionStoreResult<ObservationRetirementOutcome> {
+        self.apply_retirement_authorized(plan, confirmed_digest, &NoHandoff, Some(authorization))
+            .await
+    }
+
+    async fn apply_retirement_authorized(
+        &self,
+        plan: &ObservationRetirementPlan,
+        confirmed_digest: &str,
+        validator: &impl HandoffProofValidator,
+        prune: Option<&ProjectPruneAuthorization<'_>>,
+    ) -> ProjectionStoreResult<ObservationRetirementOutcome> {
+        if let ObservationRetirementAuthorization::OperatorProjectPrune(marker) =
+            &plan.authorization
+            && !prune.is_some_and(|authority| authority.authorizes(self, marker))
+        {
+            return refused();
+        }
         if confirmed_digest != plan.digest || plan.store != hash(self.verified_locator())? {
             return refused();
         }

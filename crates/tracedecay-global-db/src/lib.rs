@@ -69,6 +69,7 @@ pub use tracedecay_domain::CoverageStateV1;
 pub use workflow_adapter::GlobalDbWorkflowStore;
 mod observation_store;
 pub mod profile_registry_maintenance;
+pub mod profile_session_prune;
 mod project_registry;
 mod registered;
 mod registered_accounting;

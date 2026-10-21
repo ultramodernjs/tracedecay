@@ -244,7 +244,7 @@ fn marker(observation: &DurableObservationV1) -> ProjectPruneMarker {
 }
 
 #[asupersync::test]
-async fn retirement_prune_deferral_preserves_marker_authority_and_guards() {
+async fn retirement_deferral_preserves_receipt_authority_and_guards() {
     let harness =
         RegisteredGlobalDbHarness::open_without_relation_graph("retirement-rollback").await;
     let db = &harness.registered;
@@ -257,16 +257,15 @@ async fn retirement_prune_deferral_preserves_marker_authority_and_guards() {
         )
         .await
         .unwrap();
-    let authorization = marker(&observation);
-    let (key, _) = authorization.metadata().unwrap();
     let plan = db
         .plan_observation_retirement(
             &[observation.observation_id().clone()],
-            ObservationRetirementAuthorization::OperatorProjectPrune(authorization),
+            ObservationRetirementAuthorization::UnsupportedCodexRecord,
         )
         .await
         .unwrap();
     assert!(!plan.eligible());
+    let key = format!("{RECEIPT_PREFIX}{}", plan.digest());
     assert_eq!(
         plan.tables()
             .iter()
@@ -301,7 +300,7 @@ async fn retirement_prune_deferral_preserves_marker_authority_and_guards() {
     assert_eq!(
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
         0,
-        "marker rolls back with evidence"
+        "receipt rolls back with evidence"
     );
     drop(rows);
     let snapshot = db.read_snapshot().await.unwrap();
@@ -330,7 +329,7 @@ async fn retirement_prune_deferral_preserves_marker_authority_and_guards() {
         .unwrap();
     assert!(
         rows.next().await.unwrap().is_none(),
-        "deferred prune never installs a marker"
+        "deferred retirement never installs a receipt"
     );
     drop(rows);
     for table in [
@@ -635,7 +634,7 @@ async fn retirement_preserves_direct_derived_evidence_without_reverse_lineage() 
 }
 
 #[asupersync::test]
-async fn retirement_prune_preserves_materialized_message_workflow_and_usage() {
+async fn retirement_lifecycle_preserves_materialized_message_workflow_and_usage() {
     use tracedecay_domain::{
         CanonicalMessageRoleV1, CanonicalWorkflowSemanticKindV1, ProviderUsageCounterSemanticsV1,
         ProviderUsageCountersV1, ProviderUsageModelV1, ProviderUsageScopeV1,
@@ -732,7 +731,7 @@ async fn retirement_prune_preserves_materialized_message_workflow_and_usage() {
     let plan = db
         .plan_observation_retirement(
             &[observation.observation_id().clone()],
-            ObservationRetirementAuthorization::OperatorProjectPrune(marker(&observation)),
+            ObservationRetirementAuthorization::LifecycleRetention,
         )
         .await
         .unwrap();
@@ -930,3 +929,65 @@ async fn retirement_refuses_missing_source_occurrence_index_on_populated_store()
 mod hydration_budget;
 
 mod privacy_rescan;
+
+#[asupersync::test]
+async fn retirement_public_api_rejects_fabricated_project_prune_for_live_and_user_sources() {
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-prune-authority").await;
+    let db = &harness.registered;
+    for (index, root) in [(51, "/live/project"), (52, "user")] {
+        let observation = seed_facts(
+            db,
+            index,
+            vec![CanonicalObservationFactV1::Session {
+                project_path: Some(root.into()),
+                location_path: Some(root.into()),
+                transcript_path: None,
+                title: None,
+                started_at: None,
+                ended_at: None,
+                source: None,
+                native_source: None,
+                profile: None,
+                location_provenance: None,
+            }],
+        )
+        .await;
+        let result = db
+            .plan_observation_retirement(
+                &[observation.observation_id().clone()],
+                ObservationRetirementAuthorization::OperatorProjectPrune(marker(&observation)),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "ordinary writer authority and an arbitrary digest cannot authorize pruning {root}"
+        );
+        // Even an old/internal kernel plan is not an apply capability.
+        let snapshot = db.read_snapshot().await.unwrap();
+        let fabricated = plan_on(
+            &snapshot,
+            hash(db.verified_locator()).unwrap(),
+            vec![observation.observation_id().clone()],
+            ObservationRetirementAuthorization::OperatorProjectPrune(marker(&observation)),
+        )
+        .await
+        .unwrap();
+        drop(snapshot);
+        assert!(
+            db.apply_observation_retirement(&fabricated, fabricated.digest())
+                .await
+                .is_err()
+        );
+        assert!(
+            db.apply_observation_retirement_with_handoff(
+                &fabricated,
+                fabricated.digest(),
+                &NoHandoff
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert_eq!(count(db, "observations").await, 2);
+}
