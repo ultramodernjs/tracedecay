@@ -34,11 +34,11 @@ async fn receipt_refs_round_trip_body_and_metadata_authorities() {
     crate::schema::ensure_lcm_schema(&conn).await.unwrap();
     let message = message("message.first", "safe receipt fixture");
     let expected = super::projection_stored_message(&message).unwrap();
-    super::upsert_projection_raw_message(&*conn, &message)
+    super::upsert_projection_raw_message(&*conn, &message, None)
         .await
         .unwrap();
     let second = message_with_id(&message, "message.second");
-    super::upsert_projection_raw_message(&*conn, &second)
+    super::upsert_projection_raw_message(&*conn, &second, None)
         .await
         .unwrap();
     let mut rows = conn
@@ -161,7 +161,7 @@ async fn receipt_compaction_dry_run_resume_and_shared_gc() {
     let original = message("legacy.first", "safe legacy receipt fixture");
     let expected = super::projection_stored_message(&original).unwrap();
     for id in ["legacy.first", "legacy.second", "legacy.third"] {
-        super::upsert_projection_raw_message(&*conn, &message_with_id(&original, id))
+        super::upsert_projection_raw_message(&*conn, &message_with_id(&original, id), None)
             .await
             .unwrap();
     }
@@ -285,9 +285,13 @@ async fn receipt_fixture() -> (tempfile::TempDir, TestConnection) {
     let conn = TestConnection::open(&temp.path().join("receipts.db"));
     conn.execute_batch("CREATE TABLE sessions (provider TEXT NOT NULL, session_id TEXT NOT NULL, project_key TEXT NOT NULL, project_path TEXT NOT NULL, PRIMARY KEY(provider, session_id)); INSERT INTO sessions VALUES ('codex', 'session.receipts', '', '');").await.unwrap();
     crate::schema::ensure_lcm_schema(&conn).await.unwrap();
-    super::upsert_projection_raw_message(&*conn, &message("message.first", "safe receipt fixture"))
-        .await
-        .unwrap();
+    super::upsert_projection_raw_message(
+        &*conn,
+        &message("message.first", "safe receipt fixture"),
+        None,
+    )
+    .await
+    .unwrap();
     (temp, conn)
 }
 
@@ -618,9 +622,13 @@ async fn released_v15_receipt_upgrade_installs_owners_and_survives_reopen() {
             .unwrap(),
         Some(1)
     );
-    super::upsert_projection_raw_message(&*conn, &message_with_id(&original, "compact.second"))
-        .await
-        .unwrap();
+    super::upsert_projection_raw_message(
+        &*conn,
+        &message_with_id(&original, "compact.second"),
+        None,
+    )
+    .await
+    .unwrap();
     let plan = super::receipt_store::plan_receipt_compaction(&*conn, 0, 10, 1024 * 1024)
         .await
         .unwrap();

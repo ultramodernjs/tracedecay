@@ -81,7 +81,7 @@ async fn retained_compression_reads_nonempty_reference_backed_page_and_byte_coun
         source_offset: None,
         metadata_json: None,
     };
-    raw::upsert_projection_raw_message(&*conn, &message)
+    raw::upsert_projection_raw_message(&*conn, &message, None)
         .await
         .unwrap();
     let page = load_raw_messages_for_session_page(

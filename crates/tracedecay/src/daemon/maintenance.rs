@@ -1772,6 +1772,42 @@ mod tests {
         cursor_after_attempted_units, select_store_window,
     };
 
+    async fn seed_registered_graph_sql(profile_root: &Path, checkout: &Path, project_id: &str) {
+        use tracedecay_runtime_core::db::{
+            Database, DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
+            TestRuntimeProfileIdentityV1,
+        };
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
+            .expect("fixture profile identity");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(checkout, project_id)
+            .expect("fixture project enrollment");
+        let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+            checkout,
+            profile_root,
+            project_id,
+        )
+        .expect("fixture layout");
+        tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all(&layout.data_root)
+            .expect("fixture data root");
+        let authority = DatabaseAuthority::acquire_test(&layout.graph_db_path, "seed graph SQL")
+            .expect("fixture authority");
+        let (database, _) = Database::publish_registered_test_runtime_for_profile_identity(
+            &layout.graph_db_path,
+            &authority,
+            TestDatabaseRuntimeMode::Initialize,
+            TestRuntimeProfileIdentityV1::new(
+                identity.brain_id().clone(),
+                identity.profile_id().clone(),
+            ),
+            TestDatabaseRuntimeScope::Project {
+                project_id: tracedecay_domain::ProjectId::new(project_id).expect("project id"),
+            },
+        )
+        .await
+        .expect("seed existing graph SQL without native staging");
+        drop(database);
+    }
+
     #[test]
     fn cadence_rate_limits_failures_and_successes() {
         let started = std::time::Instant::now();
@@ -2229,6 +2265,7 @@ mod tests {
             .upsert_code_project("proj_unmounted", &checkout, None, None, None)
             .await
             .expect("register project");
+        seed_registered_graph_sql(&profile_root, &checkout, &project.project_id).await;
         // The scope hash is derived from the registry's stored canonical
         // root, spelled plainly. Hashing the verbatim `\\?\` spelling
         // `canonicalize` returns on Windows names a directory the tick's
@@ -2552,6 +2589,7 @@ mod tests {
                         ),
                         Path::new(&project.canonical_root),
                     );
+                seed_registered_graph_sql(&profile_root, &checkout, &project.project_id).await;
                 tracedecay_code_index_retention::code_index_generations::fixture::write_generation_store_fixture(&root, 6);
                 generation_root = Some(root);
             }

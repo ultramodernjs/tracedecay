@@ -65,6 +65,7 @@ async fn codex_profile_unknown_membership_defers_without_cursor_advance() {
             admission: &admission,
             meta: &parsed_meta.meta,
             native_thread_id: parsed_meta.native_thread_id.as_deref(),
+            rollout: CodexRolloutFile::of(&path, &parsed_meta.meta.session_id),
             cancellation: &cancellation,
         };
         let source = codex_observation_source_v2("scope-session").unwrap();

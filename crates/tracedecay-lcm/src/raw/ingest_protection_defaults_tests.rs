@@ -137,9 +137,6 @@ async fn inline_upsert_preserves_the_storage_failure_cause() {
 async fn predecessor_range_skips_policy_anchor_roles() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let conn = TestConnection::open(&temp.path().join("sessions.db"));
-    conn.execute_batch(super::receipt_store::SCHEMA)
-        .await
-        .unwrap();
     conn.execute_batch(
         "CREATE TABLE sessions (
             provider TEXT NOT NULL,
