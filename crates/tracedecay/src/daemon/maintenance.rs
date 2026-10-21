@@ -1326,8 +1326,60 @@ impl MaintenanceCoordinator {
                             .await
                         }
                         MaintenanceStoreWork::Registered(store) => {
+                            let scopes = match tracedecay_code_index_retention::code_index_generations::code_index_scopes(&store.data_root) {
+                                Ok(scopes) => scopes,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "scope_inventory_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            if scopes.is_empty() {
+                                return MaintenanceTickOutcome::Complete;
+                            }
+                            let Some(project_id) = key.strip_prefix("r:") else {
+                                return MaintenanceTickOutcome::Retry;
+                            };
+                            let project_id = match tracedecay_domain::ProjectId::new(project_id) {
+                                Ok(project_id) => project_id,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "project_identity_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let layout = match tracedecay_runtime_core::storage::profile_sharded_layout(&store.canonical_root, profile_root, project_id.as_str()) {
+                                Ok(layout) => layout,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "project_layout_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let registry = match administration.registered_runtime_registry().await {
+                                Ok(registry) => registry,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "registered_runtime_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            // The owner must outlive every SQL/replay operation below.
+                            // This admission opens only an existing SQL store, not native staging.
+                            let (_owner, database) = match registry.admit_code_graph_maintenance_database(project_id, [store.canonical_root.clone()]).await {
+                                Ok(admitted) => admitted,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "registered_store_admission_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let profile = match registry.profile_database().await {
+                                Ok(profile) => profile,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "profile_lease_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let lease = ProjectStoreMaintenanceLeaseV1::new(store.canonical_root.clone(), layout, database, registry, profile);
                             run_registered_project_generation_maintenance(
                                 store,
+                                &lease,
                                 &mounted_store_roots,
                                 code_index_schedulers,
                                 profile_database,
