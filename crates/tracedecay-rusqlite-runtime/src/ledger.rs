@@ -8,6 +8,8 @@ mod commit;
 mod error;
 mod idempotency;
 mod prune;
+pub(crate) mod replay_window;
+pub(crate) mod retention;
 mod schema;
 mod sqlite;
 

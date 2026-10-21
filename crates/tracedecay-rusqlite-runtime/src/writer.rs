@@ -1,5 +1,6 @@
 //! One bounded, persistent SQLite writer for one authorized shard.
 
+pub(crate) mod ledger_maintenance;
 mod request;
 mod settlement;
 #[cfg(test)]
