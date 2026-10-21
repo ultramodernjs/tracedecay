@@ -95,7 +95,7 @@ async fn unoffered_source_record_page(
             .query(
                 UNOFFERED_SOURCE_RECORD_PAGE_SQL,
                 params![
-                    source_key.compact.as_str(),
+                    source_key.as_str(),
                     generation,
                     after_observation_id,
                     UNOFFERED_RECORD_PAGE_SIZE
