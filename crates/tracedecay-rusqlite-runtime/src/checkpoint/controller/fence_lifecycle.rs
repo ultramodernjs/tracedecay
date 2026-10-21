@@ -23,6 +23,29 @@ impl WriterCheckpointController {
         })
     }
 
+    /// Admission policy cannot wait for physical RESTART retry backoff. This
+    /// NOOP probe does not backfill frames, reset retry deadlines, or report a
+    /// successful checkpoint. In particular an error before the first fence
+    /// must not leave the drain open as subsequent commits grow the WAL.
+    pub(crate) fn sample_admission_pressure(
+        &mut self,
+        now: Instant,
+    ) -> Result<WalSample, CheckpointError<RusqliteCheckpointError>> {
+        let sample = self.driver.sample_wal().map_err(CheckpointError::Driver)?;
+        self.drain = match self.drain {
+            Drain::Open if sample.bytes >= self.config.hard_wal_bytes => {
+                Drain::Fenced { since: now }
+            }
+            Drain::Expired { retry_at, backoff, .. } => Drain::Expired {
+                retry_at,
+                backoff,
+                wal_bytes: sample.bytes,
+            },
+            drain => drain,
+        };
+        Ok(sample)
+    }
+
     /// Expiry is a policy transition, not another RESTART attempt. Sample the
     /// current WAL so dropping the fence never bypasses the twice-hard ceiling.
     /// If sampling fails, expire conservatively with writes still blocked until

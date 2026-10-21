@@ -649,6 +649,61 @@ fn accumulated_resource_backoff_does_not_delay_hard_fence_deadlines() {
 }
 
 #[test]
+fn open_drain_resource_backoff_still_enforces_wal_admission_pressure() {
+    use std::time::Duration;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut config = AdmissionConfigV1::default();
+            config.wal.soft_limit_bytes = 64 * 1024;
+            config.wal.hard_limit_bytes = 128 * 1024;
+            let fixture = Fixture::with_checkpoint_blockers(
+                config,
+                Arc::new(crate::writer::NoCheckpointBlockers),
+            );
+            fixture.inject("requested_checkpoint", rusqlite::ffi::SQLITE_FULL);
+            // Fail before a physical attempt establishes a hard-pressure fence.
+            fixture.requested_checkpoint().await.unwrap_err();
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+            fixture.requested_checkpoint().await.unwrap_err();
+            fixture.recover_capacity();
+            let attempts = injections().lock().unwrap()[&fixture.path].attempts;
+            assert_eq!(attempts, 2);
+            fixture
+                .handle
+                .execute_batch_async(
+                    "CREATE TABLE wal_padding(payload BLOB);
+                     INSERT INTO wal_padding VALUES(zeroblob(262144));"
+                        .to_owned(),
+                )
+                .await
+                .unwrap();
+            let checkpoint = fixture.writer.checkpoint_handle();
+            tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    if let crate::CheckpointPressure::BlockGeneral { wal, .. } =
+                        checkpoint.pressure()
+                    {
+                        assert!(wal.bytes >= 256 * 1024);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("resource retry delay must not disable WAL admission pressure");
+            assert_eq!(
+                injections().lock().unwrap()[&fixture.path].attempts,
+                attempts,
+                "pressure sampling must not issue an early physical checkpoint"
+            );
+        });
+}
+
+#[test]
 fn terminal_checkpoint_fault_preserves_reason_and_stays_closed() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

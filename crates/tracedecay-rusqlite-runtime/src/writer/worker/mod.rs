@@ -1029,10 +1029,36 @@ impl Worker {
         recovery: &mut retention_writer_recovery::CheckpointFailurePolicy,
     ) {
         let now = Instant::now();
-        if self.state.load(Ordering::Acquire) != WriterState::Ready as u8
-            || checkpoint.defers_scheduled(now)
-            || recovery.defers(now)
-        {
+        if self.state.load(Ordering::Acquire) != WriterState::Ready as u8 {
+            return;
+        }
+        if checkpoint.defers_scheduled(now) || recovery.defers(now) {
+            // Physical checkpoint retries back off, not pressure admission.
+            // This also refreshes the twice-hard ceiling after an expired
+            // fence while new writes are allowed below that ceiling.
+            match checkpoint.sample_admission_pressure(now) {
+                Ok(sample) => {
+                    let pressure = if checkpoint.hard_drain_required() {
+                        CheckpointPressure::BlockGeneral {
+                            wal: CheckpointWal::from_sample(sample),
+                            blockers: self.checkpoint_blockers.checkpoint_blockers(),
+                        }
+                    } else if checkpoint.names_holders(now) {
+                        CheckpointPressure::FenceExpired {
+                            wal: CheckpointWal::from_sample(sample),
+                            holders: self.checkpoint_blockers.checkpoint_blockers(),
+                        }
+                    } else {
+                        CheckpointPressure::Open
+                    };
+                    let _ = self.checkpoint_pressure.send(pressure);
+                }
+                Err(error) => {
+                    if recovery.record_failure(&self.path, "wal_pressure_sample", &error, now) {
+                        self.state.store(WriterState::Faulted as u8, Ordering::Release);
+                    }
+                }
+            }
             return;
         }
         let mut snapshot_blockers = self.checkpoint_blockers.checkpoint_blockers();
