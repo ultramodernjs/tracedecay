@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+mod fence_lifecycle;
+
 use super::driver::{RusqliteCheckpointDriver, RusqliteCheckpointError};
 use super::types::{
     CheckpointBlockers, CheckpointConfig, CheckpointDecision, CheckpointError,

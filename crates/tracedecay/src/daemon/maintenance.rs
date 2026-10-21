@@ -293,11 +293,11 @@ fn log_registered_store_retention_outcome(report: &RegisteredStoreRetentionRepor
                 );
             }
         }
-        Some(Err(_)) => log_daemon_event(
+        Some(Err(error)) => log_daemon_event(
             "retention_degraded",
             &[
                 ("pass", "session_lcm".to_owned()),
-                ("failure", "retention_pass_failed".to_owned()),
+                ("failure", error.to_string()),
             ],
         ),
         None => {}
@@ -316,11 +316,11 @@ fn log_registered_store_retention_outcome(report: &RegisteredStoreRetentionRepor
                 );
             }
         }
-        Some(Err(_)) => log_daemon_event(
+        Some(Err(error)) => log_daemon_event(
             "retention_degraded",
             &[
                 ("pass", "observation".to_owned()),
-                ("failure", "retention_pass_failed".to_owned()),
+                ("failure", error.to_string()),
             ],
         ),
         None => {}
