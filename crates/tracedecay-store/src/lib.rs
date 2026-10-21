@@ -7,6 +7,7 @@
 pub mod canonical_body;
 mod canonical_projection;
 mod codex_goal_context;
+pub mod codex_observation_policy;
 pub mod configuration;
 pub mod cursor_dispatch;
 pub mod diagnostics;

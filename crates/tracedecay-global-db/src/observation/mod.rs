@@ -1,3 +1,4 @@
+pub mod bookkeeping;
 mod canonical_bodies;
 pub mod canonical_lifecycle;
 mod codec;

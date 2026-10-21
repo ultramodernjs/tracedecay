@@ -315,7 +315,7 @@ pub(super) async fn audit_checkpoint_is_plausible(
         .query(
             "SELECT
                 COALESCE((SELECT MAX(rowid) FROM sanitization_receipts), 0),
-                COALESCE((SELECT MAX(sequence) FROM observations), 0),
+                MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'observations'), 0), COALESCE((SELECT MAX(sequence) FROM observations), 0)),
                 COALESCE((SELECT MAX(rowid) FROM source_cursors), 0),
                 COALESCE((SELECT MAX(rowid) FROM source_cursor_advances), 0),
                 COALESCE((SELECT MAX(rowid) FROM observation_projection_provenance), 0),

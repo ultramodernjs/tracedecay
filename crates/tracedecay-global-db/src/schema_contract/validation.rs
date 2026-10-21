@@ -268,6 +268,14 @@ fn validate_indexes_for_table(
         let Some(actual_index) = actual.iter().enumerate().position(|(index, actual)| {
             !matched_actual[index] && index_matches(actual, contract, root_order)
         }) else {
+            // Retirement accelerators are optional for admission, mandatory
+            // for maintenance plans. Never rebuild a large live table here.
+            if contract
+                .name
+                .is_some_and(|name| name.starts_with("idx_retirement_"))
+            {
+                continue;
+            }
             return Err(global_db_operation_message(
                 OPERATION,
                 format!(

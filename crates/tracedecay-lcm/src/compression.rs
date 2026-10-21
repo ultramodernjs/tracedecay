@@ -2845,3 +2845,5 @@ mod authority_tests {
         assert_eq!(candidates[0].summary_text, "current summary");
     }
 }
+
+mod receipt_tests;

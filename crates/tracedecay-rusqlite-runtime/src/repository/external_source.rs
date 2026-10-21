@@ -1368,6 +1368,7 @@ fn persist_frontiers(
     Ok(())
 }
 
+pub mod compaction;
 mod reads;
 mod slim;
 use reads::{

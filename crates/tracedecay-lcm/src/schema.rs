@@ -288,7 +288,9 @@ pub async fn require_admissible_lcm_schema(
 pub async fn ensure_lcm_schema_in_transaction(
     conn: &(impl Executor + ?Sized),
 ) -> Result<(), LcmError> {
-    match require_admissible_lcm_schema(conn).await? {
+    let admission = require_admissible_lcm_schema(conn).await?;
+    raw::receipt_store::ensure_schema(conn).await?;
+    match admission {
         LcmSchemaAdmission::Current => {
             store_schema::retire_named_ledgers(conn)
                 .await
@@ -296,6 +298,7 @@ pub async fn ensure_lcm_schema_in_transaction(
             conn.execute_batch(RETIRE_LEGACY_GREP_INDEX_SQL).await?;
             conn.execute_batch(CANONICAL_BODIES_TABLE_SQL).await?;
             ensure_raw_identity_schema(conn).await?;
+            raw::receipt_store::ensure_owner_triggers(conn).await?;
             ensure_payload_gc_candidates(conn).await?;
             ensure_canonical_body_references(conn).await?;
             super::summary_convergence::ensure_schema(conn).await?;
@@ -419,6 +422,7 @@ pub async fn ensure_lcm_schema_in_transaction(
     )
     .await?;
     ensure_raw_identity_schema(conn).await?;
+    raw::receipt_store::ensure_owner_triggers(conn).await?;
     ensure_payload_gc_candidates(conn).await?;
     ensure_canonical_body_references(conn).await?;
     conn.execute_batch(RAW_FTS_DDL).await?;
@@ -702,6 +706,9 @@ mod tests {
         ))
         .await
         .map_err(|error| error.to_string())?;
+        conn.execute_batch(raw::receipt_store::SCHEMA)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok((temp, conn))
     }
 

@@ -1159,6 +1159,11 @@ async fn install_registered_schema_stage_sequence(
         "initialize registered external source state",
     )
     .await?;
+    observation::bookkeeping::retire::install_indexes(transaction)
+        .await
+        .map_err(|error| {
+            global_db_operation_error("initialize retirement reverse indexes", error)
+        })?;
     transaction
         .execute_batch(EXTERNAL_SOURCE_PENDING_ORDER_INDEX)
         .await

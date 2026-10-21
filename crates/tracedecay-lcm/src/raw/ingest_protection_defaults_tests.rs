@@ -28,6 +28,9 @@ const RAW_MESSAGE_TEST_SCHEMA: &str = "CREATE TABLE lcm_raw_messages (
 async fn exact_identity_reader_rejects_tampered_inline_content() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    conn.execute_batch(super::receipt_store::SCHEMA)
+        .await
+        .unwrap();
     conn.execute_batch(&format!(
         "{CANONICAL_BODIES_TABLE_SQL}{RAW_MESSAGE_TEST_SCHEMA}"
     ))
@@ -57,6 +60,9 @@ async fn exact_identity_reader_rejects_tampered_inline_content() {
 async fn exact_identity_reader_rejects_missing_inline_content() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    conn.execute_batch(super::receipt_store::SCHEMA)
+        .await
+        .unwrap();
     conn.execute_batch(&format!(
         "{CANONICAL_BODIES_TABLE_SQL}{RAW_MESSAGE_TEST_SCHEMA}"
     ))
@@ -86,6 +92,9 @@ async fn exact_identity_reader_rejects_missing_inline_content() {
 async fn inline_upsert_preserves_the_storage_failure_cause() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    conn.execute_batch(super::receipt_store::SCHEMA)
+        .await
+        .unwrap();
     let message = SessionMessageRecord {
         provider: "cursor".to_string(),
         message_id: "message-1".to_string(),
@@ -128,6 +137,9 @@ async fn inline_upsert_preserves_the_storage_failure_cause() {
 async fn predecessor_range_skips_policy_anchor_roles() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let conn = TestConnection::open(&temp.path().join("sessions.db"));
+    conn.execute_batch(super::receipt_store::SCHEMA)
+        .await
+        .unwrap();
     conn.execute_batch(
         "CREATE TABLE sessions (
             provider TEXT NOT NULL,
@@ -211,6 +223,9 @@ async fn predecessor_range_skips_policy_anchor_roles() {
 async fn message_record_readers_restore_compacted_bodies_and_reject_missing_bytes() {
     let temp = tempfile::tempdir().unwrap();
     let conn = TestConnection::open(&temp.path().join("body-record.db"));
+    conn.execute_batch(super::receipt_store::SCHEMA)
+        .await
+        .unwrap();
     conn.execute_batch(&format!(
         "{CANONICAL_BODIES_TABLE_SQL}{RAW_MESSAGE_TEST_SCHEMA}"
     ))

@@ -282,6 +282,12 @@ pub async fn ensure_observation_schema(
             .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
         record_marker(conn, OBSERVATION_REPOSITORY_CAPTURE_DEDUPE_MIGRATION).await?;
     }
+    conn.execute_batch(super::bookkeeping::source_keys::SOURCE_DESCRIPTOR_SCHEMA)
+        .await
+        .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
+    if !migration_recorded(conn, "observation-source-descriptors-v1").await? {
+        record_marker(conn, "observation-source-descriptors-v1").await?;
+    }
     super::canonical_bodies::ensure_canonical_bodies_table(conn).await?;
     super::canonical_lifecycle::ensure_schema(conn).await?;
     Ok(None)

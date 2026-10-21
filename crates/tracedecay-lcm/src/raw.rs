@@ -1,3 +1,9 @@
+#[path = "raw/metadata_writer.rs"]
+mod metadata_writer;
+#[path = "raw/receipt_store.rs"]
+pub mod receipt_store;
+pub use metadata_writer::compare_and_swap_raw_metadata;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::LazyLock;
@@ -24,16 +30,14 @@ use super::{
     LcmSummarySourceRange, payload, security,
 };
 
-pub const RAW_MESSAGE_SELECT_COLUMNS: &str =
+pub const RAW_MESSAGE_SELECT_COLUMNS: &str = concat!(
     "provider, message_id, session_id, store_id, role, ordinal,
-                    timestamp, content, content_hash, storage_kind, payload_ref,
-                    snippet_text, metadata_json,
-                    (SELECT encoding FROM session_canonical_bodies
-                      WHERE content_hash = lcm_raw_messages.content_hash),
-                    (SELECT body FROM session_canonical_bodies
-                      WHERE content_hash = lcm_raw_messages.content_hash),
-                    (SELECT uncompressed_bytes FROM session_canonical_bodies
-                      WHERE content_hash = lcm_raw_messages.content_hash)";
+     timestamp, content, content_hash, storage_kind, payload_ref, snippet_text, json_array(lcm_raw_messages.metadata_json, '' || ",
+    receipt_store::hydrated_metadata!("lcm_raw_messages.metadata_json"),
+    ") AS metadata_json, (SELECT encoding FROM session_canonical_bodies WHERE content_hash = lcm_raw_messages.content_hash),
+     (SELECT body FROM session_canonical_bodies WHERE content_hash = lcm_raw_messages.content_hash),
+     (SELECT uncompressed_bytes FROM session_canonical_bodies WHERE content_hash = lcm_raw_messages.content_hash)"
+);
 fn record_select_columns(alias: &str, text: &str, metadata: &str) -> String {
     format!(
         "{alias}.provider, {alias}.message_id, {alias}.session_id, {alias}.role,
@@ -69,31 +73,81 @@ pub fn message_record_select_columns(alias: &str) -> String {
 /// Reads one message row as a [`SessionMessageRecord`] carrying its whole
 /// stored body, or the placeholder of a body stored outside the row.
 pub fn message_body_record_select_columns(alias: &str) -> String {
-    body_record_select_columns(alias, &served_metadata(alias))
+    body_record_select_columns(alias, &served_metadata(alias), false)
 }
 
 /// Stored metadata retains the protection receipts for verification and re-ingestion.
 pub fn stored_message_record_select_columns(alias: &str) -> String {
-    body_record_select_columns(alias, &format!("{alias}.metadata_json"))
+    body_record_select_columns(alias, &receipt_store::stored_metadata_sql(alias), true)
 }
 
-fn body_record_select_columns(alias: &str, metadata: &str) -> String {
+fn body_record_select_columns(alias: &str, metadata: &str, verify_receipts: bool) -> String {
     let record = record_select_columns(
         alias,
         &format!("COALESCE({alias}.content, {alias}.placeholder_text, '')"),
         metadata,
     );
+    let encoding = format!(
+        "(SELECT encoding FROM session_canonical_bodies WHERE content_hash = {alias}.content_hash)"
+    );
+    // Keep the 19-column record contract, including appended consumers such as
+    // privacy rescan. The private body-read context carries exact stored bytes
+    // beside the encoding so every body decoder can verify receipt hydration.
+    let context = if verify_receipts {
+        format!(
+            "json_object('lcm_receipt_source_v1', {alias}.metadata_json, 'encoding', {encoding})"
+        )
+    } else {
+        encoding
+    };
     format!(
         "{record}, {alias}.content, {alias}.storage_kind, {alias}.content_hash,
-        (SELECT encoding FROM session_canonical_bodies WHERE content_hash = {alias}.content_hash),
+        {context},
         (SELECT body FROM session_canonical_bodies WHERE content_hash = {alias}.content_hash),
         (SELECT uncompressed_bytes FROM session_canonical_bodies WHERE content_hash = {alias}.content_hash)"
     )
 }
 
+#[derive(serde::Deserialize)]
+struct StoredRecordReadContext {
+    lcm_receipt_source_v1: Option<String>,
+    encoding: Option<String>,
+}
+
+/// Exact at-rest metadata bytes for compare-and-swap, not hydrated read bytes.
+/// Accepts only the stored-record selector, not a search/served-record selector.
+pub fn stored_metadata_bytes_from_record_row(
+    row: &Row,
+    offset: i32,
+) -> Result<Option<String>, LcmError> {
+    let context: String = row.get(offset + 16)?;
+    let context: StoredRecordReadContext =
+        serde_json::from_str(&context).map_err(|_| LcmError::PayloadIntegrityMismatch)?;
+    let hydrated: Option<String> = row.get(offset + 12)?;
+    receipt_store::validate_hydration(
+        context.lcm_receipt_source_v1.as_deref(),
+        hydrated.as_deref(),
+    )?;
+    Ok(context.lcm_receipt_source_v1)
+}
+
 /// Decodes the whole text carried by a body-record column list. External
 /// payloads keep their placeholder; missing or corrupt inline bodies fail closed.
 pub fn message_body_from_record_row(row: &Row, offset: i32) -> Result<String, LcmError> {
+    let context: Option<String> = row.get(offset + 16)?;
+    let encoding = if let Some(context) = context.as_deref().filter(|value| value.starts_with('{'))
+    {
+        let context: StoredRecordReadContext =
+            serde_json::from_str(context).map_err(|_| LcmError::PayloadIntegrityMismatch)?;
+        let hydrated: Option<String> = row.get(offset + 12)?;
+        receipt_store::validate_hydration(
+            context.lcm_receipt_source_v1.as_deref(),
+            hydrated.as_deref(),
+        )?;
+        context.encoding
+    } else {
+        context
+    };
     let kind: String = row.get(offset + 14)?;
     match LcmStorageKind::from_db(&kind)
         .ok_or_else(|| LcmError::Db(format!("invalid storage_kind: {kind}")))?
@@ -104,9 +158,7 @@ pub fn message_body_from_record_row(row: &Row, offset: i32) -> Result<String, Lc
                 return Ok(content);
             }
             let hash: String = row.get(offset + 15)?;
-            let encoding = row
-                .get::<Option<String>>(offset + 16)?
-                .ok_or(LcmError::PayloadIntegrityMismatch)?;
+            let encoding = encoding.ok_or(LcmError::PayloadIntegrityMismatch)?;
             let body = row
                 .get::<Option<Vec<u8>>>(offset + 17)?
                 .ok_or(LcmError::PayloadIntegrityMismatch)?;
@@ -117,12 +169,18 @@ pub fn message_body_from_record_row(row: &Row, offset: i32) -> Result<String, Lc
     }
 }
 
-pub const RAW_MESSAGE_METADATA_SELECT_COLUMNS: &str =
+pub const RAW_MESSAGE_METADATA_SELECT_COLUMNS: &str = concat!(
     "provider, message_id, session_id, store_id, role, ordinal,
-                    timestamp, NULL AS content, content_hash, storage_kind, payload_ref,
-                    '' AS snippet_text, metadata_json";
+     timestamp, NULL AS content, content_hash, storage_kind, payload_ref, '' AS snippet_text, json_array(lcm_raw_messages.metadata_json, '' || ",
+    receipt_store::hydrated_metadata!("lcm_raw_messages.metadata_json"),
+    ") AS metadata_json, NULL, NULL, NULL"
+);
 
 pub fn raw_message_metadata_from_row(row: &Row) -> Result<LcmRawMessageMetadata, LcmError> {
+    let packet: String = row.get(12)?;
+    let (stored_metadata, hydrated_metadata): (Option<String>, Option<String>) =
+        serde_json::from_str(&packet).map_err(|_| LcmError::PayloadIntegrityMismatch)?;
+    receipt_store::validate_hydration(stored_metadata.as_deref(), hydrated_metadata.as_deref())?;
     let storage_kind_text: String = row.get(9)?;
     let content_hash: String = row.get(8)?;
     let storage_kind = LcmStorageKind::from_db(&storage_kind_text)
@@ -138,7 +196,7 @@ pub fn raw_message_metadata_from_row(row: &Row) -> Result<LcmRawMessageMetadata,
         content_hash,
         storage_kind,
         payload_ref: row.get(10)?,
-        metadata_json: row.get(12)?,
+        metadata_json: hydrated_metadata,
     })
 }
 
@@ -361,6 +419,8 @@ pub async fn load_raw_message_by_store_id(
 
 pub struct RawMessageUpsert {
     pub projection_text: String,
+    /// At-rest receipt references, safe for replay annotation and re-persistence.
+    /// Semantic consumers hydrate through the raw-message readers.
     pub projection_metadata_json: Option<String>,
 }
 
@@ -559,6 +619,7 @@ async fn upsert_owned_raw_message(
     message: &SessionMessageRecord,
     write: OwnedRawMessageWrite<'_>,
 ) -> Result<(), LcmError> {
+    let compact_metadata = receipt_store::normalize(conn, write.metadata_json).await?;
     let affected = conn
         .execute(
             "INSERT INTO lcm_raw_messages (
@@ -597,7 +658,7 @@ async fn upsert_owned_raw_message(
                 write.storage_kind.as_str(),
                 write.payload_ref,
                 write.placeholder,
-                write.metadata_json,
+                compact_metadata.as_deref(),
                 message.kind.as_deref(),
                 message.model.as_deref(),
                 message.tool_names.as_deref(),
@@ -978,7 +1039,10 @@ pub async fn commit_staged_raw_message(
         persist_raw_predecessor_range(conn, message).await?;
         return Ok(RawMessageUpsert {
             projection_text,
-            projection_metadata_json: staged.prepared.metadata_json,
+            projection_metadata_json: receipt_store::compact(
+                staged.prepared.metadata_json.as_deref(),
+            )?
+            .0,
         });
     };
     payload::upsert_payload_metadata(conn, &whole_message.payload_ref).await?;
@@ -999,7 +1063,10 @@ pub async fn commit_staged_raw_message(
     persist_raw_predecessor_range(conn, message).await?;
     Ok(RawMessageUpsert {
         projection_text: whole_message.placeholder,
-        projection_metadata_json: Some(whole_message.metadata_json),
+        projection_metadata_json: receipt_store::compact(Some(
+            whole_message.metadata_json.as_str(),
+        ))?
+        .0,
     })
 }
 
@@ -1493,6 +1560,10 @@ const fn redaction_pattern(detector: PrivacyDetectorV1) -> &'static str {
         PrivacyDetectorV1::StructureLimit => "structure_limit",
     }
 }
+
+#[cfg(test)]
+#[path = "raw/receipt_store_tests.rs"]
+mod receipt_store_tests;
 
 #[cfg(test)]
 #[path = "raw/ingest_protection_defaults_tests.rs"]
