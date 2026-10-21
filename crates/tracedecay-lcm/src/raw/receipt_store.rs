@@ -191,6 +191,29 @@ pub(crate) async fn ensure_owner_triggers(conn: &(impl Executor + ?Sized)) -> Re
     Ok(())
 }
 
+/// Borrow arbitrary native metadata instead of deserializing its transcript
+/// bodies to owned Values twice on every receipt verification. Only the two
+/// small receipt fields need materialization; RawValue still validates JSON.
+fn receipt_fields(
+    metadata: &str,
+) -> Result<std::collections::BTreeMap<String, &serde_json::value::RawValue>, LcmError> {
+    use serde_json::value::RawValue;
+    type Object<'a> = std::collections::BTreeMap<String, &'a RawValue>;
+    let invalid = |_| LcmError::PayloadIntegrityMismatch;
+    let raw: &RawValue = serde_json::from_str(metadata).map_err(invalid)?;
+    if !raw.get().starts_with('{') {
+        return Ok(Object::new());
+    }
+    let object: Object<'_> = serde_json::from_str(raw.get()).map_err(invalid)?;
+    let Some(protection) = object.get("ingest_protection") else {
+        return Ok(Object::new());
+    };
+    if !protection.get().starts_with('{') {
+        return Ok(Object::new());
+    }
+    serde_json::from_str(protection.get()).map_err(invalid)
+}
+
 pub(super) fn validate_hydration(
     stored: Option<&str>,
     hydrated: Option<&str>,
@@ -198,20 +221,30 @@ pub(super) fn validate_hydration(
     let Some(stored) = stored else {
         return Ok(());
     };
-    let stored: Value =
-        serde_json::from_str(stored).map_err(|_| LcmError::PayloadIntegrityMismatch)?;
-    let hydrated: Value = hydrated
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|_| LcmError::PayloadIntegrityMismatch)?
-        .unwrap_or(Value::Null);
+    let stored = receipt_fields(stored)?;
+    let hydrated = hydrated
+        .map(receipt_fields)
+        .transpose()?
+        .unwrap_or_default();
     for field in FIELDS {
-        let original = &stored["ingest_protection"][field];
-        if let Some(reference) = original.get(REFERENCE)
-            && (original.as_object().map(|object| object.len()) != Some(1)
-                || reference.as_str() != Some(key(&hydrated["ingest_protection"][field])?.as_str()))
-        {
-            return Err(LcmError::PayloadIntegrityMismatch);
+        let original: Value = stored
+            .get(field)
+            .map(|raw| serde_json::from_str(raw.get()))
+            .transpose()
+            .map_err(|_| LcmError::PayloadIntegrityMismatch)?
+            .unwrap_or(Value::Null);
+        if let Some(reference) = original.get(REFERENCE) {
+            let material: Value = hydrated
+                .get(field)
+                .map(|raw| serde_json::from_str(raw.get()))
+                .transpose()
+                .map_err(|_| LcmError::PayloadIntegrityMismatch)?
+                .unwrap_or(Value::Null);
+            if original.as_object().map(|object| object.len()) != Some(1)
+                || reference.as_str() != Some(key(&material)?.as_str())
+            {
+                return Err(LcmError::PayloadIntegrityMismatch);
+            }
         }
     }
     Ok(())
