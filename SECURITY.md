@@ -67,7 +67,6 @@ Outbound capabilities include:
 | Configured remote sources and authorities | Policy-authorized retrieval and remote operations | Configured peer authentication and disclosure policy | Admission or authorization failures are reported; review each peer before enabling |
 | `github.com` | Download binary during `tracedecay upgrade` | None (public releases) | Error shown to user |
 | `huggingface.co` and Hugging Face artifact hosts | Download missing, revision-pinned semantic-model artifacts when semantic auto-download is enabled | None | Semantic retrieval reports model acquisition state or failure; exact, lexical, and graph retrieval remain available |
-| `tracedecay-counter.enzinol.workers.dev` | Aggregate token-savings counter | None | Silently ignored |
 
 Provider usage and pricing do not add an outbound connection. `tracedecay cost`
 reads immutable provider-native usage observations and the deterministic bundled
@@ -119,9 +118,11 @@ Also redact credential-bearing git remotes, database overrides such as `TRACEDEC
 - `tracedecay_run_affected_tests`, compiles and runs the project's own test suite via a `cargo` subprocess (bounded by a configurable wall-clock timeout, default 300 s, and a per-invocation test cap)
 
 The edit tools target a single file with a unique anchor and re-index in place.
-They never run shell commands you did not supply. Network-capable operations
-are limited to the documented release, pricing, semantic-model, telemetry, and
-configured GitHub review paths above. Every editing and state-mutating tool is
+They never run shell commands you did not supply. Outbound operations are
+limited to the documented GitHub release/update and review reads, explicitly
+enabled semantic-model downloads, and configured remote sources and authorities
+above. Bundled pricing and native usage reads
+are local-only and do not make an outbound request. Every editing and state-mutating tool is
 single-file or single-record scoped. There is no bulk-delete or
 recursive-write primitive.
 
@@ -145,9 +146,31 @@ paths.
 
 **Windows:** Authenticode code signing via the [SignPath.io Foundation](https://signpath.io/foundation) program is being rolled out so Windows binaries are signed as part of the release workflow (addresses the Smart App Control block reported in #79). Until that lands in a published release, Windows binaries remain unsigned.
 
-### Opt-in background daemon
+### Required daemon authority; optional service installation
 
-tracedecay installs **no background daemon, system service, or autostart process by default**. Users can explicitly opt in with `tracedecay daemon install-service`, which installs a per-user systemd service on Linux or a per-user LaunchAgent on macOS. The daemon runs with **standard user privileges** and never requests elevation. Index freshness still relies on on-demand staleness checks, catch-up syncs when MCP clients connect, and bounded hook notifications; the daemon provides shared MCP process/socket reuse and scheduled automation for projects that connect to it.
+The **running daemon is required** for daemon-owned operations, including
+`tracedecay init`, project admission, and code-index convergence. If the
+code-index scheduler is unavailable, `init` refuses with the typed
+`code_index_scheduler_unavailable` error before enrollment writes. Status and
+doctor remain read-only diagnostics; they do not start a daemon, repair
+storage, or silently index a project. An unavailable daemon is reported as
+unavailable rather than as a complete or fresh generation.
+
+Installing a persistent background **user service is optional**: TraceDecay
+installs no system service or autostart process by default.
+`tracedecay daemon install-service` explicitly enables per-user service
+management (systemd on Linux, LaunchAgent on macOS, user Task Scheduler on
+Windows). Alternatively, `tracedecay daemon run` starts the same authority
+in the foreground without installing a persistent service. The daemon uses
+standard user privileges and never requests elevation.
+
+The daemon owns freshness and background convergence; hints from hooks, MCP,
+LSP, and workspace events are bounded, while queries report exact
+worktree/generation provenance and typed not-ready coverage instead of
+performing hidden syncs. See the canonical
+[README index-freshness contract](README.md#index-freshness) and
+[user guide daemon lifecycle](docs/USER-GUIDE.md#daemon-service)
+for operations and recovery.
 
 ### Unsafe code
 
@@ -169,7 +192,6 @@ an old count of unsafe sites is not a security guarantee.
 
 The following are **not** security issues:
 
-- The aggregate token counter sending a count to the public Cloudflare Worker endpoint (this is documented behavior and contains no identifying information beyond an approximate country derived from IP by Cloudflare)
 - The database containing symbol names or file paths from your project (this is core functionality)
 - The MCP edit tools modifying files (this is opt-in functionality your AI agent invokes through its own tool-approval flow)
 - `tracedecay_run_affected_tests` compiling and running your project's own test suite (this is the tool's documented purpose)

@@ -601,6 +601,7 @@ async fn canonical_retention_preserves_shared_bytes() -> Result<(), String> {
                 source_offset: None,
                 metadata_json: None,
             },
+            None,
         )
         .await
         .map_err(|error| error.to_string())?;

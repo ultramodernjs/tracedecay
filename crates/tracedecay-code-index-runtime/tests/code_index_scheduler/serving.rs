@@ -2244,7 +2244,7 @@ fn text_artifact_ceilings_reserve_through_process_resident_memory() {
                     resident_bytes: live_bytes,
                     unreclaimable_bytes: live_bytes,
                     swapped_bytes: 0,
-                    cgroup_committed_bytes: None,
+                    cgroup_headroom_bytes: None,
                 })
             }),
         ));

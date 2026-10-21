@@ -35,11 +35,13 @@ pub struct HookOrchestrationRequestV1 {
     pub lifecycle: Option<ContextScoutLifecycleAddressV1>,
     pub hook_configuration_revision: u64,
     pub trigger: HookOrchestrationTriggerV1,
+    /// Immutable order from the event's host admission ledger.
+    pub admission_order: Option<u64>,
     explicit_request_id: Option<ManifestDigest>,
     #[cfg(any(test, feature = "test-helpers"))]
-    pub completion: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    pub completion: Option<Arc<dyn Fn(HookOrchestrationSettlementV1) + Send + Sync + 'static>>,
     #[cfg(not(any(test, feature = "test-helpers")))]
-    completion: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    completion: Option<Arc<dyn Fn(HookOrchestrationSettlementV1) + Send + Sync + 'static>>,
 }
 
 impl HookOrchestrationRequestV1 {
@@ -74,6 +76,7 @@ impl HookOrchestrationRequestV1 {
             lifecycle,
             hook_configuration_revision: configuration_revision,
             trigger,
+            admission_order: None,
             explicit_request_id: None,
             completion: None,
         })
@@ -88,10 +91,18 @@ impl HookOrchestrationRequestV1 {
                 lifecycle: self.lifecycle.clone(),
                 hook_configuration_revision: self.hook_configuration_revision,
                 trigger: HookOrchestrationTriggerV1::IntentBoundary,
+                admission_order: self.admission_order,
                 explicit_request_id: None,
                 completion: None,
             })
     }
+}
+
+/// Why an admitted producer obligation reached its terminal state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookOrchestrationSettlementV1 {
+    Completed,
+    Superseded,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,7 +139,8 @@ type HookOrchestrationEventKeyV1 = ([u8; 16], [u8; 16], [u8; 16], Option<Manifes
 /// Stable per-session work address of one lane. A newer boundary at the same
 /// address supersedes the running one instead of queueing behind it.
 type HookOrchestrationAddressV1 = String;
-type HookOrchestrationCompletionV1 = Arc<dyn Fn() + Send + Sync + 'static>;
+type HookOrchestrationCompletionV1 =
+    Arc<dyn Fn(HookOrchestrationSettlementV1) + Send + Sync + 'static>;
 
 /// Where one boundary falls in its host's order: the provider's native
 /// sequence when both boundaries carry one, else the capture time.
@@ -167,6 +179,7 @@ impl HookOrchestrationBoundaryOrderV1 {
 struct HookOrchestrationInFlightEntryV1 {
     event: HookOrchestrationEventKeyV1,
     boundary: HookOrchestrationBoundaryOrderV1,
+    admission_order: Option<u64>,
     lifecycle: Option<ContextScoutLifecycleAddressV1>,
     cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
     superseded: std::sync::atomic::AtomicBool,
@@ -288,7 +301,7 @@ impl BoundedHookOrchestratorV1 {
         emit_terminal: bool,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
-        let completions = {
+        let (completions, superseded) = {
             let mut in_flight = in_flight
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -319,11 +332,24 @@ impl BoundedHookOrchestratorV1 {
             // free while it still looks in flight. Its terminals, the host's
             // cue to send the session's next boundary, follow.
             drop(permit);
-            completions
+            // A cooperative producer can return a retryable result after the
+            // outer select polled cancellation. The same incumbent lock owns
+            // supersession and removal, so its proof remains terminal even
+            // when the work result itself does not report completion.
+            (
+                completions,
+                operation
+                    .superseded
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
         };
-        if emit_terminal {
+        if emit_terminal || superseded {
             for completion in completions {
-                completion();
+                completion(if superseded {
+                    HookOrchestrationSettlementV1::Superseded
+                } else {
+                    HookOrchestrationSettlementV1::Completed
+                });
             }
         }
     }
@@ -440,15 +466,23 @@ impl BoundedHookOrchestratorV1 {
             {
                 return Err(HookOrchestrationAdmissionV1::Backpressured);
             }
-            // Supersession settles the incumbent's receipt, which is only
-            // honest when the successor is the newer boundary. A redriven
-            // older boundary (for example one whose superseded cycle is still
-            // committing its completion) must not settle the newer boundary's
-            // owed work; the newer cycle subsumes it, so it joins that cycle.
+            // Durable ledger order is authoritative when both boundaries have
+            // it. A delayed replay must not cancel a newer live boundary.
             if let Some(incumbent) = in_flight.addresses.get(&address)
-                && boundary.precedes(incumbent.boundary)
+                && boundary.producer == incumbent.boundary.producer
             {
-                return Self::join_incumbent(incumbent, completion);
+                match (request.admission_order, incumbent.admission_order) {
+                    (Some(incoming), Some(active)) if incoming < active => {
+                        return Err(HookOrchestrationAdmissionV1::Backpressured);
+                    }
+                    // Without comparable ledger order, retain the native
+                    // sequence/capture-time guard: older work joins the newer
+                    // cycle instead of settling its still-owed obligation.
+                    (None, _) | (_, None) if boundary.precedes(incumbent.boundary) => {
+                        return Self::join_incumbent(incumbent, completion);
+                    }
+                    _ => {}
+                }
             }
             let permit = if let Some(incumbent) = in_flight.addresses.remove(&address) {
                 // A newer boundary at the same stable address supersedes the
@@ -473,6 +507,7 @@ impl BoundedHookOrchestratorV1 {
             let operation = Arc::new(HookOrchestrationInFlightEntryV1 {
                 event: event.clone(),
                 boundary,
+                admission_order: request.admission_order,
                 lifecycle: request.lifecycle.clone(),
                 cancellation: work_cancellation,
                 superseded: std::sync::atomic::AtomicBool::new(false),
@@ -719,7 +754,8 @@ pub fn admit_registered_hook_orchestration(
     lifecycle: Option<ContextScoutLifecycleAddressV1>,
     configuration_revision: u64,
     explicit: bool,
-    completion: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    admission_order: Option<u64>,
+    completion: Option<Arc<dyn Fn(HookOrchestrationSettlementV1) + Send + Sync + 'static>>,
 ) -> HookOrchestrationAdmissionV1 {
     // Any other hook of a session that now carries a lifecycle is the event a
     // boundary parked for that session waits on.
@@ -745,6 +781,7 @@ pub fn admit_registered_hook_orchestration(
     {
         runtime.resume_parked(request.hook.envelope(), lifecycle);
     }
+    request.admission_order = admission_order;
     let intent_companion = request.intent_companion();
     request.completion = completion;
     let admission = runtime.admit(request);
@@ -800,8 +837,9 @@ pub(super) async fn run_registered_context_scout_request(
         lifecycle: Some(lifecycle),
         hook_configuration_revision,
         trigger: HookOrchestrationTriggerV1::Explicit,
+        admission_order: None,
         explicit_request_id: Some(effect_identity),
-        completion: Some(Arc::new(move || {
+        completion: Some(Arc::new(move |_settlement| {
             if let Ok(mut completed) = completed.lock()
                 && let Some(completed) = completed.take()
             {

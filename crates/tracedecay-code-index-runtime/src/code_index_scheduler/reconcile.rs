@@ -534,6 +534,7 @@ pub(crate) struct SourceFreshnessFenceV1 {
     /// never walked source instead of inferring it from elapsed time.
     #[cfg(test)]
     source_sweeps: Arc<AtomicU64>,
+    pending_source: Option<Arc<dyn super::CodeIndexSourcePendingReaderV1>>,
 }
 
 #[derive(Clone)]
@@ -573,6 +574,7 @@ impl SourceFreshnessFenceV1 {
             sweep_cache: Arc::new(Mutex::new(SourceSweepCacheV1::new(path_policy))),
             #[cfg(test)]
             source_sweeps: Arc::new(AtomicU64::new(0)),
+            pending_source: None,
         }
     }
 
@@ -580,6 +582,30 @@ impl SourceFreshnessFenceV1 {
     #[cfg(test)]
     pub(super) fn source_sweeps_for_test(&self) -> u64 {
         self.source_sweeps.load(Ordering::Acquire)
+    }
+
+    pub(super) fn pending_source_reader(
+        &self,
+    ) -> Option<Arc<dyn super::CodeIndexSourcePendingReaderV1>> {
+        self.pending_source.clone()
+    }
+
+    pub(super) fn read_pending_source(
+        &self,
+    ) -> Result<bool, tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1>
+    {
+        self.pending_source
+            .as_ref()
+            .map_or(Ok(false), |reader| reader.read_pending())
+    }
+
+    pub(super) fn read_pending_source_blocking(
+        &self,
+    ) -> Result<bool, tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1>
+    {
+        self.pending_source
+            .as_ref()
+            .map_or(Ok(false), |reader| reader.read_pending_blocking())
     }
 
     fn snapshot(&self) -> SourceFreshnessFenceStateV1 {
@@ -681,6 +707,9 @@ impl SourceFreshnessFenceV1 {
         project_root: &Path,
         shutting_down: &AtomicBool,
     ) -> bool {
+        if !self.read_pending_source().is_ok_and(|pending| !pending) {
+            return false;
+        }
         let state = self.snapshot();
         self.proof_is_unmoved(&state, project_root, shutting_down)
     }
@@ -1414,6 +1443,13 @@ impl CodeIndexWorktreeSchedulerV1 {
 
     pub fn last_reconciled_at_micros_slot(&self) -> Arc<AtomicI64> {
         Arc::clone(&self.freshness_fence.last_reconciled_at_micros)
+    }
+
+    pub(super) fn bind_pending_source_reader(
+        &mut self,
+        reader: Option<Arc<dyn super::CodeIndexSourcePendingReaderV1>>,
+    ) {
+        self.freshness_fence.pending_source = reader;
     }
 
     pub(crate) fn freshness_fence(&self) -> SourceFreshnessFenceV1 {

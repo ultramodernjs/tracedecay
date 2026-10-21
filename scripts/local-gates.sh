@@ -154,7 +154,9 @@ repo_gates() {
     run_step python3 scripts/check-rust-cache-lineage.py
     run_step python3 scripts/test-check-packaged-lsp-bridge.py
     run_step python3 scripts/test-build-mcpb.py
-    run_step python3 scripts/test-check-packaged-mcp-stdio.py
+    # Preserve the NCM release contract after upstream retired crate acceptance.
+    run_step python3 -B scripts/test-check-distribution-feature-wiring.py
+    run_step python3 -B scripts/check-distribution-feature-wiring.py
     run_step python3 scripts/test-package-release-archive.py
     run_step python3 scripts/test-check-release-artifacts.py
     run_step python3 scripts/test-check-dev-skill-mirrors.py

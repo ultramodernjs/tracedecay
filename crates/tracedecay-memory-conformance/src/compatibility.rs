@@ -4338,15 +4338,11 @@ fn legacy_attribution_honest(attribution: Option<&Value>, record: &Value) -> boo
             return false;
         }
     }
-    if !fields.contains_key("/origin_scope")
-        && attribution
+    fields.contains_key("/origin_scope")
+        || attribution
             .pointer("/origin_scope/state")
             .and_then(Value::as_str)
-            != Some("unavailable")
-    {
-        return false;
-    }
-    true
+            == Some("unavailable")
 }
 
 fn bounded_opaque_text(value: &str, maximum: usize) -> bool {

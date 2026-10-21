@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
+use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
 
@@ -43,6 +44,8 @@ mod forked_session_tests;
 mod meta_cache_tests;
 #[cfg(test)]
 mod retired_source_tests;
+#[cfg(test)]
+mod rollout_source_tests;
 
 const CODEX_OBSERVATION_RETENTION: &str = "retention.provider-observation";
 pub const CODEX_HOOK_MAX_NEW_BYTES: u64 = crate::runtime::source::MAX_JSONL_RECORD_BYTES as u64;
@@ -452,7 +455,7 @@ impl CodexObservationAdmission<'_> {
         &'b self,
         session_cwd: &'b Path,
         record_cwd: &'b Path,
-        transcript_path: &'b Path,
+        transcript_path: Option<&'b Path>,
         model: Option<&'b str>,
     ) -> CodexObservationContext<'b> {
         let project_path = match self {
@@ -462,7 +465,7 @@ impl CodexObservationAdmission<'_> {
         CodexObservationContext {
             project_path: Some(project_path),
             location_path: Some(record_cwd),
-            transcript_path: Some(transcript_path),
+            transcript_path,
             model,
         }
     }
@@ -481,12 +484,11 @@ struct CodexAdmissionContext<'a> {
     admission: &'a dyn HostAdmission,
     meta: &'a super::meta::CodexMeta,
     native_thread_id: Option<&'a str>,
+    rollout: CodexRolloutFile<'a>,
     cancellation: &'a ObservationCancellation,
 }
 
 fn replay_identity(session_id: &str, domain: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update([0]);
@@ -505,6 +507,55 @@ pub fn codex_observation_source_v2(
             b"tracedecay.codex.observation-source.v2",
         ))?,
     )?)
+}
+
+/// Codex `thread/revert` keeps the thread id and writes a new rollout named
+/// `rollout-<ts>-<thread>_<rollout>.jsonl` and leaves the original
+/// `rollout-<ts>-<thread>.jsonl` in place.
+#[derive(Clone, Copy)]
+enum CodexRolloutFile<'a> {
+    Thread,
+    Revert { rollout_id: &'a str },
+}
+
+impl<'a> CodexRolloutFile<'a> {
+    fn of(rollout: &'a Path, session_id: &str) -> Self {
+        rollout
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("rollout-"))
+            .and_then(|name| name.strip_suffix(".jsonl"))
+            .filter(|stem| stem.get(19..20) == Some("-"))
+            .and_then(|stem| stem.get(20..))
+            .and_then(|ids| ids.strip_prefix(session_id))
+            .and_then(|ids| ids.strip_prefix('_'))
+            .filter(|rollout_id| !rollout_id.is_empty() && *rollout_id != session_id)
+            .map_or(Self::Thread, |rollout_id| Self::Revert { rollout_id })
+    }
+
+    fn source(self, session_id: &str) -> TranscriptIngestResult<ObservationSourceIdentityV1> {
+        let Self::Revert { rollout_id } = self else {
+            return codex_observation_source_v2(session_id);
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"tracedecay.codex.observation-source.revert-rollout.v1");
+        hasher.update([0]);
+        hasher.update(session_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(rollout_id.as_bytes());
+        Ok(ObservationSourceIdentityV1::for_provider_source(
+            ProviderId::new(PROVIDER)?,
+            SessionId::new(session_id.to_string())?,
+            SessionId::new(format!(
+                "sha256:{}",
+                encode_lowercase_hex(&hasher.finalize())
+            ))?,
+        )?)
+    }
+
+    fn session_transcript(self, rollout: &Path) -> Option<&Path> {
+        matches!(self, Self::Thread).then_some(rollout)
+    }
 }
 
 async fn shared_session_meta_with_provenance(
@@ -664,13 +715,15 @@ async fn try_admit_codex_jsonl_observations(
         }
         profile @ CodexObservationAdmission::Profile { .. } => profile,
     };
-    let canonical_source = codex_observation_source_v2(&meta.session_id)?;
+    let rollout = CodexRolloutFile::of(path, &meta.session_id);
+    let canonical_source = rollout.source(&meta.session_id)?;
     let context = CodexAdmissionContext {
         path,
         scope: &admission_scope,
         admission,
         meta: &meta,
         native_thread_id: native_thread_id.as_deref(),
+        rollout,
         cancellation,
     };
     let scope = admission_scope.scope();
@@ -694,6 +747,7 @@ async fn admit_codex_jsonl_page(
         admission,
         meta,
         native_thread_id,
+        rollout,
         cancellation,
     } = context;
     let scope = admission_scope.scope();
@@ -786,7 +840,7 @@ async fn admit_codex_jsonl_page(
                     admission_scope.observation_context(
                         meta.cwd.as_path(),
                         state.context.cwd.as_path(),
-                        path,
+                        rollout.session_transcript(path),
                         state.context.model.as_deref(),
                     ),
                 )?;
