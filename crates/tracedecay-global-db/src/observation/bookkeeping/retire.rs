@@ -1,9 +1,8 @@
 //! Registered observation retirement; apply owns the writer transaction.
 //!
-//! Sequence deletion is currently disabled: all existing observations report
-//! `ProjectionSequenceCoverageUnavailable` until every projection/rebuild
-//! consumer understands durable retirement coverage. Planning remains read-only;
-//! confirmed apply defers before any marker, deletion or disposition mutation.
+//! Deleted sequence identities are coalesced into durable ranges in the same
+//! transaction as the evidence cascade. Projection, rejection and rebuild
+//! consumers verify those ranges before crossing gaps. Planning remains read-only.
 //! Canonical-body compressed bytes and expanded references share the 8-MiB batch
 //! budget with selected column bytes and are preflighted before hydration.
 //!
@@ -170,10 +169,6 @@ pub enum RetirementBlocker {
     LegalHold,
     SourceFrontier,
     RetainedAnchorDerivative,
-    /// Projection, rejection and rebuild consumers still require a contiguous
-    /// observation stream. Never delete a sequence until they all understand
-    /// transactionally persisted retirement coverage.
-    ProjectionSequenceCoverageUnavailable,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -320,6 +315,7 @@ const GUARDS: &[&str] = &[
     "observation_admission_refusals_immutable_delete",
     "observation_provider_usage_no_delete",
     "session_temporal_observation_effects_immutable_delete_v1",
+    "observation_retired_sequences_immutable_delete",
 ];
 
 /// Installed only on empty tables during admission, never by a dry-run or
@@ -931,12 +927,6 @@ async fn plan_on(
             // rather than hydrate their bodies merely to report another blocker.
             _ => {}
         }
-        // Source cursor coverage is not projector sequence coverage. Scalar and
-        // window projection, rejection and rebuild frontiers still require every
-        // sequence, including queued skips and already-projected interior rows.
-        // Keep this gate unconditional until all those consumers can verify
-        // durable retired-sequence coverage; apply re-plans under its writer.
-        blockers.push(RetirementBlocker::ProjectionSequenceCoverageUnavailable);
         plan.candidates.push(RetirementCandidate {
             observation_id: id.clone(),
             payload_digest,
@@ -1167,6 +1157,12 @@ impl RegisteredGlobalDb {
             transaction.execute("INSERT INTO source_cursor_advances(source_json,scope_json,coverage_json,reason,receipt_id) VALUES (?1,?2,?3,'duplicate_observation',?4) ON CONFLICT(source_json,scope_json,coverage_json) DO NOTHING", params![coverage.source_json.as_str(), coverage.scope_json.as_str(), coverage.coverage_json.as_str(), coverage.receipt_id.as_str()]).await.map_err(storage)?;
         }
         for id in &current.ids {
+            let sequence = scalar(
+                &transaction,
+                "SELECT sequence FROM observations WHERE observation_id=?1",
+                id.as_str(),
+            )
+            .await?;
             // Retract derived output through its existing shared-owner reducer.
             // Settled records are intentionally NOT skipped by our cascade.
             crate::observation_projection::retire_source_record(&transaction, id.as_str()).await?;
@@ -1179,6 +1175,7 @@ impl RegisteredGlobalDb {
                     .await
                     .map_err(storage)?;
             }
+            crate::observation::retired_sequences::record(&transaction, sequence).await?;
         }
         // Keep sequence-bearing anchor identity/ledger rows, but terminate
         // servability through the canonical state machine in this transaction.

@@ -169,7 +169,7 @@ async fn retirement_external_journals_pin_only_their_own_dependency_closure() {
         db.apply_observation_retirement(&unrelated_plan, unrelated_plan.digest())
             .await
             .unwrap(),
-        ObservationRetirementOutcome::Deferred
+        ObservationRetirementOutcome::Applied { observations: 1 }
     );
     let plan = db
         .plan_observation_retirement(
@@ -212,6 +212,6 @@ async fn retirement_external_journals_pin_only_their_own_dependency_closure() {
             .unwrap(),
         ObservationRetirementOutcome::Deferred
     );
-    assert_eq!(count(db, "observations").await, 2);
+    assert_eq!(count(db, "observations").await, 1);
     assert_eq!(count(db, "external_source_mutations_v1").await, 1);
 }

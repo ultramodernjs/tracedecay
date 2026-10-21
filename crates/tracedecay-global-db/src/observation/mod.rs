@@ -6,6 +6,7 @@ pub(crate) mod ownership_read;
 mod persist;
 mod refusal_census;
 pub mod retention;
+pub(crate) mod retired_sequences;
 mod schema;
 pub mod unsupported_codex;
 

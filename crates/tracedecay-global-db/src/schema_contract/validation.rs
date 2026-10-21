@@ -368,7 +368,8 @@ async fn validate_observation_autoincrement(
                   AND version = 1
              ),
              COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'observations'), 0),
-             COALESCE((SELECT MAX(sequence) FROM observations), 0)",
+             MAX(COALESCE((SELECT MAX(sequence) FROM observations), 0),
+                 COALESCE((SELECT last_sequence FROM observation_retired_sequences ORDER BY first_sequence DESC LIMIT 1), 0))",
             (),
         )
         .await

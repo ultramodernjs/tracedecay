@@ -1517,7 +1517,21 @@ async fn validate_projection_authority_suffix_pages(
         let mut detailed_limit_reached = false;
         while let Some(row) = rows.next().await.map_err(audit_read_error)? {
             page_rows += 1;
-            scan_cursor = row.get::<i64>(0).map_err(audit_read_error)?;
+            let sequence = row.get::<i64>(0).map_err(audit_read_error)?;
+            if sequence > scan_cursor + 1
+                && !crate::observation::retired_sequences::covers(
+                    conn,
+                    scan_cursor + 1,
+                    sequence - 1,
+                )
+                .await
+                .map_err(|error| authority_violation(error.to_string()))?
+            {
+                return Err(authority_violation(
+                    "unexplained observation sequence gap before projection frontier",
+                ));
+            }
+            scan_cursor = sequence;
             let observation_receipt_id = row.get::<String>(2).map_err(audit_read_error)?;
             let state = ProjectionAuthorityState {
                 provenance_rows: row.get(3).map_err(audit_read_error)?,
@@ -1649,6 +1663,19 @@ async fn validate_projection_authority_suffix_pages(
         pages_audited += 1;
         checkpoint.projection_checkpoint = scan_cursor;
         if page_rows < OBSERVATION_AUDIT_PAGE_ROWS && !detailed_limit_reached {
+            if scan_cursor < current_projection_checkpoint
+                && !crate::observation::retired_sequences::covers(
+                    conn,
+                    scan_cursor + 1,
+                    current_projection_checkpoint,
+                )
+                .await
+                .map_err(|error| authority_violation(error.to_string()))?
+            {
+                return Err(authority_violation(
+                    "unexplained observation sequence gap before projection frontier",
+                ));
+            }
             checkpoint.projection_checkpoint = current_projection_checkpoint;
             break;
         }

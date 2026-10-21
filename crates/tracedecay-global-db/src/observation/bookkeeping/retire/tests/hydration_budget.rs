@@ -89,8 +89,7 @@ async fn retirement_refuses_oversized_canonical_body_before_hydration() {
     let db = &harness.registered;
     let observation = large_message(db, 131, MAX_BYTES as usize + 1, 1).await;
     let ids = [observation.observation_id().clone()];
-    let authorization =
-        ObservationRetirementAuthorization::OperatorProjectPrune(marker(&observation));
+    let authorization = ObservationRetirementAuthorization::LifecycleRetention;
     assert_eq!(count(db, "session_canonical_bodies").await, 1);
     let snapshot = db.read_snapshot().await.unwrap();
     let mut rows = snapshot
@@ -147,7 +146,7 @@ async fn retirement_charges_repeated_body_expansions_cumulatively() {
         matches!(
             db.plan_observation_retirement(
                 &[observation.observation_id().clone()],
-                ObservationRetirementAuthorization::OperatorProjectPrune(marker(&observation)),
+                ObservationRetirementAuthorization::LifecycleRetention,
             )
             .await,
             Err(ProjectionStoreError::ProvenanceCollision)
@@ -210,7 +209,7 @@ async fn retirement_apply_rechecks_canonical_hydration_budget() {
     let plan = db
         .plan_observation_retirement(
             &[observation.observation_id().clone()],
-            ObservationRetirementAuthorization::OperatorProjectPrune(marker(&observation)),
+            ObservationRetirementAuthorization::LifecycleRetention,
         )
         .await
         .unwrap();

@@ -240,7 +240,10 @@ impl RegisteredGlobalDb {
                     .await
                     .map_err(|error| storage("record source rewrite", error))?;
                 transaction
-                    .execute("DELETE FROM observation_source_rewrites WHERE source_key = ?1", params![key.legacy.as_str()])
+                    .execute(
+                        "DELETE FROM observation_source_rewrites WHERE source_key = ?1",
+                        params![key.legacy.as_str()],
+                    )
                     .await
                     .map_err(|error| storage("settle legacy source rewrite", error))?;
                 Ok(())
