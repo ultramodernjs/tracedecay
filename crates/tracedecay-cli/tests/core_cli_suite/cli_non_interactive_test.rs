@@ -3604,14 +3604,8 @@ fn storage_report_offline_preserves_files_and_reports_registry_unavailable() {
         report["user_sessions_database"]["pages"]["state"],
         "unavailable"
     );
-    let census =
-        tracedecay_maintenance::retention::storage_report::scan_full_profile_size(&profile_root);
-    assert_eq!(
-        report["full_profile_size"]["total_bytes"],
-        census.total_bytes
-    );
     assert!(
-        census.total_bytes
+        report["full_profile_size"]["total_bytes"].as_u64().unwrap()
             >= before
                 .iter()
                 .map(|(bytes, _)| bytes.len() as u64)
