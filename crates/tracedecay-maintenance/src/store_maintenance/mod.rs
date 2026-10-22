@@ -589,6 +589,12 @@ pub async fn run_registered_code_generation_retention(
             return CodeGenerationRetentionOutcomeV1::Failed;
         }
     };
+    observations.record_project_maintenance_scopes(
+        &store.canonical_root,
+        scopes
+            .iter()
+            .filter_map(|scope| scope.recorded_root.clone()),
+    );
     let graph_replay_pool_root = store
         .data_root
         .join(tracedecay_runtime_core::config::DB_FILENAME)

@@ -477,6 +477,9 @@ pub struct StoreTelemetrySamplingRegistry {
     /// Where table-growth state survives a restart; `None` keeps it in memory.
     table_growth_state_path: Option<PathBuf>,
     graph_replay_release: Arc<std::sync::Mutex<HashMap<PathBuf, GraphReplayReleaseProgressV1>>>,
+    /// Recorded while an admitted project's scope inventory is processed, not
+    /// by a fresh all-project filesystem scan on every daemon tick.
+    maintenance_scope_owners: Arc<std::sync::Mutex<HashMap<PathBuf, PathBuf>>>,
     graph_staging_release:
         Arc<std::sync::Mutex<HashMap<PathBuf, tracedecay_store::GraphProjectionIdentityV1>>>,
     /// Whether the by-design quiet `retry` tick line has already been written.
@@ -637,20 +640,50 @@ impl StoreTelemetrySamplingRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.maintenance_scope_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.quiet_retry_tick_logged.store(false, Ordering::Release);
         self.loud_retention_this_tick
             .store(false, Ordering::Release);
     }
 
+    /// Replace one admitted project's successfully inventoried scope ownership.
+    /// Failed inventories must leave the previous ownership intact.
+    pub fn record_project_maintenance_scopes(
+        &self,
+        project_root: &Path,
+        scopes: impl IntoIterator<Item = PathBuf>,
+    ) {
+        let mut owners = self
+            .maintenance_scope_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.retain(|_, owner| owner != project_root);
+        owners.extend(
+            scopes
+                .into_iter()
+                .map(|scope| (scope, project_root.to_path_buf())),
+        );
+    }
+
     pub fn retain_project_maintenance_state(&self, active_projects: &BTreeSet<PathBuf>) {
+        let mut owners = self
+            .maintenance_scope_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.retain(|_, owner| active_projects.contains(owner));
+        let active_scope =
+            |root: &PathBuf| active_projects.contains(root) || owners.contains_key(root);
         self.graph_replay_release
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|project, _| active_projects.contains(project));
+            .retain(|project, _| active_scope(project));
         self.graph_staging_release
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|project, _| active_projects.contains(project));
+            .retain(|project, _| active_scope(project));
     }
 
     /// Whether this tick may attempt the graph-replay release reconcile.

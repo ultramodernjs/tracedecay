@@ -759,7 +759,7 @@ struct MountedGraphListing {
 fn active_project_maintenance_roots(
     mounted: &[MountedGraphListing],
     work: &[(String, MaintenanceStoreWork)],
-) -> Option<BTreeSet<PathBuf>> {
+) -> BTreeSet<PathBuf> {
     let mut roots = mounted
         .iter()
         .map(|graph| graph.project_root.clone())
@@ -767,18 +767,11 @@ fn active_project_maintenance_roots(
     for (_, unit) in work {
         if let MaintenanceStoreWork::Registered(store) = unit {
             roots.insert(store.canonical_root.clone());
-            // Preserve all recorded linked scopes, not merely those selected
-            // by this tick's bounded store window. An incomplete inventory
-            // does not prove any old scope retired.
-            let scopes =
-                tracedecay_code_index_retention::code_index_generations::code_index_scopes(
-                    &store.data_root,
-                )
-                .ok()?;
-            roots.extend(scopes.into_iter().filter_map(|scope| scope.recorded_root));
+            // Linked scopes inherit this owner through the inventory recorded
+            // by its admitted maintenance unit. Listing never scans the store.
         }
     }
-    Some(roots)
+    roots
 }
 
 /// The work-list key of a mounted project graph: its root and serving branch.
@@ -1215,9 +1208,8 @@ impl MaintenanceCoordinator {
         );
         let maintenance_observations = administration.store_telemetry_sampling();
         let active_maintenance_projects = active_project_maintenance_roots(&project_graphs, &work);
-        // A failed inventory cannot prove that any previously admitted scope
-        // has retired. Preserve its continuation and failure backoff.
-        if registry_listed && let Some(active_maintenance_projects) = active_maintenance_projects {
+        // Only a complete registry listing can retire an owner's scope state.
+        if registry_listed {
             maintenance_observations.retain_project_maintenance_state(&active_maintenance_projects);
         }
         // A capacity retirement releasing stores skips this pass: sampling
@@ -1784,6 +1776,7 @@ pub(super) fn retention_maintenance_enabled(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex as StdMutex};
@@ -1798,11 +1791,12 @@ mod tests {
         cursor_after_attempted_units, select_store_window,
     };
 
+    use tracedecay_runtime_core::db::{
+        Database, DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
+        TestRuntimeProfileIdentityV1,
+    };
+
     async fn seed_registered_graph_sql(profile_root: &Path, checkout: &Path, project_id: &str) {
-        use tracedecay_runtime_core::db::{
-            Database, DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
-            TestRuntimeProfileIdentityV1,
-        };
         let identity = tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
             .expect("fixture profile identity");
         tracedecay_runtime_core::storage::pin_fixture_repository_identity(checkout, project_id)
@@ -1954,18 +1948,12 @@ mod tests {
 
     #[test]
     fn registered_and_linked_scope_progress_survives_a_maintenance_listing() {
-        use tracedecay_code_index_retention::code_index_generations::{
-            code_index_store_root, record_scope_root,
-        };
         let temp = tempfile::tempdir().unwrap();
         let checkout = temp.path().join("checkout");
         let linked = temp.path().join("linked");
-        let data_root = temp.path().join("data");
-        std::fs::create_dir_all(&checkout).unwrap();
-        std::fs::create_dir_all(&linked).unwrap();
-        let scope = code_index_store_root(&data_root, &linked);
-        std::fs::create_dir_all(&scope).unwrap();
-        record_scope_root(&scope, &linked).unwrap();
+        // No store directory exists: listing preserves already-admitted scope
+        // ownership without doing another filesystem inventory.
+        let data_root = temp.path().join("absent-data");
         let work = vec![(
             "r:proj_fixture".to_owned(),
             super::MaintenanceStoreWork::Registered(
@@ -1976,12 +1964,14 @@ mod tests {
             ),
         )];
         let observations = StoreTelemetrySamplingRegistry::default();
+        observations.record_project_maintenance_scopes(&checkout, [linked.clone()]);
         for root in [&checkout, &linked] {
             observations
                 .record_graph_replay_release_served(root, Some("release-000000ff.json".to_owned()));
             observations.record_graph_replay_release_unhealthy(root);
         }
-        let roots = super::active_project_maintenance_roots(&[], &work).unwrap();
+        let roots = super::active_project_maintenance_roots(&[], &work);
+        assert_eq!(roots, BTreeSet::from([checkout.clone()]));
         observations.retain_project_maintenance_state(&roots);
         for root in [&checkout, &linked] {
             assert_eq!(

@@ -197,6 +197,21 @@ async fn registered_pass_drains_collected_scope_using_its_recorded_root() {
             .exists(),
         "no native staging engine was needed"
     );
+    // Listing a registered owner must preserve linked-scope progress without
+    // opening or rescanning that scope outside its bounded maintenance unit.
+    observations
+        .record_graph_replay_release_served(&linked, Some("release-000000ff.json".to_owned()));
+    observations.record_graph_replay_release_unhealthy(&linked);
+    observations.retain_project_maintenance_state(&BTreeSet::from([store.canonical_root.clone()]));
+    assert_eq!(
+        observations.graph_replay_release_cursor(&linked).as_deref(),
+        Some("release-000000ff.json"),
+        "linked progress belongs to its still-registered project"
+    );
+    assert!(!observations.graph_replay_release_attempt_admitted(&linked));
+    observations.retain_project_maintenance_state(&BTreeSet::new());
+    assert_eq!(observations.graph_replay_release_cursor(&linked), None);
+    assert!(observations.graph_replay_release_attempt_admitted(&linked));
 }
 
 fn generation_file_count(store_root: &Path) -> usize {
