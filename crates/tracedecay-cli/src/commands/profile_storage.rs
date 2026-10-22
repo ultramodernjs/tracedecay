@@ -62,7 +62,7 @@ pub(crate) async fn handle_profile_storage_action(
                     tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1::DryRun { plan } => {
                         println!("Dry-run: {} queued source(s) in this bounded page; graph authority unvalidated", plan.releases.len());
                         println!("Plan digest: {}", plan.plan_digest);
-                        println!("Reclaimable bytes: {}", plan.reclaimable_bytes.map_or_else(|| "unknown until authority revalidation".to_owned(), |bytes| format_bytes(bytes)));
+                        println!("Reclaimable bytes: {}", plan.reclaimable_bytes.map_or_else(|| "unknown until authority revalidation".to_owned(), format_bytes));
                         println!("Continuation: {}", plan.continuation.as_deref().unwrap_or("end"));
                     }
                     tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1::Applied { released, retained, continuation, segment_sweep_more_work, .. } => {
@@ -609,7 +609,7 @@ async fn handle_storage_report(
                 .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
             backlog
                 .reclaimable_segment_bytes
-                .map_or_else(|| "unknown".to_owned(), |bytes| format_bytes(bytes))
+                .map_or_else(|| "unknown".to_owned(), format_bytes)
         );
         if let Some(cursor) = &backlog.continuation {
             println!("    queue continues after {cursor}");

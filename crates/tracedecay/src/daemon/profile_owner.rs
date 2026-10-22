@@ -22,7 +22,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
 use tracedecay_contracts::retrieval::{
-    AdminCliSurfaceRequestV1, AdminProjectResultV1, AdminProjectSurfaceRequestV1,
+    AdminCliResultV1, AdminCliSurfaceRequestV1, AdminProjectResultV1, AdminProjectSurfaceRequestV1,
     AutomationReconcileScope, HookRuntimeResultV1, ProfileAutomationReconcileReport,
     UncachedProjectReconcileOutcome,
 };
@@ -148,55 +148,15 @@ async fn compute_profile_owner_operation(
         ApplicationSurfaceOperation::AdminCli => {
             let request: AdminCliSurfaceRequestV1 =
                 decode_primitive_request(&Value::Object(arguments), operation.mcp_tool_name())?;
-            if let AdminCliSurfaceRequestV1::ReleaseGraphReplays {
-                project_id,
-                project_root,
-                after,
-                plan_digest,
-            } = &request
-            {
-                let result = graph_replay_release::release(
-                    store_administration,
-                    project_id,
-                    project_root,
-                    after.as_deref(),
-                    plan_digest.as_deref(),
-                    maintenance_cancellation,
-                )
-                .await?;
-                return Ok((
-                    scope,
-                    GraphToolCompletionV1 {
-                        result: GraphToolResultV1::AdminCli(Box::new(result)),
-                        touched_files: Vec::new(),
-                        code_graph: None,
-                        analytics: None,
-                        cost: None,
-                    },
-                ));
-            }
-            let registry = Box::pin(store_administration.registered_profile_database()).await?;
-            let session_databases =
-                if matches!(request, AdminCliSurfaceRequestV1::StorageReport { .. }) {
-                    store_administration
-                        .mounted_registered_session_databases()
-                        .await?
-                } else {
-                    Vec::new()
-                };
             GraphToolResultV1::AdminCli(Box::new(
-                Box::pin(
-                    tracedecay_mcp::handlers::admin_cli::compute_projectless_admin_cli(
-                        request,
-                        &registry,
-                        tracedecay_global_db::global_accounting_enabled()
-                            .then_some(registry.as_ref()),
-                        profile_identity.profile_root(),
-                        active_project_root,
-                        code_index_schedulers,
-                        &session_databases,
-                    ),
-                )
+                Box::pin(profile_admin_cli(
+                    store_administration,
+                    profile_identity,
+                    active_project_root,
+                    code_index_schedulers,
+                    request,
+                    maintenance_cancellation,
+                ))
                 .await?,
             ))
         }
@@ -220,6 +180,54 @@ async fn compute_profile_owner_operation(
             cost: None,
         },
     ))
+}
+
+/// Profile CLI actions share transport completion but retain distinct store authority.
+async fn profile_admin_cli(
+    administration: &StoreAdministration,
+    profile_identity: &LocalProfileIdentityAuthorityV1,
+    active_project_root: Option<&Path>,
+    schedulers: Option<&CodeIndexSchedulerRegistryV1>,
+    request: AdminCliSurfaceRequestV1,
+    cancellation: &CancellationToken,
+) -> Result<AdminCliResultV1> {
+    if let AdminCliSurfaceRequestV1::ReleaseGraphReplays {
+        project_id,
+        project_root,
+        after,
+        plan_digest,
+    } = &request
+    {
+        return graph_replay_release::release(
+            administration,
+            project_id,
+            project_root,
+            after.as_deref(),
+            plan_digest.as_deref(),
+            cancellation,
+        )
+        .await;
+    }
+    let registry = Box::pin(administration.registered_profile_database()).await?;
+    let session_databases = if matches!(request, AdminCliSurfaceRequestV1::StorageReport { .. }) {
+        administration
+            .mounted_registered_session_databases()
+            .await?
+    } else {
+        Vec::new()
+    };
+    Box::pin(
+        tracedecay_mcp::handlers::admin_cli::compute_projectless_admin_cli(
+            request,
+            &registry,
+            tracedecay_global_db::global_accounting_enabled().then_some(registry.as_ref()),
+            profile_identity.profile_root(),
+            active_project_root,
+            schedulers,
+            &session_databases,
+        ),
+    )
+    .await
 }
 
 /// One hook action with no project route. It lands in the profile's user
