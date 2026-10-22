@@ -18,7 +18,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use tracedecay_code_index_retention::code_index_generations::{
-    DurablePublicationPointerV1, code_generation_segments_root,
+    CodeGenerationRetentionModeV1, DurablePublicationPointerV1,
+    code_generation_graph_replay_release_page, code_generation_segments_root,
+    complete_code_generation_graph_replay_release, execute_code_generation_retention,
+    plan_code_generation_retention,
 };
 use tracedecay_domain::{
     CodeGenerationId, ProjectId, RefId, RepositoryId, WorktreeId, canonical_sha256,
@@ -48,6 +51,9 @@ use tracedecay_code_index_runtime::code_index_scheduler::{
     CodeIndexWorktreeSchedulerV1, SharedCodeIndexBytePoolV1, scoped_code_index_store_root,
 };
 use tracedecay_daemon_identity::profile_identity;
+use tracedecay_runtime_core::branch::{BranchAdminAction, prepare_branch_admin_mutation};
+use tracedecay_runtime_core::branch_meta::{BranchMeta, load_branch_meta, save_branch_meta};
+use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_runtime_core::resident_memory::{
     ProcessResidentSampleV1, RESIDENT_MEMORY_CHECKPOINT_SAMPLE_INTERVAL_V1,
     ResidentMemoryPressureV1,
@@ -1248,6 +1254,238 @@ async fn sealed_generation_fixture(project: &str, source: &str) -> SealedGenerat
         _database_scope,
         _temporary: temporary,
     }
+}
+
+async fn seal_fixture_revision(
+    fixture: &SealedGenerationFixture,
+    project_root: &Path,
+    value: usize,
+) -> RetainedCodeGraphRuntimeV1 {
+    std::fs::write(
+        project_root.join("src/lib.rs"),
+        format!("pub fn release_fixture_value() -> usize {{ {value} }}\n"),
+    )
+    .expect("revision source");
+    git(project_root, &["add", "src/lib.rs"]);
+    git(project_root, &["commit", "-qm", "release fixture revision"]);
+    let mut scheduler = CodeIndexWorktreeSchedulerV1::open(
+        fixture.project_id.clone(),
+        project_root,
+        fixture.scoped_store.clone(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    )
+    .expect("revision scheduler");
+    scheduler.reconcile_now().expect("seal revision");
+    let latest = scheduler.latest_complete().expect("complete revision");
+    let pointer: DurablePublicationPointerV1 = serde_json::from_slice(
+        &std::fs::read(fixture.scoped_store.join("active-code-generation-v1.json"))
+            .expect("revision pointer"),
+    )
+    .expect("decode revision pointer");
+    fixture
+        .registry
+        .retain_code_graph_runtime(
+            fixture.project_id.clone(),
+            latest.generation().snapshot().repository.clone(),
+            scheduler.identity().worktree_id().clone(),
+            latest.generation().snapshot().reference.clone(),
+            latest.generation().manifest().generation_id.clone(),
+            Arc::clone(&fixture.project_database),
+            CodeGraphReplayBindingV1 {
+                generations_root: fixture.generations_root.clone(),
+                sealed_state_digest: SealedGraphStateDigest::try_from(pointer.state_digest)
+                    .expect("revision digest"),
+            },
+        )
+        .await
+        .expect("revision graph runtime")
+}
+
+/// Real Git branches, sealed segments, persisted SQL publication heads and a
+/// direct sealed reader exercise the same source-release authority used by
+/// daemon maintenance. Branch GC does not make a verified graph head expendable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_gc_release_preserves_heads_and_an_open_sealed_reader() {
+    let fixture = sealed_generation_fixture(
+        "project.branch-gc-release",
+        "pub fn release_fixture_value() -> usize { 1 }\n",
+    )
+    .await;
+    let project_root = fixture
+        ._temporary
+        .path()
+        .join("project")
+        .canonicalize()
+        .unwrap();
+    let held_reader = fixture
+        .runtime
+        .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+        .expect("main predecessor reader");
+    let held_generation = held_reader.generation().clone();
+    git(&project_root, &["branch", "live"]);
+    git(&project_root, &["checkout", "-qb", "feature"]);
+    let feature_old = seal_fixture_revision(&fixture, &project_root, 2).await;
+    drop(
+        feature_old
+            .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+            .expect("feature predecessor publication"),
+    );
+    let feature_old_id = feature_old.generation_id.clone();
+    let feature_head = seal_fixture_revision(&fixture, &project_root, 3).await;
+    let snapshot = feature_head
+        .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+        .expect("feature head publication");
+    let feature_head_generation = snapshot.generation().clone();
+    drop(snapshot); // The persisted head alone must protect this source.
+    git(&project_root, &["checkout", "-q", "main"]);
+    let main_head = seal_fixture_revision(&fixture, &project_root, 4).await;
+    let main_snapshot = main_head
+        .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+        .expect("main head publication");
+    let main_generation = main_snapshot.generation().clone();
+    drop(main_snapshot);
+
+    let data_root = fixture.project_database.database_path().parent().unwrap();
+    let mut metadata = BranchMeta::new("main");
+    for branch in ["feature", "live"] {
+        metadata.add_branch(branch, "main");
+        metadata.branches.get_mut(branch).unwrap().last_synced_at = "0".to_owned();
+    }
+    save_branch_meta(data_root, &metadata).expect("tracked branch metadata");
+    git(&project_root, &["branch", "-D", "feature"]);
+    // This is the canonical planner/CAS commit used by `tracedecay branch gc`.
+    let gc = prepare_branch_admin_mutation(&project_root, data_root, BranchAdminAction::Gc, 0)
+        .expect("branch gc plan");
+    assert_eq!(gc.report().removed_branches, vec!["feature"]);
+    gc.commit().expect("branch gc commit");
+    let metadata = load_branch_meta(data_root).expect("metadata after gc");
+    assert!(!metadata.is_tracked("feature"));
+    assert!(metadata.is_tracked("main") && metadata.is_tracked("live"));
+
+    let pool = fixture
+        .project_database
+        .database_path()
+        .with_extension("graph-replay");
+    let plan = plan_code_generation_retention(&fixture.scoped_store, &BTreeSet::new())
+        .expect("superseded manifest plan");
+    execute_code_generation_retention(
+        &fixture.scoped_store,
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        tracedecay_contracts::clock::now_micros(),
+        Some(&pool),
+    )
+    .expect("collect superseded manifests into the replay pool");
+    let queued = code_generation_graph_replay_release_page(&fixture.scoped_store, None)
+        .expect("durable release queue")
+        .releases;
+    assert_eq!(
+        queued.len(),
+        3,
+        "main predecessor and both old feature manifests"
+    );
+    let feature_old_release = queued
+        .iter()
+        .find(|release| release.generation.generation_id == feature_old_id)
+        .unwrap();
+    let held_release = queued
+        .iter()
+        .find(|release| release.generation.generation_id == fixture.generation_id)
+        .unwrap();
+    assert!(
+        pool.join(&feature_old_release.generation.generation_file)
+            .is_file()
+    );
+    assert!(
+        pool.join(&held_release.generation.generation_file)
+            .is_file()
+    );
+    drop(feature_old);
+    drop(fixture.runtime); // Only the explicit reader protects the old main generation.
+    let cancellation = CancellationToken::new();
+    let mut released = 0;
+    for release in &queued {
+        if fixture
+            .registry
+            .reconcile_deleted_code_generation_graph_replays(
+                fixture.project_id.clone(),
+                &fixture.project_database,
+                &release.generation.generation_id,
+                &release.generation.generation_file,
+                &cancellation,
+            )
+            .await
+            .expect("registered source release")
+        {
+            assert_ne!(
+                release.generation.generation_id, fixture.generation_id,
+                "an open main predecessor reader must retain its source"
+            );
+            assert_eq!(
+                release.generation.generation_id, feature_old_id,
+                "the feature head must remain protected by persisted serving authority"
+            );
+            complete_code_generation_graph_replay_release(&fixture.scoped_store, release)
+                .expect("acknowledge released source");
+            released += 1;
+        }
+    }
+    assert_eq!(
+        released, 1,
+        "only the deleted branch's superseded graph can retire"
+    );
+    assert!(
+        !pool
+            .join(&feature_old_release.generation.generation_file)
+            .exists()
+    );
+    assert!(
+        pool.join(&held_release.generation.generation_file)
+            .is_file()
+    );
+    assert_eq!(
+        held_reader.generation(),
+        &held_generation,
+        "leased reader survives"
+    );
+    assert_eq!(
+        feature_head
+            .recover_verified_snapshot_from_head(Arc::new(AtomicBool::new(false)))
+            .expect("feature verified head survives")
+            .generation(),
+        &feature_head_generation
+    );
+    assert_eq!(
+        main_head
+            .recover_verified_snapshot_from_head(Arc::new(AtomicBool::new(false)))
+            .expect("main verified head survives")
+            .generation(),
+        &main_generation
+    );
+    drop(held_reader);
+    assert!(
+        fixture
+            .registry
+            .reconcile_deleted_code_generation_graph_replays(
+                fixture.project_id.clone(),
+                &fixture.project_database,
+                &held_release.generation.generation_id,
+                &held_release.generation.generation_file,
+                &cancellation,
+            )
+            .await
+            .expect("release after reader closes")
+    );
+    complete_code_generation_graph_replay_release(&fixture.scoped_store, held_release)
+        .expect("acknowledge closed reader source");
+    assert!(!pool.join(&held_release.generation.generation_file).exists());
+    assert_eq!(
+        code_generation_graph_replay_release_page(&fixture.scoped_store, None)
+            .expect("only persisted feature head remains")
+            .releases
+            .len(),
+        1
+    );
 }
 
 /// The graph store is the only owner of symbol, file, and import records:
