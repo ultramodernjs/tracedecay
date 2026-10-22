@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -363,6 +363,44 @@ pub(super) fn verify_seal_digest(
             message: "project graph replay seal digest does not match its filename".to_owned(),
         }),
     }
+}
+
+/// Read only the bounded metadata prefix, but authenticate the entire seal
+/// on the same inode first. No graph rows or segment bodies are materialized.
+pub(super) fn authenticated_seal_prefix(
+    path: &Path,
+    digest: &SealedGraphStateDigest,
+    check: &dyn Fn() -> Result<(), GraphDbError>,
+) -> Result<Vec<u8>, GraphDbError> {
+    let mut file =
+        File::open(path).map_err(|error| GraphDbError::unavailable(error.to_string()))?;
+    let fingerprint = staged_fingerprint(
+        &file
+            .metadata()
+            .map_err(|error| GraphDbError::unavailable(error.to_string()))?,
+    )?;
+    let expected = sha256_hex_suffix(digest.as_str())
+        .ok_or_else(|| GraphDbError::invalid("invalid seal digest"))?;
+    if !matches!(
+        verify_seal_file_digest(&mut file, expected, check)?,
+        SealDigestOutcome::Verified
+    ) {
+        return Err(GraphDbError::Corrupt {
+            message: "removed-scope seal digest mismatch".to_owned(),
+        });
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| GraphDbError::unavailable(error.to_string()))?;
+    let mut prefix = Vec::new();
+    (&mut file)
+        .take(16 * 1024 * 1024)
+        .read_to_end(&mut prefix)
+        .map_err(|error| GraphDbError::unavailable(error.to_string()))?;
+    check()?;
+    if !staged_identity_matches(path, &file, &fingerprint)? {
+        return Err(GraphDbError::conflict("removed_scope.seal_identity"));
+    }
+    Ok(prefix)
 }
 
 /// Whether a retained seal's bytes hash to the digest its filename claims. A

@@ -477,6 +477,7 @@ pub struct StoreTelemetrySamplingRegistry {
     /// Where table-growth state survives a restart; `None` keeps it in memory.
     table_growth_state_path: Option<PathBuf>,
     graph_replay_release: Arc<std::sync::Mutex<HashMap<PathBuf, GraphReplayReleaseProgressV1>>>,
+    scope_reconciliation: Arc<std::sync::Mutex<HashMap<PathBuf, ScopeReconciliationProgressV1>>>,
     /// Recorded while an admitted project's scope inventory is processed, not
     /// by a fresh all-project filesystem scan on every daemon tick.
     maintenance_scope_owners: Arc<std::sync::Mutex<HashMap<PathBuf, PathBuf>>>,
@@ -512,6 +513,18 @@ struct GraphReplayReleaseProgressV1 {
     cursor: Option<String>,
 }
 
+/// Advisory keyset positions only; all retirement authority is re-proved.
+/// Restarting safely revisits the first page. Independent scope and graph
+/// cursors prevent a reader-held scope from starving later candidates.
+#[derive(Clone, Default)]
+pub(crate) struct ScopeReconciliationProgressV1 {
+    pub alias_after: i64,
+    pub projection_after: Option<tracedecay_store::GraphProjectionIdentityV1>,
+    pub scope_after: Option<String>,
+    pub release_after: BTreeMap<String, String>,
+    pub retained_in_census: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct StoreTelemetrySamplingOutcome {
     pub observed: u64,
@@ -519,6 +532,29 @@ pub struct StoreTelemetrySamplingOutcome {
 }
 
 impl StoreTelemetrySamplingRegistry {
+    pub(crate) fn scope_reconciliation_progress(
+        &self,
+        root: &Path,
+    ) -> ScopeReconciliationProgressV1 {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_scope_reconciliation_progress(
+        &self,
+        root: &Path,
+        progress: ScopeReconciliationProgressV1,
+    ) {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_path_buf(), progress);
+    }
+
     /// A registry whose table-growth state persists under the profile's
     /// maintenance directory.
     #[must_use]
@@ -632,6 +668,10 @@ impl StoreTelemetrySamplingRegistry {
     }
 
     pub fn release_retained_handles_for_shutdown(&self) {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.ports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -669,6 +709,10 @@ impl StoreTelemetrySamplingRegistry {
     }
 
     pub fn retain_project_maintenance_state(&self, active_projects: &BTreeSet<PathBuf>) {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|project, _| active_projects.contains(project));
         let mut owners = self
             .maintenance_scope_owners
             .lock()

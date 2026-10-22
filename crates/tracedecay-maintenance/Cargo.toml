@@ -44,6 +44,7 @@ tracing.workspace = true
 [dev-dependencies]
 filetime.workspace = true
 rusqlite.workspace = true
+tracedecay-code-index-runtime = { path = "../tracedecay-code-index-runtime", default-features = false, features = ["test-helpers"] }
 tracedecay-daemon-identity = { path = "../tracedecay-daemon-identity" }
 tracedecay-code-index-retention = { path = "../tracedecay-code-index-retention", features = ["test-helpers"] }
 tracedecay-lcm = { path = "../tracedecay-lcm", features = ["test-helpers"] }

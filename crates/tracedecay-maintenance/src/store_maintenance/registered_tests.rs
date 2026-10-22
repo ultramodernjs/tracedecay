@@ -310,3 +310,214 @@ async fn registered_pass_collects_unmounted_scopes_and_leaves_mounted_ones() {
     );
     assert_eq!(generation_file_count(&mounted), 1);
 }
+
+#[test]
+fn scope_reconciliation_reclaims_a_previously_collected_graph_head() {
+    scope_reconciliation_graph_heads_case(true);
+}
+
+#[test]
+fn scope_reconciliation_preserves_graph_readers_before_quarantine() {
+    scope_reconciliation_graph_heads_case(false);
+}
+
+fn scope_reconciliation_graph_heads_case(collected: bool) {
+    let executor = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .blocking_threads(1, 2)
+        .enable_time()
+        .enable_platform_reactor(true)
+        .build()
+        .unwrap();
+    executor.block_on(async {
+        use std::sync::atomic::AtomicBool;
+        use tracedecay_code_index_retention::code_index_generations::DurablePublicationPointerV1;
+        use tracedecay_code_index_runtime::CodeGraphReplayBindingV1;
+        use tracedecay_code_index_runtime::code_index_scheduler::{
+            CodeIndexWorktreeSchedulerV1, SharedCodeIndexBytePoolV1,
+        };
+        fn git(root: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.test",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let checkout = temp.path().join("checkout");
+        let removed = temp.path().join("removed");
+        std::fs::create_dir(&checkout).unwrap();
+        git(&checkout, &["init", "-q"]);
+        std::fs::write(
+            checkout.join("lib.rs"),
+            "pub fn retained_head() -> usize { 7 }\n",
+        )
+        .unwrap();
+        git(&checkout, &["add", "."]);
+        git(&checkout, &["commit", "-qm", "fixture"]);
+        git(
+            &checkout,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "removed",
+                removed.to_str().unwrap(),
+            ],
+        );
+        let checkout = checkout.canonicalize().unwrap();
+        let removed = removed.canonicalize().unwrap();
+        let (lease, _scope, _owner) = maintenance_lease(
+            &temp.path().join("profile"),
+            &checkout,
+            "proj_collected_head",
+        )
+        .await;
+        let scope = code_index_store_root(&lease.store_layout().data_root, &removed);
+        let mut scheduler = CodeIndexWorktreeSchedulerV1::open(
+            tracedecay_domain::ProjectId::new("proj_collected_head").unwrap(),
+            &removed,
+            scope.clone(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        )
+        .unwrap();
+        scheduler.reconcile_now().unwrap();
+        let latest = scheduler.latest_complete().unwrap();
+        let pointer: DurablePublicationPointerV1 = serde_json::from_slice(
+            &std::fs::read(scope.join("active-code-generation-v1.json")).unwrap(),
+        )
+        .unwrap();
+        let retained = lease
+            .store_runtime()
+            .code_graph_seat_port()
+            .retain_code_graph_runtime(
+                tracedecay_domain::ProjectId::new("proj_collected_head").unwrap(),
+                latest.generation().snapshot().repository.clone(),
+                scheduler.identity().worktree_id().clone(),
+                latest.generation().snapshot().reference.clone(),
+                latest.generation().manifest().generation_id.clone(),
+                Arc::new(lease.graph_db().clone()),
+                CodeGraphReplayBindingV1 {
+                    generations_root: scope.join("code-generations-v1"),
+                    sealed_state_digest: tracedecay_graph_db::SealedGraphStateDigest::try_from(
+                        pointer.state_digest,
+                    )
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(scheduler);
+        let reader = retained
+            .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        drop(retained);
+        let pool = lease
+            .graph_db()
+            .database_path()
+            .with_extension("graph-replay");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::hard_link(
+            scope
+                .join("code-generations-v1")
+                .join(&pointer.generation_file),
+            pool.join(&pointer.generation_file),
+        )
+        .unwrap();
+        lease
+            .profile_database()
+            .upsert_code_project("proj_collected_head", &checkout, None, None, None)
+            .await
+            .unwrap();
+        // The real target sits beyond an alias page, so a held early census
+        // cannot prevent a later page from reaching it.
+        for index in 0..35 {
+            lease
+                .profile_database()
+                .upsert_project_alias(
+                    &temp.path().join(format!("historical-{index}")),
+                    "proj_collected_head",
+                )
+                .await
+                .unwrap();
+        }
+        lease
+            .profile_database()
+            .upsert_project_alias(&removed, "proj_collected_head")
+            .await
+            .unwrap();
+        git(
+            &checkout,
+            &["worktree", "remove", removed.to_str().unwrap()],
+        );
+        if collected {
+            std::fs::remove_dir_all(&scope).unwrap();
+        }
+        let sealed = lease.graph_db().database_path().with_extension("sealed");
+        let count = || {
+            std::fs::read_dir(&sealed)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().join("sealed.json").is_file())
+                .count()
+        };
+        let schedulers = unmounted_scheduler_registry();
+        let observations = StoreTelemetrySamplingRegistry::default();
+        let cancellation = CancellationToken::new();
+        assert_eq!(count(), 1);
+        for _ in 0..3 {
+            assert_eq!(
+                super::run_code_index_scope_reconciliation(
+                    &lease,
+                    &schedulers,
+                    &observations,
+                    &cancellation,
+                )
+                .await,
+                crate::tick::MaintenanceTickOutcome::Continue(
+                    crate::tick::MaintenanceContinuation::CodeGenerationRetention,
+                ),
+                "a reader-held historical head keeps the short follow-up cadence"
+            );
+        }
+        assert_eq!(count(), 1, "a held reader survives the real scope pass");
+        assert_eq!(
+            scope.exists(),
+            !collected,
+            "a pinned scope cannot be quarantined"
+        );
+        drop(reader);
+        for _ in 0..8 {
+            super::run_code_index_scope_reconciliation(
+                &lease,
+                &schedulers,
+                &observations,
+                &cancellation,
+            )
+            .await;
+            if count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            count(),
+            0,
+            "scope maintenance must recover heads after scope-root.v1 was collected"
+        );
+        assert!(
+            !scope.exists(),
+            "graph draining must precede whole-scope quarantine"
+        );
+    });
+}
