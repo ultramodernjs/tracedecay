@@ -31,6 +31,8 @@ use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 use tracedecay_domain::process_heap::request_idle_thread_collection_v1;
 use tracedecay_runtime_core::logging::log_daemon_event;
 use tracedecay_runtime_core::native_runtime::{self, NativeTask, TimeoutError};
+mod journal_retention;
+
 const MAINTENANCE_STORE_PAGE_LIMIT: usize = 8;
 const REGISTERED_PROJECT_PAGE_LIMIT: usize = 64;
 
@@ -686,6 +688,7 @@ pub(super) struct MaintenanceCoordinator {
     /// last store processed. The next tick resumes immediately after it so no
     /// store is starved when the mounted set exceeds `MAINTENANCE_STORE_PAGE_LIMIT`.
     store_cursor: Arc<Mutex<Option<String>>>,
+    journal_retention: Arc<Mutex<journal_retention::JournalRetentionProgress>>,
     /// Content catch-up cannot advance the full-policy fairness frontier.
     continuation_store_cursor: Arc<Mutex<Option<String>>>,
     /// Exact mounted session paths with unfinished bounded canonical work.
@@ -711,6 +714,7 @@ impl Default for MaintenanceCoordinator {
             task: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(MaintenanceMetricsV1::default())),
             store_cursor: Arc::new(Mutex::new(None)),
+            journal_retention: Arc::default(),
             continuation_store_cursor: Arc::new(Mutex::new(None)),
             canonical_gc_pending: Arc::new(Mutex::new(BTreeSet::new())),
             observation_retention_pending: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1007,6 +1011,48 @@ impl MaintenanceCoordinator {
         .await;
     }
 
+    async fn run_journal_retention(
+        &self,
+        database: &tracedecay_global_db::RegisteredGlobalDb,
+        administration: &StoreAdministration,
+        start_if_idle: bool,
+    ) -> MaintenanceTickOutcome {
+        if self.cancellation.is_cancelled() {
+            return MaintenanceTickOutcome::Complete;
+        }
+        let result = administration
+            .try_with_writer(|| async {
+                let mut progress = self.journal_retention.lock().await;
+                progress
+                    .tick(
+                        database,
+                        &administration.session_sync_service(),
+                        &self.cancellation,
+                        start_if_idle,
+                    )
+                    .await
+            })
+            .await;
+        let failure = match result {
+            Some(Ok(true)) => {
+                return MaintenanceTickOutcome::Continue(
+                    MaintenanceContinuation::SessionJournalRetention,
+                );
+            }
+            Some(Ok(false)) => return MaintenanceTickOutcome::Complete,
+            Some(Err(error)) => error.to_string(),
+            None => "writer_admission_busy".to_owned(),
+        };
+        log_daemon_event(
+            "retention_degraded",
+            &[
+                ("pass", "session_journals".to_owned()),
+                ("failure", failure),
+            ],
+        );
+        MaintenanceTickOutcome::Retry
+    }
+
     #[tracing::instrument(name = "daemon.maintenance.tick", level = "trace", skip_all)]
     #[allow(
         clippy::too_many_arguments,
@@ -1036,6 +1082,11 @@ impl MaintenanceCoordinator {
             );
             return MaintenanceTickOutcome::Retry;
         };
+        if continuation == Some(MaintenanceContinuation::SessionJournalRetention) {
+            return self
+                .run_journal_retention(profile_database, administration, false)
+                .await;
+        }
         administration
             .store_telemetry_sampling()
             .begin_retention_tick_log_window();
@@ -1433,6 +1484,13 @@ impl MaintenanceCoordinator {
             ));
         }
 
+        if continuation.is_none() && !self.cancellation.is_cancelled() {
+            outcome = outcome.combine(
+                self.run_journal_retention(profile_database, administration, true)
+                    .await,
+            );
+        }
+
         // Profile-wide maintenance is intentionally excluded from a bounded
         // continuation: only the owning phase is eligible for the short
         // cadence.
@@ -1551,6 +1609,12 @@ impl MaintenanceCoordinator {
                     outcome = MaintenanceTickOutcome::Retry;
                 }
             }
+        }
+
+        if self.journal_retention.lock().await.pending() {
+            outcome = outcome.combine(MaintenanceTickOutcome::Continue(
+                MaintenanceContinuation::SessionJournalRetention,
+            ));
         }
 
         let mut metrics = self.metrics.lock().await;
@@ -2234,6 +2298,8 @@ mod tests {
             .expect("sampler joins after cancellation");
     }
 
+    mod journal_retention_tests;
+
     /// A registered project nothing has mounted since the daemon started is
     /// collected by the first full tick and converges on its continuation,
     /// instead of waiting for a client to mount it. A tick that runs while a
@@ -2255,12 +2321,19 @@ mod tests {
         let checkout = temp.path().join("checkout");
         std::fs::create_dir_all(&checkout).expect("checkout");
         let checkout = checkout.canonicalize().expect("canonical checkout");
-        let runtime = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
-            &profile_root,
-        )
-        .await
-        .expect("profile database");
-        let profile_database = runtime.profile_database_arc();
+        let _runtime =
+            tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
+                &profile_root,
+            )
+            .await
+            .expect("profile database");
+        let (profile_database, _registry_owner) =
+            tracedecay_global_db::tests::harness::open_registered_test_database_fixture(
+                &profile_root.join("global.db"),
+                tracedecay_runtime_core::db::TestDatabaseRuntimeScope::Profile,
+            )
+            .await
+            .expect("profile registry");
         let project = profile_database
             .upsert_code_project("proj_unmounted", &checkout, None, None, None)
             .await
@@ -2936,13 +3009,17 @@ mod tests {
             let profile_root = temp.path().join("profile");
             let checkout = temp.path().join("checkout");
             std::fs::create_dir_all(&checkout).expect("checkout");
-            let runtime =
+            let _runtime =
                 tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
                     &profile_root,
                 )
                 .await
                 .expect("profile database");
-            let profile_database = runtime.profile_database_arc();
+            let (profile_database, _registry_owner) =
+                tracedecay_global_db::tests::harness::open_registered_test_database_fixture(
+                    &profile_root.join("global.db"),
+                    tracedecay_runtime_core::db::TestDatabaseRuntimeScope::Profile,
+                ).await.expect("profile registry");
             let project = profile_database
                 .upsert_code_project("proj_handles", &checkout, None, None, None)
                 .await
