@@ -397,7 +397,6 @@ use lsp_sessions::{
     settle_pending_lsp_workspace_mutation, update_connection_lsp_sessions,
 };
 mod maintenance;
-#[cfg(any(unix, test))]
 pub mod pr_autotrack;
 #[cfg(any(test, feature = "test-transport"))]
 #[allow(clippy::too_many_lines)]
