@@ -1262,6 +1262,22 @@ pub enum ProfileStorageAction {
         #[arg(long = "project-id")]
         project_id: Option<String>,
     },
+    /// Preview redundant completed startup-journal frontiers through the daemon.
+    /// One bounded page; --apply requires its unchanged preview digest. This
+    /// releases logical bytes, not physical file space, and never deletes receipts.
+    #[command(name = "journal-gc")]
+    JournalGc {
+        /// Opaque continuation from the previous page's next_cursor. Reuse
+        /// the preview's cursor (not next_cursor) when applying its digest.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        /// Normalize the preview with this exact digest; absent means read-only.
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
+        /// Output the bounded page as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Offline repack of one profile SQLite database (VACUUM INTO a validated
     /// same-volume copy, atomically swapped in). Without --apply it only
     /// previews and prints the digest to confirm. Apply requires the daemon

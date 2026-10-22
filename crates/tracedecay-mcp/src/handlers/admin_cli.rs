@@ -30,6 +30,8 @@ use tracedecay_project::project::TraceDecay;
 
 use crate::handlers::SessionAuthorities;
 
+mod journal_gc;
+
 struct AdminCliContext<'a> {
     global_db: &'a RegisteredGlobalDbLeaseV1,
     accounting_db: Option<&'a RegisteredGlobalDb>,
@@ -416,6 +418,9 @@ async fn dispatch_admin_cli(
                 .await?
             };
             AdminCliResultV1::RegistryGc(serde_json::from_value(serde_json::to_value(report)?)?)
+        }
+        AdminCliSurfaceRequestV1::StorageJournalGc { cursor, apply } => {
+            AdminCliResultV1::JournalGc(journal_gc::run(global_db, cursor, apply.as_deref()).await?)
         }
         AdminCliSurfaceRequestV1::StorageReport {
             project_id,

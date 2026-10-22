@@ -106,6 +106,14 @@ pub enum AdminCliSurfaceRequestV1 {
         #[serde(default = "default_storage_report_page_limit")]
         limit: usize,
     },
+    /// Preview one bounded page of redundant startup-journal frontiers, or
+    /// normalize it only when the freshly planned digest matches `apply`.
+    StorageJournalGc {
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default)]
+        apply: Option<String>,
+    },
     GainQuery {
         project_arg: Option<PathBuf>,
         since: i64,
@@ -133,6 +141,7 @@ impl AdminCliSurfaceRequestV1 {
             | Self::RegistryProjectTokens { .. }
             | Self::RegistryGc { .. }
             | Self::StorageReport { .. }
+            | Self::StorageJournalGc { .. }
             | Self::GainQuery { .. } => OwnerStoresV1::ProjectGraph,
         }
     }
@@ -153,11 +162,38 @@ pub enum AdminCliResultV1 {
     RegistryProjectTokens(AdminCliProjectTokensV1),
     RegistryGc(AdminCliRegistryGcV1),
     StorageReport(AdminCliStorageReportV1),
+    JournalGc(AdminCliJournalGcV1),
     GainHistory(AdminCliGainHistoryV1),
     GainTotal(AdminCliGainTotalV1),
     /// The diagnostics report is the analytics bridge's open document; it
     /// decodes last so it never claims another action's body.
     AnalyticsDiagnostics(Value),
+}
+
+/// Small projection of a journal candidate; frontier payloads never leave SQLite.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCliJournalGcCandidateV1 {
+    pub key: String,
+    pub payload_bytes: u64,
+    pub logical_bytes_released: u64,
+}
+
+/// A loopable preview/apply page. Reuse `cursor` with its digest to apply;
+/// move to `next_cursor` only after successful apply (or a candidate-free page).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCliJournalGcV1 {
+    pub digest: String,
+    pub cursor: Option<String>,
+    pub next_cursor: Option<String>,
+    pub scanned: usize,
+    pub skipped: usize,
+    pub oversized: usize,
+    pub candidates: Vec<AdminCliJournalGcCandidateV1>,
+    pub logical_bytes_released: u64,
+    pub applied: bool,
+    pub compacted: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -572,6 +608,7 @@ mod tests {
                 AdminCliResultV1::RegistryProjectTokens(_) => "registry_project_tokens",
                 AdminCliResultV1::RegistryGc(_) => "registry_gc",
                 AdminCliResultV1::StorageReport(_) => "storage_report",
+                AdminCliResultV1::JournalGc(_) => "journal_gc",
                 AdminCliResultV1::GainHistory(_) => "gain_history",
                 AdminCliResultV1::GainTotal(_) => "gain_total",
                 AdminCliResultV1::AnalyticsDiagnostics(_) => "analytics_diagnostics",
@@ -637,7 +674,7 @@ mod tests {
         );
         assert_eq!(
             refused(json!({"action": "vacuum"})),
-            "unknown variant `vacuum`, expected one of `cost_summary`, `sessions_import`, `sessions_git_sync`, `sessions_sync_status`, `sessions_sync_cancel`, `sessions_unfinished`, `analytics_sync`, `analytics_diagnostics`, `registry_update`, `registry_list`, `registry_context`, `registry_empty`, `registry_project_tokens`, `registry_gc`, `storage_report`, `gain_query`"
+            "unknown variant `vacuum`, expected one of `cost_summary`, `sessions_import`, `sessions_git_sync`, `sessions_sync_status`, `sessions_sync_cancel`, `sessions_unfinished`, `analytics_sync`, `analytics_diagnostics`, `registry_update`, `registry_list`, `registry_context`, `registry_empty`, `registry_project_tokens`, `registry_gc`, `storage_report`, `storage_journal_gc`, `gain_query`"
         );
     }
 }

@@ -31,12 +31,66 @@ pub(crate) async fn handle_profile_storage_action(
             project_root,
             project_id,
         } => handle_reset_project_store(profile, project_root, project_id, assume_yes),
+        ProfileStorageAction::JournalGc {
+            cursor,
+            apply,
+            json,
+        } => handle_journal_gc(profile, cursor, apply, json).await,
         ProfileStorageAction::Compact {
             database,
             max_pages,
             apply,
         } => compact_database(profile.data_dir(), &database, max_pages, apply.as_deref()),
     }
+}
+
+/// The daemon keeps the sole admitted registry writer; this CLI never opens a database.
+async fn handle_journal_gc(
+    profile: &ProfileRoot,
+    cursor: Option<String>,
+    apply: Option<String>,
+    json: bool,
+) -> tracedecay_domain::errors::Result<()> {
+    let result = super::daemon::admin_cli_result(
+        profile,
+        None,
+        AdminCliSurfaceRequestV1::StorageJournalGc { cursor, apply },
+    )
+    .await?;
+    let AdminCliResultV1::JournalGc(page) = result else {
+        return Err(super::daemon::admin_cli_result_mismatch(
+            "storage_journal_gc",
+        ));
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+    } else {
+        println!(
+            "{}: {} candidates, {} logical bytes; scanned {}, skipped {}, oversized {}",
+            if page.applied { "Applied" } else { "Preview" },
+            page.candidates.len(),
+            page.logical_bytes_released,
+            page.scanned,
+            page.skipped,
+            page.oversized
+        );
+        for candidate in &page.candidates {
+            println!(
+                "  {}: {} payload bytes, {} releasable bytes",
+                candidate.key, candidate.payload_bytes, candidate.logical_bytes_released
+            );
+        }
+        println!("digest: {}", page.digest);
+        if let Some(cursor) = page.cursor {
+            println!("cursor (reuse with --apply): {cursor}");
+        }
+        if let Some(next) = page.next_cursor {
+            println!("next_cursor: {next}");
+        } else {
+            println!("exhausted: true");
+        }
+    }
+    Ok(())
 }
 
 /// Preview or apply an offline repack. The maintenance crate owns every safety
@@ -1155,3 +1209,6 @@ mod compact_tests {
         assert_eq!(rows, 1000);
     }
 }
+
+#[cfg(test)]
+mod journal_gc_tests;

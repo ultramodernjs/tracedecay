@@ -79,10 +79,11 @@ fn validate_current_temporal_meta(
 pub use crate::remote::status::RemoteOperationalStatusReadV1;
 pub use admin_cli_surface::{
     AdminCliAnalyticsImportV1, AdminCliCostSummaryV1, AdminCliCostTodayV1, AdminCliCostTotalsV1,
-    AdminCliGainDayV1, AdminCliGainHistoryV1, AdminCliGainTotalV1, AdminCliProjectTokenTotalV1,
-    AdminCliProjectTokensV1, AdminCliRegistryContextV1, AdminCliRegistryEmptyV1,
-    AdminCliRegistryGcV1, AdminCliRegistryListV1, AdminCliRegistryUpdateV1, AdminCliResultV1,
-    AdminCliScopeV1, AdminCliSessionSyncV1, AdminCliStorageReportV1, AdminCliSurfaceRequestV1,
+    AdminCliGainDayV1, AdminCliGainHistoryV1, AdminCliGainTotalV1, AdminCliJournalGcCandidateV1,
+    AdminCliJournalGcV1, AdminCliProjectTokenTotalV1, AdminCliProjectTokensV1,
+    AdminCliRegistryContextV1, AdminCliRegistryEmptyV1, AdminCliRegistryGcV1,
+    AdminCliRegistryListV1, AdminCliRegistryUpdateV1, AdminCliResultV1, AdminCliScopeV1,
+    AdminCliSessionSyncV1, AdminCliStorageReportV1, AdminCliSurfaceRequestV1,
     AdminCliUnfinishedSessionsV1, SessionDatabaseFileSizeV1, SessionDatabasePagesV1,
     SessionDatabaseSizeV1, StorageReportRegistryV1,
 };
