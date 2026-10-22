@@ -12,8 +12,16 @@ use tracedecay_runtime_core::db::engine::QueryExecutor;
 use tracedecay_runtime_core::lifecycle_lease::LifecycleLease;
 use tracedecay_store::{ProjectionStoreError, ProjectionStoreResult};
 
-pub const MAX_PREPARATION_ROWS: u64 = 1_000_000;
-pub const MAX_PREPARATION_KEY_BYTES: u64 = 64 * 1024 * 1024;
+// The daemon is stopped while this runs, so the bound only has to keep one
+// in-memory sorter reasonable. A real 71 GB profile has 1.9M projection
+// provenance rows and 4.4M observations; 1M/64 MiB refused it outright. Tests
+// keep the small bound so the refusal path stays cheap to exercise.
+pub const MAX_PREPARATION_ROWS: u64 = if cfg!(test) { 1_000_000 } else { 8_000_000 };
+pub const MAX_PREPARATION_KEY_BYTES: u64 = if cfg!(test) {
+    64 * 1024 * 1024
+} else {
+    512 * 1024 * 1024
+};
 
 pub(super) struct RetirementIndex {
     pub table: &'static str,

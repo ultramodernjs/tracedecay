@@ -1238,7 +1238,7 @@ pub enum ProfileStorageAction {
     },
     /// Prepare one missing retirement reverse index offline. Dry-run by
     /// default; --apply confirms its digest. Native indexes are atomic and
-    /// capped at 1,000,000 rows / 64 MiB key bytes; completed indexes are the
+    /// capped at 8,000,000 rows / 512 MiB key bytes; completed indexes are the
     /// resume cursor. Never starts/stops the daemon or builds at startup.
     #[command(name = "prepare-retirement-indexes")]
     PrepareRetirementIndexes {
