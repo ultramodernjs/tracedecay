@@ -7323,6 +7323,7 @@ dependencies = [
  "tracedecay-domain",
  "tracedecay-framing",
  "tracedecay-private-fs",
+ "tracedecay-runtime-core",
  "tracing",
 ]
 

@@ -38,7 +38,7 @@ use tracedecay_contracts::{
     ApplicationUnavailableClassV1, ResolvedSetting,
 };
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
-use tracedecay_daemon_protocol::BrokerStream;
+use tracedecay_daemon_protocol::DaemonClientStream;
 use tracedecay_domain::ProjectId;
 use tracedecay_domain::configuration::{
     ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
@@ -1626,7 +1626,7 @@ fn wait_for_authority(daemon: &mut Child, path: &Path) {
                 matches!(
                     tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        BrokerStream::connect(&record.endpoint),
+                        DaemonClientStream::connect(&record.endpoint),
                     )
                     .await,
                     Ok(Ok(_))

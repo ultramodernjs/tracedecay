@@ -9,7 +9,9 @@ use std::process::Output;
 #[cfg(unix)]
 use std::process::{Child, Command, Stdio};
 
-use tracedecay_agent_hosts::agents::host_bundle::{HostComponentV1, HostKindV1};
+#[cfg(unix)]
+use tracedecay_agent_hosts::agents::host_bundle::HostComponentV1;
+use tracedecay_agent_hosts::agents::host_bundle::HostKindV1;
 #[cfg(unix)]
 use tracedecay_daemon_control::{SOCKET_ENV, default_socket_path};
 #[cfg(unix)]
@@ -23,10 +25,9 @@ use tracedecay_runtime_core::test_executable::write_executable_script;
 
 #[cfg(unix)]
 use super::install_kimi_cli;
-use super::{
-    IsolatedCli, ROO_SETTINGS_RELATIVE, VERIFY_FAILURE_ENV, assert_receipt_digests,
-    assert_seeded_bytes, assert_success, host_case, latest_receipt, seed_host,
-};
+use super::{IsolatedCli, VERIFY_FAILURE_ENV, assert_success, host_case, seed_host};
+#[cfg(unix)]
+use super::{ROO_SETTINGS_RELATIVE, assert_receipt_digests, assert_seeded_bytes, latest_receipt};
 
 /// `EX_TEMPFAIL`: nothing failed, but a host needs an operator step.
 const PENDING_OPERATOR_ACTION_EXIT: i32 = 75;

@@ -3,7 +3,9 @@ use std::fs;
 use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 use sha2::{Digest, Sha256};
@@ -29,6 +31,7 @@ mod exact_restore;
 #[cfg(unix)]
 #[path = "host_lifecycle_cli_acceptance/kimi_web_refresh.rs"]
 mod kimi_web_refresh;
+#[cfg(unix)]
 #[path = "host_lifecycle_cli_acceptance/native_plugin_fixture.rs"]
 mod native_plugin_fixture;
 #[path = "host_lifecycle_cli_acceptance/sweep_outcomes.rs"]

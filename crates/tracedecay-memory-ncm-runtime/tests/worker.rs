@@ -2,6 +2,7 @@
 #![doc = "Process-level acceptance tests for the bounded NCM worker transport."]
 
 use serde_json::{Value, json};
+#[cfg(unix)]
 use sha2::{Digest, Sha256};
 use std::fs;
 #[cfg(unix)]
@@ -15,14 +16,21 @@ use std::sync::{Arc, Barrier, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
+#[cfg(unix)]
+use tracedecay_memory_ncm_core::types::NcmConfig;
+use tracedecay_memory_ncm_core::types::SourceId;
 use tracedecay_memory_ncm_runtime::client::{ClientError, WorkerClient, WorkerOptions};
+#[cfg(unix)]
 use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
-use tracedecay_memory_ncm_runtime::engine::{
-    FaultPoint, NcmEngine, ObserveRequest, Outcome, RejectReason,
-};
+#[cfg(unix)]
+use tracedecay_memory_ncm_runtime::engine::FaultPoint;
+#[cfg(unix)]
+use tracedecay_memory_ncm_runtime::engine::NcmEngine;
+use tracedecay_memory_ncm_runtime::engine::{ObserveRequest, Outcome, RejectReason};
 use tracedecay_memory_ncm_runtime::platform::current_worker_platform_capability;
-use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
+use tracedecay_memory_ncm_runtime::ports::Deadline;
+#[cfg(unix)]
+use tracedecay_memory_ncm_runtime::ports::StateRoot;
 use tracedecay_memory_ncm_runtime::wire::{
     self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION,
     Reply, Request,
@@ -65,6 +73,7 @@ fn client(root: &TempDir) -> WorkerClient {
     WorkerClient::spawn(worker_binary(), root.path(), options()).expect("worker client starts")
 }
 
+#[cfg(unix)]
 fn test_config() -> NcmConfig {
     let mut config = NcmConfig {
         terrain_resolution: 3,
@@ -80,6 +89,7 @@ fn test_config() -> NcmConfig {
     config
 }
 
+#[cfg(unix)]
 fn direct_observe(
     engine: &NcmEngine,
     namespace: &str,
@@ -108,6 +118,7 @@ fn direct_observe(
     assert_eq!(engine.observe(namespace, request).outcome, Outcome::Success);
 }
 
+#[cfg(unix)]
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -115,6 +126,7 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+#[cfg(unix)]
 fn opaque_id(namespace: &str, kind: &[u8], value: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"tracedecay.ncm.opaque-id.v1\0");
@@ -129,6 +141,7 @@ fn opaque_id(namespace: &str, kind: &[u8], value: &str) -> String {
         .collect()
 }
 
+#[cfg(unix)]
 fn worker_key(namespace: &str, public_key: &str) -> String {
     opaque_id(namespace, b"idempotency-key", public_key)
 }
@@ -157,6 +170,7 @@ fn observe_payload_for_source(
     )
 }
 
+#[cfg(unix)]
 fn common_observe_payload(idempotency_key: &str, key: &str, value: &str) -> Value {
     let capsule = serde_json::to_vec(&json!({"origin": "common-maintenance-worker-test"}))
         .expect("common capsule serializes");
@@ -212,6 +226,7 @@ fn observe_payload_with_provenance(
     })
 }
 
+#[cfg(unix)]
 fn common_maintenance_control(
     namespace: &str,
     idempotency_key: &str,
@@ -228,6 +243,7 @@ fn common_maintenance_control(
     )
 }
 
+#[cfg(unix)]
 fn common_maintenance_control_page(
     namespace: &str,
     public_idempotency_key: &str,

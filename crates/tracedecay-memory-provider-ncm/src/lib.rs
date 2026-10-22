@@ -662,24 +662,24 @@ impl NcmProviderAdapter {
         if !value.is_object() {
             return None;
         }
-        let opaque_ids = OpaqueCallerIds::from_call(&namespace, call);
+        let opaque_ids = OpaqueCallerIds::from_call(namespace, call);
         if let Some(projected) =
-            common::project_portability(call, &value, &namespace, admission, descriptor, limits)?
+            common::project_portability(call, &value, namespace, admission, descriptor, limits)?
         {
             value = projected;
         }
-        if let Some(projected) = common::project_lifecycle(call, &value, &namespace, admission)? {
+        if let Some(projected) = common::project_lifecycle(call, &value, namespace, admission)? {
             value = projected;
         }
         if call.operation == ProviderOperation::Recall && value.get("temporal_query").is_some() {
-            value = common::project_recall(call, &value, &namespace)?;
+            value = common::project_recall(call, &value, namespace)?;
         }
         let retained = if call.operation == ProviderOperation::Observe {
-            common::project_attribution(call, &value, &namespace, admission)?
+            common::project_attribution(call, &value, namespace, admission)?
         } else {
             None
         };
-        project_observation_sources(&mut value, call, &namespace)?;
+        project_observation_sources(&mut value, call, namespace)?;
         if let Some(retained) = retained {
             value
                 .as_object_mut()?
@@ -1722,10 +1722,12 @@ impl MemoryProvider for NcmProviderAdapter {
                     &reply,
                     code,
                     current_admission.as_ref(),
-                    self.recall_diagnostic_sink.as_deref(),
-                    self.recall_diagnostic_key
-                        .as_ref()
-                        .map(NcmRecallDiagnosticKey::as_bytes),
+                    (
+                        self.recall_diagnostic_sink.as_deref(),
+                        self.recall_diagnostic_key
+                            .as_ref()
+                            .map(NcmRecallDiagnosticKey::as_bytes),
+                    ),
                 );
             }
             return if call.operation.mutates_provider_state() {
@@ -2171,67 +2173,6 @@ fn opaque_caller_id(
     );
     digest_field(&mut digest, public_value.as_bytes());
     hex_digest(&digest.finalize())
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod caller_id_tests {
-    use super::*;
-
-    #[test]
-    fn legacy_caller_ids_keep_durable_bytes_and_checkout_ids_partition_all_exact_callers() {
-        let exact = OwnedExactScope::new(
-            "profile",
-            "project",
-            "repository",
-            "worktree",
-            "master",
-            "session",
-            format!("sha256:{}", "ab".repeat(32)),
-        )
-        .unwrap();
-        let legacy = NcmNamespace::from_exact_scope(&exact);
-        let checkout =
-            NcmNamespace::from_scope(&exact, NcmNamespaceBinding::CheckoutObservationsV1);
-        for (kind, expected) in [
-            (
-                b"request-id".as_slice(),
-                "cb8986c562e87ab5aa2ea07efe83ee6b6569062405600f48e9fd301a9aeb45f5",
-            ),
-            (
-                b"operation-id".as_slice(),
-                "ecb4fd23c1ed795b650ad376099cd49748f9c1a54571138327b4d67c7d2fc155",
-            ),
-            (
-                b"idempotency-key".as_slice(),
-                "1075834b4748d947af67b885f7152f6e9126caddfbe5be70b03d338eb373bd25",
-            ),
-        ] {
-            assert_eq!(
-                opaque_caller_id(&legacy, &exact, kind, "caller-key"),
-                expected
-            );
-            let first = opaque_caller_id(&checkout, &exact, kind, "caller-key");
-            assert_eq!(
-                first,
-                opaque_caller_id(&checkout, &exact, kind, "caller-key")
-            );
-            let mut session_changed = exact.clone();
-            session_changed.agent_session_id = "another-session".to_owned();
-            let mut digest_changed = exact.clone();
-            digest_changed.resolved_scope_digest = format!("sha256:{}", "cd".repeat(32));
-            for other in [session_changed, digest_changed] {
-                assert_eq!(
-                    checkout,
-                    NcmNamespace::from_scope(&other, NcmNamespaceBinding::CheckoutObservationsV1)
-                );
-                assert_ne!(
-                    first,
-                    opaque_caller_id(&checkout, &other, kind, "caller-key")
-                );
-            }
-        }
-    }
 }
 
 fn opaque_surface_id(namespace: &NcmNamespace, kind: &[u8], public_value: &str) -> String {
@@ -2884,4 +2825,65 @@ fn hex_digest(value: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod caller_id_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_caller_ids_keep_durable_bytes_and_checkout_ids_partition_all_exact_callers() {
+        let exact = OwnedExactScope::new(
+            "profile",
+            "project",
+            "repository",
+            "worktree",
+            "master",
+            "session",
+            format!("sha256:{}", "ab".repeat(32)),
+        )
+        .unwrap();
+        let legacy = NcmNamespace::from_exact_scope(&exact);
+        let checkout =
+            NcmNamespace::from_scope(&exact, NcmNamespaceBinding::CheckoutObservationsV1);
+        for (kind, expected) in [
+            (
+                b"request-id".as_slice(),
+                "cb8986c562e87ab5aa2ea07efe83ee6b6569062405600f48e9fd301a9aeb45f5",
+            ),
+            (
+                b"operation-id".as_slice(),
+                "ecb4fd23c1ed795b650ad376099cd49748f9c1a54571138327b4d67c7d2fc155",
+            ),
+            (
+                b"idempotency-key".as_slice(),
+                "1075834b4748d947af67b885f7152f6e9126caddfbe5be70b03d338eb373bd25",
+            ),
+        ] {
+            assert_eq!(
+                opaque_caller_id(&legacy, &exact, kind, "caller-key"),
+                expected
+            );
+            let first = opaque_caller_id(&checkout, &exact, kind, "caller-key");
+            assert_eq!(
+                first,
+                opaque_caller_id(&checkout, &exact, kind, "caller-key")
+            );
+            let mut session_changed = exact.clone();
+            session_changed.agent_session_id = "another-session".to_owned();
+            let mut digest_changed = exact.clone();
+            digest_changed.resolved_scope_digest = format!("sha256:{}", "cd".repeat(32));
+            for other in [session_changed, digest_changed] {
+                assert_eq!(
+                    checkout,
+                    NcmNamespace::from_scope(&other, NcmNamespaceBinding::CheckoutObservationsV1)
+                );
+                assert_ne!(
+                    first,
+                    opaque_caller_id(&checkout, &other, kind, "caller-key")
+                );
+            }
+        }
+    }
 }

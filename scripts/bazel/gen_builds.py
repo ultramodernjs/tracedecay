@@ -821,7 +821,14 @@ def main():
 
     def group_label(repo_rel, *, sources=False):
         """filegroup label + pkg-relative file label for an out-of-package
-        file, registering the group for emission in the owning package."""
+        file, registering the group for emission in the owning package.
+
+        Repository-root files already have exported source labels. They have
+        no directory to group, and must not become packages named Cargo.toml
+        or .bazelrc when include_str! reaches out of a member crate.
+        """
+        if len(repo_rel.parts) == 1:
+            return f"//:{repo_rel.name}", "", repo_rel.name
         pkg_dir, group_rel = owner_pkg(repo_rel)
         pkg_rel = "/".join(repo_rel.parts[len(pkg_dir.split("/")):])
         gname = group_rel.replace("/", "_") or pkg_dir

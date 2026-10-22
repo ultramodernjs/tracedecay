@@ -18,6 +18,7 @@ exports_files(
         "MODULE.bazel",
         "version.txt",
         "Cargo.toml",
+        ".bazelrc",
         "clippy.toml",
         "rustfmt.toml",
         "pnpm-lock.yaml",

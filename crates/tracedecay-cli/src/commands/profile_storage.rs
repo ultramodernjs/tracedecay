@@ -161,6 +161,7 @@ async fn handle_journal_gc(
 
 /// Preview or apply an offline repack. The maintenance crate owns every safety
 /// check (exclusive profile lease, digest, sidecars, validation, atomic swap).
+#[cfg(unix)]
 fn compact_database(
     profile_root: &Path,
     database: &str,
@@ -189,6 +190,18 @@ fn compact_database(
     })?;
     println!("{output}");
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn compact_database(
+    _profile_root: &Path,
+    _database: &str,
+    _max_pages: u64,
+    _apply: Option<&str>,
+) -> tracedecay_domain::errors::Result<()> {
+    Err(tracedecay_domain::errors::TraceDecayError::Config {
+        message: "offline database compaction requires Unix directory durability support".into(),
+    })
 }
 
 /// Scoped operator recovery for a project graph store whose open failed with
@@ -1491,7 +1504,7 @@ mod reset_project_store_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod compact_tests {
     use super::*;
 

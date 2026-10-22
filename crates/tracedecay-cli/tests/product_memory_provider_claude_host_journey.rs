@@ -69,7 +69,7 @@ use tracedecay_contracts::{
     ApplicationUnavailableClassV1, ResolvedSetting,
 };
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
-use tracedecay_daemon_protocol::BrokerStream;
+use tracedecay_daemon_protocol::DaemonClientStream;
 use tracedecay_domain::configuration::{
     ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
     MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
@@ -604,7 +604,11 @@ impl ClaudeHostJourney {
             match &outcome {
                 CaptureObservationOutcome::Persisted { outcome, .. }
                 | CaptureObservationOutcome::AcceptedForReplay { outcome, .. } => assert_eq!(
-                    outcome.receipt().observation().observation_id(),
+                    outcome
+                        .receipt()
+                        .expect("canonical fixture is not source-excluded")
+                        .observation()
+                        .observation_id(),
                     &expected_observation_id,
                     "canonical producer receipt must retain its derived observation identity"
                 ),
@@ -690,7 +694,7 @@ impl ClaudeHostJourney {
         deadline: Instant,
         daemon_pid: u32,
     ) -> Value {
-        use tokio::io::AsyncWriteExt;
+        use asupersync::io::AsyncWriteExt;
         use tracedecay_daemon_protocol::{
             DaemonClientIdentity, DaemonConnection, DaemonHandshake, MovedStoreAdoption,
             next_daemon_response_line, write_daemon_preamble,
@@ -746,10 +750,10 @@ impl ClaudeHostJourney {
         let phase = std::cell::Cell::new("connect");
         runtime.block_on(async {
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                let stream = BrokerStream::connect(&connection.endpoint)
+                let stream = DaemonClientStream::connect(&connection.endpoint)
                     .await
                     .expect("connect status transport");
-                let (reader, mut writer) = tokio::io::split(stream);
+                let (reader, mut writer) = stream.into_split();
                 phase.set("preamble");
                 write_daemon_preamble(&mut writer, &connection, &handshake)
                     .await
@@ -763,7 +767,9 @@ impl ClaudeHostJourney {
                     .expect("write status request");
                 writer.flush().await.expect("flush status request");
                 phase.set("response_read");
-                let mut reader = tokio::io::BufReader::new(reader);
+                let mut reader = tracedecay_framing::BoundedLineReader::new(
+                    asupersync::io::BufReader::new(reader),
+                );
                 // Server notifications (for example a version notice) may
                 // precede the correlated response on the same transport.
                 let response = loop {
@@ -1850,7 +1856,7 @@ fn wait_for_authority(daemon: &mut Child, path: &Path) {
                 matches!(
                     tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        BrokerStream::connect(&record.endpoint),
+                        DaemonClientStream::connect(&record.endpoint),
                     )
                     .await,
                     Ok(Ok(_))

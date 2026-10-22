@@ -781,6 +781,7 @@ fn run_seed_runs(seed_runs: &[SeedRun]) -> Vec<NamespaceResult> {
 /// all six built-in seeds run.
 #[test]
 #[ignore = "requires TRACEDECAY_NCM_REAL_MODEL_ROOT with the pinned offline NCM model"]
+#[allow(clippy::print_stderr)]
 fn real_worker_codex_history_recall_is_seed_stable() {
     let seed_runs = configured_seed_runs();
     let results = run_seed_runs(&seed_runs);

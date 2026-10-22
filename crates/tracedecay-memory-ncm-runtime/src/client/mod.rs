@@ -1938,7 +1938,666 @@ fn idempotency_key(request: &Request) -> Option<&str> {
     }
 }
 
+enum OwnerMessage {
+    Call(OwnerCommand),
+    Start(OwnerStart),
+}
+
+struct OwnerStart {
+    expires: Instant,
+    response: SyncSender<Result<(), ClientError>>,
+}
+
+struct OwnerCommand {
+    request: Request,
+    expires: Instant,
+    queued_bytes: usize,
+    response: SyncSender<Result<Reply, ClientError>>,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct Launch {
+    binary: PathBuf,
+    root: PathBuf,
+    test_double: bool,
+    no_encoder_required: bool,
+    max_restart_attempts: u32,
+}
+
+fn owner_loop(
+    calls: Receiver<OwnerMessage>,
+    shutdown: Arc<AtomicBool>,
+    pid: Arc<AtomicU32>,
+    owner_incarnation: Arc<AtomicU64>,
+    queued_bytes: Arc<AtomicUsize>,
+    launch: Launch,
+    lifecycle: Arc<LifecycleState>,
+) {
+    let mut process: Option<WorkerProcess> = None;
+    let mut restart_failures = 0_u32;
+    while !shutdown.load(Ordering::Acquire) {
+        let requested = lifecycle.requested.load(Ordering::Acquire);
+        if requested > lifecycle.completed.load(Ordering::Acquire) {
+            if let Some(worker) = process.take() {
+                worker.terminate(!lifecycle.force.load(Ordering::Acquire));
+            }
+            restart_failures = 0;
+            lifecycle.completed.store(requested, Ordering::Release);
+        }
+        let command = match calls.recv_timeout(Duration::from_millis(10)) {
+            Ok(OwnerMessage::Call(command)) => command,
+            Ok(OwnerMessage::Start(command)) => {
+                let result = start_owner_process(
+                    &mut process,
+                    &mut restart_failures,
+                    &launch,
+                    &pid,
+                    &owner_incarnation,
+                    command.expires,
+                    &shutdown,
+                );
+                let _ = command.response.send(result);
+                continue;
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        queued_bytes.fetch_sub(command.queued_bytes, Ordering::AcqRel);
+        if (command.cancelled)() || Instant::now() >= command.expires {
+            let _ = command.response.send(Err(ClientError::Cancelled));
+            continue;
+        }
+        if process.is_none() {
+            match spawn_owner_process(&launch, &pid, &owner_incarnation, &mut restart_failures) {
+                Ok(worker) => process = Some(worker),
+                Err(error) => {
+                    let _ = command.response.send(Err(error));
+                    continue;
+                }
+            }
+        }
+        let mut restart_failure_recorded = false;
+        let mut result = match process.as_mut() {
+            Some(worker) => execute_owner_command(worker, &command, &shutdown),
+            None => Err(ClientError::OwnerStopped),
+        };
+        // A killed worker can be discovered by the first namespace operation
+        // rather than by a separate health probe. Read-only operations are
+        // safe to retry after the dead process is reaped; the replacement's
+        // empty readiness set forces a real namespace handshake before recall.
+        if should_retry_after_worker_loss(&command.request, &result) {
+            if let Some(worker) = process.take() {
+                worker.terminate(false);
+            }
+            if !shutdown.load(Ordering::Acquire)
+                && !(command.cancelled)()
+                && remaining(command.expires).is_some()
+            {
+                match WorkerProcess::spawn(&launch, Arc::clone(&pid)) {
+                    Ok(worker) => {
+                        owner_incarnation.fetch_add(1, Ordering::AcqRel);
+                        process = Some(worker);
+                        result = match process.as_mut() {
+                            Some(worker) => execute_owner_command(worker, &command, &shutdown),
+                            None => Err(ClientError::OwnerStopped),
+                        };
+                    }
+                    Err(error) => {
+                        if !matches!(&error, ClientError::Unavailable(_)) {
+                            restart_failures = restart_failures.saturating_add(1);
+                            restart_failure_recorded = true;
+                        }
+                        result = Err(if restart_failures > launch.max_restart_attempts {
+                            ClientError::RestartExhausted
+                        } else {
+                            error
+                        });
+                    }
+                }
+            }
+        }
+        let abnormal = process
+            .as_ref()
+            .is_some_and(|worker| worker.must_retire_after(&result));
+        if abnormal && let Some(worker) = process.take() {
+            worker.terminate(false);
+        }
+        if abnormal && !(command.cancelled)() && !restart_failure_recorded {
+            restart_failures = restart_failures.saturating_add(1);
+        } else if result.is_ok() {
+            restart_failures = 0;
+        }
+        let _ = command.response.send(result);
+    }
+    if let Some(worker) = process {
+        worker.terminate(true);
+    }
+    pid.store(0, Ordering::Release);
+}
+
+fn spawn_owner_process(
+    launch: &Launch,
+    pid: &Arc<AtomicU32>,
+    owner_incarnation: &AtomicU64,
+    restart_failures: &mut u32,
+) -> Result<WorkerProcess, ClientError> {
+    if *restart_failures > launch.max_restart_attempts {
+        return Err(ClientError::RestartExhausted);
+    }
+    match WorkerProcess::spawn(launch, Arc::clone(pid)) {
+        Ok(worker) => {
+            owner_incarnation.fetch_add(1, Ordering::AcqRel);
+            Ok(worker)
+        }
+        Err(error) => {
+            if matches!(&error, ClientError::Unavailable(_)) {
+                return Err(error);
+            }
+            *restart_failures = restart_failures.saturating_add(1);
+            Err(if *restart_failures > launch.max_restart_attempts {
+                ClientError::RestartExhausted
+            } else {
+                error
+            })
+        }
+    }
+}
+
+fn start_owner_process(
+    process: &mut Option<WorkerProcess>,
+    restart_failures: &mut u32,
+    launch: &Launch,
+    pid: &Arc<AtomicU32>,
+    owner_incarnation: &AtomicU64,
+    expires: Instant,
+    shutdown: &AtomicBool,
+) -> Result<(), ClientError> {
+    if shutdown.load(Ordering::Acquire) || remaining(expires).is_none() {
+        return Err(ClientError::Cancelled);
+    }
+    // The readiness set belongs to this exact child and verified launch
+    // artifact. A remembered PID or incarnation alone cannot prove liveness.
+    if let Some(worker) = process.as_mut() {
+        match worker.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                if let Some(worker) = process.take() {
+                    worker.terminate(false);
+                }
+            }
+            Err(error) => {
+                if let Some(worker) = process.take() {
+                    worker.terminate(false);
+                }
+                *restart_failures = restart_failures.saturating_add(1);
+                return Err(ClientError::Transport(error.to_string()));
+            }
+        }
+    }
+    if shutdown.load(Ordering::Acquire) || remaining(expires).is_none() {
+        return Err(ClientError::Cancelled);
+    }
+    if process.is_none() {
+        *process = Some(spawn_owner_process(
+            launch,
+            pid,
+            owner_incarnation,
+            restart_failures,
+        )?);
+    }
+    if let Some(worker) = process.as_mut()
+        && worker.ready_namespaces.contains(GLOBAL_READINESS_NAMESPACE)
+    {
+        // An expired borrower has not touched the wire and must not retire
+        // the healthy shared child whose readiness it was asking to reuse.
+        return worker.ensure_ready(GLOBAL_READINESS_NAMESPACE, expires, shutdown, &|| false);
+    }
+    let result = match process.as_mut() {
+        Some(worker) => {
+            worker.ensure_ready(GLOBAL_READINESS_NAMESPACE, expires, shutdown, &|| false)
+        }
+        None => Err(ClientError::OwnerStopped),
+    };
+    if process
+        .as_ref()
+        .is_some_and(|worker| worker.must_retire_after(&result))
+    {
+        if let Some(worker) = process.take() {
+            worker.terminate(false);
+        }
+        *restart_failures = restart_failures.saturating_add(1);
+    } else if result.is_ok() {
+        *restart_failures = 0;
+    }
+    result
+}
+
+fn execute_owner_command(
+    worker: &mut WorkerProcess,
+    command: &OwnerCommand,
+    shutdown: &AtomicBool,
+) -> Result<Reply, ClientError> {
+    let result = if requires_readiness(&command.request) {
+        worker.ensure_ready(
+            &command.request.namespace,
+            command.expires,
+            shutdown,
+            command.cancelled.as_ref(),
+        )
+    } else {
+        Ok(())
+    }
+    .and_then(|()| {
+        worker.execute(
+            &command.request,
+            command.expires,
+            shutdown,
+            command.cancelled.as_ref(),
+        )
+    });
+    if let Ok(reply) = &result
+        && command.request.op == Operation::Handshake
+        && reply.outcome == crate::engine::Outcome::Success
+    {
+        worker.mark_ready(&command.request.namespace);
+    }
+    if let Some(reply) = result.as_ref().ok()
+        && matches!(
+            &reply.outcome,
+            crate::engine::Outcome::Unavailable(_) | crate::engine::Outcome::Corrupt
+        )
+    {
+        worker.invalidate_ready(&command.request.namespace);
+    }
+    result
+}
+
+fn should_retry_after_worker_loss(request: &Request, result: &Result<Reply, ClientError>) -> bool {
+    if matches!(request.op, Operation::Health) || request.op.is_mutating() {
+        return false;
+    }
+    matches!(
+        result,
+        Err(ClientError::MalformedReply(_))
+            | Err(ClientError::Transport(_))
+            | Err(ClientError::WorkerExited)
+    )
+}
+
+enum WriterCommand {
+    Frame(Vec<u8>, SyncSender<Result<(), String>>),
+    Shutdown,
+}
+
+struct WorkerProcess {
+    child: Child,
+    _artifact: Option<VerifiedWorkerArtifact>,
+    writer: SyncSender<WriterCommand>,
+    replies: Receiver<Result<Reply, String>>,
+    writer_thread: JoinHandle<()>,
+    reader_thread: JoinHandle<()>,
+    pid: Arc<AtomicU32>,
+    ready_namespaces: BTreeSet<String>,
+    exchange_pending: bool,
+}
+
+impl WorkerProcess {
+    fn spawn(launch: &Launch, pid: Arc<AtomicU32>) -> Result<Self, ClientError> {
+        let artifact = if launch.test_double {
+            None
+        } else {
+            Some(
+                stage_verified_worker_binary(&launch.binary)
+                    .map_err(|error| ClientError::Unavailable(error.to_string()))?,
+            )
+        };
+        let binary = artifact
+            .as_ref()
+            .map(VerifiedWorkerArtifact::path)
+            .unwrap_or(launch.binary.as_path());
+        let mut command = ProcessCommand::new(binary);
+        command
+            .arg("--state-root")
+            .arg(&launch.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if launch.test_double {
+            command.arg("--test-double");
+        }
+        if launch.no_encoder_required {
+            command.arg("--no-encoder-required");
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| ClientError::Spawn(error.to_string()))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::Spawn("worker stdin was not piped".to_owned()));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                drop(stdin);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::Spawn("worker stdout was not piped".to_owned()));
+            }
+        };
+
+        let (writer, writer_rx) = mpsc::sync_channel::<WriterCommand>(1);
+        let writer_thread = match thread::Builder::new()
+            .name("ncm-worker-writer".to_owned())
+            .spawn(move || writer_loop(stdin, writer_rx))
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ClientError::Spawn(error.to_string()));
+            }
+        };
+        let (reply_tx, replies) = mpsc::sync_channel(1);
+        let reader_thread = match thread::Builder::new()
+            .name("ncm-worker-reader".to_owned())
+            .spawn(move || reader_loop(stdout, reply_tx))
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(writer);
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = writer_thread.join();
+                return Err(ClientError::Spawn(error.to_string()));
+            }
+        };
+        pid.store(child.id(), Ordering::Release);
+        Ok(Self {
+            child,
+            _artifact: artifact,
+            writer,
+            replies,
+            writer_thread,
+            reader_thread,
+            pid,
+            ready_namespaces: BTreeSet::new(),
+            exchange_pending: false,
+        })
+    }
+
+    fn must_retire_after<T>(&self, result: &Result<T, ClientError>) -> bool {
+        match result {
+            // Cancellation before dispatch or after a fully consumed handshake
+            // leaves the shared transport synchronized. An outstanding frame
+            // still requires reap so its late reply cannot answer another call.
+            Err(ClientError::Cancelled) => self.exchange_pending,
+            Err(
+                ClientError::EffectUnknown { .. }
+                | ClientError::Transport(_)
+                | ClientError::MalformedReply(_)
+                | ClientError::WorkerExited,
+            ) => true,
+            _ => false,
+        }
+    }
+
+    fn ensure_ready(
+        &mut self,
+        namespace: &str,
+        expires: Instant,
+        shutdown: &AtomicBool,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<(), ClientError> {
+        if shutdown.load(Ordering::Acquire) || cancelled() || remaining(expires).is_none() {
+            return Err(ClientError::Cancelled);
+        }
+        if self.ready_namespaces.contains(namespace) {
+            return Ok(());
+        }
+        let remaining = remaining(expires).ok_or(ClientError::Cancelled)?;
+        let request = Request::new(
+            0,
+            u64::try_from(remaining.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1),
+            Operation::Handshake,
+            namespace,
+            json!({
+                "protocol_version": wire::PROTOCOL_VERSION,
+                "protocol_identity": wire::PROTOCOL_IDENTITY,
+                "algorithm_profile": "ncm-biomem-rs.v1"
+            }),
+        );
+        let reply = self.execute(&request, expires, shutdown, cancelled)?;
+        match reply.outcome {
+            crate::engine::Outcome::Success => {
+                self.ready_namespaces.insert(namespace.to_owned());
+                Ok(())
+            }
+            crate::engine::Outcome::Cancelled => Err(ClientError::Cancelled),
+            crate::engine::Outcome::Unavailable(detail) => Err(ClientError::Unavailable(detail)),
+            outcome => Err(ClientError::Unavailable(format!(
+                "worker readiness refused: {outcome:?}"
+            ))),
+        }
+    }
+
+    fn mark_ready(&mut self, namespace: &str) {
+        self.ready_namespaces.insert(namespace.to_owned());
+    }
+
+    fn invalidate_ready(&mut self, namespace: &str) {
+        self.ready_namespaces.remove(namespace);
+    }
+
+    fn execute(
+        &mut self,
+        request: &Request,
+        expires: Instant,
+        shutdown: &AtomicBool,
+        cancelled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<Reply, ClientError> {
+        if cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+        let remaining = remaining(expires).ok_or_else(|| timeout_error(request))?;
+        let mut outbound = request.clone();
+        outbound.deadline_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let frame = wire::encode_request(&outbound).map_err(|error| match error {
+            wire::FrameError::Oversized { .. } => ClientError::RequestTooLarge,
+            other => ClientError::Transport(other.to_string()),
+        })?;
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.writer
+            .send(WriterCommand::Frame(frame, ack_tx))
+            .map_err(|_| ClientError::WorkerExited)?;
+        self.exchange_pending = true;
+        match wait_channel(&ack_rx, expires, shutdown, cancelled) {
+            Ok(Ok(())) => {}
+            Ok(Err(detail)) => return Err(ClientError::Transport(detail)),
+            Err(WaitError::Deadline) => return Err(timeout_error(request)),
+            // The writer may have sent the frame before cancellation was
+            // observed. A mutating operation is indeterminate until reconciled.
+            Err(WaitError::Shutdown) => {
+                return Err(indeterminate_or(request, ClientError::Cancelled));
+            }
+            Err(WaitError::Disconnected) => return Err(ClientError::WorkerExited),
+        }
+        let reply = match wait_channel(&self.replies, expires, shutdown, cancelled) {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(detail)) => {
+                return Err(indeterminate_or(
+                    request,
+                    ClientError::MalformedReply(detail),
+                ));
+            }
+            Err(WaitError::Deadline) => return Err(timeout_error(request)),
+            Err(WaitError::Shutdown) => {
+                return Err(indeterminate_or(request, ClientError::Cancelled));
+            }
+            Err(WaitError::Disconnected) => {
+                return Err(indeterminate_or(request, ClientError::WorkerExited));
+            }
+        };
+        if reply.id != request.id {
+            return Err(indeterminate_or(
+                request,
+                ClientError::MalformedReply(format!(
+                    "reply id {} does not match request {}",
+                    reply.id, request.id
+                )),
+            ));
+        }
+        self.exchange_pending = false;
+        Ok(reply)
+    }
+
+    fn terminate(mut self, graceful: bool) {
+        if graceful {
+            let _ = self.writer.try_send(WriterCommand::Shutdown);
+            if wait_for_exit(&mut self.child, KILL_ESCALATION) {
+                self.finish_threads();
+                return;
+            }
+        }
+        let _ = self.child.kill();
+        let _ = wait_for_exit(&mut self.child, KILL_ESCALATION);
+        let _ = self.child.wait();
+        self.finish_threads();
+    }
+
+    fn finish_threads(self) {
+        self.pid.store(0, Ordering::Release);
+        drop(self.writer);
+        let _ = self.writer_thread.join();
+        let _ = self.reader_thread.join();
+    }
+}
+
+fn requires_readiness(request: &Request) -> bool {
+    if !is_sha256_hex(&request.namespace) {
+        return false;
+    }
+    match request.op {
+        Operation::Handshake => false,
+        Operation::Health => {
+            !request.namespace.is_empty() || request.payload.get("common_control").is_some()
+        }
+        _ => true,
+    }
+}
+
+fn writer_loop(mut stdin: std::process::ChildStdin, commands: Receiver<WriterCommand>) {
+    while let Ok(command) = commands.recv() {
+        match command {
+            WriterCommand::Frame(frame, acknowledgement) => {
+                let result = stdin
+                    .write_all(&frame)
+                    .and_then(|()| stdin.flush())
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                let _ = acknowledgement.send(result);
+                if failed {
+                    break;
+                }
+            }
+            WriterCommand::Shutdown => break,
+        }
+    }
+}
+
+fn reader_loop(mut stdout: std::process::ChildStdout, replies: SyncSender<Result<Reply, String>>) {
+    loop {
+        match wire::read_reply(&mut stdout) {
+            Ok(Some(reply)) => {
+                if replies.send(Ok(reply)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => {
+                let _ = replies.send(Err("worker stdout reached EOF".to_owned()));
+                break;
+            }
+            Err(error) => {
+                let _ = replies.send(Err(error.to_string()));
+                break;
+            }
+        }
+    }
+}
+
+fn remaining(expires: Instant) -> Option<Duration> {
+    expires.checked_duration_since(Instant::now())
+}
+
+fn timeout_error(request: &Request) -> ClientError {
+    if request.op.is_mutating() {
+        ClientError::EffectUnknown { op_id: request.id }
+    } else {
+        ClientError::Cancelled
+    }
+}
+
+fn indeterminate_or(request: &Request, otherwise: ClientError) -> ClientError {
+    if request.op.is_mutating() {
+        ClientError::EffectUnknown { op_id: request.id }
+    } else {
+        otherwise
+    }
+}
+
+enum WaitError {
+    Deadline,
+    Shutdown,
+    Disconnected,
+}
+
+fn wait_channel<T>(
+    receiver: &Receiver<T>,
+    expires: Instant,
+    shutdown: &AtomicBool,
+    cancelled: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<T, WaitError> {
+    loop {
+        if shutdown.load(Ordering::Acquire) || cancelled() {
+            return Err(WaitError::Shutdown);
+        }
+        let remaining = remaining(expires).ok_or(WaitError::Deadline)?;
+        let slice = remaining.min(Duration::from_millis(10));
+        match receiver.recv_timeout(slice) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Err(WaitError::Disconnected),
+        }
+    }
+}
+
+fn wait_for_exit(child: &mut Child, budget: Duration) -> bool {
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -2884,663 +3543,5 @@ mod tests {
             .count(),
             2
         );
-    }
-}
-
-enum OwnerMessage {
-    Call(OwnerCommand),
-    Start(OwnerStart),
-}
-
-struct OwnerStart {
-    expires: Instant,
-    response: SyncSender<Result<(), ClientError>>,
-}
-
-struct OwnerCommand {
-    request: Request,
-    expires: Instant,
-    queued_bytes: usize,
-    response: SyncSender<Result<Reply, ClientError>>,
-    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
-}
-
-#[derive(Clone)]
-struct Launch {
-    binary: PathBuf,
-    root: PathBuf,
-    test_double: bool,
-    no_encoder_required: bool,
-    max_restart_attempts: u32,
-}
-
-fn owner_loop(
-    calls: Receiver<OwnerMessage>,
-    shutdown: Arc<AtomicBool>,
-    pid: Arc<AtomicU32>,
-    owner_incarnation: Arc<AtomicU64>,
-    queued_bytes: Arc<AtomicUsize>,
-    launch: Launch,
-    lifecycle: Arc<LifecycleState>,
-) {
-    let mut process: Option<WorkerProcess> = None;
-    let mut restart_failures = 0_u32;
-    while !shutdown.load(Ordering::Acquire) {
-        let requested = lifecycle.requested.load(Ordering::Acquire);
-        if requested > lifecycle.completed.load(Ordering::Acquire) {
-            if let Some(worker) = process.take() {
-                worker.terminate(!lifecycle.force.load(Ordering::Acquire));
-            }
-            restart_failures = 0;
-            lifecycle.completed.store(requested, Ordering::Release);
-        }
-        let command = match calls.recv_timeout(Duration::from_millis(10)) {
-            Ok(OwnerMessage::Call(command)) => command,
-            Ok(OwnerMessage::Start(command)) => {
-                let result = start_owner_process(
-                    &mut process,
-                    &mut restart_failures,
-                    &launch,
-                    &pid,
-                    &owner_incarnation,
-                    command.expires,
-                    &shutdown,
-                );
-                let _ = command.response.send(result);
-                continue;
-            }
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        queued_bytes.fetch_sub(command.queued_bytes, Ordering::AcqRel);
-        if (command.cancelled)() || Instant::now() >= command.expires {
-            let _ = command.response.send(Err(ClientError::Cancelled));
-            continue;
-        }
-        if process.is_none() {
-            match spawn_owner_process(&launch, &pid, &owner_incarnation, &mut restart_failures) {
-                Ok(worker) => process = Some(worker),
-                Err(error) => {
-                    let _ = command.response.send(Err(error));
-                    continue;
-                }
-            }
-        }
-        let mut restart_failure_recorded = false;
-        let mut result = match process.as_mut() {
-            Some(worker) => execute_owner_command(worker, &command, &shutdown),
-            None => Err(ClientError::OwnerStopped),
-        };
-        // A killed worker can be discovered by the first namespace operation
-        // rather than by a separate health probe. Read-only operations are
-        // safe to retry after the dead process is reaped; the replacement's
-        // empty readiness set forces a real namespace handshake before recall.
-        if should_retry_after_worker_loss(&command.request, &result) {
-            if let Some(worker) = process.take() {
-                worker.terminate(false);
-            }
-            if !shutdown.load(Ordering::Acquire)
-                && !(command.cancelled)()
-                && remaining(command.expires).is_some()
-            {
-                match WorkerProcess::spawn(&launch, Arc::clone(&pid)) {
-                    Ok(worker) => {
-                        owner_incarnation.fetch_add(1, Ordering::AcqRel);
-                        process = Some(worker);
-                        result = match process.as_mut() {
-                            Some(worker) => execute_owner_command(worker, &command, &shutdown),
-                            None => Err(ClientError::OwnerStopped),
-                        };
-                    }
-                    Err(error) => {
-                        if !matches!(&error, ClientError::Unavailable(_)) {
-                            restart_failures = restart_failures.saturating_add(1);
-                            restart_failure_recorded = true;
-                        }
-                        result = Err(if restart_failures > launch.max_restart_attempts {
-                            ClientError::RestartExhausted
-                        } else {
-                            error
-                        });
-                    }
-                }
-            }
-        }
-        let abnormal = process
-            .as_ref()
-            .is_some_and(|worker| worker.must_retire_after(&result));
-        if abnormal && let Some(worker) = process.take() {
-            worker.terminate(false);
-        }
-        if abnormal && !(command.cancelled)() && !restart_failure_recorded {
-            restart_failures = restart_failures.saturating_add(1);
-        } else if result.is_ok() {
-            restart_failures = 0;
-        }
-        let _ = command.response.send(result);
-    }
-    if let Some(worker) = process {
-        worker.terminate(true);
-    }
-    pid.store(0, Ordering::Release);
-}
-
-fn spawn_owner_process(
-    launch: &Launch,
-    pid: &Arc<AtomicU32>,
-    owner_incarnation: &AtomicU64,
-    restart_failures: &mut u32,
-) -> Result<WorkerProcess, ClientError> {
-    if *restart_failures > launch.max_restart_attempts {
-        return Err(ClientError::RestartExhausted);
-    }
-    match WorkerProcess::spawn(launch, Arc::clone(pid)) {
-        Ok(worker) => {
-            owner_incarnation.fetch_add(1, Ordering::AcqRel);
-            Ok(worker)
-        }
-        Err(error) => {
-            if matches!(&error, ClientError::Unavailable(_)) {
-                return Err(error);
-            }
-            *restart_failures = restart_failures.saturating_add(1);
-            Err(if *restart_failures > launch.max_restart_attempts {
-                ClientError::RestartExhausted
-            } else {
-                error
-            })
-        }
-    }
-}
-
-fn start_owner_process(
-    process: &mut Option<WorkerProcess>,
-    restart_failures: &mut u32,
-    launch: &Launch,
-    pid: &Arc<AtomicU32>,
-    owner_incarnation: &AtomicU64,
-    expires: Instant,
-    shutdown: &AtomicBool,
-) -> Result<(), ClientError> {
-    if shutdown.load(Ordering::Acquire) || remaining(expires).is_none() {
-        return Err(ClientError::Cancelled);
-    }
-    // The readiness set belongs to this exact child and verified launch
-    // artifact. A remembered PID or incarnation alone cannot prove liveness.
-    if let Some(worker) = process.as_mut() {
-        match worker.child.try_wait() {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                if let Some(worker) = process.take() {
-                    worker.terminate(false);
-                }
-            }
-            Err(error) => {
-                if let Some(worker) = process.take() {
-                    worker.terminate(false);
-                }
-                *restart_failures = restart_failures.saturating_add(1);
-                return Err(ClientError::Transport(error.to_string()));
-            }
-        }
-    }
-    if shutdown.load(Ordering::Acquire) || remaining(expires).is_none() {
-        return Err(ClientError::Cancelled);
-    }
-    if process.is_none() {
-        *process = Some(spawn_owner_process(
-            launch,
-            pid,
-            owner_incarnation,
-            restart_failures,
-        )?);
-    }
-    if let Some(worker) = process.as_mut()
-        && worker.ready_namespaces.contains(GLOBAL_READINESS_NAMESPACE)
-    {
-        // An expired borrower has not touched the wire and must not retire
-        // the healthy shared child whose readiness it was asking to reuse.
-        return worker.ensure_ready(GLOBAL_READINESS_NAMESPACE, expires, shutdown, &|| false);
-    }
-    let result = match process.as_mut() {
-        Some(worker) => {
-            worker.ensure_ready(GLOBAL_READINESS_NAMESPACE, expires, shutdown, &|| false)
-        }
-        None => Err(ClientError::OwnerStopped),
-    };
-    if process
-        .as_ref()
-        .is_some_and(|worker| worker.must_retire_after(&result))
-    {
-        if let Some(worker) = process.take() {
-            worker.terminate(false);
-        }
-        *restart_failures = restart_failures.saturating_add(1);
-    } else if result.is_ok() {
-        *restart_failures = 0;
-    }
-    result
-}
-
-fn execute_owner_command(
-    worker: &mut WorkerProcess,
-    command: &OwnerCommand,
-    shutdown: &AtomicBool,
-) -> Result<Reply, ClientError> {
-    let result = if requires_readiness(&command.request) {
-        worker.ensure_ready(
-            &command.request.namespace,
-            command.expires,
-            shutdown,
-            command.cancelled.as_ref(),
-        )
-    } else {
-        Ok(())
-    }
-    .and_then(|()| {
-        worker.execute(
-            &command.request,
-            command.expires,
-            shutdown,
-            command.cancelled.as_ref(),
-        )
-    });
-    if let Ok(reply) = &result
-        && command.request.op == Operation::Handshake
-        && reply.outcome == crate::engine::Outcome::Success
-    {
-        worker.mark_ready(&command.request.namespace);
-    }
-    if let Some(reply) = result.as_ref().ok()
-        && matches!(
-            &reply.outcome,
-            crate::engine::Outcome::Unavailable(_) | crate::engine::Outcome::Corrupt
-        )
-    {
-        worker.invalidate_ready(&command.request.namespace);
-    }
-    result
-}
-
-fn should_retry_after_worker_loss(request: &Request, result: &Result<Reply, ClientError>) -> bool {
-    if matches!(request.op, Operation::Health) || request.op.is_mutating() {
-        return false;
-    }
-    matches!(
-        result,
-        Err(ClientError::MalformedReply(_))
-            | Err(ClientError::Transport(_))
-            | Err(ClientError::WorkerExited)
-    )
-}
-
-enum WriterCommand {
-    Frame(Vec<u8>, SyncSender<Result<(), String>>),
-    Shutdown,
-}
-
-struct WorkerProcess {
-    child: Child,
-    _artifact: Option<VerifiedWorkerArtifact>,
-    writer: SyncSender<WriterCommand>,
-    replies: Receiver<Result<Reply, String>>,
-    writer_thread: JoinHandle<()>,
-    reader_thread: JoinHandle<()>,
-    pid: Arc<AtomicU32>,
-    ready_namespaces: BTreeSet<String>,
-    exchange_pending: bool,
-}
-
-impl WorkerProcess {
-    fn spawn(launch: &Launch, pid: Arc<AtomicU32>) -> Result<Self, ClientError> {
-        let artifact = if launch.test_double {
-            None
-        } else {
-            Some(
-                stage_verified_worker_binary(&launch.binary)
-                    .map_err(|error| ClientError::Unavailable(error.to_string()))?,
-            )
-        };
-        let binary = artifact
-            .as_ref()
-            .map(VerifiedWorkerArtifact::path)
-            .unwrap_or(launch.binary.as_path());
-        let mut command = ProcessCommand::new(binary);
-        command
-            .arg("--state-root")
-            .arg(&launch.root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if launch.test_double {
-            command.arg("--test-double");
-        }
-        if launch.no_encoder_required {
-            command.arg("--no-encoder-required");
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|error| ClientError::Spawn(error.to_string()))?;
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ClientError::Spawn("worker stdin was not piped".to_owned()));
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                drop(stdin);
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ClientError::Spawn("worker stdout was not piped".to_owned()));
-            }
-        };
-
-        let (writer, writer_rx) = mpsc::sync_channel::<WriterCommand>(1);
-        let writer_thread = match thread::Builder::new()
-            .name("ncm-worker-writer".to_owned())
-            .spawn(move || writer_loop(stdin, writer_rx))
-        {
-            Ok(handle) => handle,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(ClientError::Spawn(error.to_string()));
-            }
-        };
-        let (reply_tx, replies) = mpsc::sync_channel(1);
-        let reader_thread = match thread::Builder::new()
-            .name("ncm-worker-reader".to_owned())
-            .spawn(move || reader_loop(stdout, reply_tx))
-        {
-            Ok(handle) => handle,
-            Err(error) => {
-                drop(writer);
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = writer_thread.join();
-                return Err(ClientError::Spawn(error.to_string()));
-            }
-        };
-        pid.store(child.id(), Ordering::Release);
-        Ok(Self {
-            child,
-            _artifact: artifact,
-            writer,
-            replies,
-            writer_thread,
-            reader_thread,
-            pid,
-            ready_namespaces: BTreeSet::new(),
-            exchange_pending: false,
-        })
-    }
-
-    fn must_retire_after<T>(&self, result: &Result<T, ClientError>) -> bool {
-        match result {
-            // Cancellation before dispatch or after a fully consumed handshake
-            // leaves the shared transport synchronized. An outstanding frame
-            // still requires reap so its late reply cannot answer another call.
-            Err(ClientError::Cancelled) => self.exchange_pending,
-            Err(
-                ClientError::EffectUnknown { .. }
-                | ClientError::Transport(_)
-                | ClientError::MalformedReply(_)
-                | ClientError::WorkerExited,
-            ) => true,
-            _ => false,
-        }
-    }
-
-    fn ensure_ready(
-        &mut self,
-        namespace: &str,
-        expires: Instant,
-        shutdown: &AtomicBool,
-        cancelled: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<(), ClientError> {
-        if shutdown.load(Ordering::Acquire) || cancelled() || remaining(expires).is_none() {
-            return Err(ClientError::Cancelled);
-        }
-        if self.ready_namespaces.contains(namespace) {
-            return Ok(());
-        }
-        let remaining = remaining(expires).ok_or(ClientError::Cancelled)?;
-        let request = Request::new(
-            0,
-            u64::try_from(remaining.as_millis())
-                .unwrap_or(u64::MAX)
-                .max(1),
-            Operation::Handshake,
-            namespace,
-            json!({
-                "protocol_version": wire::PROTOCOL_VERSION,
-                "protocol_identity": wire::PROTOCOL_IDENTITY,
-                "algorithm_profile": "ncm-biomem-rs.v1"
-            }),
-        );
-        let reply = self.execute(&request, expires, shutdown, cancelled)?;
-        match reply.outcome {
-            crate::engine::Outcome::Success => {
-                self.ready_namespaces.insert(namespace.to_owned());
-                Ok(())
-            }
-            crate::engine::Outcome::Cancelled => Err(ClientError::Cancelled),
-            crate::engine::Outcome::Unavailable(detail) => Err(ClientError::Unavailable(detail)),
-            outcome => Err(ClientError::Unavailable(format!(
-                "worker readiness refused: {outcome:?}"
-            ))),
-        }
-    }
-
-    fn mark_ready(&mut self, namespace: &str) {
-        self.ready_namespaces.insert(namespace.to_owned());
-    }
-
-    fn invalidate_ready(&mut self, namespace: &str) {
-        self.ready_namespaces.remove(namespace);
-    }
-
-    fn execute(
-        &mut self,
-        request: &Request,
-        expires: Instant,
-        shutdown: &AtomicBool,
-        cancelled: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<Reply, ClientError> {
-        if cancelled() {
-            return Err(ClientError::Cancelled);
-        }
-        let remaining = remaining(expires).ok_or_else(|| timeout_error(request))?;
-        let mut outbound = request.clone();
-        outbound.deadline_ms = u64::try_from(remaining.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let frame = wire::encode_request(&outbound).map_err(|error| match error {
-            wire::FrameError::Oversized { .. } => ClientError::RequestTooLarge,
-            other => ClientError::Transport(other.to_string()),
-        })?;
-        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-        self.writer
-            .send(WriterCommand::Frame(frame, ack_tx))
-            .map_err(|_| ClientError::WorkerExited)?;
-        self.exchange_pending = true;
-        match wait_channel(&ack_rx, expires, shutdown, cancelled) {
-            Ok(Ok(())) => {}
-            Ok(Err(detail)) => return Err(ClientError::Transport(detail)),
-            Err(WaitError::Deadline) => return Err(timeout_error(request)),
-            // The writer may have sent the frame before cancellation was
-            // observed. A mutating operation is indeterminate until reconciled.
-            Err(WaitError::Shutdown) => {
-                return Err(indeterminate_or(request, ClientError::Cancelled));
-            }
-            Err(WaitError::Disconnected) => return Err(ClientError::WorkerExited),
-        }
-        let reply = match wait_channel(&self.replies, expires, shutdown, cancelled) {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(detail)) => {
-                return Err(indeterminate_or(
-                    request,
-                    ClientError::MalformedReply(detail),
-                ));
-            }
-            Err(WaitError::Deadline) => return Err(timeout_error(request)),
-            Err(WaitError::Shutdown) => {
-                return Err(indeterminate_or(request, ClientError::Cancelled));
-            }
-            Err(WaitError::Disconnected) => {
-                return Err(indeterminate_or(request, ClientError::WorkerExited));
-            }
-        };
-        if reply.id != request.id {
-            return Err(indeterminate_or(
-                request,
-                ClientError::MalformedReply(format!(
-                    "reply id {} does not match request {}",
-                    reply.id, request.id
-                )),
-            ));
-        }
-        self.exchange_pending = false;
-        Ok(reply)
-    }
-
-    fn terminate(mut self, graceful: bool) {
-        if graceful {
-            let _ = self.writer.try_send(WriterCommand::Shutdown);
-            if wait_for_exit(&mut self.child, KILL_ESCALATION) {
-                self.finish_threads();
-                return;
-            }
-        }
-        let _ = self.child.kill();
-        let _ = wait_for_exit(&mut self.child, KILL_ESCALATION);
-        let _ = self.child.wait();
-        self.finish_threads();
-    }
-
-    fn finish_threads(self) {
-        self.pid.store(0, Ordering::Release);
-        drop(self.writer);
-        let _ = self.writer_thread.join();
-        let _ = self.reader_thread.join();
-    }
-}
-
-fn requires_readiness(request: &Request) -> bool {
-    if !is_sha256_hex(&request.namespace) {
-        return false;
-    }
-    match request.op {
-        Operation::Handshake => false,
-        Operation::Health => {
-            !request.namespace.is_empty() || request.payload.get("common_control").is_some()
-        }
-        _ => true,
-    }
-}
-
-fn writer_loop(mut stdin: std::process::ChildStdin, commands: Receiver<WriterCommand>) {
-    while let Ok(command) = commands.recv() {
-        match command {
-            WriterCommand::Frame(frame, acknowledgement) => {
-                let result = stdin
-                    .write_all(&frame)
-                    .and_then(|()| stdin.flush())
-                    .map_err(|error| error.to_string());
-                let failed = result.is_err();
-                let _ = acknowledgement.send(result);
-                if failed {
-                    break;
-                }
-            }
-            WriterCommand::Shutdown => break,
-        }
-    }
-}
-
-fn reader_loop(mut stdout: std::process::ChildStdout, replies: SyncSender<Result<Reply, String>>) {
-    loop {
-        match wire::read_reply(&mut stdout) {
-            Ok(Some(reply)) => {
-                if replies.send(Ok(reply)).is_err() {
-                    break;
-                }
-            }
-            Ok(None) => {
-                let _ = replies.send(Err("worker stdout reached EOF".to_owned()));
-                break;
-            }
-            Err(error) => {
-                let _ = replies.send(Err(error.to_string()));
-                break;
-            }
-        }
-    }
-}
-
-fn remaining(expires: Instant) -> Option<Duration> {
-    expires.checked_duration_since(Instant::now())
-}
-
-fn timeout_error(request: &Request) -> ClientError {
-    if request.op.is_mutating() {
-        ClientError::EffectUnknown { op_id: request.id }
-    } else {
-        ClientError::Cancelled
-    }
-}
-
-fn indeterminate_or(request: &Request, otherwise: ClientError) -> ClientError {
-    if request.op.is_mutating() {
-        ClientError::EffectUnknown { op_id: request.id }
-    } else {
-        otherwise
-    }
-}
-
-enum WaitError {
-    Deadline,
-    Shutdown,
-    Disconnected,
-}
-
-fn wait_channel<T>(
-    receiver: &Receiver<T>,
-    expires: Instant,
-    shutdown: &AtomicBool,
-    cancelled: &(dyn Fn() -> bool + Send + Sync),
-) -> Result<T, WaitError> {
-    loop {
-        if shutdown.load(Ordering::Acquire) || cancelled() {
-            return Err(WaitError::Shutdown);
-        }
-        let remaining = remaining(expires).ok_or(WaitError::Deadline)?;
-        let slice = remaining.min(Duration::from_millis(10));
-        match receiver.recv_timeout(slice) {
-            Ok(value) => return Ok(value),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Err(WaitError::Disconnected),
-        }
-    }
-}
-
-fn wait_for_exit(child: &mut Child, budget: Duration) -> bool {
-    let deadline = Instant::now()
-        .checked_add(budget)
-        .unwrap_or_else(Instant::now);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => {}
-            Err(_) => return false,
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(5));
     }
 }

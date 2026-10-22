@@ -12,6 +12,7 @@ mod enabled {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
