@@ -31,7 +31,44 @@ pub(crate) async fn handle_profile_storage_action(
             project_root,
             project_id,
         } => handle_reset_project_store(profile, project_root, project_id, assume_yes),
+        ProfileStorageAction::Compact {
+            database,
+            max_pages,
+            apply,
+        } => compact_database(profile.data_dir(), &database, max_pages, apply.as_deref()),
     }
+}
+
+/// Preview or apply an offline repack. The maintenance crate owns every safety
+/// check (exclusive profile lease, digest, sidecars, validation, atomic swap).
+fn compact_database(
+    profile_root: &Path,
+    database: &str,
+    max_pages: u64,
+    apply: Option<&str>,
+) -> tracedecay_domain::errors::Result<()> {
+    use tracedecay_maintenance::offline_compaction::{
+        compact_offline_v1, inspect_compaction_candidate_v1,
+    };
+    let database = profile_root.join(database);
+    let output = match apply {
+        None => serde_json::to_string_pretty(&inspect_compaction_candidate_v1(
+            profile_root,
+            &database,
+            max_pages,
+        )?),
+        Some(digest) => serde_json::to_string_pretty(&compact_offline_v1(
+            profile_root,
+            &database,
+            digest,
+            max_pages,
+        )?),
+    }
+    .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+        message: format!("cannot render compaction result: {error}"),
+    })?;
+    println!("{output}");
+    Ok(())
 }
 
 /// Scoped operator recovery for a project graph store whose open failed with
@@ -1068,5 +1105,53 @@ mod reset_project_store_tests {
                 "proj_absent"
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn compact_previews_without_writing_and_applies_only_the_previewed_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().canonicalize().unwrap();
+        let database = profile.join("user-sessions.db");
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE t(id INTEGER PRIMARY KEY, body TEXT);
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+                     INSERT INTO t SELECT i, hex(randomblob(512)) FROM n;
+                     DELETE FROM t WHERE id % 2 = 0;",
+                )
+                .unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+        compact_database(&profile, "user-sessions.db", 1 << 20, None).unwrap();
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            before,
+            "preview never writes"
+        );
+        assert!(compact_database(&profile, "user-sessions.db", 1 << 20, Some("stale")).is_err());
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+
+        let plan = tracedecay_maintenance::offline_compaction::inspect_compaction_candidate_v1(
+            &profile,
+            &database,
+            1 << 20,
+        )
+        .unwrap();
+        compact_database(&profile, "user-sessions.db", 1 << 20, Some(&plan.digest)).unwrap();
+        let after = std::fs::metadata(&database).unwrap().len();
+        assert!(after < before.len() as u64, "{after} >= {}", before.len());
+        let rows: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1000);
     }
 }

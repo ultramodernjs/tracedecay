@@ -1262,6 +1262,23 @@ pub enum ProfileStorageAction {
         #[arg(long = "project-id")]
         project_id: Option<String>,
     },
+    /// Offline repack of one profile SQLite database (VACUUM INTO a validated
+    /// same-volume copy, atomically swapped in). Without --apply it only
+    /// previews and prints the digest to confirm. Apply requires the daemon
+    /// stopped and a cleanly closed database without WAL/journal sidecars.
+    #[command(name = "compact")]
+    Compact {
+        /// Database inside the profile root, e.g. user-sessions.db or
+        /// projects/<proj_id>/sessions.db.
+        #[arg(long)]
+        database: String,
+        /// Whole-database page budget; larger databases are refused.
+        #[arg(long = "max-pages", default_value_t = 1 << 26)]
+        max_pages: u64,
+        /// Apply the preview with this exact digest.
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

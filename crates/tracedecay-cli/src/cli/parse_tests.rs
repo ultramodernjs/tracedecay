@@ -425,3 +425,49 @@ fn every_help_example_is_accepted_by_the_parser() {
         .collect();
     assert_eq!(rejected, Vec::<String>::new());
 }
+
+#[test]
+fn storage_compact_previews_by_default_and_applies_with_a_digest() {
+    let parsed = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "compact",
+        "--database",
+        "user-sessions.db",
+    ])
+    .expect("preview parses")
+    .command;
+    let Some(Commands::Storage {
+        action:
+            ProfileStorageAction::Compact {
+                database,
+                apply,
+                max_pages,
+            },
+    }) = parsed
+    else {
+        panic!("storage compact must parse");
+    };
+    assert_eq!(
+        (database.as_str(), apply, max_pages),
+        ("user-sessions.db", None, 1 << 26)
+    );
+    let parsed = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "compact",
+        "--database",
+        "global.db",
+        "--apply",
+        "abc",
+    ])
+    .expect("apply parses")
+    .command;
+    let Some(Commands::Storage {
+        action: ProfileStorageAction::Compact { apply, .. },
+    }) = parsed
+    else {
+        panic!("storage compact --apply must parse");
+    };
+    assert_eq!(apply.as_deref(), Some("abc"));
+}
