@@ -390,38 +390,12 @@ impl DrainFixture {
     }
 }
 
-/// Compare drain queries at the same WAL phase. A threshold-triggered
+/// Compare read probes at the same WAL phase. A threshold-triggered
 /// checkpoint copies earlier messages' dirty pages, so including it in only
-/// one probe measures periodic maintenance rather than this message's reads.
+/// one probe measures periodic maintenance rather than the queried work.
 /// Ordinary capture/drain writes on a separate session advance the log to its
 /// next generation; checkpoint policy and the probed session stay unchanged.
-pub async fn probe_drain_after_wal_restart(
-    facade: &HostAdmissionFacade<'_>,
-    fixture: &DrainFixture,
-    probed: &mut SessionCursor,
-    padding: &mut SessionCursor,
-    timestamp: i64,
-) -> u64 {
-    advance_wal_to_next_generation(facade, fixture, padding, timestamp).await;
-    let (project, scope) = (fixture.project.as_path(), fixture.scope());
-    let database = fixture
-        .runtime
-        .registered_database(HostAdmissionScope::Project)
-        .unwrap();
-    let checkpointed = writer_telemetry(database).wal.checkpointed_frames;
-    let read = probe_one_message(facade, project, &scope, probed, timestamp).await;
-    assert_eq!(
-        writer_telemetry(database).wal.checkpointed_frames,
-        checkpointed,
-        "the drain query comparison must not include a periodic checkpoint"
-    );
-    read
-}
-
-/// Advances the WAL through its ordinary checkpoint/reuse cycle before a
-/// query probe. An empty writer transaction orders after the writer's
-/// trailing automatic checkpoint without changing the WAL.
-pub async fn advance_wal_to_next_generation(
+pub async fn advance_to_wal_restart(
     facade: &HostAdmissionFacade<'_>,
     fixture: &DrainFixture,
     padding: &mut SessionCursor,
@@ -452,6 +426,30 @@ pub async fn advance_wal_to_next_generation(
         .registered_database(HostAdmissionScope::Project)
         .unwrap();
     await_previous_writer_work(database).await;
+}
+
+pub async fn probe_drain_after_wal_restart(
+    facade: &HostAdmissionFacade<'_>,
+    fixture: &DrainFixture,
+    probed: &mut SessionCursor,
+    padding: &mut SessionCursor,
+    timestamp: i64,
+) -> u64 {
+    advance_to_wal_restart(facade, fixture, padding, timestamp).await;
+    let (project, scope) = (fixture.project.as_path(), fixture.scope());
+    let database = fixture
+        .runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let checkpointed = writer_telemetry(database).wal.checkpointed_frames;
+    let read = probe_one_message(facade, project, &scope, probed, timestamp).await;
+    await_previous_writer_work(database).await;
+    assert_eq!(
+        writer_telemetry(database).wal.checkpointed_frames,
+        checkpointed,
+        "the drain query comparison must not include a periodic checkpoint"
+    );
+    read
 }
 
 /// A reader query can overlap the writer's trailing checkpoint. This SELECT
@@ -782,12 +780,10 @@ pub async fn settle_retention(database: &RegisteredGlobalDb) {
     panic!("bounded historical retention did not settle");
 }
 
-/// Measures one retention tick between ordered writer round trips. A periodic WAL
-/// copy belongs to the preceding ingest, so a probe that includes one must
-/// fail rather than attribute the copy to retention's reads.
+/// Measures one retention tick between ordered writer round trips. Warm-up
+/// ticks may checkpoint; measured query probes check for that separately.
 pub async fn retention_tick_read_bytes(database: &RegisteredGlobalDb) -> u64 {
     await_previous_writer_work(database).await;
-    let checkpointed = writer_telemetry(database).wal.checkpointed_frames;
     let before = process_read_bytes();
     let report = run_registered_store_retention(
         database,
@@ -799,6 +795,15 @@ pub async fn retention_tick_read_bytes(database: &RegisteredGlobalDb) -> u64 {
     assert!(report.succeeded(), "retention must succeed");
     let read = process_read_bytes() - before;
     await_previous_writer_work(database).await;
+    read
+}
+
+/// Measures retention after aligning the WAL and settling the seeded backlog.
+/// Warm-up ticks may checkpoint; neither measured tick may include that copy.
+pub async fn probe_retention_tick_read_bytes(database: &RegisteredGlobalDb) -> u64 {
+    await_previous_writer_work(database).await;
+    let checkpointed = writer_telemetry(database).wal.checkpointed_frames;
+    let read = retention_tick_read_bytes(database).await;
     assert_eq!(
         writer_telemetry(database).wal.checkpointed_frames,
         checkpointed,

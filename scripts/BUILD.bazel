@@ -128,6 +128,8 @@ exports_files(
         "test-package-release-archive.py",
         "test-plan-release-recovery.py",
         "test-check-release-artifacts.py",
+        "generate-release-inventory.py",
+        "test-generate-release-inventory.py",
         "test-update-release-checksums.py",
         "bazel/gen_builds.py",
         "bazel/ncm_worker_bundle.bzl",

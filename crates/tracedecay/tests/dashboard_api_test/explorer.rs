@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dashboard_api_support::*;
 use serde_json::{Value, json};
@@ -8,9 +8,15 @@ use serde_json::{Value, json};
 /// not a test-side clock, guarantees this loop ends; a timed-out source then
 /// fails the caller's coverage assertions.
 fn wait_for_query(agent: &ureq::Agent, base_url: &str, run_id: &str) -> Value {
+    let started = Instant::now();
     loop {
         let (status, body) = get_json(agent, &format!("{base_url}/api/explorer/queries/{run_id}"));
-        assert_eq!(status, 200, "query status should resolve: {body}");
+        assert_eq!(
+            status,
+            200,
+            "explorer query {run_id} status should resolve after {:?}: {body}",
+            started.elapsed()
+        );
         if matches!(
             body["payload"]["state"].as_str(),
             Some("completed" | "partial" | "cancelled" | "error" | "timed_out")

@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use crate::{
-    ProviderRunFailure, ProviderRunFold as GenericProviderRunFold,
+    ProviderPassUnits, ProviderRunFailure, ProviderRunFold as GenericProviderRunFold,
     ProviderRunOutcome as GenericProviderRunOutcome,
 };
 use serde::Serialize;
@@ -181,6 +183,7 @@ pub struct IngestPassOutcome {
     pub byte_bounds_enforced: bool,
     /// The pass durably advanced source coverage beyond its upserts.
     pub coverage_advanced: bool,
+    pub provider_units: BTreeMap<&'static str, ProviderPassUnits>,
 }
 
 impl IngestPassOutcome {
@@ -195,6 +198,7 @@ impl IngestPassOutcome {
             units_failed: 0,
             byte_bounds_enforced: true,
             coverage_advanced: false,
+            provider_units: BTreeMap::new(),
         }
     }
 

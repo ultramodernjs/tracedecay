@@ -29,7 +29,7 @@ use tracedecay_session_runtime::session_sync::test_harness::SessionTemporalRefre
 use tracedecay_session_runtime::session_sync::test_harness::configure_scheduler;
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::history::{
     SessionHistoricalCapacityRelease, SessionHistoricalIngestOutcome, SessionHistoricalIngestPass,
-    SessionHistoricalIngestor,
+    SessionHistoricalIngestor, SessionHistoricalPass,
 };
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::projector::{
     CanonicalSessionTemporalProjector, SessionTemporalRefreshEffect, SessionTemporalRefreshPolicy,
@@ -105,6 +105,7 @@ impl SessionHistoricalIngestor for ScriptedHistoricalIngestor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_front()
                 .unwrap_or(SessionHistoricalIngestOutcome::Complete)
+                .into()
         })
     }
 
@@ -233,6 +234,7 @@ impl SessionHistoricalIngestor for HealthyProvidersWithBlockedCursorIngestor {
                 reason_code: "observation_cursor_advance_collision".to_owned(),
                 made_progress: claude_progress || codex_progress,
             }
+            .into()
         })
     }
 
@@ -257,7 +259,7 @@ impl SessionHistoricalIngestor for CompleteHealthyProvidersIngestor {
             self.0
                 .admit_healthy_provider("codex", "session.healthy.codex")
                 .await;
-            SessionHistoricalIngestOutcome::Complete
+            SessionHistoricalIngestOutcome::Complete.into()
         })
     }
 
@@ -306,7 +308,7 @@ impl SessionHistoricalIngestor for PanicOnceHistoricalIngestor {
                 self.passes.increment() != 0,
                 "historical ingest panic fixture"
             );
-            SessionHistoricalIngestOutcome::Complete
+            SessionHistoricalIngestOutcome::Complete.into()
         })
     }
 
@@ -342,7 +344,7 @@ impl BlockThirdHistoricalIngestor {
 impl SessionHistoricalIngestor for BlockThirdHistoricalIngestor {
     fn run_pass(&self) -> SessionHistoricalIngestPass<'_> {
         Box::pin(async move {
-            match self.passes.fetch_add(1, Ordering::AcqRel) {
+            let outcome = match self.passes.fetch_add(1, Ordering::AcqRel) {
                 0 => SessionHistoricalIngestOutcome::Complete,
                 1 => {
                     // The refused capacity frees while this pass is running.
@@ -362,7 +364,8 @@ impl SessionHistoricalIngestor for BlockThirdHistoricalIngestor {
                         made_progress: false,
                     }
                 }
-            }
+            };
+            outcome.into()
         })
     }
 
@@ -383,7 +386,8 @@ impl SessionHistoricalIngestor for RetryThenBlockHistoricalIngestor {
                 return SessionHistoricalIngestOutcome::Retryable {
                     reason_code: "provider_busy".to_owned(),
                     made_progress: false,
-                };
+                }
+                .into();
             }
             loop {
                 // notify_waiters covers futures created before cancellation,
@@ -394,7 +398,7 @@ impl SessionHistoricalIngestor for RetryThenBlockHistoricalIngestor {
                 }
                 notified.await;
             }
-            SessionHistoricalIngestOutcome::Cancelled
+            SessionHistoricalIngestOutcome::Cancelled.into()
         })
     }
 
@@ -420,9 +424,7 @@ impl CancelAwareHistoricalIngestor {
 }
 
 impl SessionHistoricalIngestor for CancelAwareHistoricalIngestor {
-    fn run_pass(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = SessionHistoricalIngestOutcome> + Send + '_>> {
+    fn run_pass(&self) -> Pin<Box<dyn Future<Output = SessionHistoricalPass> + Send + '_>> {
         Box::pin(async move {
             self.entered.send_replace(true);
             loop {
@@ -433,7 +435,7 @@ impl SessionHistoricalIngestor for CancelAwareHistoricalIngestor {
                 notified.await;
             }
             self.exited.store(true, Ordering::Release);
-            SessionHistoricalIngestOutcome::Cancelled
+            SessionHistoricalIngestOutcome::Cancelled.into()
         })
     }
 

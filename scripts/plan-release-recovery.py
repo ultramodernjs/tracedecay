@@ -28,11 +28,17 @@ def plan(
     existing: set[str],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     checker = artifact_checker()
-    expected_mutable = {
-        asset
+    packages = {
+        target["name"]: checker.target_assets(target, tag, profile)
         for target in targets
-        for asset in checker.target_assets(target, tag, profile)
     }
+    inventories = {
+        target["name"]: checker.target_inventory(target, tag, profile)
+        for target in targets
+    }
+    expected_mutable = {
+        asset for names in packages.values() for asset in names
+    } | set(inventories.values())
     # Both profiles publish the installer beside the archives, so `install.sh`
     # is immutable release metadata on a prerelease exactly as it is on a
     # stable release. While it counted as unexpected under `beta`, uploading
@@ -45,16 +51,25 @@ def plan(
             "unexpected existing release assets: " + ", ".join(unexpected)
         )
 
+    missing_packages = {
+        name: any(asset not in existing for asset in names)
+        for name, names in packages.items()
+    }
     missing_targets = [
-        target
+        {
+            **target,
+            **(
+                {"inventory_only": True}
+                if not missing_packages[target["name"]]
+                else {}
+            ),
+        }
         for target in targets
-        if any(
-            asset not in existing
-            for asset in checker.target_assets(target, tag, profile)
-        )
+        if missing_packages[target["name"]]
+        or inventories[target["name"]] not in existing
     ]
     finalized = sorted(existing & fixed)
-    if finalized and missing_targets:
+    if finalized and any(missing_packages[target["name"]] for target in missing_targets):
         raise SystemExit(
             "final release metadata exists before all immutable artifacts "
             f"({', '.join(finalized)}); refusing destructive recovery"
@@ -88,9 +103,15 @@ def main() -> None:
         encoding="utf-8",
     )
     matrix = json.dumps({"include": missing}, separators=(",", ":"))
+    package_build_required = any(
+        not target.get("inventory_only", False) for target in missing
+    )
     with arguments.github_output.open("a", encoding="utf-8") as output:
         output.write(f"matrix={matrix}\n")
         output.write(f"build_required={'true' if missing else 'false'}\n")
+        output.write(
+            f"package_build_required={'true' if package_build_required else 'false'}\n"
+        )
 
 
 if __name__ == "__main__":

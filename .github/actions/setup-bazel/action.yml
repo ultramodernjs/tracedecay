@@ -29,6 +29,9 @@ inputs:
       store, which cannot read the GitHub-stored master entries; one
       designated job per platform sets this.
     default: "false"
+  cache-save:
+    description: Whether this setup may save Bazelisk and repository caches.
+    default: "true"
   tailscale-client-id:
     description: OIDC client for trusted Linux CI; empty keeps the hosted-only build.
     default: ""
@@ -177,9 +180,10 @@ runs:
           && !(github.repository == 'ScriptedAlchemy/tracedecay' && inputs.tailscale-client-id != '')
           && format('build --disk_cache={0}', steps.disk-cache-config.outputs.path) || '' }}
         cache-save: >-
-          ${{ github.ref == 'refs/heads/master'
+          ${{ inputs.cache-save == 'true'
+          && (github.ref == 'refs/heads/master'
           || (inputs.save-download-caches == 'true'
-          && steps.disk-cache-config.outputs.remote-cache == 'true') }}
+          && steps.disk-cache-config.outputs.remote-cache == 'true')) }}
         # Windows build-script runfiles nest each vendored crate's sources
         # under its repository name twice; a short output base (default
         # D:/_bazel) keeps MSVC's header paths under MAX_PATH.
@@ -240,7 +244,9 @@ runs:
         build --remote_cache=grpc://ubuntu-main:50051
         build --remote_instance_name=main
         build --remote_timeout=600
-        build --remote_local_fallback
+        # Fleet compilation must not fall back onto the smaller hosted VM.
+        # Dynamic tests still have their explicitly scheduled local branch.
+        build --noremote_local_fallback
         build --remote_download_outputs=toplevel
         build --jobs=40
         build --local_resources=cpu=HOST_CPUS
@@ -248,7 +254,10 @@ runs:
         build --internal_spawn_scheduler
         build --dynamic_local_strategy=sandboxed
         build --dynamic_remote_strategy=remote
-        build --strategy=Rustc=dynamic
+        # Large Rust links raced on the hosted VM while the same actions ran
+        # remotely. local_resources only schedules estimates; it does not cap
+        # rustc memory. Keep compilation on the fleet and tests hybrid.
+        build --strategy=Rustc=remote
         build --strategy=TestRunner=dynamic
         build --bes_backend=grpc://ubuntu-main:1985
         build --bes_results_url=https://ubuntu-main.tail039078.ts.net/invocation/

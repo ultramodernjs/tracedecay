@@ -174,7 +174,7 @@ async fn plan_summary(
 ) -> (LcmCompressionRequest, LcmSummaryRequest, i64) {
     let mut request = daemon_summary_request("cursor", session_id);
     // One plan covers three raw messages and leaves exactly one fresh tail.
-    request.leaf_chunk_tokens = None;
+    request.overrides.leaf_chunk_tokens = None;
     let (planned, revision) = service.commit_compression(&request, None).await.unwrap();
     assert_eq!(planned.status, "needs_summary");
     assert_eq!(planned.summary_nodes_created, 0);
@@ -183,6 +183,7 @@ async fn plan_summary(
     request.summarizer = LcmSummarizerMode::Provided {
         summary_text: "summary generated from the original exact three-message plan".to_owned(),
         route: Some("test_exact_planned_source".to_owned()),
+        extraction_result: None,
     };
     (request, summary, revision.unwrap())
 }

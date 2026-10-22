@@ -14,6 +14,7 @@ exports_files(
         ".github/release-targets.json",
         ".github/workflows/release.yml",
         ".github/workflows/release-beta.yml",
+        ".npmrc",
         "MODULE.bazel",
         "version.txt",
         "Cargo.toml",

@@ -80,6 +80,11 @@ def target_assets(target: dict[str, Any], tag: str, profile: str) -> tuple[str, 
     return assets
 
 
+def target_inventory(target: dict[str, Any], tag: str, profile: str) -> str:
+    prefix = "tracedecay-beta" if profile == "beta" else "tracedecay"
+    return f"{prefix}-{tag}-{target['name']}.spdx.json"
+
+
 def files(path: Path) -> set[str]:
     if not path.is_dir():
         raise SystemExit(f"release artifact directory is missing: {path}")
@@ -108,6 +113,8 @@ def require_whole_targets(
     mcpbs: set[str],
     workers: set[str],
     assets: dict[str, tuple[str, ...]],
+    inventories: set[str] | None,
+    inventory_names: dict[str, str],
 ) -> list[str]:
     """Partial coverage: every present target is whole, nothing is foreign.
 
@@ -121,6 +128,8 @@ def require_whole_targets(
     ) + sorted(
         workers - {name for names in assets.values() for name in names[2:]}
     )
+    if inventories is not None:
+        extra.extend(sorted(inventories - set(inventory_names.values())))
     if extra:
         raise SystemExit("unexpected release artifacts: " + ", ".join(extra))
     missing = []
@@ -131,6 +140,9 @@ def require_whole_targets(
         if len(names) > 2:
             present.extend(name in workers for name in names[2:])
             labels.extend(("worker", "checksum"))
+        if inventories is not None:
+            present.append(inventory_names[target["name"]] in inventories)
+            labels.append("inventory")
         if any(present) and not all(present):
             raise SystemExit(
                 f"release target {target['name']} is half built: "
@@ -178,10 +190,15 @@ def main() -> int:
         action="store_true",
         help="accept a subset of targets as long as each present target is whole",
     )
+    parser.add_argument("--inventories", type=Path)
     arguments = parser.parse_args()
     targets = target_matrix(arguments.manifest, arguments.worker_platforms)
     assets = {
         target["name"]: target_assets(target, arguments.tag, arguments.profile)
+        for target in targets
+    }
+    inventory_name = {
+        target["name"]: target_inventory(target, arguments.tag, arguments.profile)
         for target in targets
     }
     if arguments.mcpbs is None:
@@ -193,8 +210,11 @@ def main() -> int:
     workers = files(arguments.ncm_workers)
     worker_archives = {names[2] for names in assets.values() if len(names) > 2}
 
+    inventories = files(arguments.inventories) if arguments.inventories is not None else None
     if arguments.allow_missing_targets:
-        missing = require_whole_targets(targets, binaries, mcpbs, workers, assets)
+        missing = require_whole_targets(
+            targets, binaries, mcpbs, workers, assets, inventories, inventory_name
+        )
         verify_worker_checksums(arguments.ncm_workers, worker_archives & workers)
         if missing:
             print(
@@ -211,6 +231,8 @@ def main() -> int:
         name for names in assets.values() for name in names[2:]
     })
     verify_worker_checksums(arguments.ncm_workers, worker_archives)
+    if inventories is not None:
+        require_exact("component inventory", inventories, set(inventory_name.values()))
     print("release artifact coverage matches target manifest")
     return 0
 

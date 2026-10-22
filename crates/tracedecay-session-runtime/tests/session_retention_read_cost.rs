@@ -7,9 +7,9 @@
 pub mod support;
 
 use support::{
-    BASE_SESSIONS, DrainFixture, GROWN_SESSIONS, SEED_TIMESTAMP, advance_wal_to_next_generation,
-    probe_one_message, retention_tick_read_bytes, retention_writer_steps, seed_sessions,
-    settle_retention,
+    BASE_SESSIONS, DrainFixture, GROWN_SESSIONS, SEED_TIMESTAMP, advance_to_wal_restart,
+    probe_one_message, probe_retention_tick_read_bytes, retention_tick_read_bytes, seed_sessions,
+    session_cursor, settle_retention,
 };
 use tracedecay_sessions::admission::HostAdmissionScope;
 
@@ -30,11 +30,14 @@ async fn retention_tick_reads_do_not_scale_with_the_session_store() {
         .unwrap();
     let (project, scope) = (fixture.project.as_path(), fixture.scope());
     let probe_timestamp = SEED_TIMESTAMP + 10_000_000;
+    let mut padding = session_cursor(GROWN_SESSIONS);
 
     let mut streamed = seed_sessions(&facade, project, &scope, 0..BASE_SESSIONS).await;
     settle_retention(database).await;
-    advance_wal_to_next_generation(&facade, &fixture, &mut streamed, probe_timestamp).await;
-    retention_writer_steps(database).await;
+    // Settle padding before the warm-up so each measured tick still follows
+    // exactly STREAMED new messages at a comparable checkpoint phase.
+    advance_to_wal_restart(&facade, &fixture, &mut padding, probe_timestamp).await;
+    retention_tick_read_bytes(database).await;
     for offset in 0..STREAMED {
         probe_one_message(
             &facade,
@@ -45,12 +48,12 @@ async fn retention_tick_reads_do_not_scale_with_the_session_store() {
         )
         .await;
     }
-    let base_read = retention_tick_read_bytes(database).await;
+    let base_read = probe_retention_tick_read_bytes(database).await;
 
     seed_sessions(&facade, project, &scope, BASE_SESSIONS..GROWN_SESSIONS).await;
     settle_retention(database).await;
-    advance_wal_to_next_generation(&facade, &fixture, &mut streamed, probe_timestamp).await;
-    retention_writer_steps(database).await;
+    advance_to_wal_restart(&facade, &fixture, &mut padding, probe_timestamp).await;
+    retention_tick_read_bytes(database).await;
     for offset in STREAMED..2 * STREAMED {
         probe_one_message(
             &facade,
@@ -61,7 +64,7 @@ async fn retention_tick_reads_do_not_scale_with_the_session_store() {
         )
         .await;
     }
-    let grown_read = retention_tick_read_bytes(database).await;
+    let grown_read = probe_retention_tick_read_bytes(database).await;
 
     eprintln!("retention tick read bytes: base={base_read} grown={grown_read}");
     assert!(
