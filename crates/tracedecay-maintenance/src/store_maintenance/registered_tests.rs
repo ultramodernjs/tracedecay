@@ -121,6 +121,16 @@ async fn registered_pass_drains_collected_scope_using_its_recorded_root() {
     let checkout = checkout.canonicalize().expect("canonical checkout");
     let linked = linked.canonicalize().expect("canonical linked checkout");
     let (lease, _scope, _owner) = maintenance_lease(&profile, &checkout, "proj_release_only").await;
+    // A project with only session SQL mounted owns no memory graph attachment.
+    // Its existence must not block lazy, engine-free replay reconciliation.
+    let _sessions = lease
+        .store_runtime()
+        .project_sessions(
+            tracedecay_domain::ProjectId::new("proj_release_only").expect("project id"),
+            [checkout.clone()],
+        )
+        .await
+        .expect("session-only project runtime");
     tracedecay_runtime_core::storage::pin_fixture_repository_identity(&linked, "proj_release_only")
         .expect("linked checkout repository identity");
     let data_root = lease.store_layout().data_root.clone();
