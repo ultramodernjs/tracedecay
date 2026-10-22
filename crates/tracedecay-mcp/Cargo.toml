@@ -78,11 +78,15 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 tracedecay-code-index-runtime = { path = "../tracedecay-code-index-runtime", features = ["test-helpers"] }
 tracedecay-daemon-identity = { path = "../tracedecay-daemon-identity" }
+# Hook admission fixtures inspect orchestration settlement and task completion.
+tracedecay-daemon-service = { path = "../tracedecay-daemon-service", features = ["test-helpers"] }
 tracedecay-daemon-protocol = { path = "../tracedecay-daemon-protocol", features = ["test-helpers"] }
 # The dashboard LCM adapter's unit tests build request controls through the
 # dashboard-api test-transport constructor.
 tracedecay-dashboard-api = { path = "../tracedecay-dashboard-api", features = ["test-transport"] }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", features = ["test-helpers"] }
+# Standalone Tokio fixtures need the same native host runtime as workspace tests.
+tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", features = ["test-runtime"] }
 tracedecay-global-db = { path = "../tracedecay-global-db", features = ["test-helpers"] }
 tracedecay-graph-db = { path = "../tracedecay-graph-db" }
 # The moved handler tests open projects through the registered test runtime

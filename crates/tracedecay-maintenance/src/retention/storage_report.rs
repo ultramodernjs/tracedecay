@@ -7,7 +7,7 @@
 //! Reports never copy database families, migrate stores, hydrate transcripts,
 //! or reclaim disk space. Missing and unavailable telemetry stays explicit.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -749,7 +749,10 @@ async fn build_storage_report_with_walk_budget(
     let full_profile_root = profile_root.to_path_buf();
     let footprint = native_runtime::spawn_blocking(move || {
         census_profile_footprint_with_budget(
-            &full_profile_root, &BTreeMap::new(), &BTreeMap::new(), &mut walk_entry_budget,
+            &full_profile_root,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut walk_entry_budget,
         )
     })
     .await
@@ -1385,7 +1388,9 @@ fn append_project_report(
 ) -> tracedecay_domain::errors::Result<()> {
     let data_root = profile_root.join("projects").join(project_id);
     graph_replay_release.extend(graph_replay_release_backlog(
-        project_id, &data_root, Path::new(canonical_root),
+        project_id,
+        &data_root,
+        Path::new(canonical_root),
     ));
     let code_index_root = data_root.join("code-index-v1");
     let code_index_store_root =
@@ -1758,7 +1763,6 @@ fn sample_free_pages(graph_db_path: &Path) -> Option<(u64, f64)> {
 #[derive(Debug)]
 struct UnregisteredDirectorySample {
     directory_count: usize,
-    count_is_lower_bound: bool,
     bytes: u64,
     coverage: StorageReportSizeCoverageV1,
 }
@@ -1800,112 +1804,6 @@ fn sample_unregistered_paths(
     }
     UnregisteredDirectorySample {
         directory_count,
-        count_is_lower_bound: false,
-        bytes,
-        coverage: size_coverage(termination, bytes, unavailable_entry_count),
-    }
-}
-
-fn scan_unregistered_dirs(
-    profile_root: &Path,
-    registered_ids: &HashSet<String>,
-    remaining_entries: &mut usize,
-    walk_control: &StorageReportWalkControl,
-) -> UnregisteredDirectorySample {
-    let projects_dir = profile_root.join("projects");
-    let entries = match std::fs::symlink_metadata(&projects_dir).and_then(|metadata| {
-        if !metadata.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotADirectory,
-                "storage report projects path is not a directory",
-            ));
-        }
-        std::fs::read_dir(&projects_dir)
-    }) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return UnregisteredDirectorySample {
-                directory_count: 0,
-                count_is_lower_bound: false,
-                bytes: 0,
-                coverage: StorageReportSizeCoverageV1::default(),
-            };
-        }
-        Err(_) => {
-            return UnregisteredDirectorySample {
-                directory_count: 0,
-                count_is_lower_bound: true,
-                bytes: 0,
-                coverage: size_coverage(WalkTerminationV1::Complete, 0, 1),
-            };
-        }
-    };
-    let mut paths = Vec::new();
-    let mut unavailable_entry_count = 0usize;
-    let mut termination = WalkTerminationV1::Complete;
-    for entry in entries {
-        if let Some(interruption) = walk_control.interruption() {
-            termination = match interruption {
-                WalkInterruptionV1::Cancelled => WalkTerminationV1::Cancelled,
-                WalkInterruptionV1::DeadlineExceeded => WalkTerminationV1::DeadlineExceeded,
-            };
-            break;
-        }
-        if *remaining_entries == 0 {
-            termination = WalkTerminationV1::EntryBudgetExceeded;
-            break;
-        }
-        *remaining_entries -= 1;
-        let Ok(entry) = entry else {
-            unavailable_entry_count = unavailable_entry_count.saturating_add(1);
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            unavailable_entry_count = unavailable_entry_count.saturating_add(1);
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else {
-            unavailable_entry_count = unavailable_entry_count.saturating_add(1);
-            continue;
-        };
-        if tracedecay_runtime_core::storage::validate_project_id(&name).is_err()
-            || registered_ids.contains(&name)
-        {
-            continue;
-        }
-        paths.push(entry.path());
-    }
-    let directory_count = paths.len();
-    let count_is_lower_bound =
-        termination != WalkTerminationV1::Complete || unavailable_entry_count > 0;
-    let mut bytes = 0u64;
-    for path in paths {
-        if termination != WalkTerminationV1::Complete {
-            break;
-        }
-        let current = walk_regular_files_with_budget(
-            &path,
-            remaining_entries,
-            &|| walk_control.interruption(),
-            &mut |_, walked| match walked {
-                WalkedEntryV1::File { bytes: file_bytes } => {
-                    bytes = bytes.saturating_add(file_bytes);
-                }
-                WalkedEntryV1::Unavailable => {
-                    unavailable_entry_count = unavailable_entry_count.saturating_add(1);
-                }
-            },
-        );
-        if current != WalkTerminationV1::Complete {
-            termination = current;
-        }
-    }
-    UnregisteredDirectorySample {
-        directory_count,
-        count_is_lower_bound,
         bytes,
         coverage: size_coverage(termination, bytes, unavailable_entry_count),
     }
@@ -1930,7 +1828,6 @@ mod tests {
 
     use super::*;
     use crate::retention::footprint::census_profile_footprint;
-    use tracedecay_runtime_core::db::engine::TestConnection;
 
     #[test]
     fn report_lists_release_backlog_for_collected_primary_and_linked_scopes() {
@@ -2267,8 +2164,9 @@ mod tests {
             .unwrap();
         assert_eq!(u64::try_from(graph_freelist).unwrap(), 0);
         assert_eq!(
-            report.stores[0].free_bytes, None,
-            "session authority cannot sample graph pages"
+            report.stores[0].free_bytes,
+            Some(0),
+            "checkpointed graph header bytes remain independent of session freelists"
         );
         assert_eq!(report.stores[1].project_id, "proj_missing");
         assert_eq!(
@@ -2806,7 +2704,7 @@ mod tests {
         let profile_root = tmp.path().join("profile");
         let store_root = profile_root.join("projects/proj_a");
         std::fs::create_dir_all(&store_root).unwrap();
-        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]).await;
+        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]);
         for index in 0..16 {
             std::fs::write(store_root.join(format!("payload-{index}")), [1u8]).unwrap();
         }
@@ -2821,17 +2719,17 @@ mod tests {
             report.full_profile_size.as_ref().unwrap().state,
             ProfileTotalCoverageStateV1::Partial
         );
-        assert_eq!(report.stores.len(), 1);
-        assert_eq!(
-            report.stores[0].total_bytes, 0,
-            "the store walk cannot reset the exhausted census budget"
+        assert!(
+            report.stores.is_empty(),
+            "offline sizing cannot infer registry authority"
         );
-        assert_eq!(
-            report.stores[0].size_coverage.reason,
-            Some(StorageReportSizeReasonV1::EntryBudgetExceeded)
-        );
+        assert!(matches!(
+            report.registry,
+            Some(StorageReportRegistryV1::Unavailable { .. })
+        ));
         assert_eq!(report.unregistered_dir_count, 0);
-        assert!(report.coverage.unregistered_count_is_lower_bound);
+        assert_eq!(report.unregistered_bytes, 0);
+        assert!(report.footprint.as_ref().unwrap().total_bytes < profile_tree_bytes(&profile_root));
     }
 
     #[asupersync::test]
@@ -3071,8 +2969,9 @@ mod tests {
             "size must come from filesystem metadata"
         );
         assert_eq!(
-            report.stores[0].free_page_ratio, None,
-            "unmounted graph telemetry is unavailable"
+            report.stores[0].free_page_ratio,
+            Some(0.0),
+            "the checkpointed graph header is readable without mounting a graph authority"
         );
         assert_eq!(
             std::fs::metadata(&graph_db).unwrap().modified().unwrap(),
@@ -3090,8 +2989,8 @@ mod tests {
     }
 
     /// Session telemetry needs its retained project authority. An exclusive
-    /// graph writer must not block that independent sample or authorize graph
-    /// page telemetry merely because both stores belong to the same project.
+    /// graph writer must not block it or the independent checkpoint-header
+    /// sample, and neither sample may open or change the graph family.
     #[asupersync::test]
     async fn registered_project_session_telemetry_survives_an_exclusive_graph_writer() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3164,8 +3063,9 @@ mod tests {
             "the retained session authority must report real pages"
         );
         assert_eq!(
-            report.stores[0].free_page_ratio, None,
-            "session authority cannot authorize graph telemetry"
+            report.stores[0].free_page_ratio,
+            Some(0.0),
+            "graph header sampling needs no SQLite reader or session authority"
         );
         assert_eq!(
             sqlite_family_bytes(&graph_path),
@@ -3238,14 +3138,12 @@ mod tests {
             Some(StorageReportRegistryV1::Unavailable { .. })
         ));
         assert_eq!(
-            report.full_profile_size.unwrap().total_bytes,
+            report.full_profile_size.as_ref().unwrap().total_bytes,
             profile_tree_bytes(&profile_root)
         );
-        assert_eq!(report.coverage.unregistered_size.unavailable_entry_count, 2);
-        assert_eq!(
-            report.coverage.unregistered_size.state,
-            StorageReportSizeStateV1::Partial
-        );
+        let size = report.full_profile_size.unwrap();
+        assert_eq!(size.unavailable_entry_count, 2);
+        assert_eq!(size.state, ProfileTotalCoverageStateV1::Partial);
     }
 
     #[cfg(unix)]
@@ -3254,7 +3152,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let profile_root = tmp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        seed_global_db(&profile_root, &[]).await;
+        seed_global_db(&profile_root, &[]);
         let outside_projects = tmp.path().join("outside-projects");
         std::fs::create_dir_all(outside_projects.join("proj_outside")).unwrap();
         std::fs::write(outside_projects.join("proj_outside/payload"), [7; 2048]).unwrap();
@@ -3264,12 +3162,21 @@ mod tests {
 
         assert_eq!(report.unregistered_bytes, 0);
         assert_eq!(report.unregistered_dir_count, 0);
-        assert!(report.coverage.unregistered_count_is_lower_bound);
+        assert!(matches!(
+            report.registry,
+            Some(StorageReportRegistryV1::Unavailable { .. })
+        ));
+        let size = report.full_profile_size.unwrap();
+        assert_eq!(size.state, ProfileTotalCoverageStateV1::Partial);
+        assert_eq!(size.unavailable_entry_count, 1);
         assert_eq!(
-            report.coverage.unregistered_size.state,
-            StorageReportSizeStateV1::Unavailable
+            size.total_bytes,
+            profile_root
+                .join(GLOBAL_DB_FILENAME)
+                .metadata()
+                .unwrap()
+                .len()
         );
-        assert_eq!(report.coverage.unregistered_size.unavailable_entry_count, 1);
     }
 
     /// Each store row sizes every family under its project directory, and the
@@ -3616,6 +3523,7 @@ mod tests {
             None,
             None,
             1,
+            &[],
             1,
             None,
             None,
@@ -3671,6 +3579,7 @@ mod tests {
             None,
             None,
             2,
+            &[],
             3,
             None,
             None,
@@ -3742,6 +3651,7 @@ mod tests {
                 None,
                 Some(&cursor),
                 1,
+                &[],
                 inventory.entries_scanned + sizing_budget,
                 None,
                 None,
@@ -3769,27 +3679,33 @@ mod tests {
             std::fs::create_dir_all(&path).unwrap();
             std::fs::write(path.join("payload"), [1u8]).unwrap();
         }
-        let control = StorageReportWalkControl::default();
-        let mut remaining = 1;
-        let partial_inventory =
-            scan_unregistered_dirs(tmp.path(), &HashSet::new(), &mut remaining, &control);
-        assert_eq!(partial_inventory.directory_count, 1);
-        assert!(partial_inventory.count_is_lower_bound);
-        assert_eq!(
-            partial_inventory.coverage.reason,
-            Some(StorageReportSizeReasonV1::EntryBudgetExceeded)
-        );
-
-        let mut remaining = 2;
-        let complete_inventory =
-            scan_unregistered_dirs(tmp.path(), &HashSet::new(), &mut remaining, &control);
-        assert_eq!(complete_inventory.directory_count, 2);
+        let first = list_project_directories_page(tmp.path(), "", 1).unwrap();
+        assert_eq!(first.directories.len(), 1);
         assert!(
-            !complete_inventory.count_is_lower_bound,
-            "exhausting the byte walk does not erase a complete directory count"
+            first.next_cursor.is_some(),
+            "one page is not the whole inventory"
         );
+        let mut paths = first
+            .directories
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect::<Vec<_>>();
+        let mut cursor = first.next_cursor;
+        while let Some(after) = cursor {
+            let page = list_project_directories_page(tmp.path(), &after, 1).unwrap();
+            paths.extend(page.directories.into_iter().map(|(_, path)| path));
+            cursor = page.next_cursor;
+        }
+        let mut remaining = 1;
+        let sample =
+            sample_unregistered_paths(paths, &mut remaining, &StorageReportWalkControl::default());
         assert_eq!(
-            complete_inventory.coverage.reason,
+            sample.directory_count, 2,
+            "a sizing limit cannot erase enumerated directories"
+        );
+        assert_eq!(sample.bytes, 1);
+        assert_eq!(
+            sample.coverage.reason,
             Some(StorageReportSizeReasonV1::EntryBudgetExceeded)
         );
     }
@@ -3846,6 +3762,7 @@ mod tests {
             None,
             None,
             1,
+            &[],
             Some(cancellation),
             None,
         )
@@ -3868,6 +3785,7 @@ mod tests {
             None,
             None,
             1,
+            &[],
             None,
             Some(expired),
         )
@@ -3910,6 +3828,8 @@ mod tests {
             &mut stores,
             &mut plans,
             &mut availability,
+            &mut Vec::new(),
+            &SessionTelemetryHandles::new(),
             &mut exact_budget,
             &StorageReportWalkControl::default(),
         )
@@ -3951,6 +3871,8 @@ mod tests {
             &mut stores,
             &mut plans,
             &mut availability,
+            &mut Vec::new(),
+            &SessionTelemetryHandles::new(),
             &mut remaining,
             &StorageReportWalkControl::default(),
         )
@@ -3986,6 +3908,8 @@ mod tests {
             &mut stores,
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut Vec::new(),
+            &SessionTelemetryHandles::new(),
             &mut remaining,
             &StorageReportWalkControl::default(),
         )
@@ -4024,6 +3948,8 @@ mod tests {
             &mut stores,
             &mut Vec::new(),
             &mut availability,
+            &mut Vec::new(),
+            &SessionTelemetryHandles::new(),
             &mut remaining,
             &StorageReportWalkControl::default(),
         )
@@ -4079,6 +4005,8 @@ mod tests {
             &mut Vec::new(),
             &mut Vec::new(),
             &mut availability,
+            &mut Vec::new(),
+            &SessionTelemetryHandles::new(),
             &mut remaining,
             &StorageReportWalkControl::default(),
         )

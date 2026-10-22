@@ -7485,6 +7485,7 @@ dependencies = [
  "tracedecay-project",
  "tracedecay-query",
  "tracedecay-runtime-core",
+ "tracedecay-rusqlite-runtime",
  "tracedecay-session-memory",
  "tracedecay-session-runtime",
  "tracedecay-session-temporal-store",
