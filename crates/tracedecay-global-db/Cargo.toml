@@ -51,6 +51,7 @@ tracedecay-temporal-query = { path = "../tracedecay-temporal-query" }
 tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
+tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", features = ["test-runtime"] }
 criterion = { workspace = true, features = ["async"] }
 rusqlite.workspace = true
 tempfile.workspace = true

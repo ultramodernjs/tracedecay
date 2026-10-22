@@ -6,15 +6,15 @@
 //! drive the production limits deterministically, and no other test can
 //! expire because the machine running it was loaded.
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-runtime")))]
 pub(super) fn now() -> std::time::Instant {
     std::time::Instant::now()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-runtime"))]
 pub(super) use fake::now;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-runtime"))]
 pub(super) mod fake {
     use std::{
         cell::RefCell,
@@ -30,22 +30,30 @@ pub(super) mod fake {
     /// so no test's exact SQL deadline passes because the machine was slow.
     pub(in crate::exact_sql) fn now() -> Instant {
         INSTALLED.with(|installed| {
-            installed
+            #[cfg(test)]
+            return installed
                 .borrow_mut()
                 .get_or_insert_with(FakeClock::frozen)
-                .read()
+                .read();
+            #[cfg(not(test))]
+            installed
+                .borrow()
+                .as_ref()
+                .map_or_else(Instant::now, |clock| clock.read())
         })
     }
 
     /// A shared clock that moves only when a test moves it, or by a fixed
     /// tick on every read.
     pub(in crate::exact_sql) struct FakeClock {
+        #[cfg(test)]
         started: Instant,
         now: Mutex<Instant>,
         tick: Duration,
     }
 
     impl FakeClock {
+        #[cfg(test)]
         pub(in crate::exact_sql) fn frozen() -> Arc<Self> {
             Self::ticking(Duration::ZERO)
         }
@@ -55,6 +63,7 @@ pub(super) mod fake {
         pub(in crate::exact_sql) fn ticking(tick: Duration) -> Arc<Self> {
             let started = Instant::now();
             Arc::new(Self {
+                #[cfg(test)]
                 started,
                 now: Mutex::new(started),
                 tick,
@@ -67,10 +76,12 @@ pub(super) mod fake {
             INSTALLED.with(|installed| *installed.borrow_mut() = Some(Arc::clone(self)));
         }
 
+        #[cfg(test)]
         pub(in crate::exact_sql) fn advance(&self, by: Duration) {
             *self.now.lock().unwrap_or_else(PoisonError::into_inner) += by;
         }
 
+        #[cfg(test)]
         pub(in crate::exact_sql) fn elapsed(&self) -> Duration {
             self.now
                 .lock()
@@ -86,9 +97,70 @@ pub(super) mod fake {
         }
     }
 
+    #[cfg(feature = "test-runtime")]
+    static STATEMENT_CLOCKS: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<std::path::PathBuf, Arc<FakeClock>>>,
+    > = std::sync::LazyLock::new(Mutex::default);
+
+    /// Accelerates statement deadlines on one temporary database, including its
+    /// reader and writer workers. Dropping it unregisters the clock.
+    #[cfg(feature = "test-runtime")]
+    pub struct StatementClock(std::path::PathBuf);
+
+    #[cfg(feature = "test-runtime")]
+    impl StatementClock {
+        pub fn ticking(path: &std::path::Path, tick: Duration) -> Self {
+            let path = path.canonicalize().expect("test database must exist");
+            let previous = STATEMENT_CLOCKS
+                .lock()
+                .unwrap()
+                .insert(path.clone(), FakeClock::ticking(tick));
+            assert!(
+                previous.is_none(),
+                "test database already has a statement clock"
+            );
+            Self(path)
+        }
+    }
+
+    #[cfg(feature = "test-runtime")]
+    impl Drop for StatementClock {
+        fn drop(&mut self) {
+            STATEMENT_CLOCKS.lock().unwrap().remove(&self.0);
+        }
+    }
+
+    #[cfg(feature = "test-runtime")]
+    pub(in crate::exact_sql) struct InstalledClock(Option<Arc<FakeClock>>);
+
+    #[cfg(feature = "test-runtime")]
+    impl Drop for InstalledClock {
+        fn drop(&mut self) {
+            INSTALLED.with(|installed| *installed.borrow_mut() = self.0.take());
+        }
+    }
+
+    #[cfg(feature = "test-runtime")]
+    pub(in crate::exact_sql) fn for_statement(connection: &rusqlite::Connection) -> InstalledClock {
+        let clock = connection.path().and_then(|path| {
+            STATEMENT_CLOCKS
+                .lock()
+                .unwrap()
+                .get(std::path::Path::new(path))
+                .cloned()
+        });
+        let previous = INSTALLED.with(|installed| installed.borrow().clone());
+        if let Some(clock) = clock {
+            clock.install();
+        }
+        InstalledClock(previous)
+    }
+
+    #[cfg(test)]
     #[derive(Default)]
     pub(crate) struct TaskClock(Option<Arc<FakeClock>>);
 
+    #[cfg(test)]
     impl TaskClock {
         pub(crate) fn swap(&mut self) {
             INSTALLED.with(|installed| std::mem::swap(&mut *installed.borrow_mut(), &mut self.0));

@@ -443,6 +443,18 @@ impl DatabaseWriteTransaction<'_> {
         self.transaction.query(sql, params).await
     }
 
+    /// Executes schema or bulk-maintenance work without a statement deadline.
+    /// Only an authority-bound long-lease transaction accepts this policy;
+    /// shutdown and continuous write-authority checks still interrupt it.
+    pub async fn execute_authority_revalidated_batch(
+        &self,
+        sql: &str,
+    ) -> crate::db::engine::Result<()> {
+        self.transaction
+            .execute_authority_revalidated_batch(sql)
+            .await
+    }
+
     /// A query for schema-convergence audits whose single statement scans a
     /// whole table. It carries no statement deadline and is accepted only by
     /// a bulk (authority-bound long-lease) transaction.

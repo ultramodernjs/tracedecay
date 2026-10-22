@@ -1310,6 +1310,70 @@ async fn offline_retirement_index_preparation_is_bounded_and_resumable() {
 }
 
 #[asupersync::test]
+async fn offline_retirement_index_preparation_outlives_request_deadlines() {
+    use std::time::Duration;
+    use tracedecay_rusqlite_runtime::exact_sql::StatementClock;
+
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-index-offline-deadline")
+            .await;
+    let db = &harness.registered;
+    let writer = db.writer_connection().unwrap();
+    install_indexes(&writer).await.unwrap();
+    writer
+        .execute_batch(
+            "DROP INDEX idx_retirement_external_source_anchor;
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<12000)
+         INSERT INTO external_source_mutations_v1
+         SELECT 'binding.offline', printf('%08d',i), printf('%08d',i), 'revision',
+                json_object('evidence',json_object('retrieval_anchor',printf('%08d',i)),
+                            'payload',hex(zeroblob(1024))) FROM n;",
+        )
+        .await
+        .unwrap();
+    let lease = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
+        db.db_path().parent().unwrap(),
+        "offline index deadline test",
+    )
+    .unwrap();
+    // Each SQLite progress callback advances the existing runtime fake clock.
+    // Scope it to this database so concurrent tests keep their normal clocks.
+    let _clock = StatementClock::ticking(db.db_path(), Duration::from_secs(10));
+    let read = db.read_snapshot().await.unwrap();
+    assert!(
+        read.query(
+            "SELECT sum(length(mutation_json)) FROM external_source_mutations_v1",
+            ()
+        )
+        .await
+        .is_err(),
+        "ordinary reads must still enforce their request deadline",
+    );
+    drop(read);
+
+    let plan = db
+        .plan_retirement_index_preparation(&lease)
+        .await
+        .expect("offline preflight must outlive the request deadline");
+    assert_eq!(
+        plan.index_name.as_deref(),
+        Some("idx_retirement_external_source_anchor")
+    );
+    assert_eq!(plan.rows, 12000);
+    assert_eq!(plan.key_bytes, 384000);
+    assert!(plan.within_budget);
+    db.apply_retirement_index_preparation(&lease, &plan, plan.digest())
+        .await
+        .expect("offline revalidation and CREATE INDEX must outlive request deadlines");
+    assert!(
+        db.plan_retirement_index_preparation(&lease)
+            .await
+            .unwrap()
+            .done
+    );
+}
+
+#[asupersync::test]
 async fn offline_retirement_index_preparation_refuses_oversized_key_work() {
     let harness =
         RegisteredGlobalDbHarness::open_without_relation_graph("retirement-index-budget").await;

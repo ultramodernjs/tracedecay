@@ -40,6 +40,8 @@ const ROW_ALLOCATION_OVERHEAD: usize =
 const CELL_ALLOCATION_OVERHEAD: usize = std::mem::size_of::<ExactSqlValue>();
 
 mod clock;
+#[cfg(feature = "test-runtime")]
+pub use clock::fake::StatementClock;
 #[cfg(test)]
 pub(crate) use clock::fake::TaskClock;
 mod column;

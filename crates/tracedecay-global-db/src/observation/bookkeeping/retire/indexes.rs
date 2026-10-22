@@ -8,7 +8,10 @@ use super::{
 };
 use crate::RegisteredGlobalDb;
 use serde::Serialize;
-use tracedecay_runtime_core::db::engine::QueryExecutor;
+use tracedecay_runtime_core::db::{
+    DatabaseWriteTransaction,
+    engine::{IntoParams, QueryExecutor, Result as EngineResult, Rows},
+};
 use tracedecay_runtime_core::lifecycle_lease::LifecycleLease;
 use tracedecay_store::{ProjectionStoreError, ProjectionStoreResult};
 
@@ -111,6 +114,19 @@ fn require_lease(db: &RegisteredGlobalDb, lease: &LifecycleLease) -> ProjectionS
     Ok(())
 }
 
+// Only constructed after the offline lease and write scope have been checked.
+// Revalidation scans and native index builds must not inherit request deadlines.
+struct OfflinePreparationTransaction<'a>(DatabaseWriteTransaction<'a>);
+
+impl QueryExecutor for OfflinePreparationTransaction<'_> {
+    async fn query<P>(&self, sql: &str, params: P) -> EngineResult<Rows>
+    where
+        P: IntoParams,
+    {
+        self.0.convergence_query(sql, params).await
+    }
+}
+
 async fn plan_on(
     conn: &impl QueryExecutor,
     store: String,
@@ -141,7 +157,8 @@ async fn plan_on(
             continue;
         }
         // No ORDER BY, GROUP BY, DISTINCT or automatic-index join: this bounded
-        // preflight cannot construct a whole-store sorter. Never read payloads.
+        // preflight cannot construct a whole-store sorter. Expression keys may
+        // parse JSON payloads, so offline scans need the convergence budget.
         let mut rows = conn.query(&format!(
             "SELECT count(*), coalesce(sum(coalesce(length(CAST(retirement_key AS BLOB)),0)+24),0) FROM (SELECT {} AS retirement_key FROM {} LIMIT {})",
             index.key, index.table, MAX_PREPARATION_ROWS + 1), ()).await.map_err(storage)?;
@@ -170,7 +187,11 @@ impl RegisteredGlobalDb {
         lease: &LifecycleLease,
     ) -> ProjectionStoreResult<RetirementIndexPreparationPlan> {
         require_lease(self, lease)?;
-        let read = self.read_snapshot().await.map_err(storage)?;
+        let read = self
+            .read_connection()
+            .convergence_snapshot()
+            .await
+            .map_err(storage)?;
         plan_on(&read, hash(&self.retirement_store_identity())?).await
     }
 
@@ -203,7 +224,12 @@ impl RegisteredGlobalDb {
             .execute_batch("PRAGMA temp_store=MEMORY;")
             .await
             .map_err(storage)?;
-        let tx = self.begin_write_transaction().await.map_err(storage)?;
+        let tx = OfflinePreparationTransaction(
+            self.runtime_database()
+                .begin_bulk_write_transaction("prepare retirement indexes")
+                .await
+                .map_err(storage)?,
+        );
         let current = plan_on(&tx, plan.store.clone()).await?;
         if current.digest != confirmed_digest {
             return Err(preparation_error(
@@ -215,7 +241,7 @@ impl RegisteredGlobalDb {
                 .into_iter()
                 .find(|index| index.name == name)
                 .ok_or(ProjectionStoreError::ProvenanceCollision)?;
-            tx.execute_batch(&format!(
+            tx.0.execute_authority_revalidated_batch(&format!(
                 "CREATE INDEX {} ON {}({});",
                 index.name, index.table, index.key
             ))
@@ -223,7 +249,7 @@ impl RegisteredGlobalDb {
             .map_err(storage)?;
             require_index(&tx, index.table, index.key, "").await?;
         }
-        tx.commit().await.map_err(storage)?;
+        tx.0.commit().await.map_err(storage)?;
         Ok(())
     }
 }

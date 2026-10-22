@@ -209,6 +209,8 @@ pub(super) fn with_exact_sql_guard<T, F>(
 where
     F: FnOnce() -> Result<T, ExactSqlError>,
 {
+    #[cfg(feature = "test-runtime")]
+    let _statement_clock = clock::fake::for_statement(connection);
     let deadline = if enforce_statement_limit {
         let operation_deadline = clock::now() + EXACT_SQL_EXECUTION_LIMIT;
         Some(execution_deadline.map_or(operation_deadline, |deadline| {
