@@ -27,6 +27,10 @@
 //! entire batch rather than release an incompletely understood dependency.
 
 mod hydration;
+mod indexes;
+pub use indexes::{
+    MAX_PREPARATION_KEY_BYTES, MAX_PREPARATION_ROWS, RetirementIndexPreparationPlan,
+};
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -324,45 +328,10 @@ const GUARDS: &[&str] = &[
 pub(crate) async fn install_indexes(
     conn: &impl Executor,
 ) -> tracedecay_runtime_core::db::engine::Result<()> {
-    for (table, key, _) in TABLES {
-        if matches!(
-            *table,
-            "observations"
-                | "projection_queue"
-                | "session_canonical_body_references"
-                | "observation_repository_capture_references"
-                | "observation_repository_provenance"
-                | "observation_retrieval_anchors"
-                | "observation_admission_refusals"
-                | "session_temporal_observation_effects"
-        ) {
-            continue;
-        }
-        install_empty_table_index(conn, table, &format!("idx_retirement_{table}"), key).await?;
+    for index in indexes::definitions() {
+        install_empty_table_index(conn, index.table, &index.name, index.key).await?;
     }
-    for (table, column) in ANCHOR_REVERSE_INDEXES {
-        install_empty_table_index(
-            conn,
-            table,
-            &format!("idx_retirement_{table}_{column}"),
-            column,
-        )
-        .await?;
-    }
-    install_empty_table_index(
-        conn,
-        "session_occurrences",
-        "idx_retirement_occurrences",
-        "source_observation_id",
-    )
-    .await?;
-    install_empty_table_index(
-        conn,
-        "external_source_mutations_v1",
-        "idx_retirement_external_source_anchor",
-        EXTERNAL_ANCHOR_KEY,
-    )
-    .await
+    Ok(())
 }
 
 async fn install_empty_table_index(

@@ -425,3 +425,34 @@ fn every_help_example_is_accepted_by_the_parser() {
         .collect();
     assert_eq!(rejected, Vec::<String>::new());
 }
+
+#[test]
+fn storage_retirement_index_preparation_defaults_to_dry_run() {
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "prepare-retirement-indexes",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Storage {
+            action: ProfileStorageAction::PrepareRetirementIndexes {
+                apply: None,
+                json: true
+            }
+        })
+    ));
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "prepare-retirement-indexes",
+        "--apply",
+        "reviewed-digest",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Some(Commands::Storage { action: ProfileStorageAction::PrepareRetirementIndexes { apply: Some(digest), .. } }) if digest == "reviewed-digest")
+    );
+}

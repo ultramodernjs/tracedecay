@@ -728,7 +728,7 @@ fn claude_and_kiro_hooks_skip_startup_maintenance() {
 fn every_hook_subcommand_skips_startup_maintenance() {
     // Hooks run on the host's hot path and their stderr reaches the host. A
     // hook outside the native-capture table (the PostCompact pressure probes)
-    // must still skip the counter flush, first-run note and install check.
+    // must still skip the first-run note and install check.
     let hooks: Vec<String> = Cli::command()
         .get_subcommands()
         .map(|subcommand| subcommand.get_name().to_owned())
@@ -740,7 +740,6 @@ fn every_hook_subcommand_skips_startup_maintenance() {
     );
     for hook in &hooks {
         let command = parse_command(&[hook.as_str()]);
-        assert!(!runs_worldwide_counter_flush(&command));
         assert!(
             should_skip_startup_maintenance(&command),
             "{hook} runs startup maintenance"

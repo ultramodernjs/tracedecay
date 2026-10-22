@@ -1,3 +1,5 @@
+mod retirement;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracedecay_runtime_core::config::ProfileRoot;
@@ -21,6 +23,9 @@ pub(crate) async fn handle_profile_storage_action(
     assume_yes: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     match action {
+        ProfileStorageAction::PrepareRetirementIndexes { apply, json } => {
+            Box::pin(retirement::prepare_indexes(profile, apply, json)).await
+        }
         ProfileStorageAction::StorageReport {
             profile_root,
             project_id,

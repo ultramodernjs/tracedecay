@@ -1229,3 +1229,115 @@ async fn retirement_projection_and_rebuild_refuse_unexplained_interior_gaps() {
     );
     assert!(db.observation_store().rebuild_projection(2).await.is_err());
 }
+
+#[asupersync::test]
+async fn offline_retirement_index_preparation_is_bounded_and_resumable() {
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-index-prepare").await;
+    let db = &harness.registered;
+    let observation = seed(db, 200).await;
+    let writer = db.writer_connection().unwrap();
+    writer
+        .execute(
+            "INSERT INTO observation_source_presence VALUES ('source.prepare',?1,'1',0)",
+            [observation.observation_id().as_str()],
+        )
+        .await
+        .unwrap();
+    writer.execute_batch("DROP INDEX idx_retirement_occurrences; DROP INDEX idx_retirement_observation_source_presence;").await.unwrap();
+    // Populate a reverse-lookup table before preparing; startup must leave it alone.
+    install_indexes(&writer).await.unwrap();
+    writer
+        .execute_batch("DROP INDEX idx_retirement_occurrences;")
+        .await
+        .unwrap();
+    let profile = db.db_path().parent().unwrap();
+    let lease = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
+        profile,
+        "prepare retirement indexes test",
+    )
+    .unwrap();
+    let plan = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert!(!plan.done);
+    assert_eq!(
+        plan.index_name.as_deref(),
+        Some("idx_retirement_observation_source_presence")
+    );
+    assert_eq!(plan.rows, 1);
+    assert!(
+        db.apply_retirement_index_preparation(&lease, &plan, "wrong")
+            .await
+            .is_err()
+    );
+    db.apply_retirement_index_preparation(&lease, &plan, plan.digest())
+        .await
+        .unwrap();
+    let next = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert_eq!(
+        next.index_name.as_deref(),
+        Some("idx_retirement_occurrences")
+    );
+    db.apply_retirement_index_preparation(&lease, &next, next.digest())
+        .await
+        .unwrap();
+    assert!(
+        db.plan_retirement_index_preparation(&lease)
+            .await
+            .unwrap()
+            .done
+    );
+    assert!(
+        db.plan_observation_retirement(
+            &[observation.observation_id().clone()],
+            ObservationRetirementAuthorization::UnsupportedCodexRecord
+        )
+        .await
+        .unwrap()
+        .eligible()
+    );
+    let done = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    let harness = harness.restart().await;
+    let reopened = harness
+        .registered
+        .plan_retirement_index_preparation(&lease)
+        .await
+        .unwrap();
+    assert_eq!(
+        done.digest(),
+        reopened.digest(),
+        "operator digests must survive process/runtime remounts of the same physical store"
+    );
+}
+
+#[asupersync::test]
+async fn offline_retirement_index_preparation_refuses_oversized_key_work() {
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-index-budget").await;
+    let db = &harness.registered;
+    let writer = db.writer_connection().unwrap();
+    writer.execute_batch("DROP INDEX idx_retirement_observation_source_presence; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1024) INSERT INTO observation_source_presence SELECT 'source.oversize',printf('%04d',i)||hex(zeroblob(32768)),'1',0 FROM n;").await.unwrap();
+    let lease = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
+        db.db_path().parent().unwrap(),
+        "index work budget test",
+    )
+    .unwrap();
+    let plan = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert_eq!(plan.rows, 1024);
+    assert_eq!(plan.key_bytes, 67_137_536);
+    assert!(!plan.within_budget);
+    assert!(
+        db.apply_retirement_index_preparation(&lease, &plan, plan.digest())
+            .await
+            .is_err()
+    );
+    let unchanged = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert_eq!(
+        unchanged.index_name.as_deref(),
+        Some("idx_retirement_observation_source_presence")
+    );
+    assert_eq!(
+        plan.digest(),
+        unchanged.digest(),
+        "over-budget apply must leave the store unchanged"
+    );
+}

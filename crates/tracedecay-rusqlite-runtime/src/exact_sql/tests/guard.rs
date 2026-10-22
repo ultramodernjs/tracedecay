@@ -316,3 +316,18 @@ fn cache_key_suffixes_fit_the_reserved_length() {
             .all(|suffix| suffix.len() <= crate::exact_sql::guard::MAX_CACHE_KEY_SUFFIX_BYTES)
     );
 }
+
+#[test]
+fn index_preparation_can_force_memory_sort_without_enabling_disk_sort_pragmas() {
+    let connection = policy_connection(ConnectionMode::Writer);
+    prepare_under(&connection, exact_writer(false), "PRAGMA temp_store=MEMORY").unwrap();
+    assert!(prepare_under(&connection, exact_writer(false), "PRAGMA temp_store=FILE").is_err());
+    assert!(
+        prepare_under(
+            &connection,
+            exact_writer(false),
+            "PRAGMA temp_store=DEFAULT"
+        )
+        .is_err()
+    );
+}
