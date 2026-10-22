@@ -617,3 +617,96 @@ async fn unsupported_cleanup_apply_retires_only_eligible_records_and_is_retry_sa
         .unwrap();
     assert!(rows.next().await.unwrap().is_none());
 }
+
+#[asupersync::test]
+async fn unsupported_cleanup_refuses_classification_hydration_before_loading_a_body() {
+    let directory = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(directory.path())
+        .await
+        .unwrap();
+    seed(&runtime).await;
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    // A historical/imported body can exceed today's command admission bound.
+    // Corrupt bytes prove size-only refusal takes precedence over decompression.
+    database
+        .writer_connection()
+        .unwrap()
+        .execute(
+            "UPDATE session_canonical_bodies SET uncompressed_bytes=8388609, body=X'00'",
+            (),
+        )
+        .await
+        .unwrap();
+    let before = file_bytes(database);
+    let error = database
+        .plan_unsupported_codex_cleanup(None, 128)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("classification budget/integrity preflight"),
+        "classification must authorize hydration before loading canonical blobs: {error}"
+    );
+    assert_eq!(
+        before,
+        file_bytes(database),
+        "refused planning must remain passive"
+    );
+}
+
+#[asupersync::test]
+async fn unsupported_cleanup_bounds_inline_json_before_classifying_supported_records() {
+    let directory = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(directory.path())
+        .await
+        .unwrap();
+    seed(&runtime).await;
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let first = database
+        .plan_unsupported_codex_cleanup(None, 1)
+        .await
+        .unwrap();
+    let cursor = UnsupportedCodexCleanupCursor {
+        after_sequence: 6,
+        high_water_sequence: 7,
+        ..first.cursor
+    };
+    // Model a valid historical/imported row below today's command size cap.
+    // It is supported, so the retirement kernel will never see its JSON.
+    let observation = observation(
+        6,
+        vec![json!({"kind":"message", "role":"user", "content":"preserve"})],
+    );
+    let committed = ObservationSourceCursorV1::for_ordering(
+        observation.source().clone(),
+        observation.scope().clone(),
+        observation.identity().generation(),
+        observation.identity().ordering_domain(),
+        700,
+    )
+    .unwrap();
+    let receipt = observation.receipt();
+    let tx = database.begin_write_transaction().await.unwrap();
+    tx.execute("INSERT INTO sanitization_receipts(receipt_id,sanitizer_version,payload_digest,receipt_json) VALUES (?1,?2,?3,?4)",
+        params![receipt.receipt().receipt_id().as_str(), receipt.receipt().sanitizer_version().as_str(), observation.payload_reference().digest().as_str(), serde_json::to_string(receipt).unwrap()]).await.unwrap();
+    tx.execute("INSERT INTO observations(observation_id,payload_digest,receipt_id,observation_json,committed_cursor_json) VALUES (?1,?2,?3,?4||printf('%*s',8388609,''),?5)",
+        params![observation.observation_id().as_str(), observation.payload_reference().digest().as_str(), receipt.receipt().receipt_id().as_str(), serde_json::to_string(&observation).unwrap(), serde_json::to_string(&committed).unwrap()]).await.unwrap();
+    tx.commit().await.unwrap();
+    let before = file_bytes(database);
+    let error = database
+        .plan_unsupported_codex_cleanup(Some(&cursor), 1)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("classification budget/integrity preflight refused observation sequence 7"),
+        "inline bytes must be bounded before decoding even a supported record: {error}"
+    );
+    assert_eq!(before, file_bytes(database));
+}

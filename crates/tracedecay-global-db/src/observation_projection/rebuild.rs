@@ -33,6 +33,7 @@ use super::transition::{
     MessageTransition, MessageTransitionState, WorkflowFactTarget, WorkflowFactTransition,
     message_transition, write_workflow_fact_transition,
 };
+use crate::observation::retired_sequences;
 use tracedecay_session_temporal_store::record_canonical_observation_effect;
 
 pub(super) const REBUILD_PAGE_SIZE: i64 = 128;
@@ -368,7 +369,15 @@ async fn persist_projection_rejection_on_database(
         return Err(ProjectionStoreError::ObservationNotFound);
     };
     let expected = checkpoint.last_sequence().saturating_add(1);
-    if sequence > checkpoint.last_sequence() && sequence != expected {
+    if sequence > checkpoint.last_sequence()
+        && sequence != expected
+        && !retired_sequences::covers(
+            &transaction,
+            sequence_i64(expected)?,
+            sequence_i64(sequence)? - 1,
+        )
+        .await?
+    {
         return Err(ProjectionStoreError::Gap {
             expected,
             actual: sequence,
@@ -620,7 +629,14 @@ async fn project_observation_in_transaction_with_session(
         ));
     }
     let expected = checkpoint.last_sequence().saturating_add(1);
-    if sequence != expected {
+    if sequence != expected
+        && !retired_sequences::covers(
+            transaction,
+            sequence_i64(expected)?,
+            sequence_i64(sequence)? - 1,
+        )
+        .await?
+    {
         return Err(ProjectionStoreError::Gap {
             expected,
             actual: sequence,
@@ -706,6 +722,19 @@ async fn start_or_resume_projection_rebuild_transaction(
     Ok(())
 }
 
+async fn advance_retired_suffix(
+    conn: &impl QueryExecutor,
+    through: i64,
+    frontier: i64,
+) -> ProjectionStoreResult<i64> {
+    if through >= frontier {
+        return Ok(through);
+    }
+    Ok(retired_sequences::covered_through(conn, through + 1)
+        .await?
+        .map_or(through, |end| end.min(frontier)))
+}
+
 async fn stage_projection_alias_batch_transaction(
     transaction: &impl Executor,
 ) -> ProjectionStoreResult<()> {
@@ -740,7 +769,9 @@ async fn stage_projection_alias_batch_transaction(
                 "observation sequence overflow before alias frontier",
             )
         })?;
-        if sequence != expected {
+        if sequence != expected
+            && !retired_sequences::covers(transaction, expected, sequence - 1).await?
+        {
             return Err(storage_message(
                 "stage projection alias batch",
                 "observation sequence gap before alias frontier",
@@ -749,6 +780,8 @@ async fn stage_projection_alias_batch_transaction(
         aliases_staged_through = sequence;
     }
     drop(rows);
+    aliases_staged_through =
+        advance_retired_suffix(transaction, aliases_staged_through, job.frontier).await?;
     if aliases_staged_through < job.frontier && aliases_staged_through == job.aliases_staged_through
     {
         return Err(storage_message(
@@ -853,7 +886,9 @@ async fn stage_projection_rebuild_batch_transaction(
                 "observation sequence overflow before rebuild frontier",
             )
         })?;
-        if sequence_i64 != expected {
+        if sequence_i64 != expected
+            && !retired_sequences::covers(transaction, expected, sequence_i64 - 1).await?
+        {
             return Err(storage_message(
                 "stage projection rebuild batch",
                 "observation sequence gap before rebuild frontier",
@@ -895,6 +930,7 @@ async fn stage_projection_rebuild_batch_transaction(
             break;
         }
     }
+    staged_through = advance_retired_suffix(transaction, staged_through, job.frontier).await?;
     if staged_through < job.frontier && staged_through == job.staged_through {
         return Err(storage_message(
             "stage projection rebuild batch",
@@ -1304,15 +1340,15 @@ fn decode_usize(value: i64, operation: &'static str) -> ProjectionStoreResult<us
     usize::try_from(value).map_err(|_| storage_message(operation, "invalid rebuild counter"))
 }
 
-/// Reads the current observation frontier: `COALESCE(MAX(sequence), 0)` over
-/// `observations`. The query's row cursor lives only inside this function and
+/// Reads the retained-or-retired observation frontier, never allocator state.
+/// The query's row cursor lives only inside this function and
 /// is fully consumed and dropped before it returns, so a caller may safely go
 /// on to read or write further rows through the same connection and observe
 /// them, a cursor left open past that point would otherwise pin the
 /// connection's read snapshot and hide those subsequent writes.
 async fn read_observation_frontier(conn: &impl QueryExecutor) -> ProjectionStoreResult<u64> {
     let mut rows = conn
-        .query("SELECT COALESCE(MAX(sequence), 0) FROM observations", ())
+        .query(retired_sequences::FRONTIER_SQL, ())
         .await
         .map_err(|error| storage("read projection rebuild frontier", error))?;
     let frontier = rows

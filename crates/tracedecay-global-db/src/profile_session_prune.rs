@@ -586,24 +586,6 @@ pub enum PruneExclusion {
     OperatorPrunedSource,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SourceExclusionMarker {
-    version: u8,
-    source: ObservationSourceIdentityV1,
-    scope: ObservationScopeV1,
-    plan_digest: String,
-}
-
-fn source_marker_key(
-    source: &ObservationSourceIdentityV1,
-    scope: &ObservationScopeV1,
-) -> Result<String> {
-    Ok(format!(
-        "profile-project-prune.v1.source.{}",
-        hex::encode(Sha256::digest(source_key(source, scope)?.as_bytes()))
-    ))
-}
-
 /// Read before evidence/bookkeeping admission, and recheck in the final writer
 /// transaction. An exclusion must advance terminal cursor-only coverage; it is
 /// not an exact duplicate, a failed write, or a per-observation refusal row.
@@ -612,7 +594,11 @@ pub async fn classify_exclusion(
     read: &impl QueryExecutor,
     observation: &DurableObservationV1,
 ) -> Result<Option<PruneExclusion>> {
-    let key = source_marker_key(observation.source(), observation.scope())?;
+    let key = tracedecay_store::observation_source_exclusion_key(
+        observation.source(),
+        observation.scope(),
+    )
+    .map_err(error)?;
     let mut rows = read
         .query(
             "SELECT value FROM session_backfill_meta WHERE key = ?1",
@@ -624,17 +610,11 @@ pub async fn classify_exclusion(
         return Ok(None);
     };
     let value = row.get::<String>(0).map_err(error)?;
-    let marker: SourceExclusionMarker = serde_json::from_str(&value).map_err(error)?;
-    if marker.version != 1
-        || marker.source != *observation.source()
-        || marker.scope != *observation.scope()
-        || marker.plan_digest.len() != 64
-        || !marker
-            .plan_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(error("invalid profile prune exclusion marker"));
-    }
+    tracedecay_store::validate_observation_source_exclusion(
+        &value,
+        observation.source(),
+        observation.scope(),
+    )
+    .map_err(error)?;
     Ok(Some(PruneExclusion::OperatorPrunedSource))
 }

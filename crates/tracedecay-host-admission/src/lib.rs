@@ -1279,6 +1279,11 @@ fn classify_capture(outcome: CaptureObservationOutcome) -> HostAdmissionOutcome 
             ObservationPersistOutcome::Committed(_) => {
                 admission_outcome(HostAdmissionStatus::Committed, false, None)
             }
+            ObservationPersistOutcome::SourceExcluded(_) => admission_outcome(
+                HostAdmissionStatus::NotApplicable,
+                false,
+                Some("operator_pruned_source"),
+            ),
             ObservationPersistOutcome::ExactDuplicate(_) => {
                 admission_outcome(HostAdmissionStatus::ExactDuplicate, false, None)
             }
@@ -1374,9 +1379,10 @@ async fn project_captured_outcomes(
                 persisted.as_ref(),
                 ObservationPersistOutcome::CoveredDuplicate(_)
             )
+            && let Some(receipt) = persisted.receipt()
         {
             persisted_slots.push(slot);
-            receipts.push(persisted.receipt().clone());
+            receipts.push(receipt.clone());
         }
     }
     if receipts.is_empty() {
@@ -1434,11 +1440,16 @@ async fn publish_canonical_git_evidence(
     let mut worktrees = AdmittedWorktrees::new(repository_provenance.admitted_project_root());
     for outcome in outcomes {
         let CaptureObservationOutcome::Persisted {
-            sanitized_record, ..
+            outcome: persisted,
+            sanitized_record,
+            ..
         } = outcome
         else {
             continue;
         };
+        if persisted.receipt().is_none() {
+            continue;
+        }
         let (commit_records, span_observations) =
             canonical_observation_git_evidence(sanitized_record.payload(), &mut worktrees)
                 .map_err(classify_git_evidence_error)?;
@@ -1491,7 +1502,16 @@ fn accepted_for_external_source_replay(
             "external_source_projection_receipt_mismatch",
         ));
     };
-    let durable_observation_id = outcome.receipt().observation().observation_id().clone();
+    let durable_observation_id = outcome
+        .receipt()
+        .ok_or_else(|| {
+            HostAdmissionOutcome::retained_unavailable(
+                "external_source_projection_receipt_mismatch",
+            )
+        })?
+        .observation()
+        .observation_id()
+        .clone();
     let retry_handle = ExternalSourceProjectionRetryHandleV1::new(
         receipt.binding().clone(),
         receipt.receipt_digest().clone(),

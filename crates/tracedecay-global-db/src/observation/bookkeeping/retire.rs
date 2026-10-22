@@ -1,9 +1,8 @@
 //! Registered observation retirement; apply owns the writer transaction.
 //!
-//! Sequence deletion is currently disabled: all existing observations report
-//! `ProjectionSequenceCoverageUnavailable` until every projection/rebuild
-//! consumer understands durable retirement coverage. Planning remains read-only;
-//! confirmed apply defers before any marker, deletion or disposition mutation.
+//! Deleted sequence identities are coalesced into durable ranges in the same
+//! transaction as the evidence cascade. Projection, rejection and rebuild
+//! consumers verify those ranges before crossing gaps. Planning remains read-only.
 //! Canonical-body compressed bytes and expanded references share the 8-MiB batch
 //! budget with selected column bytes and are preflighted before hydration.
 //!
@@ -28,6 +27,10 @@
 //! entire batch rather than release an incompletely understood dependency.
 
 mod hydration;
+mod indexes;
+pub use indexes::{
+    MAX_PREPARATION_KEY_BYTES, MAX_PREPARATION_ROWS, RetirementIndexPreparationPlan,
+};
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -72,17 +75,12 @@ pub struct ProjectPruneMarker {
 
 impl ProjectPruneMarker {
     pub fn metadata(&self) -> ProjectionStoreResult<(String, String)> {
-        let identity = serde_json::to_string(&(&self.source, &self.scope)).map_err(storage)?;
-        let key = format!(
-            "profile-project-prune.v1.source.{}",
-            tracedecay_domain::canonical_text::sha256_hex(identity.as_bytes())
-        );
-        let value = serde_json::to_string(&serde_json::json!({
-            "version": 1, "source": self.source, "scope": self.scope,
-            "plan_digest": self.approved_plan_digest,
-        }))
-        .map_err(storage)?;
-        Ok((key, value))
+        tracedecay_store::observation_source_exclusion_metadata(
+            &self.source,
+            &self.scope,
+            &self.approved_plan_digest,
+        )
+        .map_err(storage)
     }
 }
 
@@ -170,10 +168,6 @@ pub enum RetirementBlocker {
     LegalHold,
     SourceFrontier,
     RetainedAnchorDerivative,
-    /// Projection, rejection and rebuild consumers still require a contiguous
-    /// observation stream. Never delete a sequence until they all understand
-    /// transactionally persisted retirement coverage.
-    ProjectionSequenceCoverageUnavailable,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -320,6 +314,7 @@ const GUARDS: &[&str] = &[
     "observation_admission_refusals_immutable_delete",
     "observation_provider_usage_no_delete",
     "session_temporal_observation_effects_immutable_delete_v1",
+    "observation_retired_sequences_immutable_delete",
 ];
 
 /// Installed only on empty tables during admission, never by a dry-run or
@@ -328,45 +323,10 @@ const GUARDS: &[&str] = &[
 pub(crate) async fn install_indexes(
     conn: &impl Executor,
 ) -> tracedecay_runtime_core::db::engine::Result<()> {
-    for (table, key, _) in TABLES {
-        if matches!(
-            *table,
-            "observations"
-                | "projection_queue"
-                | "session_canonical_body_references"
-                | "observation_repository_capture_references"
-                | "observation_repository_provenance"
-                | "observation_retrieval_anchors"
-                | "observation_admission_refusals"
-                | "session_temporal_observation_effects"
-        ) {
-            continue;
-        }
-        install_empty_table_index(conn, table, &format!("idx_retirement_{table}"), key).await?;
+    for index in indexes::definitions() {
+        install_empty_table_index(conn, index.table, &index.name, index.key).await?;
     }
-    for (table, column) in ANCHOR_REVERSE_INDEXES {
-        install_empty_table_index(
-            conn,
-            table,
-            &format!("idx_retirement_{table}_{column}"),
-            column,
-        )
-        .await?;
-    }
-    install_empty_table_index(
-        conn,
-        "session_occurrences",
-        "idx_retirement_occurrences",
-        "source_observation_id",
-    )
-    .await?;
-    install_empty_table_index(
-        conn,
-        "external_source_mutations_v1",
-        "idx_retirement_external_source_anchor",
-        EXTERNAL_ANCHOR_KEY,
-    )
-    .await
+    Ok(())
 }
 
 async fn install_empty_table_index(
@@ -566,9 +526,37 @@ async fn external_anchor_bindings(
 }
 
 #[derive(Default)]
-struct CaptureBudget {
+pub(crate) struct CaptureBudget {
     rows: usize,
     bytes: u64,
+}
+
+impl CaptureBudget {
+    /// Authorize cumulative row work from size metadata before materialization.
+    pub(crate) fn charge(&mut self, rows: usize, bytes: u64) -> ProjectionStoreResult<()> {
+        self.rows = self
+            .rows
+            .checked_add(rows)
+            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
+        if self.rows > MAX_ROWS || self.bytes > MAX_BYTES {
+            return refused();
+        }
+        Ok(())
+    }
+
+    /// Classification uses the same reference expansion rules and cumulative
+    /// work bound as retirement, before either decoder can fetch a body.
+    pub(crate) async fn preflight_hydration(
+        &mut self,
+        conn: &impl QueryExecutor,
+        json: &str,
+    ) -> ProjectionStoreResult<()> {
+        hydration::preflight(conn, json, &mut Vec::new(), self).await
+    }
 }
 
 async fn capture_table(
@@ -621,14 +609,7 @@ async fn capture_table(
                 .ok_or(ProjectionStoreError::ProvenanceCollision)?;
         }
         drop(sizes);
-        budget.rows += count;
-        budget.bytes = budget
-            .bytes
-            .checked_add(bytes)
-            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
-        if budget.rows > MAX_ROWS || budget.bytes > MAX_BYTES {
-            return refused();
-        }
+        budget.charge(count, bytes)?;
         let mut rows = conn
             .query(
                 &format!(
@@ -931,12 +912,6 @@ async fn plan_on(
             // rather than hydrate their bodies merely to report another blocker.
             _ => {}
         }
-        // Source cursor coverage is not projector sequence coverage. Scalar and
-        // window projection, rejection and rebuild frontiers still require every
-        // sequence, including queued skips and already-projected interior rows.
-        // Keep this gate unconditional until all those consumers can verify
-        // durable retired-sequence coverage; apply re-plans under its writer.
-        blockers.push(RetirementBlocker::ProjectionSequenceCoverageUnavailable);
         plan.candidates.push(RetirementCandidate {
             observation_id: id.clone(),
             payload_digest,
@@ -1039,7 +1014,7 @@ impl RegisteredGlobalDb {
         let snapshot = self.read_snapshot().await.map_err(storage)?;
         plan_on(
             &snapshot,
-            hash(self.verified_locator())?,
+            hash(&self.retirement_store_identity())?,
             ids,
             authorization,
         )
@@ -1088,7 +1063,8 @@ impl RegisteredGlobalDb {
         {
             return refused();
         }
-        if confirmed_digest != plan.digest || plan.store != hash(self.verified_locator())? {
+        if confirmed_digest != plan.digest || plan.store != hash(&self.retirement_store_identity())?
+        {
             return refused();
         }
         let transaction = self.begin_write_transaction().await.map_err(storage)?;
@@ -1167,6 +1143,12 @@ impl RegisteredGlobalDb {
             transaction.execute("INSERT INTO source_cursor_advances(source_json,scope_json,coverage_json,reason,receipt_id) VALUES (?1,?2,?3,'duplicate_observation',?4) ON CONFLICT(source_json,scope_json,coverage_json) DO NOTHING", params![coverage.source_json.as_str(), coverage.scope_json.as_str(), coverage.coverage_json.as_str(), coverage.receipt_id.as_str()]).await.map_err(storage)?;
         }
         for id in &current.ids {
+            let sequence = scalar(
+                &transaction,
+                "SELECT sequence FROM observations WHERE observation_id=?1",
+                id.as_str(),
+            )
+            .await?;
             // Retract derived output through its existing shared-owner reducer.
             // Settled records are intentionally NOT skipped by our cascade.
             crate::observation_projection::retire_source_record(&transaction, id.as_str()).await?;
@@ -1179,6 +1161,7 @@ impl RegisteredGlobalDb {
                     .await
                     .map_err(storage)?;
             }
+            crate::observation::retired_sequences::record(&transaction, sequence).await?;
         }
         // Keep sequence-bearing anchor identity/ledger rows, but terminate
         // servability through the canonical state machine in this transaction.

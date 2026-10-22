@@ -274,7 +274,7 @@ async fn observation_store_statement_faults_roll_back_and_retry_exactly_once() {
             duplicate,
             ObservationPersistOutcome::ExactDuplicate(_)
         ));
-        assert_eq!(duplicate.receipt(), &committed);
+        assert_eq!(duplicate.receipt(), Some(&committed));
 
         let replay = replayed_store
             .replay_observations(ObservationReplayRequest::new(0, 10).unwrap())

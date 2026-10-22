@@ -107,7 +107,7 @@ async fn persist(runtime: &HostAdmissionTestRuntimeV1, observation: DurableObser
 async fn persist_in_database(
     database: &crate::RegisteredGlobalDb,
     observation: DurableObservationV1,
-) {
+) -> tracedecay_store::ObservationPersistOutcome {
     let store = database.observation_store();
     let cursor = ObservationSourceCursorV1::for_ordering(
         observation.source().clone(),
@@ -132,14 +132,17 @@ async fn persist_in_database(
         authorization,
     )
     .unwrap();
-    store
+    let outcome = store
         .persist_observation(AnchoredObservationWrite::new(write, anchor, generation).unwrap())
         .await
         .unwrap();
-    store
-        .project_observation(observation.observation_id())
-        .await
-        .unwrap();
+    if outcome.receipt().is_some() {
+        store
+            .project_observation(observation.observation_id())
+            .await
+            .unwrap();
+    }
+    outcome
 }
 
 #[test]

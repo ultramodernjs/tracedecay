@@ -46,8 +46,11 @@ async fn fixture() -> (
     (directory, owner, database, lease)
 }
 
-async fn persist_offered(database: &RegisteredGlobalDb, observation: DurableObservationV1) {
-    persist_in_database(database, observation.clone()).await;
+async fn persist_offered(
+    database: &RegisteredGlobalDb,
+    observation: DurableObservationV1,
+) -> tracedecay_store::ObservationPersistOutcome {
+    let outcome = persist_in_database(database, observation.clone()).await;
     database
         .record_observation_source_presence(
             observation.source(),
@@ -60,6 +63,7 @@ async fn persist_offered(database: &RegisteredGlobalDb, observation: DurableObse
         )
         .await
         .unwrap();
+    outcome
 }
 
 async fn present(database: &RegisteredGlobalDb, observation: &DurableObservationV1) -> bool {
@@ -379,7 +383,7 @@ async fn apply_rechecks_real_filesystem_and_exact_store_and_profile_authority() 
 }
 
 #[asupersync::test]
-async fn retry_never_extends_old_approval_to_newly_admitted_evidence() {
+async fn retry_preserves_source_exclusion_without_extending_old_approval() {
     let (directory, _owner, database, lease) = fixture().await;
     let _scope =
         enter_maintenance_database_scope(&lease, &directory.path().join("profile"), "stale prune")
@@ -395,7 +399,8 @@ async fn retry_never_extends_old_approval_to_newly_admitted_evidence() {
         .apply_profile_session_prune_offline(&plan, plan.digest(), &lease, &[], &probe, 1, 0)
         .await
         .unwrap();
-    // Exercise the fail-closed maintenance boundary even before admission is wired.
+    // The original approval installed a source exclusion. Later intake is
+    // terminal cursor-only coverage, never new evidence for that old approval.
     let newcomer = observation_record(
         "reappeared",
         "/missing",
@@ -404,14 +409,20 @@ async fn retry_never_extends_old_approval_to_newly_admitted_evidence() {
         1,
         "new evidence",
     );
-    persist_offered(&database, newcomer.clone()).await;
-    assert!(
-        database
-            .apply_profile_session_prune_offline(&plan, plan.digest(), &lease, &[], &probe, 1, 0)
-            .await
-            .is_err()
-    );
-    assert!(present(&database, &newcomer).await);
+    let admitted = persist_offered(&database, newcomer.clone()).await;
+    assert!(matches!(
+        admitted,
+        tracedecay_store::ObservationPersistOutcome::SourceExcluded(_)
+    ));
+    assert!(admitted.receipt().is_none());
+    assert_eq!(admitted.committed_cursor().position(), 200);
+    assert!(!present(&database, &newcomer).await);
+    let retry = database
+        .apply_profile_session_prune_offline(&plan, plan.digest(), &lease, &[], &probe, 1, 0)
+        .await
+        .unwrap();
+    assert_eq!(retry.retired_observations, 0);
+    assert_eq!(retry.completed_sources, 1);
 }
 
 #[asupersync::test]

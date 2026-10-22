@@ -125,7 +125,7 @@ async fn count(db: &RegisteredGlobalDb, table: &str) -> i64 {
 }
 
 #[asupersync::test]
-async fn retirement_plan_apply_defers_without_changing_authority() {
+async fn retirement_plan_apply_is_confirmed_and_idempotent() {
     let harness = RegisteredGlobalDbHarness::open_without_relation_graph("retirement-kernel").await;
     let db = &harness.registered;
     let observation = seed(db, 1).await;
@@ -143,18 +143,16 @@ async fn retirement_plan_apply_defers_without_changing_authority() {
             .await
             .is_err()
     );
-    assert!(!plan.eligible());
-    assert!(
-        plan.candidates()[0]
-            .blockers
-            .contains(&RetirementBlocker::ProjectionSequenceCoverageUnavailable)
-    );
-    for _ in 0..2 {
+    assert!(plan.eligible());
+    for expected in [
+        ObservationRetirementOutcome::Applied { observations: 1 },
+        ObservationRetirementOutcome::AlreadyApplied,
+    ] {
         assert_eq!(
             db.apply_observation_retirement(&plan, plan.digest())
                 .await
                 .unwrap(),
-            ObservationRetirementOutcome::Deferred
+            expected
         );
     }
     for table in [
@@ -163,7 +161,7 @@ async fn retirement_plan_apply_defers_without_changing_authority() {
         "observation_repository_provenance",
         "observation_retrieval_anchors",
     ] {
-        assert_eq!(count(db, table).await, 1, "deferral preserves {table}");
+        assert_eq!(count(db, table).await, 0, "retirement removes {table}");
     }
     // The source frontier is never rewound or fabricated by retirement.
     assert_eq!(count(db, "source_cursors").await, 1);
@@ -227,7 +225,7 @@ async fn retirement_settled_tail_preserves_authority_frontier() {
         db.apply_observation_retirement(&plan, plan.digest())
             .await
             .unwrap(),
-        ObservationRetirementOutcome::Deferred
+        ObservationRetirementOutcome::Applied { observations: 1 }
     );
     let snapshot = db.read_snapshot().await.unwrap();
     crate::schema_contract::invariants::validate_authority_rows_exhaustive(&snapshot)
@@ -244,7 +242,7 @@ fn marker(observation: &DurableObservationV1) -> ProjectPruneMarker {
 }
 
 #[asupersync::test]
-async fn retirement_deferral_preserves_receipt_authority_and_guards() {
+async fn retirement_rollback_preserves_receipt_authority_and_guards() {
     let harness =
         RegisteredGlobalDbHarness::open_without_relation_graph("retirement-rollback").await;
     let db = &harness.registered;
@@ -264,7 +262,7 @@ async fn retirement_deferral_preserves_receipt_authority_and_guards() {
         )
         .await
         .unwrap();
-    assert!(!plan.eligible());
+    assert!(plan.eligible());
     let key = format!("{RECEIPT_PREFIX}{}", plan.digest());
     assert_eq!(
         plan.tables()
@@ -275,11 +273,15 @@ async fn retirement_deferral_preserves_receipt_authority_and_guards() {
         1
     );
     writer.execute_batch("CREATE TRIGGER injected_mid_cascade BEFORE DELETE ON observation_repository_provenance BEGIN SELECT RAISE(ABORT,'injected cascade failure'); END;").await.unwrap();
-    assert_eq!(
+    assert!(
         db.apply_observation_retirement(&plan, plan.digest())
             .await
-            .unwrap(),
-        ObservationRetirementOutcome::Deferred
+            .is_err()
+    );
+    assert_eq!(
+        count(db, "observation_retired_sequences").await,
+        0,
+        "coverage rolls back with evidence"
     );
     for table in [
         "observations",
@@ -318,7 +320,7 @@ async fn retirement_deferral_preserves_receipt_authority_and_guards() {
         db.apply_observation_retirement(&plan, plan.digest())
             .await
             .unwrap(),
-        ObservationRetirementOutcome::Deferred
+        ObservationRetirementOutcome::Applied { observations: 1 }
     );
     let mut rows = writer
         .query(
@@ -328,8 +330,8 @@ async fn retirement_deferral_preserves_receipt_authority_and_guards() {
         .await
         .unwrap();
     assert!(
-        rows.next().await.unwrap().is_none(),
-        "deferred retirement never installs a receipt"
+        rows.next().await.unwrap().is_some(),
+        "committed retirement installs its receipt"
     );
     drop(rows);
     for table in [
@@ -339,9 +341,9 @@ async fn retirement_deferral_preserves_receipt_authority_and_guards() {
         "observation_retrieval_anchors",
         "observation_source_presence",
     ] {
-        assert_eq!(count(db, table).await, 1, "deferral preserves {table}");
+        assert_eq!(count(db, table).await, 0, "retirement removes {table}");
     }
-    assert_eq!(count(db, "retrieval_anchor_dispositions").await, 0);
+    assert_eq!(count(db, "retrieval_anchor_dispositions").await, 1);
 }
 
 #[asupersync::test]
@@ -478,7 +480,7 @@ async fn retirement_cost_stays_index_bounded_and_refuses_missing_reverse_index()
             .rows,
         0
     );
-    assert!(!plan.eligible());
+    assert!(plan.eligible());
     writer
         .execute_batch("DROP INDEX idx_retirement_observation_source_presence; ANALYZE observation_source_presence;")
         .await
@@ -781,7 +783,7 @@ async fn retirement_lifecycle_preserves_materialized_message_workflow_and_usage(
 mod external;
 
 #[asupersync::test]
-async fn retirement_defers_until_queued_sequences_can_be_projected() {
+async fn retirement_queued_sequence_gap_is_explained_for_projection() {
     use tracedecay_store::ObservationProjectionStore;
     let harness = RegisteredGlobalDbHarness::open_without_relation_graph("retirement-drain").await;
     let db = &harness.registered;
@@ -797,23 +799,16 @@ async fn retirement_defers_until_queued_sequences_can_be_projected() {
         .apply_observation_retirement(&plan, plan.digest())
         .await
         .unwrap();
+    assert_eq!(
+        outcome,
+        ObservationRetirementOutcome::Applied { observations: 1 }
+    );
     let next = seed(db, 102).await;
-    if outcome == ObservationRetirementOutcome::Deferred {
-        db.observation_store()
-            .project_observation(first.observation_id())
-            .await
-            .unwrap();
-    }
     db.observation_store()
         .project_observation(next.observation_id())
         .await
         .expect("retirement must not leave an unexplained gap in the normal projection drain");
-    assert_eq!(
-        outcome,
-        ObservationRetirementOutcome::Deferred,
-        "retirement must defer until all sequence consumers support durable coverage"
-    );
-    assert!(!plan.eligible());
+    assert!(plan.eligible());
     assert_eq!(
         db.observation_store()
             .projection_checkpoint()
@@ -825,7 +820,7 @@ async fn retirement_defers_until_queued_sequences_can_be_projected() {
 }
 
 #[asupersync::test]
-async fn retirement_defers_until_interior_sequences_can_be_rebuilt() {
+async fn retirement_interior_sequence_gap_is_explained_for_rebuild() {
     use tracedecay_store::ObservationProjectionStore;
     let harness =
         RegisteredGlobalDbHarness::open_without_relation_graph("retirement-rebuild").await;
@@ -855,8 +850,11 @@ async fn retirement_defers_until_interior_sequences_can_be_rebuilt() {
     );
     assert!(rebuilt.is_complete());
     assert_eq!(rebuilt.checkpoint().last_sequence(), 3);
-    assert_eq!(outcome, ObservationRetirementOutcome::Deferred);
-    assert!(!plan.eligible());
+    assert_eq!(
+        outcome,
+        ObservationRetirementOutcome::Applied { observations: 1 }
+    );
+    assert!(plan.eligible());
 }
 
 #[asupersync::test]
@@ -990,4 +988,356 @@ async fn retirement_public_api_rejects_fabricated_project_prune_for_live_and_use
         );
     }
     assert_eq!(count(db, "observations").await, 2);
+}
+
+#[asupersync::test]
+async fn retirement_readmission_refuses_an_unexplained_tail() {
+    use tracedecay_store::ObservationProjectionStore;
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-unexplained-tail").await;
+    let db = &harness.registered;
+    let observation = seed(db, 301).await;
+    db.observation_store()
+        .project_observation(observation.observation_id())
+        .await
+        .unwrap();
+    let plan = db
+        .plan_observation_retirement(
+            &[observation.observation_id().clone()],
+            ObservationRetirementAuthorization::UnsupportedCodexRecord,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        db.apply_observation_retirement(&plan, plan.digest())
+            .await
+            .unwrap(),
+        ObservationRetirementOutcome::Applied { observations: 1 }
+    );
+    // Simulate lost retirement authority, not another supported retirement.
+    db.writer_connection()
+        .unwrap()
+        .execute_batch(
+            "DROP TRIGGER observation_retired_sequences_immutable_delete;
+         DELETE FROM observation_retired_sequences;",
+        )
+        .await
+        .unwrap();
+    assert!(
+        crate::schema_contract::invariants::ensure_authority_invariants(
+            db.runtime_database(),
+            true,
+            false,
+        )
+        .await
+        .is_err(),
+        "allocated identities alone must never explain missing committed evidence"
+    );
+}
+
+async fn retire_supported_fixture(db: &RegisteredGlobalDb, observation: &DurableObservationV1) {
+    let plan = db
+        .plan_observation_retirement(
+            &[observation.observation_id().clone()],
+            ObservationRetirementAuthorization::UnsupportedCodexRecord,
+        )
+        .await
+        .unwrap();
+    assert!(plan.eligible(), "{:?}", plan.candidates());
+    assert_eq!(
+        db.apply_observation_retirement(&plan, plan.digest())
+            .await
+            .unwrap(),
+        ObservationRetirementOutcome::Applied { observations: 1 }
+    );
+}
+
+#[asupersync::test]
+async fn retirement_ranges_preserve_window_rebuild_and_empty_stream_frontiers() {
+    use tracedecay_store::ObservationProjectionStore;
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-range-consumers").await;
+    let db = &harness.registered;
+    let mut observations = Vec::new();
+    for index in 401..=405 {
+        observations.push(seed(db, index).await);
+    }
+    // Bridge two independently committed ranges, then retire a queued tail.
+    for index in [0, 2, 1, 4] {
+        retire_supported_fixture(db, &observations[index]).await;
+    }
+    let batch = db
+        .observation_store()
+        .project_queued_observations(128)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(batch.items.len(), 1);
+    assert!(!batch.has_more);
+    assert_eq!(
+        db.observation_store()
+            .projection_checkpoint()
+            .await
+            .unwrap()
+            .last_sequence(),
+        4
+    );
+    let rebuilt = db.observation_store().rebuild_projection(5).await.unwrap();
+    assert!(rebuilt.is_complete());
+    assert_eq!(rebuilt.checkpoint().last_sequence(), 5);
+    retire_supported_fixture(db, &observations[3]).await;
+    let rebuilt = db.observation_store().rebuild_projection(5).await.unwrap();
+    assert!(
+        rebuilt.is_complete(),
+        "an entirely retired stream is still a committed stream"
+    );
+    assert_eq!(rebuilt.checkpoint().last_sequence(), 5);
+    crate::schema_contract::invariants::ensure_authority_invariants(
+        db.runtime_database(),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.observation_store()
+            .projection_checkpoint()
+            .await
+            .unwrap()
+            .last_sequence(),
+        5
+    );
+    let successor = seed(db, 406).await;
+    db.observation_store()
+        .project_observation(successor.observation_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        db.observation_store()
+            .projection_checkpoint()
+            .await
+            .unwrap()
+            .last_sequence(),
+        6
+    );
+}
+
+#[asupersync::test]
+async fn retirement_rejection_crosses_only_covered_sequences() {
+    use tracedecay_store::ObservationProjectionStore;
+    for explained in [true, false] {
+        let harness =
+            RegisteredGlobalDbHarness::open_without_relation_graph("retirement-rejection").await;
+        let db = &harness.registered;
+        let first = seed(db, 501).await;
+        retire_supported_fixture(db, &first).await;
+        let invalid = seed_payload(
+            db,
+            502,
+            serde_json::json!({"not_a_canonical_envelope": true}),
+        )
+        .await;
+        if !explained {
+            db.writer_connection().unwrap().execute_batch("DROP TRIGGER observation_retired_sequences_immutable_delete; DELETE FROM observation_retired_sequences;").await.unwrap();
+        }
+        let error = db
+            .observation_store()
+            .project_observation(invalid.observation_id())
+            .await
+            .unwrap_err();
+        if explained {
+            assert!(
+                matches!(error, ProjectionStoreError::Contract(_)),
+                "{error:?}"
+            );
+            assert_eq!(
+                db.observation_store()
+                    .projection_checkpoint()
+                    .await
+                    .unwrap()
+                    .last_sequence(),
+                2
+            );
+            assert!(
+                db.observation_store()
+                    .next_queued_observation()
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    ProjectionStoreError::Gap {
+                        expected: 1,
+                        actual: 2
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                db.observation_store()
+                    .projection_checkpoint()
+                    .await
+                    .unwrap()
+                    .last_sequence(),
+                0
+            );
+        }
+    }
+}
+
+#[asupersync::test]
+async fn retirement_projection_and_rebuild_refuse_unexplained_interior_gaps() {
+    use tracedecay_store::ObservationProjectionStore;
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-unexplained-consumers")
+            .await;
+    let db = &harness.registered;
+    let first = seed(db, 601).await;
+    retire_supported_fixture(db, &first).await;
+    let next = seed(db, 602).await;
+    db.writer_connection().unwrap().execute_batch("DROP TRIGGER observation_retired_sequences_immutable_delete; DELETE FROM observation_retired_sequences;").await.unwrap();
+    assert!(matches!(
+        db.observation_store()
+            .project_observation(next.observation_id())
+            .await
+            .unwrap_err(),
+        ProjectionStoreError::Gap {
+            expected: 1,
+            actual: 2
+        }
+    ));
+    assert!(matches!(
+        db.observation_store()
+            .project_queued_observations(128)
+            .await
+            .unwrap_err(),
+        ProjectionStoreError::Gap {
+            expected: 1,
+            actual: 2
+        }
+    ));
+    assert_eq!(
+        db.observation_store()
+            .projection_checkpoint()
+            .await
+            .unwrap()
+            .last_sequence(),
+        0
+    );
+    assert!(db.observation_store().rebuild_projection(2).await.is_err());
+}
+
+#[asupersync::test]
+async fn offline_retirement_index_preparation_is_bounded_and_resumable() {
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-index-prepare").await;
+    let db = &harness.registered;
+    let observation = seed(db, 200).await;
+    let writer = db.writer_connection().unwrap();
+    writer
+        .execute(
+            "INSERT INTO observation_source_presence VALUES ('source.prepare',?1,'1',0)",
+            [observation.observation_id().as_str()],
+        )
+        .await
+        .unwrap();
+    writer.execute_batch("DROP INDEX idx_retirement_occurrences; DROP INDEX idx_retirement_observation_source_presence;").await.unwrap();
+    // Populate a reverse-lookup table before preparing; startup must leave it alone.
+    install_indexes(&writer).await.unwrap();
+    writer
+        .execute_batch("DROP INDEX idx_retirement_occurrences;")
+        .await
+        .unwrap();
+    let profile = db.db_path().parent().unwrap();
+    let lease = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
+        profile,
+        "prepare retirement indexes test",
+    )
+    .unwrap();
+    let plan = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert!(!plan.done);
+    assert_eq!(
+        plan.index_name.as_deref(),
+        Some("idx_retirement_observation_source_presence")
+    );
+    assert_eq!(plan.rows, 1);
+    assert!(
+        db.apply_retirement_index_preparation(&lease, &plan, "wrong")
+            .await
+            .is_err()
+    );
+    db.apply_retirement_index_preparation(&lease, &plan, plan.digest())
+        .await
+        .unwrap();
+    let next = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert_eq!(
+        next.index_name.as_deref(),
+        Some("idx_retirement_occurrences")
+    );
+    db.apply_retirement_index_preparation(&lease, &next, next.digest())
+        .await
+        .unwrap();
+    assert!(
+        db.plan_retirement_index_preparation(&lease)
+            .await
+            .unwrap()
+            .done
+    );
+    assert!(
+        db.plan_observation_retirement(
+            &[observation.observation_id().clone()],
+            ObservationRetirementAuthorization::UnsupportedCodexRecord
+        )
+        .await
+        .unwrap()
+        .eligible()
+    );
+    let done = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    let harness = harness.restart().await;
+    let reopened = harness
+        .registered
+        .plan_retirement_index_preparation(&lease)
+        .await
+        .unwrap();
+    assert_eq!(
+        done.digest(),
+        reopened.digest(),
+        "operator digests must survive process/runtime remounts of the same physical store"
+    );
+}
+
+#[asupersync::test]
+async fn offline_retirement_index_preparation_refuses_oversized_key_work() {
+    let harness =
+        RegisteredGlobalDbHarness::open_without_relation_graph("retirement-index-budget").await;
+    let db = &harness.registered;
+    let writer = db.writer_connection().unwrap();
+    writer.execute_batch("DROP INDEX idx_retirement_observation_source_presence; WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1024) INSERT INTO observation_source_presence SELECT 'source.oversize',printf('%04d',i)||hex(zeroblob(32768)),'1',0 FROM n;").await.unwrap();
+    let lease = tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
+        db.db_path().parent().unwrap(),
+        "index work budget test",
+    )
+    .unwrap();
+    let plan = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert_eq!(plan.rows, 1024);
+    assert_eq!(plan.key_bytes, 67_137_536);
+    assert!(!plan.within_budget);
+    assert!(
+        db.apply_retirement_index_preparation(&lease, &plan, plan.digest())
+            .await
+            .is_err()
+    );
+    let unchanged = db.plan_retirement_index_preparation(&lease).await.unwrap();
+    assert_eq!(
+        unchanged.index_name.as_deref(),
+        Some("idx_retirement_observation_source_presence")
+    );
+    assert_eq!(
+        plan.digest(),
+        unchanged.digest(),
+        "over-budget apply must leave the store unchanged"
+    );
 }

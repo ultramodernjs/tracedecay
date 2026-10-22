@@ -134,6 +134,10 @@ const OBSERVATION_AUTHORITY_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS sanit
             committed_cursor_json TEXT NOT NULL,
             FOREIGN KEY(receipt_id) REFERENCES sanitization_receipts(receipt_id)
         );
+        CREATE TABLE IF NOT EXISTS observation_retired_sequences (
+            first_sequence INTEGER PRIMARY KEY CHECK(first_sequence > 0),
+            last_sequence INTEGER NOT NULL CHECK(last_sequence >= first_sequence)
+        );
         CREATE TABLE IF NOT EXISTS remote_writer_fences (
             authority_key TEXT PRIMARY KEY,
             writer_fence_json TEXT NOT NULL CHECK(json_valid(writer_fence_json)),

@@ -209,7 +209,12 @@ async fn secret_canary_is_absent_from_every_observation_sink_and_safe_representa
     let observation_id = match &committed {
         CaptureObservationOutcome::Persisted { outcome, .. } => {
             assert!(matches!(**outcome, ObservationPersistOutcome::Committed(_)));
-            outcome.receipt().observation().observation_id().clone()
+            outcome
+                .receipt()
+                .expect("fixture persists an observation")
+                .observation()
+                .observation_id()
+                .clone()
         }
         other => panic!("sanitized record must persist, got {other:?}"),
     };
@@ -454,7 +459,12 @@ async fn native_ordering_domain_survives_authoritative_capture() {
     let observation_id = match &outcome {
         CaptureObservationOutcome::Persisted { outcome, .. } => {
             assert!(matches!(**outcome, ObservationPersistOutcome::Committed(_)));
-            outcome.receipt().observation().observation_id().clone()
+            outcome
+                .receipt()
+                .expect("fixture persists an observation")
+                .observation()
+                .observation_id()
+                .clone()
         }
         other => panic!("native observation must persist, got {other:?}"),
     };
@@ -706,7 +716,12 @@ async fn cross_provider_capture_duplicate_conflict_cancel_non_durable_malformed_
         let observation_id = match &first {
             CaptureObservationOutcome::Persisted { outcome, .. } => {
                 assert!(matches!(**outcome, ObservationPersistOutcome::Committed(_)));
-                outcome.receipt().observation().observation_id().clone()
+                outcome
+                    .receipt()
+                    .expect("fixture persists an observation")
+                    .observation()
+                    .observation_id()
+                    .clone()
             }
             other => panic!("{provider}: first capture must persist, got {other:?}"),
         };
@@ -912,7 +927,11 @@ async fn cross_provider_capture_duplicate_conflict_cancel_non_durable_malformed_
                     "{provider}: restart retry must be ExactDuplicate, got {outcome:?}"
                 );
                 assert_eq!(
-                    outcome.receipt().observation().observation_id(),
+                    outcome
+                        .receipt()
+                        .expect("fixture persists an observation")
+                        .observation()
+                        .observation_id(),
                     &observation_id,
                     "{provider}"
                 );

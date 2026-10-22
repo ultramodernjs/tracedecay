@@ -199,6 +199,8 @@ impl ReplayObservationsRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationProjectionReadback {
     Authoritative(ObservationProjectionStatus),
+    /// Successful source exclusion persisted no observation to project.
+    NotApplicable,
     Unavailable,
 }
 
@@ -233,9 +235,19 @@ pub enum CaptureObservationOutcome {
 impl CaptureObservationOutcome {
     pub fn sanitization_receipt(&self) -> &SanitizationReceiptV1 {
         match self {
-            Self::Persisted { outcome, .. } | Self::AcceptedForReplay { outcome, .. } => {
-                outcome.receipt().sanitization_receipt()
+            Self::Persisted {
+                outcome,
+                sanitized_record,
+                ..
             }
+            | Self::AcceptedForReplay {
+                outcome,
+                sanitized_record,
+                ..
+            } => outcome.receipt().map_or_else(
+                || sanitized_record.receipt(),
+                |receipt| receipt.sanitization_receipt(),
+            ),
             Self::Rejected { receipt, .. } | Self::Quarantined { receipt, .. } => receipt,
         }
     }
@@ -579,8 +591,14 @@ where
         if cancellation.is_cancelled() {
             return Err(ObservationApplicationError::Cancelled);
         }
-        let observation_id = outcome.receipt().observation().observation_id();
-        let stored = self.store.get_observation(observation_id).await?;
+        let stored = match outcome.receipt() {
+            Some(receipt) => {
+                self.store
+                    .get_observation(receipt.observation().observation_id())
+                    .await?
+            }
+            None => None,
+        };
         if cancellation.is_cancelled() {
             return Err(ObservationApplicationError::Cancelled);
         }
@@ -603,6 +621,9 @@ where
         // prove durability but carry no projection status, so a
         // trailing reader snapshot remains explicitly unavailable.
         let projection_status = match (stored, &outcome) {
+            (_, ObservationPersistOutcome::SourceExcluded(_)) => {
+                ObservationProjectionReadback::NotApplicable
+            }
             (Some(stored), _) => {
                 ObservationProjectionReadback::Authoritative(stored.projection_status())
             }

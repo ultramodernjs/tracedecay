@@ -499,3 +499,77 @@ fn storage_compact_previews_by_default_and_applies_with_a_digest() {
     };
     assert_eq!(apply.as_deref(), Some("abc"));
 }
+
+#[test]
+fn storage_retirement_index_preparation_defaults_to_dry_run() {
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "prepare-retirement-indexes",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Storage {
+            action: ProfileStorageAction::PrepareRetirementIndexes {
+                apply: None,
+                json: true
+            }
+        })
+    ));
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "prepare-retirement-indexes",
+        "--apply",
+        "reviewed-digest",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Some(Commands::Storage { action: ProfileStorageAction::PrepareRetirementIndexes { apply: Some(digest), .. } }) if digest == "reviewed-digest")
+    );
+}
+
+#[test]
+fn storage_cleanup_codex_defaults_to_bounded_dry_run_and_resumes_a_cursor() {
+    let cli = Cli::try_parse_from(["tracedecay", "storage", "cleanup-codex", "--json"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Storage {
+            action: ProfileStorageAction::CleanupCodex {
+                apply: None,
+                cursor: None,
+                page_size: 128,
+                json: true
+            }
+        })
+    ));
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "cleanup-codex",
+        "--apply",
+        "reviewed-digest",
+        "--cursor",
+        "{\"after_sequence\":128}",
+        "--page-size",
+        "7",
+    ])
+    .unwrap();
+    assert!(matches!(cli.command, Some(Commands::Storage {
+        action: ProfileStorageAction::CleanupCodex { apply: Some(digest), cursor: Some(cursor), page_size: 7, .. }
+    }) if digest == "reviewed-digest" && cursor == "{\"after_sequence\":128}"));
+    for invalid in ["0", "129"] {
+        assert!(
+            Cli::try_parse_from([
+                "tracedecay",
+                "storage",
+                "cleanup-codex",
+                "--page-size",
+                invalid
+            ])
+            .is_err()
+        );
+    }
+}

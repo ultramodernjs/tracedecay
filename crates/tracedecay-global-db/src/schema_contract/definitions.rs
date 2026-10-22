@@ -305,6 +305,14 @@ pub(super) const TABLES: &[Table] = &[
         )]
     ),
     table!(
+        "observation_retired_sequences",
+        [
+            column("first_sequence", "INTEGER", false, None, 1),
+            column("last_sequence", "INTEGER", true, None, 0),
+        ],
+        []
+    ),
+    table!(
         "remote_writer_fences",
         [
             column("authority_key", "TEXT", true, None, 1),

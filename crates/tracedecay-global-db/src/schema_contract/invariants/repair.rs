@@ -19,8 +19,9 @@ struct CommittedCursorCandidate {
     cursor: ObservationSourceCursorV1,
 }
 
-/// Reads the current observation frontier: `COALESCE(MAX(sequence), 0)` over
-/// `observations`. The row cursor lives only inside this function, so it is
+/// Reads the allocated high-water to detect missing committed tails as well
+/// as retained rows. Allocation is not retirement proof: the coverage pass
+/// verifies every absent interval separately. The row cursor is
 /// fully consumed and dropped before returning, see
 /// `observation_projection::rebuild::read_observation_frontier` for why a
 /// caller doing further reads or writes on the same connection depends on
@@ -160,7 +161,17 @@ pub(super) async fn repair_projection_frontier_page(
             let mut count = 0;
             let mut gap = false;
             while let Some(row) = rows.next().await.map_err(audit_read_error)? {
-                scan = row.get(0).map_err(audit_read_error)?;
+                let sequence = row.get::<i64>(0).map_err(audit_read_error)?;
+                if sequence > scan + 1
+                    && !crate::observation::retired_sequences::covers(conn, scan + 1, sequence - 1)
+                        .await
+                        .map_err(|error| authority_violation(error.to_string()))?
+                {
+                    return Err(authority_violation(
+                        "unexplained observation sequence gap before projection frontier",
+                    ));
+                }
+                scan = sequence;
                 count += 1;
                 if row.get::<i64>(1).map_err(audit_read_error)? != 1 {
                     gap = true;
@@ -171,9 +182,17 @@ pub(super) async fn repair_projection_frontier_page(
             drop(rows);
             if gap || count < AUDIT_PAGE_ROWS {
                 if !gap {
-                    // An absent identity below the allocated high-water was
-                    // retired, not an uncovered retained observation.
-                    repaired = original.min(frontier);
+                    let target = original.min(frontier);
+                    if scan < target
+                        && !crate::observation::retired_sequences::covers(conn, scan + 1, target)
+                            .await
+                            .map_err(|error| authority_violation(error.to_string()))?
+                    {
+                        return Err(authority_violation(
+                            "unexplained observation sequence gap before projection frontier",
+                        ));
+                    }
+                    repaired = target;
                     scan = scan.max(repaired);
                 }
                 conn.execute(
