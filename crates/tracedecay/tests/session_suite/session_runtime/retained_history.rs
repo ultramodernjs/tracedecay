@@ -212,6 +212,9 @@ impl HealthyProvidersWithBlockedCursorIngestor {
             ObservationPersistOutcome::CoveredDuplicate(_) => {
                 panic!("fixture replay must be an exact duplicate")
             }
+            ObservationPersistOutcome::SourceExcluded(_) => {
+                panic!("fixture provider source is never excluded")
+            }
         }
     }
 }

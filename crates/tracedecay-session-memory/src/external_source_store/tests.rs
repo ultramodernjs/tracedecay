@@ -108,6 +108,7 @@ impl Fixture {
             .await
             .unwrap()
             .receipt()
+            .expect("fixture source is never excluded")
             .clone()
     }
 }

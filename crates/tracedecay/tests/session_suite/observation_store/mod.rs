@@ -2310,7 +2310,8 @@ async fn concurrent_exact_retry_commits_one_sequence_and_settles_one_receipt() {
         .find_map(|outcome| match outcome {
             ObservationPersistOutcome::Committed(receipt) => Some(receipt),
             ObservationPersistOutcome::ExactDuplicate(_)
-            | ObservationPersistOutcome::CoveredDuplicate(_) => None,
+            | ObservationPersistOutcome::CoveredDuplicate(_)
+            | ObservationPersistOutcome::SourceExcluded(_) => None,
         })
         .expect("one concurrent writer must commit");
     let settled = outcomes
@@ -2322,6 +2323,9 @@ async fn concurrent_exact_retry_commits_one_sequence_and_settles_one_receipt() {
                 "a byte-identical retry keeps its own identity and can never be a covered \
                  duplicate, got {receipt:?}"
             ),
+            ObservationPersistOutcome::SourceExcluded(cursor) => {
+                panic!("a non-excluded source can never settle as excluded, got {cursor:?}")
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(settled.len(), 2);
