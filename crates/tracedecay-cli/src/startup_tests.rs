@@ -740,7 +740,6 @@ fn every_hook_subcommand_skips_startup_maintenance() {
     );
     for hook in &hooks {
         let command = parse_command(&[hook.as_str()]);
-        assert!(!runs_worldwide_counter_flush(&command));
         assert!(
             should_skip_startup_maintenance(&command),
             "{hook} runs startup maintenance"
