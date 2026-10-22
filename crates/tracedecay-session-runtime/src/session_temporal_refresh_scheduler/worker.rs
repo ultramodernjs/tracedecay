@@ -581,7 +581,11 @@ pub(crate) async fn run_session_temporal_refresh_scheduler(
                     tokio::select! {
                         () = tracing::Instrument::instrument(state.wait_for_cancellation(), tracing::trace_span!("daemon.scheduler.session_temporal.publication_idle_cancel")) => return,
                         () = tracing::Instrument::instrument(state.wake.notified(), tracing::trace_span!("daemon.scheduler.session_temporal.publication_wake_wait")) => {}
-                        () = tracing::Instrument::instrument(tokio::time::sleep(HISTORY_IDLE_RECHECK_INTERVAL), tracing::trace_span!("daemon.scheduler.session_temporal.publication_idle_wait")) => {}
+                        fired = tracing::Instrument::instrument(native_runtime::sleep_until(Instant::now() + HISTORY_IDLE_RECHECK_INTERVAL), tracing::trace_span!("daemon.scheduler.session_temporal.publication_idle_wait")) => {
+                            if stop_without_timer(fired) {
+                                return;
+                            }
+                        }
                     }
                     state.requeue_projection();
                 }
