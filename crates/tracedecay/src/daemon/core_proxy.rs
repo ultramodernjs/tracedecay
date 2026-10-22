@@ -482,7 +482,7 @@ pub(crate) fn apply_proxy_initialize_metadata(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn reset_proxy_handshake_for_initialize(
     base_handshake: &DaemonHandshake,
     handshake: &mut DaemonHandshake,
@@ -735,7 +735,7 @@ async fn write_proxy_request_result(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn send_daemon_request_line(
     socket_path: &Path,
     handshake: &DaemonHandshake,
@@ -809,7 +809,7 @@ async fn send_daemon_request_with_project_open_retry(
     Ok(responses)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) async fn send_daemon_request_line_with_liveness_poll(
     socket_path: &Path,
     handshake: &DaemonHandshake,
@@ -984,7 +984,7 @@ where
 /// This works against daemons older than the handshake version field, so a
 /// freshly-updated client can still detect a stale daemon left running by a
 /// non-systemd setup or a plain `tracedecay upgrade`.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn proxy_initialize_metadata(
     request_line: &str,
     responses: &[String],

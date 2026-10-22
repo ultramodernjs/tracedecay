@@ -357,8 +357,10 @@ async fn drive_rmcp(
     )
     .await
     .expect("bind loopback broker");
-    let tracedecay_daemon_protocol::DaemonEndpoint::Loopback(address) = bound else {
-        panic!("loopback bind returned {bound}");
+    let address = match bound {
+        tracedecay_daemon_protocol::DaemonEndpoint::Loopback(address) => address,
+        #[cfg(unix)]
+        _ => panic!("loopback bind returned {bound}"),
     };
     let client_io = tokio::net::TcpStream::connect(address)
         .await

@@ -1,7 +1,9 @@
 //! Foreground daemon bootstrap: `run_foreground` entry points, the Unix
 //! accept/serve loop, socket preparation, and client-task draining.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 

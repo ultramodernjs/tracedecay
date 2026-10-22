@@ -229,6 +229,41 @@ impl McpServer {
         }
     }
 
+    fn claim_identical_read(
+        &self,
+        cg: &TraceDecay,
+        tool_name: &str,
+        handler_arguments: &Value,
+    ) -> Option<ReadFlightClaim> {
+        let engine_identity = cg.db_path();
+        tool_allows_identical_read_coalescing(tool_name, |tool_name| {
+            tracedecay_mcp::tools::binding::mcp_dispatch_contract(tool_name)
+                .is_ok_and(tracedecay_tool_catalog::McpDispatchContractV1::read_only)
+        })
+        .then(|| {
+            self.identical_read_coalescer.claim(
+                engine_identity.to_string_lossy().as_ref(),
+                tool_name,
+                handler_arguments,
+                self.scope_prefix(),
+            )
+        })
+    }
+
+    fn scope_tool_dispatch<'a>(
+        &self,
+        dispatch: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
+        match self.profile.clone() {
+            Some(profile) => Box::pin(
+                tracedecay_sessions::runtime::with_transcript_source_profile(profile, dispatch),
+            ),
+            None => dispatch,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn execute_tool_dispatch(
         &self,
@@ -244,19 +279,7 @@ impl McpServer {
         application_deadline: Option<tracedecay_contracts::Deadline>,
         application_cancellation: Option<tracedecay_contracts::CancellationSignal>,
     ) -> Result<ToolResult> {
-        let engine_identity = cg.db_path();
-        let read_flight = tool_allows_identical_read_coalescing(tool_name, |tool_name| {
-            tracedecay_mcp::tools::binding::mcp_dispatch_contract(tool_name)
-                .is_ok_and(tracedecay_tool_catalog::McpDispatchContractV1::read_only)
-        })
-        .then(|| {
-            self.identical_read_coalescer.claim(
-                engine_identity.to_string_lossy().as_ref(),
-                tool_name,
-                &handler_arguments,
-                self.scope_prefix(),
-            )
-        });
+        let read_flight = self.claim_identical_read(cg, tool_name, &handler_arguments);
         let session_sync_service = self
             .session_sync_service
             .as_ref()
@@ -299,32 +322,8 @@ impl McpServer {
         // A composed daemon serves one transcript owner. The refresh
         // schedulers already run their sweep under this profile; scoping the
         // dispatch puts every hook-triggered ingest on the same reader.
-        let dispatch: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>,
-        > = match self.profile.clone() {
-            Some(profile) => Box::pin(
-                tracedecay_sessions::runtime::with_transcript_source_profile(profile, dispatch),
-            ),
-            None => dispatch,
-        };
-        let dispatched = if let Some(read_flight) = read_flight {
-            match read_flight {
-                ReadFlightClaim::Leader(leader) => match dispatch.await {
-                    Ok(result) => Ok(leader.complete(result)),
-                    Err(error) => Err(error),
-                },
-                ReadFlightClaim::Follower(follower) => match follower.wait().await {
-                    Some(result) => Ok({
-                        let _span = tracing::trace_span!("mcp.server.read_coalescing.result_clone")
-                            .entered();
-                        (*result).clone()
-                    }),
-                    None => dispatch.await,
-                },
-            }
-        } else {
-            dispatch.await
-        };
+        let dispatch = self.scope_tool_dispatch(dispatch);
+        let dispatched = settle_read_flight(read_flight, dispatch).await;
         // The handler keeps its whole deadline and a failed lane leaves the
         // canonical result exactly as produced; running after the read flight
         // keeps a coalesced read free of this caller's provider candidates.
@@ -457,4 +456,28 @@ fn registered_project_selector_arguments(arguments: &Value) -> Value {
         }
     }
     Value::Object(snapshot)
+}
+
+async fn settle_read_flight(
+    read_flight: Option<ReadFlightClaim>,
+    dispatch: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>>,
+) -> Result<ToolResult> {
+    if let Some(read_flight) = read_flight {
+        match read_flight {
+            ReadFlightClaim::Leader(leader) => match dispatch.await {
+                Ok(result) => Ok(leader.complete(result)),
+                Err(error) => Err(error),
+            },
+            ReadFlightClaim::Follower(follower) => match follower.wait().await {
+                Some(result) => Ok({
+                    let _span =
+                        tracing::trace_span!("mcp.server.read_coalescing.result_clone").entered();
+                    (*result).clone()
+                }),
+                None => dispatch.await,
+            },
+        }
+    } else {
+        dispatch.await
+    }
 }

@@ -1459,6 +1459,7 @@ mod code_index_activation_test {
     use std::sync::Arc;
 
     use tempfile::TempDir;
+    #[cfg(unix)]
     use tracedecay_runtime_core::cancellation::CancellationToken;
 
     use super::*;

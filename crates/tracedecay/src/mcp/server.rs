@@ -77,7 +77,7 @@ pub(crate) use hook_writes::*;
 pub(crate) use ledger::McpToolErrorAnalyticsRequest;
 pub(crate) use lifecycle::VersionCheckState;
 pub(crate) use rmcp::RmcpInitializeResponseDecorator;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use rmcp::{RmcpSelectedProjectResponseAuthority, RmcpWorkDeliverySettlement};
 pub(crate) use routing::*;
 use tracedecay_daemon_service::DaemonSessionRefreshService;
@@ -1226,6 +1226,7 @@ impl McpServer {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn watcher_sync_config(&self) -> &tracedecay_configuration::SyncConfig {
         &self.sync_config
     }

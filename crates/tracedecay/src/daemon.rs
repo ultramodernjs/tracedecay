@@ -397,6 +397,7 @@ use lsp_sessions::{
     settle_pending_lsp_workspace_mutation, update_connection_lsp_sessions,
 };
 mod maintenance;
+#[cfg(any(unix, test))]
 pub mod pr_autotrack;
 #[cfg(any(test, feature = "test-transport"))]
 #[allow(clippy::too_many_lines)]
@@ -472,14 +473,16 @@ use project_open_orchestration::{
 #[cfg(any(not(unix), test, feature = "test-transport"))]
 use project_routing::portable_database_owner_reconciler;
 #[cfg(unix)]
-use project_routing::{CatalogRefreshClientKey, maintenance_transition_gate};
 use project_routing::{
-    bind_authenticated_profile_identity, cached_or_bind_ready_project_server,
-    ensure_checkout_topology_before_admission, prefer_recorded_open_failure,
-    project_open_cancellation_checkpoint, project_open_cancellation_error,
-    project_open_capacity_gate, project_open_gate, project_open_task_capacity_error,
-    project_open_tasks, project_route_for_handshake, project_server_capacity_error,
-    project_server_retirement_blocked_error, project_warming_error, resolved_project_server_key,
+    CatalogRefreshClientKey, cached_or_bind_ready_project_server, maintenance_transition_gate,
+    resolved_project_server_key,
+};
+use project_routing::{
+    bind_authenticated_profile_identity, ensure_checkout_topology_before_admission,
+    prefer_recorded_open_failure, project_open_cancellation_checkpoint,
+    project_open_cancellation_error, project_open_capacity_gate, project_open_gate,
+    project_open_task_capacity_error, project_open_tasks, project_route_for_handshake,
+    project_server_capacity_error, project_server_retirement_blocked_error, project_warming_error,
 };
 #[cfg(test)]
 use project_server_lifecycle::replay_user_profile_host_admission_for_identity;

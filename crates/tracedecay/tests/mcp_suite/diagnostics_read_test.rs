@@ -12,8 +12,11 @@ use serde_json::{Value, json};
 
 use crate::support::{
     extract_real_server_text, handle_real_server_tool_call, handle_real_server_tool_call_raw,
-    production_composition_fixture, wait_for_current_graph,
+    production_composition_fixture,
 };
+
+#[cfg(unix)]
+use crate::support::wait_for_current_graph;
 
 const JSON_RPC_ID_ONE_DIGEST: &str = "6b86b273ff34fce19d6b804eff5a3f57";
 const ABSENT_PRODUCER_CODE: &str = "application.diagnostics.unsupported";

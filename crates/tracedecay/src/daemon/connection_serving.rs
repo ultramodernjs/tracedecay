@@ -33,10 +33,12 @@ type ProjectOwnerAwaitFutureV1<'a, T> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<(T, VecDeque<String>)>>> + Send + 'a>,
 >;
 
+#[cfg(unix)]
 type BrokerConnectionPhaseFutureV1<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
 
 #[inline(never)]
+#[cfg(unix)]
 fn boxed_broker_connection_phase<'a, T>(
     future: impl std::future::Future<Output = Result<T>> + Send + 'a,
 ) -> BrokerConnectionPhaseFutureV1<'a, T>

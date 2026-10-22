@@ -480,13 +480,13 @@ async fn concurrent_reenable_creates_one_live_scheduler_owner() {
 #[cfg(unix)]
 #[tokio::test]
 async fn unavailable_host_admission_spool_does_not_block_project_server_open() {
-    project_server_retains_read_authority_with_an_unavailable_spool(false).await;
+    Box::pin(project_server_retains_read_authority_with_an_unavailable_spool(false)).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn incompatible_host_spool_preserves_read_authority_and_typed_reset() {
-    project_server_retains_read_authority_with_an_unavailable_spool(true).await;
+    Box::pin(project_server_retains_read_authority_with_an_unavailable_spool(true)).await;
 }
 
 #[cfg(unix)]

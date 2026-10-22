@@ -86,7 +86,7 @@ fn journal_maintenance_tick_expires_resumes_and_cancels() {
                 coalesced_primary: journal.coalesced_primary.clone(),
                 completed_at: completed,
                 termination: OperationTermination::Completed,
-                stats: Default::default(),
+                stats: tracedecay_contracts::session_sync::SessionSyncStatsV1::default(),
                 coverage: Vec::new(),
                 source_frontiers: journal.source_frontiers.clone(),
                 failure_codes: Vec::new(),
@@ -250,7 +250,7 @@ fn journal_maintenance_tick_expires_resumes_and_cancels() {
                 .unwrap(),
         )
         .unwrap();
-        assert!(recent.source_frontiers.is_empty());
+        assert_eq!(recent.source_frontiers, []);
         assert_eq!(recent.completion.unwrap().source_frontiers.len(), 1);
         coordinator.cancel();
         let before = db.read_session_sync_journal(&keys[14]).await.unwrap();

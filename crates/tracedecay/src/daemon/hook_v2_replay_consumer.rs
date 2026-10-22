@@ -276,8 +276,7 @@ async fn drain_all_hosts(
                         *worktree_id,
                         now,
                         &mut sweep,
-                        project_sessions,
-                        background_cpu,
+                        (project_sessions, background_cpu),
                     ))
                     .await
                 }
@@ -355,7 +354,7 @@ async fn renew_replay_bindings(
         }
         Err(error) => {
             for host in tracedecay_agent_hosts::hooks::NATIVE_HOOK_HOSTS {
-                sweep.fail(*host, StatusHookReplaySpoolV1::Records, error.to_string());
+                sweep.fail(*host, StatusHookReplaySpoolV1::Records, error.clone());
             }
         }
     }
@@ -497,9 +496,12 @@ async fn redrive_pending_work(
     worktree_id: [u8; 16],
     now: UtcMicros,
     sweep: &mut HookReplaySweepV1,
-    project_sessions: &tracedecay_global_db::RegisteredGlobalDb,
-    background_cpu: &Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
+    authorities: (
+        &tracedecay_global_db::RegisteredGlobalDb,
+        &Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
+    ),
 ) -> Option<&'static str> {
+    let (project_sessions, background_cpu) = authorities;
     let data_root = &graph.hook_store_layout().data_root;
     let pending_work = match hook_v2_pending_work_envelopes(data_root, host, now) {
         Ok(pending_work) => pending_work,
@@ -823,6 +825,22 @@ pub(crate) fn transfer_hook_v2_replay_consumer(
     )
 }
 
+async fn wait_for_replay_retry(
+    wake: &tokio::sync::Notify,
+    retry_at: std::time::Instant,
+) -> Result<(), String> {
+    tracing::Instrument::instrument(
+        async {
+            tokio::select! {
+                slept = tracedecay_runtime_core::native_runtime::sleep_until(retry_at) => slept,
+                () = wake.notified() => Ok(()),
+            }
+        },
+        tracing::trace_span!("daemon.hook_replay.interval_wait"),
+    )
+    .await
+}
+
 fn install_hook_v2_replay_consumer(
     roots: &mut BTreeMap<ReplayScope, RegisteredReplayConsumer>,
     graph: Arc<tracedecay_project::project::TraceDecay>,
@@ -891,31 +909,14 @@ fn install_hook_v2_replay_consumer(
             // Retained records and failed spools wait at most this interval
             // for their next attempt; a hook append wakes the drain sooner. Keep
             // the pacing WAIT separate from sweep WORK.
-            let timer = tracing::Instrument::instrument(
-                async {
-                    tokio::select! {
-                        slept = tracedecay_runtime_core::native_runtime::sleep_until(retry_at) => slept,
-                        () = wake.notified() => Ok(()),
-                    }
-                },
-                tracing::trace_span!("daemon.hook_replay.interval_wait"),
-            )
-            .await;
-            if let Err(error) = timer {
+            if let Err(error) = wait_for_replay_retry(&wake, retry_at).await {
                 tracing::error!(event = "hook_replay_timer_unavailable", %error);
                 break;
             }
             deferred_hosts.clear();
             retry_at = std::time::Instant::now() + REPLAY_INTERVAL;
         }
-        if let Ok(mut roots) = registered_replay_roots().lock()
-            && roots
-                .get(&task_scope)
-                .is_some_and(|registered| Weak::ptr_eq(&registered.graph, &task_graph))
-        {
-            spool_watch::detach_consumer(&task_scope.0, &task_scope.1, &wake);
-            roots.remove(&task_scope);
-        }
+        detach_finished_consumer(&task_scope, &task_graph, &wake);
     };
     let task = match tracedecay_runtime_core::native_runtime::NativeTask::spawn(consumer) {
         Ok(task) => task,
@@ -943,6 +944,21 @@ fn install_hook_v2_replay_consumer(
     );
     let _ = start.send(());
     ReplayConsumerStart::Started
+}
+
+fn detach_finished_consumer(
+    scope: &ReplayScope,
+    graph: &Weak<tracedecay_project::project::TraceDecay>,
+    wake: &Arc<tokio::sync::Notify>,
+) {
+    if let Ok(mut roots) = registered_replay_roots().lock()
+        && roots
+            .get(scope)
+            .is_some_and(|registered| Weak::ptr_eq(&registered.graph, graph))
+    {
+        spool_watch::detach_consumer(&scope.0, &scope.1, wake);
+        roots.remove(scope);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

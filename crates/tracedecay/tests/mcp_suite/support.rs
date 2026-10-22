@@ -1972,7 +1972,10 @@ pub(crate) async fn persist_temporal_lcm_observation_with_access(
     .unwrap();
     TemporalLcmProjectionInput {
         occurrence,
-        source_frontier: committed.receipt().sequence(),
+        source_frontier: committed
+            .receipt()
+            .expect("fixture observation is committed, not source-excluded")
+            .sequence(),
     }
 }
 

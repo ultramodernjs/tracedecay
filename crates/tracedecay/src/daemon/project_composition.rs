@@ -69,6 +69,7 @@ fn project_memory_provider_activation(
 pub(super) struct ProductionProjectComposition {
     #[cfg(unix)]
     pub(super) key: ProjectServerKey,
+    #[cfg(any(unix, test, feature = "test-transport"))]
     pub(super) canonical_project_path: PathBuf,
     pub(super) server: Arc<crate::mcp::McpServer>,
     #[cfg(unix)]
@@ -534,9 +535,12 @@ async fn production_project_server_inner(
             return Err(error);
         }
     };
+    #[cfg(not(unix))]
+    let _ = inserted;
     Ok(ProductionProjectComposition {
         #[cfg(unix)]
         key: opened.key,
+        #[cfg(any(unix, test, feature = "test-transport"))]
         canonical_project_path: canonical_project_path.to_path_buf(),
         server: resolved,
         #[cfg(unix)]
@@ -1151,11 +1155,13 @@ impl ProjectOpenInputs<'_> {
                 ncm_observer::construct_ncm_registration_with_authority(
                     &owners,
                     &profile_id,
-                    worker_binary,
-                    state_root,
-                    registration_revision,
-                    mode,
-                    namespace_binding,
+                    ncm_observer::NcmRegistrationSettings {
+                        worker_binary,
+                        state_root,
+                        registration_revision,
+                        mode,
+                        namespace_binding,
+                    },
                     authority,
                 )
                 .map_err(|error| error.to_string())
@@ -2295,10 +2301,11 @@ fn cached_project_composition(
     server: Arc<crate::mcp::McpServer>,
 ) -> ProductionProjectComposition {
     #[cfg(not(unix))]
-    let _ = key;
+    let _ = (key, canonical_project_path);
     ProductionProjectComposition {
         #[cfg(unix)]
         key,
+        #[cfg(any(unix, test, feature = "test-transport"))]
         canonical_project_path: canonical_project_path.to_path_buf(),
         server,
         #[cfg(unix)]

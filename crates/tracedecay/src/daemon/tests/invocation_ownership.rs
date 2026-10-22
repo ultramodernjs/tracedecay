@@ -843,7 +843,8 @@ async fn required_ncm_failure_preserves_core_configuration_repair() {
     let observer = MemoryProviderNcmObserverV1::Enabled {
         worker_binary: worker_binary.clone(),
         state_root,
-        namespace_binding: Default::default(),
+        namespace_binding:
+            tracedecay_domain::configuration::MemoryProviderNcmNamespaceBindingV1::default(),
     };
     let strict_routing = MemoryProviderRecallRoutingV1 {
         active_provider: Some("ncm".to_owned()),
