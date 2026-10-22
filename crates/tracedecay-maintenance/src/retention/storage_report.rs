@@ -1371,6 +1371,12 @@ mod tests {
         )
         .expect("read-only storage report");
         assert_eq!(report.graph_replay_release.len(), 2);
+        let wire: tracedecay_contracts::retrieval::AdminCliStorageReportV1 =
+            serde_json::from_value(serde_json::to_value(&report).unwrap())
+                .expect("nonempty release backlog survives strict canonical transport");
+        let roundtrip: StorageReport =
+            serde_json::from_value(serde_json::to_value(wire).unwrap()).unwrap();
+        assert_eq!(roundtrip.graph_replay_release.len(), 2);
         for backlog in &report.graph_replay_release {
             assert_eq!(backlog.pending_release_count, Some(1));
             assert_eq!(

@@ -114,6 +114,16 @@ pub enum AdminCliSurfaceRequestV1 {
         #[serde(default)]
         apply: Option<String>,
     },
+    /// One bounded, digest-confirmed replay-release page for a registered scope.
+    ReleaseGraphReplays {
+        project_id: String,
+        project_root: PathBuf,
+        #[serde(default)]
+        after: Option<String>,
+        /// Omit for a read-only preview; exact preview digest confirms apply.
+        #[serde(default)]
+        plan_digest: Option<String>,
+    },
     GainQuery {
         project_arg: Option<PathBuf>,
         since: i64,
@@ -142,6 +152,7 @@ impl AdminCliSurfaceRequestV1 {
             | Self::RegistryGc { .. }
             | Self::StorageReport { .. }
             | Self::StorageJournalGc { .. }
+            | Self::ReleaseGraphReplays { .. }
             | Self::GainQuery { .. } => OwnerStoresV1::ProjectGraph,
         }
     }
@@ -163,6 +174,7 @@ pub enum AdminCliResultV1 {
     RegistryGc(AdminCliRegistryGcV1),
     StorageReport(AdminCliStorageReportV1),
     JournalGc(AdminCliJournalGcV1),
+    GraphReplayRelease(AdminCliGraphReplayReleaseV1),
     GainHistory(AdminCliGainHistoryV1),
     GainTotal(AdminCliGainTotalV1),
     /// The diagnostics report is the analytics bridge's open document; it
@@ -401,6 +413,14 @@ pub struct AdminCliRegistryGcV1 {
     pub storage_project_candidates: Vec<PathBuf>,
 }
 
+/// One bounded graph replay release preview or apply result.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCliGraphReplayReleaseV1 {
+    /// The maintenance kernel's exact preview or apply result, never deletion authority.
+    pub graph_replay_release: Value,
+}
+
 /// One storage report page, or one project's report.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -609,6 +629,7 @@ mod tests {
                 AdminCliResultV1::RegistryGc(_) => "registry_gc",
                 AdminCliResultV1::StorageReport(_) => "storage_report",
                 AdminCliResultV1::JournalGc(_) => "journal_gc",
+                AdminCliResultV1::GraphReplayRelease(_) => "graph_replay_release",
                 AdminCliResultV1::GainHistory(_) => "gain_history",
                 AdminCliResultV1::GainTotal(_) => "gain_total",
                 AdminCliResultV1::AnalyticsDiagnostics(_) => "analytics_diagnostics",
@@ -616,6 +637,22 @@ mod tests {
             assert_eq!(variant, action, "{body}");
             assert_eq!(serde_json::to_value(&result).unwrap(), body);
         }
+    }
+
+    #[test]
+    fn graph_release_request_defaults_to_preview() {
+        let request: AdminCliSurfaceRequestV1 = serde_json::from_value(json!({
+            "action": "release_graph_replays",
+            "project_id": "proj_fixture",
+            "project_root": "/checkout"
+        }))
+        .expect("registered release action");
+        let wire = serde_json::to_value(request).unwrap();
+        assert!(
+            wire["plan_digest"].is_null(),
+            "no confirmation means dry-run"
+        );
+        assert!(wire["after"].is_null(), "first bounded page by default");
     }
 
     #[test]
@@ -674,7 +711,7 @@ mod tests {
         );
         assert_eq!(
             refused(json!({"action": "vacuum"})),
-            "unknown variant `vacuum`, expected one of `cost_summary`, `sessions_import`, `sessions_git_sync`, `sessions_sync_status`, `sessions_sync_cancel`, `sessions_unfinished`, `analytics_sync`, `analytics_diagnostics`, `registry_update`, `registry_list`, `registry_context`, `registry_empty`, `registry_project_tokens`, `registry_gc`, `storage_report`, `storage_journal_gc`, `gain_query`"
+            "unknown variant `vacuum`, expected one of `cost_summary`, `sessions_import`, `sessions_git_sync`, `sessions_sync_status`, `sessions_sync_cancel`, `sessions_unfinished`, `analytics_sync`, `analytics_diagnostics`, `registry_update`, `registry_list`, `registry_context`, `registry_empty`, `registry_project_tokens`, `registry_gc`, `storage_report`, `storage_journal_gc`, `release_graph_replays`, `gain_query`"
         );
     }
 }

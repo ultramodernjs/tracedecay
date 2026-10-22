@@ -1248,9 +1248,13 @@ impl GraphDb {
             .write()
             .map_err(|_| GraphDbError::unavailable("graph quarantine lock is poisoned"))?
             .clear();
-        *self.inner.verified_generations.write().map_err(|_| {
-            GraphDbError::unavailable("verified graph generation state lock is poisoned")
-        })? = VerifiedGenerationState::default();
+        self.inner
+            .verified_generations
+            .write()
+            .map_err(|_| {
+                GraphDbError::unavailable("verified graph generation state lock is poisoned")
+            })?
+            .hibernate();
         // Sealed per-generation readers are separate containers with their own
         // reopen authority; nothing about them depends on this staging engine
         // being resident. Uninstalling them here (which is what closing them

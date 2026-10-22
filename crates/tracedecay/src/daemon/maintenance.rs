@@ -760,6 +760,24 @@ struct MountedGraphListing {
     code_index_store_root: PathBuf,
 }
 
+fn active_project_maintenance_roots(
+    mounted: &[MountedGraphListing],
+    work: &[(String, MaintenanceStoreWork)],
+) -> BTreeSet<PathBuf> {
+    let mut roots = mounted
+        .iter()
+        .map(|graph| graph.project_root.clone())
+        .collect::<BTreeSet<_>>();
+    for (_, unit) in work {
+        if let MaintenanceStoreWork::Registered(store) = unit {
+            roots.insert(store.canonical_root.clone());
+            // Linked scopes inherit this owner through the inventory recorded
+            // by its admitted maintenance unit. Listing never scans the store.
+        }
+    }
+    roots
+}
+
 /// The work-list key of a mounted project graph: its root and serving branch.
 fn graph_work_key(graph: &tracedecay_project::project::TraceDecay) -> String {
     format!(
@@ -1243,11 +1261,11 @@ impl MaintenanceCoordinator {
                 .filter_map(|index| work[*index].1.database_path().map(Path::to_path_buf)),
         );
         let maintenance_observations = administration.store_telemetry_sampling();
-        let active_maintenance_projects = project_graphs
-            .iter()
-            .map(|graph| graph.project_root.clone())
-            .collect::<BTreeSet<_>>();
-        maintenance_observations.retain_project_maintenance_state(&active_maintenance_projects);
+        let active_maintenance_projects = active_project_maintenance_roots(&project_graphs, &work);
+        // Only a complete registry listing can retire an owner's scope state.
+        if registry_listed {
+            maintenance_observations.retain_project_maintenance_state(&active_maintenance_projects);
+        }
         // A capacity retirement releasing stores skips this pass: sampling
         // leases every sampled store until it ends.
         let telemetry_sampling = if continuation.is_none()
@@ -1827,6 +1845,7 @@ pub(super) fn retention_maintenance_enabled(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex as StdMutex};
@@ -1841,11 +1860,12 @@ mod tests {
         cursor_after_attempted_units, select_store_window,
     };
 
+    use tracedecay_runtime_core::db::{
+        Database, DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
+        TestRuntimeProfileIdentityV1,
+    };
+
     async fn seed_registered_graph_sql(profile_root: &Path, checkout: &Path, project_id: &str) {
-        use tracedecay_runtime_core::db::{
-            Database, DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
-            TestRuntimeProfileIdentityV1,
-        };
         let identity = tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
             .expect("fixture profile identity");
         tracedecay_runtime_core::storage::pin_fixture_repository_identity(checkout, project_id)
@@ -1993,6 +2013,42 @@ mod tests {
         registry.record_graph_replay_release_served(project, None);
         assert_eq!(registry.graph_replay_release_cursor(project), None);
         assert!(registry.graph_replay_release_attempt_admitted(project));
+    }
+
+    #[test]
+    fn registered_and_linked_scope_progress_survives_a_maintenance_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let linked = temp.path().join("linked");
+        // No store directory exists: listing preserves already-admitted scope
+        // ownership without doing another filesystem inventory.
+        let data_root = temp.path().join("absent-data");
+        let work = vec![(
+            "r:proj_fixture".to_owned(),
+            super::MaintenanceStoreWork::Registered(
+                tracedecay_maintenance::store_maintenance::RegisteredProjectStoreV1 {
+                    data_root,
+                    canonical_root: checkout.clone(),
+                },
+            ),
+        )];
+        let observations = StoreTelemetrySamplingRegistry::default();
+        observations.record_project_maintenance_scopes(&checkout, [linked.clone()]);
+        for root in [&checkout, &linked] {
+            observations
+                .record_graph_replay_release_served(root, Some("release-000000ff.json".to_owned()));
+            observations.record_graph_replay_release_unhealthy(root);
+        }
+        let roots = super::active_project_maintenance_roots(&[], &work);
+        assert_eq!(roots, BTreeSet::from([checkout.clone()]));
+        observations.retain_project_maintenance_state(&roots);
+        for root in [&checkout, &linked] {
+            assert_eq!(
+                observations.graph_replay_release_cursor(root).as_deref(),
+                Some("release-000000ff.json")
+            );
+            assert!(!observations.graph_replay_release_attempt_admitted(root));
+        }
     }
 
     #[test]
@@ -2326,19 +2382,17 @@ mod tests {
         let checkout = temp.path().join("checkout");
         std::fs::create_dir_all(&checkout).expect("checkout");
         let checkout = checkout.canonicalize().expect("canonical checkout");
-        let _runtime =
-            tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
-                &profile_root,
-            )
+        // The passed profile lease must be the same admitted profile the
+        // maintenance registry owns, not a second harness's synthetic identity.
+        let administration = super::StoreAdministration::default().with_profile_identity(
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+                .expect("canonical profile identity"),
+        );
+        administration
+            .retain_authenticated_profile_database_scope(&profile_root)
             .await
-            .expect("profile database");
-        let (profile_database, _registry_owner) =
-            tracedecay_global_db::tests::harness::open_registered_test_database_fixture(
-                &profile_root.join("global.db"),
-                tracedecay_runtime_core::db::TestDatabaseRuntimeScope::Profile,
-            )
-            .await
-            .expect("profile registry");
+            .unwrap();
+        let profile_database = administration.registered_profile_database().await.unwrap();
         let project = profile_database
             .upsert_code_project("proj_unmounted", &checkout, None, None, None)
             .await
@@ -2373,10 +2427,6 @@ mod tests {
             )),
             ..MaintenanceCoordinator::default()
         };
-        let administration = super::StoreAdministration::default().with_profile_identity(
-            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
-                .expect("canonical profile identity"),
-        );
         let schedulers =
             tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::new(
                 1,

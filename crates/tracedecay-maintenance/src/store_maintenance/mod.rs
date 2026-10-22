@@ -29,7 +29,7 @@ mod graph_replay;
 mod replay_release;
 pub use replay_release::{
     GraphReplayReleaseAuthorityV1, GraphReplayReleasePlanV1, GraphReplayReleaseRunV1,
-    plan_graph_replay_releases, release_graph_replays,
+    plan_graph_replay_releases, plan_project_graph_replay_releases, release_graph_replays,
 };
 mod scope_reconciliation;
 use graph_replay::{defer_graph_replay_pool_busy, log_code_generation_retention_degraded};
@@ -589,6 +589,12 @@ pub async fn run_registered_code_generation_retention(
             return CodeGenerationRetentionOutcomeV1::Failed;
         }
     };
+    observations.record_project_maintenance_scopes(
+        &store.canonical_root,
+        scopes
+            .iter()
+            .filter_map(|scope| scope.recorded_root.clone()),
+    );
     let graph_replay_pool_root = store
         .data_root
         .join(tracedecay_runtime_core::config::DB_FILENAME)

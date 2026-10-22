@@ -422,6 +422,7 @@ impl ApplicationSurfaceOperation {
                     | "registry_gc"
                     | "storage_report"
                     | "storage_journal_gc"
+                    | "release_graph_replays"
                     | "gain_query",
                 ) => true,
                 Some("cost_summary" | "analytics_sync" | "analytics_diagnostics") => {

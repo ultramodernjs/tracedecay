@@ -422,6 +422,12 @@ async fn dispatch_admin_cli(
         AdminCliSurfaceRequestV1::StorageJournalGc { cursor, apply } => {
             AdminCliResultV1::JournalGc(journal_gc::run(global_db, cursor, apply.as_deref()).await?)
         }
+        AdminCliSurfaceRequestV1::ReleaseGraphReplays { .. } => {
+            return Err(TraceDecayError::Config {
+                message: "graph replay release requires the daemon profile maintenance owner"
+                    .to_owned(),
+            });
+        }
         AdminCliSurfaceRequestV1::StorageReport {
             project_id,
             project_root,

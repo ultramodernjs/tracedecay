@@ -2,6 +2,34 @@ use super::{Cli, Commands, DaemonAction, ProfileStorageAction, RemoteAction};
 use clap::{Parser, error::ErrorKind};
 
 #[test]
+fn graph_replay_release_defaults_to_preview_and_requires_a_digest_to_apply() {
+    let base = [
+        "tracedecay",
+        "storage",
+        "release-graph-replays",
+        "--project-id",
+        "proj_fixture",
+        "--project-root",
+        "/tmp/checkout",
+        "--json",
+    ];
+    assert!(Cli::try_parse_from(base).is_ok(), "default is a preview");
+    let digest = format!("sha256:{}", "1".repeat(64));
+    let mut confirmed = base.to_vec();
+    confirmed.extend(["--apply", &digest]);
+    assert!(
+        Cli::try_parse_from(confirmed).is_ok(),
+        "--apply takes the exact preview digest"
+    );
+    let mut unconfirmed = base.to_vec();
+    unconfirmed.push("--apply");
+    assert!(
+        Cli::try_parse_from(unconfirmed).is_err(),
+        "bare --apply cannot mutate"
+    );
+}
+
+#[test]
 fn tool_command_preserves_trailing_help_and_reserved_args() {
     let cli = Cli::try_parse_from([
         "tracedecay",

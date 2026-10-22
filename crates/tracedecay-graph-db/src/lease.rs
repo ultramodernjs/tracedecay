@@ -117,6 +117,16 @@ impl VerifiedGenerationState {
         self.known.retain(|_, weak| weak.strong_count() > 0);
     }
 
+    /// Native hibernation drops installed state, not already-issued readers.
+    pub(crate) fn hibernate(&mut self) {
+        let known = std::mem::take(&mut self.known);
+        *self = Self {
+            known,
+            ..Self::default()
+        };
+        self.sweep_dead_known();
+    }
+
     pub(crate) fn remember(
         &mut self,
         lease: &Arc<VerifiedGenerationLease>,
