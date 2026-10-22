@@ -46,6 +46,27 @@ use rows::{
 };
 use tracedecay_store::StoredObservationRowV1;
 
+fn source_is_excluded(
+    connection: &Connection,
+    source: &ObservationSourceIdentityV1,
+    scope: &ObservationScopeV1,
+) -> rusqlite::Result<bool> {
+    let key = tracedecay_store::observation_source_exclusion_key(source, scope).map_err(invalid)?;
+    let value: Option<String> = connection
+        .query_row_cached(
+            "SELECT value FROM session_backfill_meta WHERE key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    tracedecay_store::validate_observation_source_exclusion(&value, source, scope)
+        .map_err(invalid)?;
+    Ok(true)
+}
+
 #[derive(Clone, Default)]
 pub struct ObservationExecutor;
 
@@ -58,6 +79,10 @@ impl ObservationExecutor {
         let observation = write.observation();
         let source_json = encode(observation.source())?;
         let scope_json = encode(observation.scope())?;
+        if source_is_excluded(savepoint, observation.source(), observation.scope())? {
+            let advance = write.write().source_exclusion_advance().map_err(invalid)?;
+            return self.execute_cursor_advance(savepoint, &advance);
+        }
         let observation_json = encode_stored_observation(savepoint, observation)?;
         let committed_cursor_json = encode(write.next_cursor())?;
         let receipt = observation.receipt();
@@ -211,6 +236,17 @@ impl ObservationExecutor {
         savepoint: &Savepoint<'_>,
         advance: &ObservationCursorAdvance,
     ) -> Result<(), StorageOperationError> {
+        let excluded_advance;
+        let advance = if source_is_excluded(
+            savepoint,
+            advance.next_cursor().source(),
+            advance.next_cursor().scope(),
+        )? {
+            excluded_advance = advance.source_exclusion_advance();
+            &excluded_advance
+        } else {
+            advance
+        };
         let source_json = encode(advance.next_cursor().source())?;
         let scope_json = encode(advance.next_cursor().scope())?;
         let actual_cursor = read_cursor(savepoint, &source_json, &scope_json)?;

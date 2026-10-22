@@ -152,9 +152,18 @@ fn anchored_write_and_replay_receipt_keep_the_original_anchor() {
     )
     .unwrap();
     let replay = ObservationPersistOutcome::ExactDuplicate(receipt);
-    assert_eq!(replay.receipt().retrieval_anchor(), &original_anchor);
     assert_eq!(
-        replay.receipt().projection_generation(),
+        replay
+            .receipt()
+            .expect("fixture persists an observation")
+            .retrieval_anchor(),
+        &original_anchor
+    );
+    assert_eq!(
+        replay
+            .receipt()
+            .expect("fixture persists an observation")
+            .projection_generation(),
         &projection_generation()
     );
 }

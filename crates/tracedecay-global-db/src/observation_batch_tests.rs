@@ -397,14 +397,28 @@ async fn persist_observations_opens_one_writer_transaction_for_the_batch() {
     assert_eq!(
         outcomes
             .iter()
-            .map(|outcome| outcome.outcome().receipt().observation().observation_id())
+            .map(|outcome| outcome
+                .outcome()
+                .receipt()
+                .expect("fixture persists an observation")
+                .observation()
+                .observation_id())
             .collect::<Vec<_>>(),
         expected_observation_ids.iter().collect::<Vec<_>>(),
         "batch receipt hydration must preserve caller order"
     );
     assert!(
         outcomes.windows(2).all(|pair| {
-            pair[0].outcome().receipt().sequence() < pair[1].outcome().receipt().sequence()
+            pair[0]
+                .outcome()
+                .receipt()
+                .expect("fixture persists an observation")
+                .sequence()
+                < pair[1]
+                    .outcome()
+                    .receipt()
+                    .expect("fixture persists an observation")
+                    .sequence()
         }),
         "writer authority must commit the ordered input frontier"
     );
@@ -1273,6 +1287,7 @@ async fn persist_observations_recovers_a_peer_commit_as_exact_duplicate() {
         ObservationPersistOutcome::Committed(_) => "committed",
         ObservationPersistOutcome::ExactDuplicate(_) => "exact_duplicate",
         ObservationPersistOutcome::CoveredDuplicate(_) => "covered_duplicate",
+        ObservationPersistOutcome::SourceExcluded(_) => "source_excluded",
     };
     let left_class = persist_class(left[0].outcome());
     let right_class = persist_class(right[0].outcome());

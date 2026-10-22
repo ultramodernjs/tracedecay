@@ -192,7 +192,11 @@ impl ObservationStore for FakeStore {
                 .iter()
                 .find(|stored| {
                     stored.observation().observation_id()
-                        == outcome.receipt().observation().observation_id()
+                        == outcome
+                            .receipt()
+                            .expect("fixture persists an observation")
+                            .observation()
+                            .observation_id()
                 })
                 .cloned();
             outcomes.push(ObservationBatchPersistOutcome::new(outcome, stored));
@@ -563,13 +567,22 @@ async fn repository_provenance_is_bound_to_the_sanitized_observation_write() {
     let sanitized_payload = sanitized_record.payload().to_string();
     assert_eq!(sanitized_payload, SANITIZED_REPOSITORY_PAYLOAD);
     assert!(!sanitized_payload.contains("sk-repository-provenance-secret"));
-    let attachment = outcome.receipt().repository_provenance_attachment();
+    let attachment = outcome
+        .receipt()
+        .expect("fixture persists an observation")
+        .repository_provenance_attachment();
     let EvidenceAvailabilityV1::Known(provenance) = attachment.availability() else {
         panic!("repository provenance must be known");
     };
     assert_eq!(
         provenance.source_observation(),
-        Some(outcome.receipt().observation().observation_id())
+        Some(
+            outcome
+                .receipt()
+                .expect("fixture persists an observation")
+                .observation()
+                .observation_id()
+        )
     );
     assert!(matches!(
         attachment.anchor().map(tracedecay_domain::RetrievalAnchorRecord::target),
@@ -610,6 +623,7 @@ async fn repository_provenance_context_refuses_cross_project_reuse() {
     assert!(matches!(
         outcome
             .receipt()
+            .expect("fixture persists an observation")
             .repository_provenance_attachment()
             .availability(),
         EvidenceAvailabilityV1::Unavailable
@@ -946,9 +960,12 @@ async fn cancellation_after_point_read_and_replay_discards_non_atomic_results() 
         .await
         .unwrap();
     let observation_id = match capture {
-        CaptureObservationOutcome::Persisted { outcome, .. } => {
-            outcome.receipt().observation().observation_id().clone()
-        }
+        CaptureObservationOutcome::Persisted { outcome, .. } => outcome
+            .receipt()
+            .expect("fixture persists an observation")
+            .observation()
+            .observation_id()
+            .clone(),
         other => panic!("capture must persist, got {other:?}"),
     };
 

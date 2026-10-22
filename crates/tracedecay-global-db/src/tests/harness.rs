@@ -1250,7 +1250,11 @@ pub(crate) async fn seed_projected_messages(
             ));
             assert_eq!(
                 item.outcome.checkpoint().last_sequence(),
-                admitted.outcome().receipt().sequence(),
+                admitted
+                    .outcome()
+                    .receipt()
+                    .expect("fixture persists an observation")
+                    .sequence(),
                 "fixture projection follows its admitted observations in order"
             );
         }

@@ -25,7 +25,7 @@ async fn claude_updates_with_one_native_message_id_drain_without_collisions() {
         .persist_observation(canonical_write(first))
         .await
         .unwrap();
-    let first_cursor = first_outcome.receipt().committed_cursor().clone();
+    let first_cursor = first_outcome.committed_cursor().clone();
     store
         .persist_observation(canonical_write_with_cursor(second, Some(first_cursor)))
         .await

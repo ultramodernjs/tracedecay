@@ -44,6 +44,35 @@ fn offset(value: u64) -> ProjectionStoreResult<i64> {
     i64::try_from(value).map_err(|_| ProjectionStoreError::SequenceOverflow(value))
 }
 
+async fn source_is_excluded(
+    conn: &impl QueryExecutor,
+    source: &ObservationSourceIdentityV1,
+    scope: &ObservationScopeV1,
+) -> ProjectionStoreResult<bool> {
+    let key = tracedecay_store::observation_source_exclusion_key(source, scope)
+        .map_err(|error| storage("read source exclusion", error))?;
+    let mut rows = conn
+        .query(
+            "SELECT value FROM session_backfill_meta WHERE key = ?1",
+            [key],
+        )
+        .await
+        .map_err(|error| storage("read source exclusion", error))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| storage("read source exclusion", error))?
+    else {
+        return Ok(false);
+    };
+    let value: String = row
+        .get(0)
+        .map_err(|error| storage("read source exclusion", error))?;
+    tracedecay_store::validate_observation_source_exclusion(&value, source, scope)
+        .map_err(|error| storage("validate source exclusion", error))?;
+    Ok(true)
+}
+
 async fn pending_rewrite(
     conn: &impl QueryExecutor,
     key: &SourceKey,
@@ -137,6 +166,8 @@ impl RegisteredGlobalDb {
             return Ok(());
         }
         let key = SourceKey::new(source, scope)?;
+        let source = source.clone();
+        let scope = scope.clone();
         let rows = records
             .iter()
             .map(|record| {
@@ -150,6 +181,7 @@ impl RegisteredGlobalDb {
         self.transact_or(
             |error| storage("run source presence transaction", error),
             async move |transaction| {
+                if source_is_excluded(&transaction, &source, &scope).await? { return Ok(()); }
                 key.ensure_descriptor(&transaction).await?;
                 for (observation_id, generation, start_offset) in &rows {
                     transaction
@@ -201,12 +233,17 @@ impl RegisteredGlobalDb {
             return Ok(());
         }
         let key = SourceKey::new(source, scope)?;
+        let source = source.clone();
+        let scope = scope.clone();
         let generation = generation.generation_id().to_string();
         let retained_through = offset(retained_through)?;
         let previous = previous.generation_id().to_string();
         self.transact_or(
             |error| storage("run source rewrite transaction", error),
             async move |transaction| {
+                if source_is_excluded(&transaction, &source, &scope).await? {
+                    return Ok(());
+                }
                 key.ensure_descriptor(&transaction).await?;
                 // A rewrite the previous generation never finished still names its
                 // own layout: its retained prefix was relabeled to it.
@@ -267,6 +304,8 @@ impl RegisteredGlobalDb {
         generation: ObservationSourceGenerationV1,
     ) -> ProjectionStoreResult<u64> {
         let key = SourceKey::new(source, scope)?;
+        let source = source.clone();
+        let scope = scope.clone();
         let generation = generation.generation_id().to_string();
         let snapshot = self
             .read_snapshot()
@@ -279,6 +318,9 @@ impl RegisteredGlobalDb {
         self.transact_or_rollback(
             |error| storage("run source rewrite completion", error),
             async move |transaction| {
+                if source_is_excluded(&transaction, &source, &scope).await? {
+                    return Err(JobExit::Rollback(0));
+                }
                 if pending_rewrite(&transaction, &key).await?.as_deref()
                     != Some(generation.as_str())
                 {

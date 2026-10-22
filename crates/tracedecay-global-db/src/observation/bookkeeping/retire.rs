@@ -75,17 +75,12 @@ pub struct ProjectPruneMarker {
 
 impl ProjectPruneMarker {
     pub fn metadata(&self) -> ProjectionStoreResult<(String, String)> {
-        let identity = serde_json::to_string(&(&self.source, &self.scope)).map_err(storage)?;
-        let key = format!(
-            "profile-project-prune.v1.source.{}",
-            tracedecay_domain::canonical_text::sha256_hex(identity.as_bytes())
-        );
-        let value = serde_json::to_string(&serde_json::json!({
-            "version": 1, "source": self.source, "scope": self.scope,
-            "plan_digest": self.approved_plan_digest,
-        }))
-        .map_err(storage)?;
-        Ok((key, value))
+        tracedecay_store::observation_source_exclusion_metadata(
+            &self.source,
+            &self.scope,
+            &self.approved_plan_digest,
+        )
+        .map_err(storage)
     }
 }
 
