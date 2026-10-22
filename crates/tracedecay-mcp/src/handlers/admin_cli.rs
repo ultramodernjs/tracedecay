@@ -417,6 +417,12 @@ async fn dispatch_admin_cli(
             };
             AdminCliResultV1::RegistryGc(serde_json::from_value(serde_json::to_value(report)?)?)
         }
+        AdminCliSurfaceRequestV1::ReleaseGraphReplays { .. } => {
+            return Err(TraceDecayError::Config {
+                message: "graph replay release requires the daemon profile maintenance owner"
+                    .to_owned(),
+            });
+        }
         AdminCliSurfaceRequestV1::StorageReport {
             project_id,
             project_root,

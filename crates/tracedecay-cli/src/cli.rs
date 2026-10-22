@@ -1239,6 +1239,24 @@ pub enum ProfileStorageAction {
         #[arg(long)]
         json: bool,
     },
+    /// Preview one bounded page of collected graph replays; apply only with
+    /// the digest returned by that exact preview. Uses the running daemon.
+    #[command(name = "release-graph-replays")]
+    ReleaseGraphReplays {
+        #[arg(long)]
+        project_id: String,
+        /// Recorded checkout/worktree root of the scope to release.
+        #[arg(long)]
+        project_root: PathBuf,
+        /// Continuation returned by the previous page.
+        #[arg(long)]
+        after: Option<String>,
+        /// Execute only the exact preview identified by this digest.
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Reset a project store refused with ResetRequired. An incompatible graph
     /// database is deleted while its canonical store directory, session archive,
     /// and transcripts are preserved; the next open rebuilds from those transcripts.

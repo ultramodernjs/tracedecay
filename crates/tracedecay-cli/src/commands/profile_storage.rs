@@ -27,6 +27,52 @@ pub(crate) async fn handle_profile_storage_action(
             project_root,
             json,
         } => handle_storage_report(profile, profile_root, project_id, project_root, json).await,
+        ProfileStorageAction::ReleaseGraphReplays {
+            project_id,
+            project_root,
+            after,
+            apply,
+            json,
+        } => {
+            let result = super::daemon::admin_cli_result(
+                profile,
+                None,
+                AdminCliSurfaceRequestV1::ReleaseGraphReplays {
+                    project_id,
+                    project_root,
+                    after,
+                    plan_digest: apply,
+                },
+            )
+            .await?;
+            let AdminCliResultV1::GraphReplayRelease(result) = result else {
+                return Err(super::daemon::admin_cli_result_mismatch(
+                    "release_graph_replays",
+                ));
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result.graph_replay_release)?
+                );
+            } else {
+                let result: tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1 =
+                    serde_json::from_value(result.graph_replay_release)?;
+                match result {
+                    tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1::DryRun { plan } => {
+                        println!("Dry-run: {} queued source(s) in this bounded page; graph authority unvalidated", plan.releases.len());
+                        println!("Plan digest: {}", plan.plan_digest);
+                        println!("Reclaimable bytes: {}", plan.reclaimable_bytes.map_or_else(|| "unknown until authority revalidation".to_owned(), |bytes| format_bytes(bytes)));
+                        println!("Continuation: {}", plan.continuation.as_deref().unwrap_or("end"));
+                    }
+                    tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1::Applied { released, retained, continuation, segment_sweep_more_work, .. } => {
+                        println!("Released {released} source(s); retained {retained} by live graph authority");
+                        println!("Continuation: {}; segment sweep more work: {segment_sweep_more_work}", continuation.as_deref().unwrap_or("end"));
+                    }
+                }
+            }
+            Ok(())
+        }
         ProfileStorageAction::ResetProjectStore {
             project_root,
             project_id,
@@ -322,6 +368,9 @@ fn merge_storage_report_page(
     }
     report.stores.extend(page.stores);
     report
+        .graph_replay_release
+        .extend(page.graph_replay_release);
+    report
         .code_generation_retention
         .extend(page.code_generation_retention);
     report
@@ -548,6 +597,25 @@ async fn handle_storage_report(
                 generation.size_bytes,
                 generation.sealed_at_micros
             );
+        }
+    }
+    for backlog in &report.graph_replay_release {
+        println!(
+            "  graph replay release for {} ({}): {} queued in this bounded page, authority unvalidated, reclaimable segment bytes {}",
+            backlog.project_id,
+            backlog.store_root,
+            backlog
+                .pending_release_count
+                .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+            backlog
+                .reclaimable_segment_bytes
+                .map_or_else(|| "unknown".to_owned(), |bytes| format_bytes(bytes))
+        );
+        if let Some(cursor) = &backlog.continuation {
+            println!("    queue continues after {cursor}");
+        }
+        if let Some(reason) = &backlog.unavailable_reason {
+            println!("    unavailable: {reason}");
         }
     }
     for availability in &report.code_generation_retention_availability {

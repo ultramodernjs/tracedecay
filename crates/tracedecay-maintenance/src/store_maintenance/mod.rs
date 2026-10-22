@@ -29,7 +29,7 @@ mod graph_replay;
 mod replay_release;
 pub use replay_release::{
     GraphReplayReleaseAuthorityV1, GraphReplayReleasePlanV1, GraphReplayReleaseRunV1,
-    plan_graph_replay_releases, release_graph_replays,
+    plan_graph_replay_releases, plan_project_graph_replay_releases, release_graph_replays,
 };
 mod scope_reconciliation;
 use graph_replay::{defer_graph_replay_pool_busy, log_code_generation_retention_degraded};

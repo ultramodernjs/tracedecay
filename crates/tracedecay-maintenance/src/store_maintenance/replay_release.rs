@@ -14,6 +14,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{ProjectId, canonical_sha256};
 use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_runtime_core::native_runtime;
+use tracedecay_runtime_core::storage::StoreLayout;
 
 use crate::lease::ProjectStoreMaintenanceLeaseV1;
 
@@ -88,6 +89,35 @@ pub fn plan_graph_replay_releases(
     })
 }
 
+/// Read-only preview for a registry-resolved layout. Root provenance is checked
+/// without admitting writable graph SQL or creating an absent store.
+pub fn plan_project_graph_replay_releases(
+    layout: &StoreLayout,
+    checkout_root: &Path,
+    after: Option<&str>,
+) -> Result<GraphReplayReleasePlanV1> {
+    let project_id = layout
+        .identity
+        .project_id
+        .as_deref()
+        .ok_or_else(|| release_error("graph replay project identity unavailable"))?;
+    let store_root = code_index_store_root(&layout.data_root, checkout_root);
+    let scopes = tracedecay_code_index_retention::code_index_generations::code_index_scopes(
+        &layout.data_root,
+    )
+    .map_err(|error| release_error(error.to_string()))?;
+    if !scopes.iter().any(|scope| {
+        scope.store_root == store_root
+            && (scope.recorded_root.as_deref() == Some(checkout_root)
+                || checkout_root == layout.project_root)
+    }) {
+        return Err(release_error(
+            "graph replay checkout root is not recorded for this scope",
+        ));
+    }
+    plan_graph_replay_releases(project_id, &store_root, checkout_root, after)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum GraphReplayReleaseRunV1 {
@@ -139,26 +169,11 @@ pub async fn release_graph_replays(
         ));
     }
     let store_root = code_index_store_root(&layout.data_root, checkout_root);
-    let scopes = tracedecay_code_index_retention::code_index_generations::code_index_scopes(
-        &layout.data_root,
-    )
-    .map_err(|error| release_error(error.to_string()))?;
-    let root_proven = scopes.iter().any(|scope| {
-        scope.store_root == store_root
-            && (scope.recorded_root.as_deref() == Some(checkout_root)
-                || checkout_root == layout.project_root)
-    });
-    if !root_proven {
-        return Err(release_error(
-            "graph replay checkout root is not recorded for this scope",
-        ));
-    }
-    let root = store_root.clone();
+    let layout = layout.clone();
     let checkout = checkout_root.to_path_buf();
-    let project = project_id.to_owned();
     let after = after.map(str::to_owned);
     let plan = native_runtime::spawn_blocking(move || {
-        plan_graph_replay_releases(&project, &root, &checkout, after.as_deref())
+        plan_project_graph_replay_releases(&layout, &checkout, after.as_deref())
     })
     .await
     .map_err(|error| release_error(format!("join release preview: {error}")))??;
