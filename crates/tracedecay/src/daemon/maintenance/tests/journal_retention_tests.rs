@@ -1,13 +1,21 @@
-use super::*;
+use std::sync::Arc;
+
+use tracedecay_contracts::session_sync::{
+    SessionSyncCommandV1, SessionSyncCompletionReceiptV1, SessionSyncJournalStatusV1,
+    SessionSyncJournalV1, SessionSyncRequestV1, SessionSyncScopeV1, SessionSyncSourceFrontierV1,
+    SessionTranscriptImportV1,
+};
+use tracedecay_contracts::{
+    CancellationSignal, Deadline, IdempotencyKey, OperationTermination, RequestId,
+};
+use tracedecay_domain::{ProjectId, UtcMicros};
+use tracedecay_maintenance::tick::{MaintenanceContinuation, MaintenanceTickOutcome};
+
+use super::MaintenanceCoordinator;
 
 #[test]
 fn journal_maintenance_tick_expires_resumes_and_cancels() {
     tracedecay_runtime_core::native_runtime::block_on(async {
-        use tracedecay_contracts::session_sync::*;
-        use tracedecay_contracts::{
-            CancellationSignal, Deadline, IdempotencyKey, OperationTermination, RequestId,
-        };
-        use tracedecay_domain::{ProjectId, UtcMicros};
         let temp = tempfile::tempdir().unwrap();
         let profile = &temp.path().join("profile");
         tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all(profile).unwrap();
@@ -24,9 +32,11 @@ fn journal_maintenance_tick_expires_resumes_and_cancels() {
             db.binding().shard_id.profile_id.clone(),
         );
         let mut keys = Vec::new();
-        for n in 0..15 {
+        for n in 0..16 {
             let id = if n == 14 {
                 "manual.b9".to_owned()
+            } else if n == 15 {
+                format!("session-sync.startup.{n:032x}.project.active")
             } else {
                 format!("session-sync.startup.{n:032x}.project.b9")
             };
@@ -38,10 +48,19 @@ fn journal_maintenance_tick_expires_resumes_and_cancels() {
                         3 * 86_400_000_000
                     },
             );
+            // A nonterminal receipt conservatively pins its entire project scope.
+            let journal_scope = if n == 15 {
+                SessionSyncScopeV1::new(
+                    ProjectId::new("project.active").unwrap(),
+                    scope.profile_id().clone(),
+                )
+            } else {
+                scope.clone()
+            };
             let request = SessionSyncRequestV1::new(
                 RequestId::new(&id).unwrap(),
                 IdempotencyKey::new(&id).unwrap(),
-                scope.clone(),
+                journal_scope,
                 Deadline::new(UtcMicros(now.0 + 60_000_000)).unwrap(),
                 CancellationSignal::active(&id).unwrap(),
                 SessionSyncCommandV1::ImportTranscripts(SessionTranscriptImportV1::all_hosts()),
@@ -72,8 +91,12 @@ fn journal_maintenance_tick_expires_resumes_and_cancels() {
                 source_frontiers: journal.source_frontiers.clone(),
                 failure_codes: Vec::new(),
             });
-            let p = scope.profile_id().as_str();
-            let r = scope.project_id().as_str();
+            if n == 15 {
+                journal.status = SessionSyncJournalStatusV1::Queued;
+                journal.completion = None;
+            }
+            let p = journal.scope.profile_id().as_str();
+            let r = journal.scope.project_id().as_str();
             let key = format!("session-sync.v1.p{}:{p}.r{}:{r}.{id}", p.len(), r.len());
             db.insert_session_sync_journal(&key, &serde_json::to_string(&journal).unwrap())
                 .await
@@ -146,6 +169,52 @@ fn journal_maintenance_tick_expires_resumes_and_cancels() {
             );
             previous_remaining = remaining;
             ticks += 1;
+            if ticks == 1 {
+                let cpu = coordinator
+                    .background_cpu
+                    .as_ref()
+                    .unwrap()
+                    .try_acquire()
+                    .unwrap();
+                let blocked = coordinator
+                    .run_tick(
+                        profile,
+                        &db,
+                        &administration,
+                        &schedulers,
+                        &retention,
+                        super::super::BranchStoreGcCadenceV1 { branch_gc_days: 30 },
+                        Some(MaintenanceContinuation::SessionJournalRetention),
+                    )
+                    .await;
+                assert_eq!(
+                    blocked,
+                    MaintenanceTickOutcome::Retry,
+                    "journal continuation must respect exhausted background CPU admission"
+                );
+                drop(cpu);
+                let blocked = administration
+                    .try_with_writer(|| async {
+                        coordinator
+                            .run_tick(
+                                profile,
+                                &db,
+                                &administration,
+                                &schedulers,
+                                &retention,
+                                super::super::BranchStoreGcCadenceV1 { branch_gc_days: 30 },
+                                Some(MaintenanceContinuation::SessionJournalRetention),
+                            )
+                            .await
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    blocked,
+                    MaintenanceTickOutcome::Retry,
+                    "busy writer must retry without losing the journal cursor"
+                );
+            }
             continuation = outcome.continuation();
             if outcome.is_complete() {
                 break;
@@ -165,9 +234,14 @@ fn journal_maintenance_tick_expires_resumes_and_cancels() {
         for key in &keys[12..] {
             assert!(
                 db.read_session_sync_journal(key).await.unwrap().is_some(),
-                "recent, pinned and manual receipts must survive"
+                "recent, pinned, manual and unfinished receipts must survive"
             );
         }
+        assert_eq!(
+            db.read_session_sync_journal(&keys[15]).await.unwrap(),
+            original[15],
+            "unfinished work must not be normalized"
+        );
         // Normalization keeps the completion's replay evidence, only the duplicate goes.
         let recent: SessionSyncJournalV1 = serde_json::from_str(
             &db.read_session_sync_journal(&keys[12])

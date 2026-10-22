@@ -1083,6 +1083,9 @@ impl MaintenanceCoordinator {
             return MaintenanceTickOutcome::Retry;
         };
         if continuation == Some(MaintenanceContinuation::SessionJournalRetention) {
+            let Some(_background_cpu) = background_cpu.try_acquire() else {
+                return MaintenanceTickOutcome::Retry;
+            };
             return self
                 .run_journal_retention(profile_database, administration, false)
                 .await;
@@ -1428,12 +1431,14 @@ impl MaintenanceCoordinator {
                                 }
                             };
                             let lease = ProjectStoreMaintenanceLeaseV1::new(store.canonical_root.clone(), layout, database, registry, profile);
+                            // Generation pins belong to the admitted session store,
+                            // not the profile registry used by journal retention.
                             run_registered_project_generation_maintenance(
                                 store,
                                 &lease,
                                 &mounted_store_roots,
                                 code_index_schedulers,
-                                profile_database,
+                                lease.profile_database(),
                                 &maintenance_observations,
                                 &self.cancellation,
                             )
