@@ -1028,11 +1028,15 @@ async fn memory_curator_stops_before_backend_or_apply_when_caller_is_interrupted
         .and_then(|fact| fact.payload().map(|payload| payload.tags().to_vec()))
         .expect("interrupted run must retain the seeded winner");
     assert_eq!(winner_tags_after, winner_tags_before);
+    // An interrupted run still settles one terminal ledger row, but only as a
+    // failure: it must never record a successful application.
+    let records = load_run_records(&cg.store_layout().dashboard_root, 10)
+        .await
+        .unwrap();
     assert!(
-        load_run_records(&cg.store_layout().dashboard_root, 10)
-            .await
-            .unwrap()
-            .is_empty(),
-        "an interrupted run must not emit an application receipt"
+        records
+            .iter()
+            .all(|record| record.status == AutomationRunStatus::Failed),
+        "an interrupted run must not emit an application receipt: {records:?}"
     );
 }
