@@ -46,10 +46,19 @@ struct OfflineStore {
     _registry: StoreRuntimeRegistry,
 }
 
+fn process_incarnation() -> Result<StoreIncarnationV1> {
+    let generation = tracedecay_store_runtime::process_runtime_generation(
+        tracedecay_runtime_core::runtime_identity::process_run_id(),
+    )
+    .ok_or_else(|| error("unsupported process runtime identity"))?;
+    StoreIncarnationV1::new(generation).map_err(error)
+}
+
 async fn open_existing(
     profile_root: &Path,
     lifecycle: &LifecycleLease,
     writable: bool,
+    incarnation: StoreIncarnationV1,
 ) -> Result<OfflineStore> {
     // Do not manufacture a new profile/store because a maintenance path is wrong.
     for name in [GLOBAL_DB_FILENAME, USER_SESSIONS_DB_FILENAME] {
@@ -61,11 +70,6 @@ async fn open_existing(
         }
     }
     let identity = tracedecay_daemon_identity::profile_identity::load_existing(profile_root)?;
-    let generation = tracedecay_store_runtime::process_runtime_generation(
-        tracedecay_runtime_core::runtime_identity::process_run_id(),
-    )
-    .ok_or_else(|| error("unsupported process runtime identity"))?;
-    let incarnation = StoreIncarnationV1::new(generation).map_err(error)?;
     let profile_shard =
         StoreShardIdV1::profile(identity.brain_id().clone(), identity.profile_id().clone());
     let sessions_shard = StoreShardIdV1::profile_sessions(
@@ -163,7 +167,13 @@ pub(super) async fn prepare_indexes(
         &profile_root,
         "prepare-retirement-indexes",
     )?;
-    let store = Box::pin(open_existing(&profile_root, &lifecycle, apply.is_some())).await?;
+    let store = Box::pin(open_existing(
+        &profile_root,
+        &lifecycle,
+        apply.is_some(),
+        process_incarnation()?,
+    ))
+    .await?;
     let plan = store
         .db
         .plan_retirement_index_preparation(&lifecycle)
@@ -209,17 +219,225 @@ pub(super) async fn prepare_indexes(
     Ok(())
 }
 
+pub(super) async fn cleanup_codex(
+    profile: &ProfileRoot,
+    apply: Option<String>,
+    cursor: Option<String>,
+    page_size: u16,
+    json: bool,
+) -> Result<()> {
+    let cursor = cursor
+        .as_deref()
+        .map(
+            serde_json::from_str::<
+                tracedecay_global_db::observation::unsupported_codex::UnsupportedCodexCleanupCursor,
+            >,
+        )
+        .transpose()
+        .map_err(error)?;
+    let profile_root = profile.data_dir().canonicalize()?;
+    let lifecycle = acquire_offline(&profile_root, "cleanup-codex")?;
+    let _scope = tracedecay_runtime_core::db::enter_maintenance_database_scope(
+        &lifecycle,
+        &profile_root,
+        "cleanup-codex",
+    )?;
+    let store = Box::pin(open_existing(
+        &profile_root,
+        &lifecycle,
+        apply.is_some(),
+        process_incarnation()?,
+    ))
+    .await?;
+    let plan = store.db.plan_unsupported_codex_cleanup(cursor.as_ref(), usize::from(page_size)).await.map_err(|cause| error(format!(
+        "cleanup-codex refused: {cause}. Missing retirement reverse indexes must be prepared offline with `tracedecay storage prepare-retirement-indexes` until done"
+    )))?;
+    let retired = match &apply {
+        Some(digest) => store
+            .db
+            .apply_unsupported_codex_cleanup(&plan, digest)
+            .await
+            .map_err(error)?,
+        None => 0,
+    };
+    let eligible = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.retained_reasons.is_empty())
+        .count();
+    let tables = plan
+        .retirement()
+        .map(|retirement| retirement.tables())
+        .unwrap_or(&[]);
+    let rows: u64 = tables
+        .iter()
+        .filter(|table| !table.retained)
+        .map(|table| table.rows)
+        .sum();
+    let bytes: u64 = tables
+        .iter()
+        .filter(|table| !table.retained)
+        .map(|table| table.bytes)
+        .sum();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": apply.is_none(), "retired_observations": retired,
+                "summary": { "examined": plan.examined, "candidates": plan.candidates.len(),
+                    "eligible": eligible, "retained": plan.candidates.len() - eligible,
+                    "exclusive_rows": rows, "exclusive_column_bytes": bytes },
+                "plan": plan,
+            }))
+            .map_err(error)?
+        );
+    } else {
+        println!(
+            "{}: examined {}, unsupported candidates {}, eligible {}, retained {}; {} exclusive rows / {} logical column bytes",
+            if apply.is_some() {
+                "Applied reviewed page"
+            } else {
+                "Dry run only"
+            },
+            plan.examined,
+            plan.candidates.len(),
+            eligible,
+            plan.candidates.len() - eligible,
+            rows,
+            bytes
+        );
+        println!(
+            "Retired observations: {retired}; physical disk reclamation is not measured or performed."
+        );
+        println!("digest: {}", plan.plan_digest);
+        println!(
+            "page cursor: {}",
+            serde_json::to_string(&plan.cursor).map_err(error)?
+        );
+        for candidate in &plan.candidates {
+            if !candidate.retained_reasons.is_empty() {
+                println!(
+                    "retained {}: {}",
+                    candidate.observation_id,
+                    candidate.retained_reasons.join(", ")
+                );
+            }
+        }
+        if let Some(next) = &plan.next_cursor {
+            println!(
+                "next cursor (use after applying this page): {}",
+                serde_json::to_string(next).map_err(error)?
+            );
+        } else {
+            println!("Reached the reviewed high water; no next cursor.");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{acquire_offline, open_existing};
-    use tracedecay_global_db::RegisteredGlobalDbOwnerV1;
+    use super::{acquire_offline, open_existing, process_incarnation};
+    use tracedecay_domain::{
+        CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
+        CanonicalObservationRelationsV1, ComponentVersion, DurableObservationV1, ObservationId,
+        ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
+        ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
+        ObservationSourceRangeV1, PayloadReferenceV1, ProjectionGenerationId, ProviderId,
+        RetentionClass, SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1,
+        SanitizerDispositionV1, SensitivityV1, SessionId, UtcMicros,
+    };
+    use tracedecay_global_db::{RegisteredGlobalDbLeaseV1, RegisteredGlobalDbOwnerV1};
     use tracedecay_runtime_core::config::GLOBAL_DB_FILENAME;
     use tracedecay_runtime_core::db::{
         Database, DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
         TestRuntimeProfileIdentityV1,
     };
     use tracedecay_runtime_core::storage::USER_SESSIONS_DB_FILENAME;
-    use tracedecay_store::StoreIncarnationV1;
+    use tracedecay_store::{
+        AnchoredObservationWrite, ObservationStore, ObservationWrite, StoreIncarnationV1,
+        build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
+    };
+
+    async fn cleanup_record(
+        db: &RegisteredGlobalDbLeaseV1,
+        index: u64,
+        supported: bool,
+    ) -> DurableObservationV1 {
+        let provider = ProviderId::new("codex").unwrap();
+        let session = SessionId::new("session.offline.cleanup").unwrap();
+        let native = ObservationId::new(format!("record.offline.cleanup.{index}")).unwrap();
+        let range = ObservationSourceRangeV1::new(index * 100, index * 100 + 100).unwrap();
+        let fact = if supported {
+            serde_json::json!({"kind":"message", "role":"user", "content":"Keep supported evidence"})
+        } else {
+            serde_json::json!({"kind":"unknown", "native_kind":"future_event", "state":"unsupported"})
+        };
+        let envelope = CanonicalObservationEnvelopeV1::new(
+            provider.clone(),
+            "event_msg",
+            native.clone(),
+            CanonicalObservationRelationsV1::new(session.clone()),
+            vec![serde_json::from_value(fact).unwrap()],
+            CanonicalObservationEvidenceV1::new(ObservationOrderingDomainV1::FileBytes, range),
+        )
+        .unwrap();
+        let payload = serde_json::to_value(envelope).unwrap();
+        let observation = DurableObservationV1::new(
+            ObservationIdentityMaterialV1::for_native_record(
+                ObservationSourceIdentityV1::for_provider(provider, session).unwrap(),
+                ObservationScopeV1::Profile,
+                ObservationSourceGenerationV1::new(1).unwrap(),
+                range,
+                ObservationOrderingDomainV1::FileBytes,
+                native,
+            )
+            .unwrap(),
+            SanitizationReceiptV1::new(
+                SanitizationReceiptRefV1::new(
+                    SanitizationReceiptId::new(format!("receipt.offline.cleanup.{index}")).unwrap(),
+                    ComponentVersion::new("sanitizer.offline.v1").unwrap(),
+                )
+                .unwrap(),
+                SanitizerDispositionV1::Accepted,
+                SensitivityV1::NonSensitive,
+                Some(PayloadReferenceV1::for_payload(&payload).unwrap()),
+            )
+            .unwrap(),
+            RetentionClass::new("retention.offline.fixture").unwrap(),
+            payload,
+        )
+        .unwrap();
+        let previous = db
+            .observation_store()
+            .get_source_cursor(observation.source(), observation.scope())
+            .await
+            .unwrap();
+        let next = ObservationSourceCursorV1::for_ordering(
+            observation.source().clone(),
+            observation.scope().clone(),
+            observation.identity().generation(),
+            observation.identity().ordering_domain(),
+            range.end(),
+        )
+        .unwrap();
+        let generation = ProjectionGenerationId::new("projection.offline.v1").unwrap();
+        let authorization =
+            build_observation_resolution_authorization_v1(&observation, "offline-cleanup").unwrap();
+        let anchor = build_observation_retrieval_anchor(
+            &observation,
+            generation.clone(),
+            UtcMicros(1),
+            authorization,
+        )
+        .unwrap();
+        let write = ObservationWrite::new(observation.clone(), previous, next).unwrap();
+        db.observation_store()
+            .persist_observation(AnchoredObservationWrite::new(write, anchor, generation).unwrap())
+            .await
+            .unwrap();
+        observation
+    }
 
     #[asupersync::test]
     async fn offline_retirement_digest_survives_runtime_incarnation_and_dry_run_is_passive() {
@@ -275,9 +493,14 @@ mod tests {
         }
         let reviewed = reviewed.unwrap();
         let before = std::fs::read(root.join(USER_SESSIONS_DB_FILENAME)).unwrap();
-        let store = Box::pin(open_existing(&root, &lifecycle, false))
-            .await
-            .unwrap();
+        let store = Box::pin(open_existing(
+            &root,
+            &lifecycle,
+            false,
+            process_incarnation().unwrap(),
+        ))
+        .await
+        .unwrap();
         assert_ne!(
             store.db.verified_locator().incarnation,
             StoreIncarnationV1::new(1).unwrap()
@@ -302,9 +525,14 @@ mod tests {
             std::fs::read(root.join(USER_SESSIONS_DB_FILENAME)).unwrap(),
             "dry-run must not install schema or indexes"
         );
-        let store = Box::pin(open_existing(&root, &lifecycle, true))
-            .await
-            .unwrap();
+        let store = Box::pin(open_existing(
+            &root,
+            &lifecycle,
+            true,
+            process_incarnation().unwrap(),
+        ))
+        .await
+        .unwrap();
         store
             .db
             .apply_retirement_index_preparation(&lifecycle, &plan, reviewed.digest())
@@ -317,6 +545,102 @@ mod tests {
                 .await
                 .unwrap()
                 .done
+        );
+        let first = cleanup_record(&store.db, 0, false).await;
+        cleanup_record(&store.db, 1, false).await;
+        let kept = cleanup_record(&store.db, 2, true).await;
+        let reviewed = store
+            .db
+            .plan_unsupported_codex_cleanup(None, 1)
+            .await
+            .unwrap();
+        assert_eq!(reviewed.examined, 1);
+        assert_eq!(reviewed.candidates.len(), 1);
+        assert_eq!(
+            reviewed.candidates[0].observation_id,
+            first.observation_id().as_str()
+        );
+        assert!(reviewed.candidates[0].retained_reasons.is_empty());
+        let cursor =
+            serde_json::from_str(&serde_json::to_string(&reviewed.cursor).unwrap()).unwrap();
+        drop(store);
+        let before_cleanup = std::fs::read(root.join(USER_SESSIONS_DB_FILENAME)).unwrap();
+        let read_only = Box::pin(open_existing(
+            &root,
+            &lifecycle,
+            false,
+            StoreIncarnationV1::new(2).unwrap(),
+        ))
+        .await
+        .unwrap();
+        let remounted = read_only
+            .db
+            .plan_unsupported_codex_cleanup(Some(&cursor), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            reviewed.plan_digest, remounted.plan_digest,
+            "cleanup approval and its bounded cursor must survive a fresh process"
+        );
+        drop(read_only);
+        assert_eq!(
+            before_cleanup,
+            std::fs::read(root.join(USER_SESSIONS_DB_FILENAME)).unwrap()
+        );
+        let apply = Box::pin(open_existing(
+            &root,
+            &lifecycle,
+            true,
+            StoreIncarnationV1::new(3).unwrap(),
+        ))
+        .await
+        .unwrap();
+        assert!(
+            apply
+                .db
+                .apply_unsupported_codex_cleanup(&remounted, "wrong")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            apply
+                .db
+                .apply_unsupported_codex_cleanup(&remounted, &reviewed.plan_digest)
+                .await
+                .unwrap(),
+            1
+        );
+        let next = apply
+            .db
+            .plan_unsupported_codex_cleanup(remounted.next_cursor.as_ref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(next.examined, 1);
+        assert_eq!(next.cursor.high_water_sequence, 3);
+        let remaining = apply
+            .db
+            .plan_unsupported_codex_cleanup(None, 128)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.examined, 2,
+            "only the reviewed unsupported record is removed"
+        );
+        assert_eq!(
+            remaining.candidates.len(),
+            1,
+            "supported evidence is not a cleanup candidate"
+        );
+        assert_eq!(
+            apply
+                .db
+                .observation_store()
+                .get_source_cursor(kept.source(), kept.scope())
+                .await
+                .unwrap()
+                .unwrap()
+                .position(),
+            300
         );
     }
 

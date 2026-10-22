@@ -1221,6 +1221,21 @@ pub enum MemoryAction {
 
 #[derive(Subcommand)]
 pub enum ProfileStorageAction {
+    /// Review one bounded page of historical unsupported-only Codex records
+    /// offline. Dry-run by default; --apply confirms the exact page digest.
+    #[command(name = "cleanup-codex")]
+    CleanupCodex {
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
+        /// JSON cursor from the reviewed/previous page; binds a fixed high water.
+        #[arg(long, value_name = "JSON")]
+        cursor: Option<String>,
+        /// Maximum observations examined in this invocation (1..=128).
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=128))]
+        page_size: u16,
+        #[arg(long)]
+        json: bool,
+    },
     /// Prepare one missing retirement reverse index offline. Dry-run by
     /// default; --apply confirms its digest. Native indexes are atomic and
     /// capped at 1,000,000 rows / 64 MiB key bytes; completed indexes are the

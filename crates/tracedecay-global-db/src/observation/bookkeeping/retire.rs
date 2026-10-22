@@ -531,9 +531,37 @@ async fn external_anchor_bindings(
 }
 
 #[derive(Default)]
-struct CaptureBudget {
+pub(crate) struct CaptureBudget {
     rows: usize,
     bytes: u64,
+}
+
+impl CaptureBudget {
+    /// Authorize cumulative row work from size metadata before materialization.
+    pub(crate) fn charge(&mut self, rows: usize, bytes: u64) -> ProjectionStoreResult<()> {
+        self.rows = self
+            .rows
+            .checked_add(rows)
+            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
+        if self.rows > MAX_ROWS || self.bytes > MAX_BYTES {
+            return refused();
+        }
+        Ok(())
+    }
+
+    /// Classification uses the same reference expansion rules and cumulative
+    /// work bound as retirement, before either decoder can fetch a body.
+    pub(crate) async fn preflight_hydration(
+        &mut self,
+        conn: &impl QueryExecutor,
+        json: &str,
+    ) -> ProjectionStoreResult<()> {
+        hydration::preflight(conn, json, &mut Vec::new(), self).await
+    }
 }
 
 async fn capture_table(
@@ -586,14 +614,7 @@ async fn capture_table(
                 .ok_or(ProjectionStoreError::ProvenanceCollision)?;
         }
         drop(sizes);
-        budget.rows += count;
-        budget.bytes = budget
-            .bytes
-            .checked_add(bytes)
-            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
-        if budget.rows > MAX_ROWS || budget.bytes > MAX_BYTES {
-            return refused();
-        }
+        budget.charge(count, bytes)?;
         let mut rows = conn
             .query(
                 &format!(
@@ -998,7 +1019,7 @@ impl RegisteredGlobalDb {
         let snapshot = self.read_snapshot().await.map_err(storage)?;
         plan_on(
             &snapshot,
-            hash(self.verified_locator())?,
+            hash(&self.retirement_store_identity())?,
             ids,
             authorization,
         )
@@ -1047,7 +1068,8 @@ impl RegisteredGlobalDb {
         {
             return refused();
         }
-        if confirmed_digest != plan.digest || plan.store != hash(self.verified_locator())? {
+        if confirmed_digest != plan.digest || plan.store != hash(&self.retirement_store_identity())?
+        {
             return refused();
         }
         let transaction = self.begin_write_transaction().await.map_err(storage)?;

@@ -15,7 +15,8 @@ use tracedecay_store::{
 };
 
 use super::bookkeeping::retire::{
-    ObservationRetirementAuthorization, ObservationRetirementOutcome, ObservationRetirementPlan,
+    CaptureBudget, ObservationRetirementAuthorization, ObservationRetirementOutcome,
+    ObservationRetirementPlan,
 };
 use crate::RegisteredGlobalDb;
 
@@ -36,6 +37,14 @@ pub enum UnsupportedCodexCleanupError {
     Retirement(#[from] ProjectionStoreError),
     #[error("observation dependencies pin this cleanup batch; no records were changed")]
     RetirementDeferred,
+    #[error(
+        "classification budget/integrity preflight refused observation sequence {sequence}; reduce --page-size or inspect a single oversized observation offline; nothing changed: {source}"
+    )]
+    ClassificationPreflight {
+        sequence: i64,
+        #[source]
+        source: ProjectionStoreError,
+    },
 }
 
 fn storage(error: impl std::error::Error + Send + Sync + 'static) -> UnsupportedCodexCleanupError {
@@ -121,7 +130,7 @@ impl RegisteredGlobalDb {
         let snapshot = self.read_snapshot().await.map_err(storage)?;
         let mut plan = plan_page(
             &snapshot,
-            digest(self.verified_locator())?,
+            digest(&self.retirement_store_identity())?,
             cursor,
             page_size,
         )
@@ -184,7 +193,7 @@ impl RegisteredGlobalDb {
     ) -> Result<u64> {
         if confirmed_digest != plan.plan_digest
             || plan.plan_digest != plan.digest()?
-            || plan.cursor.store_digest != digest(self.verified_locator())?
+            || plan.cursor.store_digest != digest(&self.retirement_store_identity())?
         {
             return Err(UnsupportedCodexCleanupError::StalePlan);
         }
@@ -248,7 +257,7 @@ async fn plan_page(
     };
     let mut rows = conn
         .query(
-            "SELECT sequence, observation_id, payload_digest, observation_json,
+            "SELECT sequence, observation_id, payload_digest,
                 length(CAST(observation_json AS BLOB))
          FROM observations WHERE sequence > ?1 AND sequence <= ?2
          ORDER BY sequence LIMIT ?3",
@@ -261,13 +270,18 @@ async fn plan_page(
         .await
         .map_err(storage)?;
     let mut page = Vec::new();
+    let mut budget = CaptureBudget::default();
     while let Some(row) = rows.next().await.map_err(storage)? {
+        let sequence = row.get::<i64>(0).map_err(storage)?;
+        let bytes = row.get::<u64>(3).map_err(storage)?;
+        budget.charge(1, bytes).map_err(|source| {
+            UnsupportedCodexCleanupError::ClassificationPreflight { sequence, source }
+        })?;
         page.push((
-            row.get::<i64>(0).map_err(storage)?,
+            sequence,
             row.get::<String>(1).map_err(storage)?,
             row.get::<String>(2).map_err(storage)?,
-            row.get::<String>(3).map_err(storage)?,
-            row.get::<i64>(4).map_err(storage)?,
+            bytes,
         ));
     }
     drop(rows);
@@ -284,8 +298,34 @@ async fn plan_page(
     // The kernel checks external journals and historical outputs with indexed
     // candidate-local lookups; neither may pin unrelated observations.
     let mut candidates = Vec::new();
-    for (sequence, id, payload_digest, json, bytes) in &page {
-        let observation = super::decode_observation_json(conn, json, OPERATION).await?;
+    // Inline work for the entire keyset page was authorized above. Fetch one
+    // JSON row at a time; authorize every canonical expansion before decoding.
+    for (sequence, id, payload_digest, bytes) in &page {
+        let mut rows = conn
+            .query(
+                "SELECT observation_json FROM observations WHERE sequence=?1 AND observation_id=?2",
+                params![*sequence, id.as_str()],
+            )
+            .await
+            .map_err(storage)?;
+        let json: String = rows
+            .next()
+            .await
+            .map_err(storage)?
+            .ok_or(UnsupportedCodexCleanupError::StalePlan)?
+            .get(0)
+            .map_err(storage)?;
+        drop(rows);
+        budget
+            .preflight_hydration(conn, &json)
+            .await
+            .map_err(
+                |source| UnsupportedCodexCleanupError::ClassificationPreflight {
+                    sequence: *sequence,
+                    source,
+                },
+            )?;
+        let observation = super::decode_observation_json(conn, &json, OPERATION).await?;
         let envelope: CanonicalObservationEnvelopeV1 =
             serde_json::from_value(observation.payload().clone()).map_err(storage)?;
         if !unsupported_codex_record(&envelope) {
@@ -342,7 +382,7 @@ async fn plan_page(
             sequence: *sequence,
             observation_id: id.clone(),
             payload_digest: payload_digest.clone(),
-            stored_observation_bytes: (*bytes).try_into().map_err(storage)?,
+            stored_observation_bytes: *bytes,
             retained_reasons,
         });
     }

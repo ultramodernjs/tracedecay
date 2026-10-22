@@ -23,6 +23,17 @@ pub(crate) async fn handle_profile_storage_action(
     assume_yes: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     match action {
+        ProfileStorageAction::CleanupCodex {
+            apply,
+            cursor,
+            page_size,
+            json,
+        } => {
+            Box::pin(retirement::cleanup_codex(
+                profile, apply, cursor, page_size, json,
+            ))
+            .await
+        }
         ProfileStorageAction::PrepareRetirementIndexes { apply, json } => {
             Box::pin(retirement::prepare_indexes(profile, apply, json)).await
         }

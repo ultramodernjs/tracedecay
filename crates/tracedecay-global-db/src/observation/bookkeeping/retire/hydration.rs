@@ -68,17 +68,7 @@ pub(super) async fn preflight(
             .checked_mul(copies)
             .and_then(|bytes| bytes.checked_add(compressed))
             .ok_or(ProjectionStoreError::ProvenanceCollision)?;
-        budget.rows = budget
-            .rows
-            .checked_add(1)
-            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
-        budget.bytes = budget
-            .bytes
-            .checked_add(charge)
-            .ok_or(ProjectionStoreError::ProvenanceCollision)?;
-        if budget.rows > MAX_ROWS || budget.bytes > MAX_BYTES {
-            return refused();
-        }
+        budget.charge(1, charge)?;
         evidence.push(hash(&(
             "canonical-body-hydration.v1",
             body_hash,
