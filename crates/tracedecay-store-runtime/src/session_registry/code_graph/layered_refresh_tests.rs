@@ -548,12 +548,12 @@ fn assert_layered_over(
     base: &str,
     #[cfg(unix)] base_container: (u64, u64),
 ) {
-    let (directory, receipt) = receipt_for(profile, generation);
+    let (_directory, receipt) = receipt_for(profile, generation);
     assert_eq!(receipt["form"], "layered");
     assert_eq!(receipt["base"]["generation"], base);
     #[cfg(unix)]
     assert_eq!(
-        file_identity(&directory.join("base.grafeo")),
+        file_identity(&_directory.join("base.grafeo")),
         base_container,
         "the refresh references its base's container instead of re-encoding it"
     );

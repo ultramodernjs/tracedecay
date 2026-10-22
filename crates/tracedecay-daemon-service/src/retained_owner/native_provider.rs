@@ -2131,9 +2131,7 @@ fn recall_temporal_digest(temporal: &NativeRecallTemporalQueryV1) -> String {
         "include_revoked": temporal.include_revoked,
         "unknown_validity_policy": temporal.unknown_validity_policy,
     });
-    serde_json::to_vec(&value)
-        .map(|bytes| sha256_hex(&bytes))
-        .unwrap_or_default()
+    serde_json::to_vec(&value).map_or_else(|_| String::new(), |bytes| sha256_hex(&bytes))
 }
 
 fn map_retained_error(error: RetainedSurfaceExecutionErrorV1) -> NativeReadFailure {

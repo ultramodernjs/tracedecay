@@ -21,5 +21,6 @@ tracedecay-framing = { path = "../tracedecay-framing" }
 tracedecay-private-fs = { path = "../tracedecay-private-fs" }
 
 [dev-dependencies]
+tracedecay-runtime-core = { path = "../tracedecay-runtime-core", features = ["test-helpers"] }
 asupersync.workspace = true
 tracedecay-private-fs = { path = "../tracedecay-private-fs", features = ["test-helpers"] }

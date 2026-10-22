@@ -588,14 +588,15 @@ async fn reopened_canonical_authority_resolves_a_prior_session_without_redeliver
         .current(&fixture.destination(CURRENT_SESSION), &control())
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         fixture
             .authority
             .journal
             .inspect(&JournalInspectionFilterV1::default())
             .unwrap()
             .rows
-            .is_empty()
+            .len(),
+        0
     );
     fixture.reopen_authority();
     let recalled = fixture
@@ -605,14 +606,15 @@ async fn reopened_canonical_authority_resolves_a_prior_session_without_redeliver
     assert_eq!(recalled.observation(), original.observation());
     assert_eq!(recalled.retrieval_anchor(), original.retrieval_anchor());
     assert!(fixture.authority.original_authority.is_none());
-    assert!(
+    assert_eq!(
         fixture
             .authority
             .journal
             .inspect(&JournalInspectionFilterV1::default())
             .unwrap()
             .rows
-            .is_empty()
+            .len(),
+        0
     );
 }
 

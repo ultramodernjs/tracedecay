@@ -1696,7 +1696,7 @@ mod session_publication_tests {
                 .await;
         assert_ne!(first.registered.binding(), second.registered.binding());
         let first_held = first.registered.session_publication_guard().await;
-        let mut second_waiter = Box::pin(second.registered.session_publication_guard());
+        let mut second_waiter = std::pin::pin!(second.registered.session_publication_guard());
         let mut context = Context::from_waker(Waker::noop());
         let Poll::Ready(second_held) = second_waiter.as_mut().poll(&mut context) else {
             panic!("one registered owner must not block another owner's session publication");
@@ -1727,7 +1727,7 @@ mod session_publication_tests {
                 futures_util::future::Either::Right((guard, _)) => Some(guard),
             }
         });
-        let mut surviving_waiter = Box::pin(surviving_lease.session_publication_guard());
+        let mut surviving_waiter = std::pin::pin!(surviving_lease.session_publication_guard());
         let mut context = Context::from_waker(Waker::noop());
         assert!(dropped_waiter.as_mut().poll(&mut context).is_pending());
         assert!(cancelled_waiter.as_mut().poll(&mut context).is_pending());
@@ -1749,7 +1749,7 @@ mod session_publication_tests {
             panic!("cancelled waiters must not prevent the next live publisher from acquiring");
         };
 
-        let mut original_waiter = Box::pin(harness.registered.session_publication_guard());
+        let mut original_waiter = std::pin::pin!(harness.registered.session_publication_guard());
         assert!(original_waiter.as_mut().poll(&mut context).is_pending());
         drop(surviving_held);
         assert!(original_waiter.as_mut().poll(&mut context).is_ready());

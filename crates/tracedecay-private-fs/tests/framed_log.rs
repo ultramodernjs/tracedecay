@@ -12,15 +12,13 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tracedecay_private_fs::framed_log::DurableFileBatch;
-#[cfg(all(
-    feature = "test-helpers",
-    any(target_os = "linux", target_os = "macos")
+#[cfg(any(
+    target_os = "linux",
+    all(feature = "test-helpers", target_os = "macos")
 ))]
 use tracedecay_private_fs::framed_log::sync_latency;
 
 use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, atomic_write_prepared, read_bounded};
-#[cfg(target_os = "linux")]
-use tracedecay_private_fs::framed_log::{DurableFileBatch, sync_latency};
 
 #[test]
 fn bounded_read_distinguishes_missing_oversized_and_non_regular_objects() {

@@ -892,13 +892,11 @@ mod tests {
         // Release only after the real lock attempt observes contention, so
         // publication needs no separately scheduled thread or timer.
         let waits = std::sync::Arc::new(AtomicUsize::new(0));
-        let opened = tracing::subscriber::with_default(
-            PublishingWriter {
-                lock: publishing,
-                waits: std::sync::Arc::clone(&waits),
-            },
-            || HookDeliveryReceiptSpoolV1::open(&root.0, crate::HOOK_SYNCHRONOUS_BUDGET),
-        );
+        let _capture = tracedecay_runtime_core::logging::set_tracing_capture(PublishingWriter {
+            lock: publishing,
+            waits: std::sync::Arc::clone(&waits),
+        });
+        let opened = HookDeliveryReceiptSpoolV1::open(&root.0, crate::HOOK_SYNCHRONOUS_BUDGET);
         assert!(opened.is_ok(), "owner open after publication: {opened:?}");
         assert_eq!(waits.load(Ordering::Acquire), 1);
     }

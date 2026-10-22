@@ -483,7 +483,7 @@ pub(super) fn pause_next_host_config_write_at_publication(
     pause_next_host_config_write(path, TestHostConfigWriteBoundary::Publication)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn pause_next_host_config_write_after_publication(
     path: &Path,
 ) -> TestHostConfigWritePauseController {

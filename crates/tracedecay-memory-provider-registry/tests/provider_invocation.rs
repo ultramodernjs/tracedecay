@@ -254,6 +254,10 @@ async fn foreign_code_is_refused_by_a_host_that_cannot_terminate_a_worker() {
 /// into a permanently unavailable route.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions require successful process/task synchronization before checking cancellation"
+)]
 async fn a_terminable_host_stops_a_never_returning_worker_and_reopens_the_route() {
     use std::collections::VecDeque;
     use std::io::Read;
@@ -597,6 +601,10 @@ async fn a_cancelled_non_terminable_worker_holds_the_route_only_until_it_returns
 /// that race, a provider quick enough to answer inside the same poll has its
 /// answer accepted for a caller that no longer exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions require successful process/task synchronization before checking cancellation"
+)]
 async fn an_already_withdrawn_caller_is_refused_before_the_provider_is_contacted() {
     let boundary = boundary();
     let contacted = Arc::new(AtomicUsize::new(0));
@@ -691,6 +699,10 @@ async fn an_already_withdrawn_caller_is_refused_before_the_provider_is_contacted
 /// keeps the caller — and the route above it — blocked for its whole blocking
 /// duration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions require successful process/task synchronization before checking cancellation"
+)]
 async fn cancellation_releases_the_caller_without_waiting_out_the_provider() {
     let boundary = boundary();
     const PROVIDER_BLOCKS_FOR: Duration = Duration::from_millis(1_500);

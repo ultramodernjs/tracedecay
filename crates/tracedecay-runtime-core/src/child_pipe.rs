@@ -136,7 +136,7 @@ impl ChildPipeWatch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::io::Write;
 

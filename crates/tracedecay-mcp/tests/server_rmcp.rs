@@ -155,8 +155,10 @@ async fn broker_pair() -> (BrokerStreamTransport, ClientStream) {
     let (listener, endpoint) = BrokerListener::bind(&default_loopback_endpoint())
         .await
         .expect("bind loopback listener");
-    let DaemonEndpoint::Loopback(address) = endpoint else {
-        panic!("loopback bind returned {endpoint}");
+    let address = match endpoint {
+        DaemonEndpoint::Loopback(address) => address,
+        #[cfg(unix)]
+        DaemonEndpoint::Unix(path) => panic!("loopback bind returned {}", path.display()),
     };
     let client = tokio::net::TcpStream::connect(address)
         .await

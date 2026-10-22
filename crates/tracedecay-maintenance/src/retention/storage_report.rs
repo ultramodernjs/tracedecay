@@ -1244,7 +1244,7 @@ pub async fn build_project_storage_report_from_daemon(
         resolve_retention_protection(code_index_schedulers, global_db, &canonical_root).await;
     let profile_root = profile_root.to_path_buf();
     let project_id = project_id.to_owned();
-    let canonical_root = canonical_root.to_path_buf();
+    let canonical_root = canonical_root.clone();
     let walk_control = StorageReportWalkControl {
         cancellation,
         deadline,
@@ -1827,6 +1827,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    #[cfg(unix)]
     use crate::retention::footprint::census_profile_footprint;
 
     #[test]

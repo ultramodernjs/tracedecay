@@ -1,12 +1,13 @@
 use super::*;
 use serde_json::Value;
 use tracedecay_domain::ProjectId;
+#[cfg(unix)]
+use tracedecay_domain::configuration::LcmSummarizerExecutablesV1;
 use tracedecay_domain::configuration::{
     ConfigurationGrantId, ConfigurationGrantReceiptId, ConfigurationIdempotencyKey,
     ConfigurationLayerIdV1, ConfigurationMutationEffectV1, ConfigurationMutationGrantReceiptV1,
     ConfigurationMutationOperationV1, ConfigurationMutationSinkV1, ConfigurationValueV1,
-    LcmSummarizerExecutableV1, LcmSummarizerExecutablesV1, SettingKey,
-    USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
+    LcmSummarizerExecutableV1, SettingKey, USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
 };
 use tracedecay_domain::test_fixtures::id;
 use tracedecay_domain::{AccessPolicyDigest, ActorId, canonical_sha256};
@@ -31,10 +32,12 @@ use tracedecay_runtime_core::db::engine::params;
 #[cfg(unix)]
 use tracedecay_runtime_core::test_executable::write_executable_script;
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
+#[cfg(unix)]
+use tracedecay_store::SessionRefreshStore as _;
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationProjectionStore, ObservationStore, ObservationWrite,
-    SessionRefreshStore as _, build_observation_resolution_authorization_v1,
-    build_observation_retrieval_anchor, derive_canonical_projection,
+    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
+    derive_canonical_projection,
 };
 
 mod compression_ownership;
@@ -173,6 +176,7 @@ fn retained_guard(
 
 /// A configured fake summarizer on the shortest admitted run budget, so a
 /// fake that stops answering fails the test quickly instead of at the default.
+#[cfg(unix)]
 fn fake_summarizer(executable: &std::path::Path) -> LcmSummarizerExecutableV1 {
     LcmSummarizerExecutableV1::configured_with(
         executable.to_path_buf(),
@@ -189,7 +193,7 @@ fn fake_summarizer(executable: &std::path::Path) -> LcmSummarizerExecutableV1 {
 struct ProjectSummarizerFixture {
     runtime: RegisteredGlobalDbTestRuntime,
     project_id: ProjectId,
-    root: tempfile::TempDir,
+    _root: tempfile::TempDir,
 }
 
 impl ProjectSummarizerFixture {
@@ -209,7 +213,7 @@ impl ProjectSummarizerFixture {
         Self {
             runtime,
             project_id,
-            root,
+            _root: root,
         }
     }
 
@@ -217,15 +221,17 @@ impl ProjectSummarizerFixture {
         self.runtime.project_database_arc().unwrap()
     }
 
+    #[cfg(unix)]
     fn pin(&self, executables: LcmSummarizerExecutablesV1) {
         tracedecay_configuration::test_support::pin_lcm_summarizer_executables(
             &self.db(),
-            &self.root.path().join("project"),
+            &self._root.path().join("project"),
             executables,
         )
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn pin_cursor_agent(&self, cursor_agent: &std::path::Path) {
         self.pin(LcmSummarizerExecutablesV1 {
             cursor_agent: fake_summarizer(cursor_agent),
@@ -233,6 +239,7 @@ impl ProjectSummarizerFixture {
         });
     }
 
+    #[cfg(unix)]
     fn pin_codex(&self, codex: &std::path::Path) {
         self.pin(LcmSummarizerExecutablesV1 {
             cursor_agent: LcmSummarizerExecutableV1::Unconfigured,
@@ -241,11 +248,12 @@ impl ProjectSummarizerFixture {
     }
 
     /// Reopens the same project shard, as a daemon restart would.
+    #[cfg(unix)]
     async fn restart(self) -> Self {
         let Self {
             runtime,
             project_id,
-            root,
+            _root: root,
         } = self;
         drop(runtime);
         let runtime = RegisteredGlobalDbTestRuntime::project(
@@ -258,7 +266,7 @@ impl ProjectSummarizerFixture {
         Self {
             runtime,
             project_id,
-            root,
+            _root: root,
         }
     }
 }
@@ -1688,6 +1696,7 @@ fn parked_sessions_converge_once_the_summarizer_becomes_available_without_restar
     });
 }
 
+#[cfg(unix)]
 async fn active_projection_frontier(db: &RegisteredGlobalDb, session_id: &str) -> Option<i64> {
     let snapshot = db.read_snapshot().await.unwrap();
     let mut rows = snapshot
@@ -1734,6 +1743,7 @@ fn explicit_refresh_request(
     .with_refresh_key(refresh_key)
 }
 
+#[cfg(unix)]
 async fn eventually<F, Fut>(what: &str, mut ready: F)
 where
     F: FnMut() -> Fut,

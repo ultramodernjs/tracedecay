@@ -62,7 +62,9 @@ fn offline_intent_survives_three_lifetimes_and_retries_keep_original_receipt() -
     {
         let journal = SqliteObservationJournal::open(&path, support::policy())?;
         assert_eq!(
-            journal.read_provider_source_fence("ncm", SOURCE)?.unwrap(),
+            journal
+                .read_provider_source_fence("ncm", SOURCE)?
+                .ok_or("expected provider source fence or fixture JSON pointer")?,
             original.fence
         );
         let receipt = journal.admit_provider_source_revision(&admission())?;
@@ -84,7 +86,9 @@ fn offline_intent_survives_three_lifetimes_and_retries_keep_original_receipt() -
             journal.record_provider_source_deletion_intent(&retry)?,
             original
         );
-        let current = journal.read_provider_source_fence("ncm", SOURCE)?.unwrap();
+        let current = journal
+            .read_provider_source_fence("ncm", SOURCE)?
+            .ok_or("expected provider source fence or fixture JSON pointer")?;
         assert_eq!(current.revision, 2);
         assert!(!current.blocks_revision(Some("source_r2")));
         retry.source_revision = Some("other_revision");
@@ -94,7 +98,9 @@ fn offline_intent_survives_three_lifetimes_and_retries_keep_original_receipt() -
                 .is_err()
         );
         assert_eq!(
-            journal.read_provider_source_fence("ncm", SOURCE)?.unwrap(),
+            journal
+                .read_provider_source_fence("ncm", SOURCE)?
+                .ok_or("expected provider source fence or fixture JSON pointer")?,
             current
         );
     }
@@ -132,7 +138,7 @@ fn strong_privacy_modes_never_reopen_and_stale_or_unchanged_revisions_fail() -> 
     assert_eq!(
         journal
             .read_provider_source_fence("ncm", SOURCE)?
-            .unwrap()
+            .ok_or("expected provider source fence or fixture JSON pointer")?
             .revision,
         1
     );
@@ -220,7 +226,7 @@ fn hard_delete_upgrades_anonymize_and_immutable_receipts_keep_each_intent() -> T
     assert_eq!(
         journal
             .read_provider_source_fence("ncm", SOURCE)?
-            .unwrap()
+            .ok_or("expected provider source fence or fixture JSON pointer")?
             .mode,
         "hard_delete"
     );
@@ -315,7 +321,9 @@ fn bounded_intent_and_receipt_lookup_keep_original_acceptance_after_later_revisi
         journal.record_provider_source_deletion_intent_bounded(&retry, budget(), &token)?,
         original
     );
-    let current = journal.read_provider_source_fence("ncm", SOURCE)?.unwrap();
+    let current = journal
+        .read_provider_source_fence("ncm", SOURCE)?
+        .ok_or("expected provider source fence or fixture JSON pointer")?;
     assert_eq!(current.revision, 2);
     assert!(!current.blocks_revision(Some("source_r2")));
     retry.source_revision = Some("changed_retry");
@@ -330,7 +338,9 @@ fn bounded_intent_and_receipt_lookup_keep_original_acceptance_after_later_revisi
             .is_err()
     );
     assert_eq!(
-        journal.read_provider_source_fence("ncm", SOURCE)?.unwrap(),
+        journal
+            .read_provider_source_fence("ncm", SOURCE)?
+            .ok_or("expected provider source fence or fixture JSON pointer")?,
         current
     );
     Ok(())
@@ -415,7 +425,9 @@ fn immutable_receipt_lookup_refuses_corrupt_binding_and_oversized_json() -> Test
     ];
     for (pointer, replacement) in modifications {
         let mut corrupt = baseline.clone();
-        *corrupt.pointer_mut(pointer).unwrap() = replacement;
+        *corrupt
+            .pointer_mut(pointer)
+            .ok_or("expected provider source fence or fixture JSON pointer")? = replacement;
         observer.execute(
             "UPDATE tdmem_provider_source_intent_receipt_v1 SET receipt_json = ?1
              WHERE provider_id = ?2 AND operation_id = ?3",
@@ -450,7 +462,9 @@ fn immutable_receipt_lookup_refuses_corrupt_binding_and_oversized_json() -> Test
             "{pointer}"
         );
         assert_eq!(
-            journal.read_provider_source_fence("ncm", SOURCE)?.unwrap(),
+            journal
+                .read_provider_source_fence("ncm", SOURCE)?
+                .ok_or("expected provider source fence or fixture JSON pointer")?,
             original.fence
         );
     }

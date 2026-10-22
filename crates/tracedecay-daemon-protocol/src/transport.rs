@@ -606,8 +606,10 @@ mod tests {
         let (listener, endpoint) = runtime
             .block_on(BrokerListener::bind(&default_loopback_endpoint()))
             .unwrap();
-        let DaemonEndpoint::Loopback(address) = endpoint else {
-            panic!("loopback bind returned {endpoint}");
+        let address = match endpoint {
+            DaemonEndpoint::Loopback(address) => address,
+            #[cfg(unix)]
+            DaemonEndpoint::Unix(path) => panic!("loopback bind returned {}", path.display()),
         };
 
         let client = std::net::TcpStream::connect(address).unwrap();

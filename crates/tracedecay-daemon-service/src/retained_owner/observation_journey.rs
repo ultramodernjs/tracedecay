@@ -2943,6 +2943,10 @@ impl ThreadBoundedProviderCallV1 {
         if let Err(source) = thread::Builder::new()
             .name("tdmem-provider-call".to_owned())
             .spawn(move || {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "propagate the caller-owned dispatcher to its borrowed worker, not a new tracing capture"
+                )]
                 tracing::dispatcher::with_default(&diagnostics, || {
                     // Diagnose here, even if cancellation already dropped the
                     // receiver. Never retain or log the untrusted panic payload.
@@ -6111,17 +6115,15 @@ mod tests {
                 .with_max_level(tracing::Level::WARN)
                 .with_writer(move || DiagnosticWriter(Arc::clone(&writer_diagnostics)))
                 .finish();
-            let dispatcher = tracing::Dispatch::new(subscriber);
 
             let worker_boundary = Arc::clone(&boundary);
             let worker_cancellation = cancellation.clone();
             let caller = std::thread::spawn(move || {
-                tracing::dispatcher::with_default(&dispatcher, || {
-                    worker_boundary.call_within(5_000, &worker_cancellation, move || -> u8 {
-                        entered.send(()).expect("provider entry receiver");
-                        release_rx.recv().expect("provider release sender");
-                        panic!("provider panic after caller cancellation")
-                    })
+                let _capture = tracedecay_runtime_core::logging::set_tracing_capture(subscriber);
+                worker_boundary.call_within(5_000, &worker_cancellation, move || -> u8 {
+                    entered.send(()).expect("provider entry receiver");
+                    release_rx.recv().expect("provider release sender");
+                    panic!("provider panic after caller cancellation")
                 })
             });
 
@@ -8571,8 +8573,7 @@ mod tests {
                         row.get::<_, Option<String>>(3)?.unwrap_or_default()
                     ))
                 })
-                .map(|rows| rows.flatten().collect::<Vec<_>>())
-                .unwrap_or_default();
+                .map_or_else(|_| Vec::new(), |rows| rows.flatten().collect::<Vec<_>>());
             deliveries = rows.join(" | ");
         }
         format!(

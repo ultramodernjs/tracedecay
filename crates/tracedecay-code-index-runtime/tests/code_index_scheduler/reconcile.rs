@@ -1,4 +1,6 @@
 #[cfg(unix)]
+use crate::code_index_scheduler::classification::NonUtf8ClassifiedChangeV1;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::BTreeSet,
@@ -13,9 +15,12 @@ use tempfile::TempDir;
 use tracedecay_application::diagnostics_publication::CodeIndexPublicationIdentityPortV1;
 use tracedecay_code_index_retention::code_index_generations::acquire_code_generation_store_lock;
 use tracedecay_contracts::code_index_freshness::{
-    CodeGraphServingReadinessV1, CodeIndexBuildBlockedReasonV1, CodeIndexFreshnessCoverageV1,
-    CodeIndexReadinessTargetV1, CodeIndexReadinessV1, CodeIndexReadinessWaitReadV1,
-    CodeIndexSourceOmissionReasonV1 as StatusOmissionReasonV1, CodeIndexStalenessStateV1,
+    CodeGraphServingReadinessV1, CodeIndexBuildBlockedReasonV1, CodeIndexReadinessTargetV1,
+    CodeIndexReadinessV1, CodeIndexReadinessWaitReadV1, CodeIndexStalenessStateV1,
+};
+#[cfg(unix)]
+use tracedecay_contracts::code_index_freshness::{
+    CodeIndexFreshnessCoverageV1, CodeIndexSourceOmissionReasonV1 as StatusOmissionReasonV1,
 };
 use tracedecay_contracts::{
     CallableCodeOperationKind, CallableCodeQueryPort, CodeQueryScope, Deadline,
@@ -23,10 +28,11 @@ use tracedecay_contracts::{
     callable_code_operation,
 };
 use tracedecay_domain::{
-    CodeGenerationId, CodeSourceOmissionReasonV1, CommitId, OmittedCodeSourceV1, ProjectId,
-    PublicRetrieverStatus, RefId, RetrieverKind, SensitivityLevelV1, SnapshotFileDispositionV1,
-    UtcMicros, WorktreeId,
+    CodeGenerationId, CommitId, ProjectId, PublicRetrieverStatus, RefId, RetrieverKind,
+    SensitivityLevelV1, SnapshotFileDispositionV1, UtcMicros, WorktreeId,
 };
+#[cfg(unix)]
+use tracedecay_domain::{CodeSourceOmissionReasonV1, OmittedCodeSourceV1};
 use tracedecay_runtime_core::resident_memory::{
     DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1, ResidentHoldingV1,
     ResidentOwnerBytesV1, ResidentOwnerKindV1, ResidentOwnerReleaseV1, ResidentOwnerSampleV1,
@@ -60,9 +66,7 @@ use crate::code_index_scheduler::{
     CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1, CodeIndexWorkerPhaseV1,
     CodeIndexWorktreeSchedulerV1, GenerationDecodeAdmissionV1, LatestCompleteCodeIndexV1,
     RetainedGraphRecoveryPauseV1, SharedCodeIndexBytePoolV1,
-    classification::{
-        NonUtf8ClassifiedChangeV1, WorktreeChangeClassV1, WorktreeChangeClassificationV1,
-    },
+    classification::{WorktreeChangeClassV1, WorktreeChangeClassificationV1},
     feedback_document_identity_from_generation,
     freshness_witness::RestoreFreshnessWitnessV1,
     freshness_witness::SourceSweepStatsV1,

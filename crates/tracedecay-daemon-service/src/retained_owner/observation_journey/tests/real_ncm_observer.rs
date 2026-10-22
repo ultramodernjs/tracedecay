@@ -1048,7 +1048,7 @@ fn assert_current_capsule(
         resolved_scope
             .reference
             .as_ref()
-            .map(|reference| reference.as_str())
+            .map(tracedecay_domain::RefId::as_str)
     );
     let owned = observations
         .iter()
@@ -1441,7 +1441,9 @@ fn real_ncm_recall(
     let descriptor = ready.descriptor.expect("NCM ready descriptor");
     let generation = descriptor.state_generation;
     let temporal = tracedecay_memory_provider_registry::AdmittedTemporalQuery::current(
-        &chrono::Utc::now().to_rfc3339(),
+        &chrono::DateTime::from_timestamp_micros(tracedecay_contracts::now_micros().0)
+            .expect("current UTC timestamp")
+            .to_rfc3339(),
     )
     .expect("real NCM current temporal query")
     .with_unknown_validity_policy(UnknownValidityPolicy::AllowWithWarning);
