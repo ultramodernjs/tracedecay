@@ -100,7 +100,7 @@ async fn confirmed_apply_retires_missing_sources_but_never_the_user_pseudo_proje
         persist_offered(&database, record.clone()).await;
     }
     let probe = |path: &Path| {
-        if path == Path::new("/live") {
+        if path == Path::new(&fixture_path("/live")) {
             PathProbe::Live
         } else {
             PathProbe::Missing
@@ -437,7 +437,7 @@ async fn one_source_apply_does_not_reclassify_unrelated_observations() {
     let selected = observation("selected", "/missing", "/missing", false);
     persist_offered(&database, selected.clone()).await;
     let probe = |path: &Path| {
-        if path == Path::new("/live") {
+        if path == Path::new(&fixture_path("/live")) {
             PathProbe::Live
         } else {
             PathProbe::Missing

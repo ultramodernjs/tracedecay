@@ -21,6 +21,16 @@ pub(super) fn record_approval_digest() {
     APPROVAL_DIGEST_CALLS.with(|calls| calls.set(calls.get() + 1));
 }
 
+/// Keep synthetic absolute locators absolute on the host under test. A rooted
+/// `/missing` spelling has no drive on Windows and cannot authorize pruning.
+fn fixture_path(path: &str) -> String {
+    if cfg!(windows) && path.starts_with('/') {
+        format!("C:{path}")
+    } else {
+        path.to_owned()
+    }
+}
+
 fn observation(session: &str, root: &str, location: &str, message: bool) -> DurableObservationV1 {
     observation_record(session, root, location, message, 0, "fixture")
 }
@@ -40,8 +50,8 @@ fn observation_record(
     let range = ObservationSourceRangeV1::new(ordinal * 100, (ordinal + 1) * 100).unwrap();
     let record = ObservationId::new(format!("record.{session}.{ordinal}")).unwrap();
     let mut facts = vec![CanonicalObservationFactV1::Session {
-        project_path: Some(root.to_owned()),
-        location_path: Some(location.to_owned()),
+        project_path: Some(fixture_path(root)),
+        location_path: Some(fixture_path(location)),
         transcript_path: None,
         title: None,
         started_at: None,
@@ -240,10 +250,14 @@ async fn missing_project_plan_includes_profile_sessions_and_rowless_sources() {
     let plan = plan_profile_session_prune(
         &read,
         &[],
-        &|path| match path.to_str().unwrap() {
-            "/missing" => PathProbe::Missing,
-            "/live" => PathProbe::Live,
-            _ => PathProbe::Unavailable,
+        &|path| {
+            if path == Path::new(&fixture_path("/missing")) {
+                PathProbe::Missing
+            } else if path == Path::new(&fixture_path("/live")) {
+                PathProbe::Live
+            } else {
+                PathProbe::Unavailable
+            }
         },
         2,
     )
@@ -381,10 +395,10 @@ async fn explicit_forget_selects_only_the_named_project_and_aliases() {
         .registered_database(HostAdmissionScope::Profile)
         .unwrap();
     let read = database.read_snapshot().await.unwrap();
-    let roots = vec![PathBuf::from("/live"), PathBuf::from("/old-alias")];
+    let roots = vec![PathBuf::from(fixture_path("/live")), PathBuf::from(fixture_path("/old-alias"))];
     let registry = vec![roots.clone()];
     let probe = |path: &Path| {
-        if path.starts_with("/missing") || path.starts_with("/old-alias") {
+        if path.starts_with(fixture_path("/missing")) || path.starts_with(fixture_path("/old-alias")) {
             PathProbe::Missing
         } else {
             PathProbe::Live
@@ -424,7 +438,7 @@ async fn explicit_forget_selects_only_the_named_project_and_aliases() {
             .is_err()
     );
     let incomplete =
-        plan_profile_session_forget(&read, &registry, &[PathBuf::from("/old-alias")], &probe, 1)
+        plan_profile_session_forget(&read, &registry, &[PathBuf::from(fixture_path("/old-alias"))], &probe, 1)
             .await
             .unwrap();
     assert!(
@@ -500,7 +514,7 @@ async fn missing_canonical_body_prevents_source_wide_prune_approval() {
         &read,
         &[],
         &|path| {
-            if path == Path::new("/live") {
+            if path == Path::new(&fixture_path("/live")) {
                 PathProbe::Live
             } else {
                 PathProbe::Missing

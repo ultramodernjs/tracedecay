@@ -659,7 +659,7 @@ async fn dashboard_membership_returns_only_requested_registered_projects() {
 
 fn git(dir: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
-        .args(args)
+        .args(tracedecay_runtime_core::path_safety::plain_git_args(args))
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
