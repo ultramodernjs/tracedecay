@@ -432,12 +432,29 @@ impl BrokerResponseWriter {
                 let mut bytes = bytes
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
                 bytes.push(b'\n');
+                // A route rejected before response admission has no selected
+                // lease. Its typed revocation refusal must reach the client so
+                // it can resolve the replacement owner; applying the retired
+                // connection's lifecycle would suppress the only retry signal.
+                // Selected leases still fence every target-owned response.
+                let revocation_refusal = matches!(
+                    &item,
+                    rmcp::model::JsonRpcMessage::Error(error)
+                        if error.error.data.as_ref().is_some_and(|data| {
+                            data.get("retryable").and_then(serde_json::Value::as_bool) == Some(true)
+                                && matches!(
+                                    data.get("reason_code").and_then(serde_json::Value::as_str),
+                                    Some("project_server_response_revoked" | "project_server_retired")
+                                )
+                        })
+                );
                 let response_revoked = selected_response_lease
                     .as_deref()
                     .map(BrokerSelectedResponseLease::response_revoked)
                     .or_else(|| {
                         response_lifecycle
                             .as_deref()
+                            .filter(|_| !revocation_refusal)
                             .map(BrokerResponseLifecycle::response_revoked)
                     });
                 let write_result = match response_revoked {
@@ -695,6 +712,50 @@ mod tests {
         ))
         .expect("native runtime");
         assert!(closed, "the probe must observe the peer's full close");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_connection_delivers_only_typed_retryable_revocation_refusals() {
+        use std::io::BufRead;
+
+        for (code, retryable, deliver) in [
+            ("project_server_response_revoked", true, true),
+            ("project_server_retired", true, true),
+            ("project_server_response_revoked", false, false),
+            ("unrelated_error", true, false),
+        ] {
+            let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+            server.set_nonblocking(true).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let lifecycle = ProjectServerResponseLifecycle::default();
+            let transport = BrokerStreamTransport::new(BrokerStream::Unix(
+                asupersync::net::unix::UnixStream::from_std(server).unwrap(),
+            ))
+            .with_project_response_lifecycle(lifecycle.clone());
+            transport.observe_incoming_message(&json!({"id": 1, "method": "tools/call"}));
+            lifecycle.revoke();
+            let response = serde_json::from_value(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {
+                    "code": -32603,
+                    "message": "route refused",
+                    "data": {"reason_code": code, "retryable": retryable},
+                },
+            }))
+            .unwrap();
+            let result = native_runtime::block_on(transport.send(response)).unwrap();
+            if deliver {
+                result.expect("the client needs the typed refusal to retry its route");
+                let mut line = String::new();
+                std::io::BufReader::new(client).read_line(&mut line).unwrap();
+                let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(response["error"]["data"]["reason_code"], code);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+            }
+        }
     }
 
     #[test]
