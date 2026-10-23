@@ -1642,6 +1642,7 @@ impl RecallReplayRetentionActivityV1 {
         recall: impl std::future::Future<Output = T>,
     ) -> Result<T, tokio::time::error::Elapsed> {
         tokio::pin!(recall);
+        // ambient-tokio: advisory_memory_context_for_call polls this private fuse inside in_tokio_context.
         match tokio::time::timeout(wall_clock_budget, &mut recall).await {
             Ok(context) => Ok(context),
             Err(_) if self.cancel_active() => {
@@ -1715,6 +1716,7 @@ impl RecallHistoryControlV1 {
                 self.cancellation.cancel();
                 Err(ObservationJourneyError::Cancelled { admitted: 0 })
             }
+            // ambient-tokio: advisory_memory_context_for_call polls all private history stages inside in_tokio_context.
             result = tokio::time::timeout_at(self.deadline, stage) => match result {
                 Ok(result) => result,
                 Err(_) => {
@@ -1753,6 +1755,7 @@ impl RecallHistoryControlV1 {
                     self.cancellation.cancel();
                     stage.await
                 }
+                // ambient-tokio: advisory_memory_context_for_call polls retention inside in_tokio_context.
                 () = tokio::time::sleep_until(self.deadline) => {
                     self.operation.cancellation().cancel();
                     self.cancellation.cancel();
@@ -10558,6 +10561,66 @@ mod history_recall_tests {
                 .is_err()
         );
         assert!(!activity.cancel_active());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recall_timers_work_on_native_workers_with_the_call_owned_tokio_bridge() {
+        let runtime = tokio::runtime::Handle::try_current().unwrap();
+        let task = tracedecay_runtime_core::native_runtime::NativeTask::spawn(async move {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            tracedecay_runtime_core::native_runtime::in_tokio_context(runtime, async {
+                let activity = RecallReplayRetentionActivityV1::default();
+                assert!(
+                    activity
+                        .within_lane_fuse(std::time::Duration::ZERO, std::future::pending::<()>(),)
+                        .await
+                        .is_err()
+                );
+
+                let signal =
+                    tracedecay_contracts::CancellationSignal::active("history.native-timers")
+                        .unwrap();
+                let now = try_now_micros().unwrap();
+                let elapsed =
+                    tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 - 1))
+                        .unwrap();
+                let control = RecallHistoryControlV1::new(&elapsed, &signal).unwrap();
+                assert!(matches!(
+                    control
+                        .run(std::future::pending::<Result<(), ObservationJourneyError>>())
+                        .await,
+                    Err(ObservationJourneyError::DeadlineExceeded { .. })
+                ));
+
+                let now = try_now_micros().unwrap();
+                let deadline = tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(
+                    now.0 + 10_000,
+                ))
+                .unwrap();
+                let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
+                let original = control.operation.clone();
+                let stage = std::future::poll_fn(|_| {
+                    if original.cancellation().is_cancelled() {
+                        std::task::Poll::Ready(Ok::<_, ()>(23))
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                });
+                assert_eq!(
+                    control.run_replay_retention(Some(&activity), stage).await,
+                    (Ok(23), true)
+                );
+                assert!(original.cancellation().is_cancelled());
+                assert!(!activity.cancel_active());
+            })
+            .await;
+            assert!(tokio::runtime::Handle::try_current().is_err());
+        })
+        .unwrap();
+        assert_eq!(
+            task.await,
+            tracedecay_runtime_core::native_runtime::NativeTaskOutcome::Completed(())
+        );
     }
 }
 

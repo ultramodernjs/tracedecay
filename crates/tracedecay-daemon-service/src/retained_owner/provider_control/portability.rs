@@ -907,7 +907,7 @@ pub(crate) async fn retain_settled_replay_batches(
     let journal = Arc::clone(&authority.journal);
     let scope = scope.clone();
     let operation = control.clone();
-    let worker = tokio::task::spawn_blocking(move || {
+    let worker = authority.runtime.spawn_blocking(move || {
         let settled = settled_replay(&scope, &grant, &journal, &operation)?;
         let root = root_for(&ledger)?;
         prepare_root(&root, &operation)?;
@@ -978,7 +978,7 @@ async fn resolve_replay_artifacts(
     let operation = invocation.control.clone();
     let artifacts = invocation
         .run_controlled(async {
-            tokio::task::spawn_blocking(move || {
+            invocation.runtime.spawn_blocking(move || {
                 let root = root_for(&ledger)?;
                 validate_root(&root)?;
                 let mut artifacts = Vec::new();
@@ -1043,16 +1043,16 @@ async fn resolve_replay_artifacts(
     let grant_copy = grant.clone();
     let settled = invocation
         .run_controlled(async {
-            tokio::task::spawn_blocking(move || {
-                settled_replay(&scope, &grant_copy, &journal, &operation)
-            })
-            .await
-            .map_err(|_| {
-                ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-                    "replay settled evidence worker",
-                ))
-            })?
-            .map_err(control_failure)
+            invocation
+                .runtime
+                .spawn_blocking(move || settled_replay(&scope, &grant_copy, &journal, &operation))
+                .await
+                .map_err(|_| {
+                    ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                        "replay settled evidence worker",
+                    ))
+                })?
+                .map_err(control_failure)
         })
         .await?;
     let retained_bindings: Vec<_> = artifacts
@@ -1147,24 +1147,26 @@ pub(super) async fn snapshot_export(
     let operation = invocation.control.clone();
     invocation
         .run_controlled(async {
-            tokio::task::spawn_blocking(move || {
-                let root = root_for(&ledger_for_quota)?;
-                prepare_root(&root, &operation)?;
-                let _lock = acquire_admission_lock(&root, &operation)?;
-                if available_artifact_bytes(&root, QUOTA, &operation)?
-                    <= PREFIX_BYTES + CHECKSUM_BYTES
-                {
-                    return Err(PortabilityErrorV1::CapacityExceeded);
-                }
-                Ok::<_, PortabilityErrorV1>(())
-            })
-            .await
-            .map_err(|_| {
-                ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-                    "snapshot capacity worker",
-                ))
-            })?
-            .map_err(control_failure)
+            invocation
+                .runtime
+                .spawn_blocking(move || {
+                    let root = root_for(&ledger_for_quota)?;
+                    prepare_root(&root, &operation)?;
+                    let _lock = acquire_admission_lock(&root, &operation)?;
+                    if available_artifact_bytes(&root, QUOTA, &operation)?
+                        <= PREFIX_BYTES + CHECKSUM_BYTES
+                    {
+                        return Err(PortabilityErrorV1::CapacityExceeded);
+                    }
+                    Ok::<_, PortabilityErrorV1>(())
+                })
+                .await
+                .map_err(|_| {
+                    ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                        "snapshot capacity worker",
+                    ))
+                })?
+                .map_err(control_failure)
         })
         .await?;
     let dispatched = port
@@ -1252,9 +1254,9 @@ pub(super) async fn snapshot_export(
         .map_err(|_| PortabilityErrorV1::Corrupt("snapshot provider reply binding"))?;
         let scope = state.retained.clone();
         let operation = invocation.control.clone();
-        let runtime = tokio::runtime::Handle::current();
+        let runtime = authority.runtime.clone();
         let authority = Arc::clone(authority);
-        let worker = tokio::task::spawn_blocking(move || {
+        let worker = invocation.runtime.spawn_blocking(move || {
             let root = root_for(&ledger)?;
             prepare_root(&root, &operation)?;
             let _lock = acquire_admission_lock(&root, &operation)?;
@@ -1321,16 +1323,18 @@ pub(super) async fn snapshot_restore(
     let operation = invocation.control.clone();
     let artifact = invocation
         .run_controlled(async {
-            tokio::task::spawn_blocking(move || {
-                read_snapshot_artifact(&ledger, &scope, &reference, &operation)
-            })
-            .await
-            .map_err(|_| {
-                ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-                    "snapshot restore artifact worker",
-                ))
-            })?
-            .map_err(control_failure)
+            invocation
+                .runtime
+                .spawn_blocking(move || {
+                    read_snapshot_artifact(&ledger, &scope, &reference, &operation)
+                })
+                .await
+                .map_err(|_| {
+                    ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                        "snapshot restore artifact worker",
+                    ))
+                })?
+                .map_err(control_failure)
         })
         .await?;
     let inventory = port

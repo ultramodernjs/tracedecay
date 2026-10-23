@@ -252,6 +252,7 @@ pub(super) struct ControlInvocationV1<'a, 'context> {
     pub(super) request: &'a ProviderControlRequestV1,
     pub(super) control: OperationControl,
     pub(super) identity: ControlOperationIdentityV1,
+    pub(super) runtime: tokio::runtime::Handle,
     deadline: tokio::time::Instant,
     /// Shared by nested stages; the first observed host stop cause wins.
     stop_cause: AtomicU8,
@@ -261,6 +262,7 @@ impl<'a, 'context> ControlInvocationV1<'a, 'context> {
     fn new(
         context: &'a RetainedSurfaceExecutionContextV1<'context>,
         request: &'a ProviderControlRequestV1,
+        runtime: tokio::runtime::Handle,
     ) -> ControlResult<Self> {
         context.request_context.validate().map_err(|_| {
             ControlFailureV1::new(ControlFailureStageV1::InvalidBinding("request context"))
@@ -327,6 +329,7 @@ impl<'a, 'context> ControlInvocationV1<'a, 'context> {
                     request.operation(),
                 )?,
             },
+            runtime,
             deadline: tokio::time::Instant::now() + std::time::Duration::from_micros(remaining),
             stop_cause: AtomicU8::new(0),
         };
@@ -396,18 +399,25 @@ impl<'a, 'context> ControlInvocationV1<'a, 'context> {
     ) -> ControlResult<T> {
         self.check()?;
         tokio::pin!(future);
-        let result = tokio::select! {
-            biased;
-            () = self.context.cancellation_signal.cancelled() => {
-                self.stop(ControlStopCauseV1::Caller);
-                future.await
-            }
-            () = tokio::time::sleep_until(self.deadline) => {
-                self.stop(ControlStopCauseV1::Deadline);
-                future.await
-            }
-            result = &mut future => result,
-        };
+        let result = tracedecay_runtime_core::native_runtime::in_tokio_context(
+            self.runtime.clone(),
+            async {
+                tokio::select! {
+                    biased;
+                    () = self.context.cancellation_signal.cancelled() => {
+                        self.stop(ControlStopCauseV1::Caller);
+                        future.await
+                    }
+                    // ambient-tokio: in_tokio_context enters the request-owned handle for every poll.
+                    () = tokio::time::sleep_until(self.deadline) => {
+                        self.stop(ControlStopCauseV1::Deadline);
+                        future.await
+                    }
+                    result = &mut future => result,
+                }
+            },
+        )
+        .await;
         self.normalize_control_refusal(result)
     }
 }
@@ -557,16 +567,18 @@ impl ProjectProviderControlPortV1 {
                 let control = invocation.control.clone();
                 let retained = invocation
                     .run_controlled(async move {
-                        tokio::task::spawn_blocking(move || {
-                            ledger.read_retained_control_scope(&trace, &control)
-                        })
-                        .await
-                        .map_err(|_| {
-                            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-                                "retained control scope",
-                            ))
-                        })?
-                        .map_err(ControlFailureV1::from)
+                        invocation
+                            .runtime
+                            .spawn_blocking(move || {
+                                ledger.read_retained_control_scope(&trace, &control)
+                            })
+                            .await
+                            .map_err(|_| {
+                                ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                                    "retained control scope",
+                                ))
+                            })?
+                            .map_err(ControlFailureV1::from)
                     })
                     .await?;
                 invocation
@@ -623,15 +635,17 @@ impl ProjectProviderControlPortV1 {
         let ledger = self.ledger()?;
         let observation_id = selector.observation_id.clone();
         let read_control = control.clone();
-        let retained = tokio::task::spawn_blocking(move || {
-            ledger.read_retained_control_source(&trace, &item, &observation_id, &read_control)
-        })
-        .await
-        .map_err(|_| {
-            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-                "retained control source",
-            ))
-        })??;
+        let retained = authority
+            .runtime
+            .spawn_blocking(move || {
+                ledger.read_retained_control_source(&trace, &item, &observation_id, &read_control)
+            })
+            .await
+            .map_err(|_| {
+                ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                    "retained control source",
+                ))
+            })??;
         let authorized = authority
             .authorize_source(&retained, include_unavailable, control)
             .await?;
@@ -772,7 +786,11 @@ impl ProjectProviderControlPortV1 {
         // the blocking caller and retains post-contact uncertainty intact.
         invocation
             .run_controlled(async {
-                match tokio::task::spawn_blocking(move || journey.dispatch_control(request)).await {
+                match invocation
+                    .runtime
+                    .spawn_blocking(move || journey.dispatch_control(request))
+                    .await
+                {
                     Ok(Ok(reply)) => Ok(reply),
                     Ok(Err(error)) => Err(ControlFailureV1::new(ControlFailureStageV1::Dispatch {
                         state: state.retained.clone(),
@@ -887,9 +905,9 @@ impl RetainedProviderControlExecutionPortV1 for ProjectProviderControlPortV1 {
                             "memory provider Tokio runtime unavailable".to_owned(),
                         )
                     })?;
-            tracedecay_runtime_core::native_runtime::in_tokio_context(runtime, async move {
+            tracedecay_runtime_core::native_runtime::in_tokio_context(runtime.clone(), async move {
                 let result = async {
-                    let invocation = ControlInvocationV1::new(&context, request)?;
+                    let invocation = ControlInvocationV1::new(&context, request, runtime)?;
                     self.validate_invocation(&invocation)?;
                     invocation
                         .run_controlled(async {
@@ -1165,6 +1183,47 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn controlled_stage_can_be_polled_without_an_ambient_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let (request_context, signal) = context("actor.one", "request.one", "worktree.one");
+        let request = health_request();
+        let operation =
+            tracedecay_contracts::retained_surface_application_operation(request.operation())
+                .unwrap();
+        let context = RetainedSurfaceExecutionContextV1 {
+            request_context: &request_context,
+            cancellation_signal: &signal,
+            operation: &operation,
+            observed_at: tracedecay_contracts::now_micros(),
+        };
+        let invocation =
+            ControlInvocationV1::new(&context, &request, runtime.handle().clone()).unwrap();
+        let (settle_tx, settle_rx) = tokio::sync::oneshot::channel();
+        let mut work = Box::pin(invocation.run_controlled(async {
+            settle_rx.await.unwrap();
+            assert!(invocation.control.cancellation().is_cancelled());
+            Ok("actual settled result")
+        }));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        // This first poll creates and polls the deadline timer on a thread
+        // which has never entered Tokio.
+        assert!(work.as_mut().poll(&mut task).is_pending());
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        signal.cancel(tracedecay_contracts::now_micros());
+        settle_tx.send(()).unwrap();
+        assert!(matches!(
+            work.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Ok("actual settled result"))
+        ));
+        assert!(tokio::runtime::Handle::try_current().is_err());
+    }
+
     #[tokio::test]
     async fn cancelled_stage_is_joined_and_keeps_its_actual_result() {
         let (request_context, signal) = context("actor.one", "request.one", "worktree.one");
@@ -1178,7 +1237,9 @@ mod tests {
             operation: &operation,
             observed_at: tracedecay_contracts::now_micros(),
         };
-        let invocation = ControlInvocationV1::new(&context, &request).unwrap();
+        let invocation =
+            ControlInvocationV1::new(&context, &request, tokio::runtime::Handle::current())
+                .unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (settle_tx, settle_rx) = tokio::sync::oneshot::channel();
         let run = invocation.run_controlled(async {
@@ -1232,7 +1293,9 @@ mod tests {
                 operation: &operation,
                 observed_at: tracedecay_contracts::now_micros(),
             };
-            let invocation = ControlInvocationV1::new(&context, &request).unwrap();
+            let invocation =
+                ControlInvocationV1::new(&context, &request, tokio::runtime::Handle::current())
+                    .unwrap();
             let settled = std::sync::atomic::AtomicBool::new(false);
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (settle_tx, settle_rx) = tokio::sync::oneshot::channel();
@@ -1298,7 +1361,7 @@ mod tests {
             observed_at: tracedecay_contracts::now_micros(),
         };
         assert!(matches!(
-            *ControlInvocationV1::new(&context, &request)
+            *ControlInvocationV1::new(&context, &request, tokio::runtime::Handle::current())
                 .err()
                 .unwrap()
                 .stage,

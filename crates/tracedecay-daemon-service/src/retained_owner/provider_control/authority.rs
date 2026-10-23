@@ -67,7 +67,7 @@ pub(crate) struct ProviderControlAuthorityV1 {
     ledger: Option<Arc<RecallAdmissionLedgerV1>>,
     locator_key: RecallLocatorKeyV1,
     journals: BTreeMap<OwnedProviderId, Arc<SqliteObservationJournal>>,
-    runtime: tokio::runtime::Handle,
+    pub(super) runtime: tokio::runtime::Handle,
 }
 
 /// Exact retained producing identity together with a fresh canonical source grant.
@@ -164,7 +164,7 @@ impl ProviderControlAuthorityV1 {
         let canonical_provider_id = canonical_provider_id.to_owned();
         let session_id = session_id.to_owned();
         let operation = control.clone();
-        let work = tokio::task::spawn_blocking(move || {
+        let work = self.runtime.spawn_blocking(move || {
             check(&operation)?;
             let bridge = &authority.original_authority.bridge;
             let destination = bridge.destination(&session_id)?;
@@ -226,7 +226,7 @@ impl ProviderControlAuthorityV1 {
         let scope = scope.clone();
         let sources = sources.to_vec();
         let operation = control.clone();
-        let work = tokio::task::spawn_blocking(move || {
+        let work = self.runtime.spawn_blocking(move || {
             validate_retained_scope_identity(&scope)?;
             let journal = authority
                 .journals
@@ -322,7 +322,7 @@ impl ProviderControlAuthorityV1 {
             .authorize_source(&source.retained, include_unavailable, control)
             .await?;
         let operation = control.clone();
-        let work = tokio::task::spawn_blocking(move || {
+        let work = self.runtime.spawn_blocking(move || {
             let snapshot = operation
                 .snapshot()
                 .map_err(ProviderHistoryErrorV1::Control)?;
@@ -582,7 +582,7 @@ impl ProviderControlAuthorityV1 {
         let authority = Arc::clone(self);
         let retained = retained.clone();
         let operation = control.clone();
-        let work = tokio::task::spawn_blocking(move || {
+        let work = self.runtime.spawn_blocking(move || {
             validate_retained_scope_identity(&retained)?;
             // Scope checks do not need to open or select a provider journal.
             authority
@@ -607,7 +607,7 @@ impl ProviderControlAuthorityV1 {
         let authority = Arc::clone(self);
         let retained = retained.clone();
         let operation = control.clone();
-        let work = tokio::task::spawn_blocking(move || {
+        let work = self.runtime.spawn_blocking(move || {
             validate_retained_scope_identity(&retained.scope)?;
             let journal = authority
                 .journals
@@ -751,7 +751,7 @@ impl AuthorizedRetainedControlSourceV1 {
         let source_revision = request.source_revision.map(str::to_owned);
         let authority_ref = request.authority_ref.to_owned();
         let accepted_at_utc_micros = request.accepted_at_utc_micros;
-        let work = tokio::task::spawn_blocking(move || {
+        let work = self.authority.runtime.spawn_blocking(move || {
             // Snapshot after the blocking-pool queue wait; the original request
             // never receives a replacement budget or cancellation token.
             let snapshot = operation

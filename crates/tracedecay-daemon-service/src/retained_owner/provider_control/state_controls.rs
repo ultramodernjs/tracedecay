@@ -288,18 +288,20 @@ pub(super) async fn inspection(
             let control = invocation.control.clone();
             let artifact = invocation
                 .run_controlled(async move {
-                    tokio::task::spawn_blocking(move || {
-                        super::portability::read_snapshot_artifact(
-                            &ledger, &retained, &reference, &control,
-                        )
-                    })
-                    .await
-                    .map_err(|_| {
-                        ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-                            "snapshot artifact",
-                        ))
-                    })?
-                    .map_err(super::portability::control_failure)
+                    invocation
+                        .runtime
+                        .spawn_blocking(move || {
+                            super::portability::read_snapshot_artifact(
+                                &ledger, &retained, &reference, &control,
+                            )
+                        })
+                        .await
+                        .map_err(|_| {
+                            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                                "snapshot artifact",
+                            ))
+                        })?
+                        .map_err(super::portability::control_failure)
                 })
                 .await?;
             if state.provider_id != artifact.export_scope().provider_id

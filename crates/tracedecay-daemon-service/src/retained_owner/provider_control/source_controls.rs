@@ -644,16 +644,18 @@ async fn cleanup_snapshots(
     let control = invocation.control.clone();
     // The enclosing executor keeps forwarding the original cancellation while
     // this existing blocking-pool operation settles all witnessed removals.
-    tokio::task::spawn_blocking(move || {
-        let cleanup = cleanup_source_snapshots(&ledger, &source.authorized, &intent, &control);
-        (source, cleanup)
-    })
-    .await
-    .map_err(|_| {
-        ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-            "host snapshot cleanup worker",
-        ))
-    })
+    invocation
+        .runtime
+        .spawn_blocking(move || {
+            let cleanup = cleanup_source_snapshots(&ledger, &source.authorized, &intent, &control);
+            (source, cleanup)
+        })
+        .await
+        .map_err(|_| {
+            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                "host snapshot cleanup worker",
+            ))
+        })
 }
 
 fn unconfirmed_cleanup(requested: bool) -> HostSnapshotCleanupResultV1 {
@@ -832,16 +834,18 @@ async fn accept_feedback(
     let target = source.target.clone();
     let attribution = source.granted_source()?.attribution.clone();
     let control = invocation.control.clone();
-    tokio::task::spawn_blocking(move || {
-        ledger.accept_feedback_assertion(&context, &request, &target, &attribution, &control)
-    })
-    .await
-    .map_err(|_| {
-        ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-            "feedback assertion acceptance worker",
-        ))
-    })?
-    .map_err(command_error)
+    invocation
+        .runtime
+        .spawn_blocking(move || {
+            ledger.accept_feedback_assertion(&context, &request, &target, &attribution, &control)
+        })
+        .await
+        .map_err(|_| {
+            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                "feedback assertion acceptance worker",
+            ))
+        })?
+        .map_err(command_error)
 }
 
 async fn accept_deletion(
@@ -856,16 +860,18 @@ async fn accept_deletion(
     let target = source.target.clone();
     let attribution = source.granted_source()?.attribution.clone();
     let control = invocation.control.clone();
-    tokio::task::spawn_blocking(move || {
-        ledger.accept_deletion_command(&context, &request, &target, &attribution, &control)
-    })
-    .await
-    .map_err(|_| {
-        ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-            "deletion command acceptance worker",
-        ))
-    })?
-    .map_err(command_error)
+    invocation
+        .runtime
+        .spawn_blocking(move || {
+            ledger.accept_deletion_command(&context, &request, &target, &attribution, &control)
+        })
+        .await
+        .map_err(|_| {
+            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                "deletion command acceptance worker",
+            ))
+        })?
+        .map_err(command_error)
 }
 
 fn feedback_identity(accepted: &AcceptedFeedbackAssertionV1) -> ControlOperationIdentityV1 {

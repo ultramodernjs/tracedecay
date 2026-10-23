@@ -217,6 +217,35 @@ fn native_readiness(composition: &ProjectMemoryProviderComposition) -> ProviderR
     statuses[0].readiness
 }
 
+#[test]
+fn missing_runtime_refuses_recall_before_provider_contact() {
+    let provider = Arc::new(RecallFixturePort::new());
+    let observer = Arc::new(LedgerObserver::default());
+    let port = mount(
+        compose_mode(provider.clone(), EnabledProviderMode::Active),
+        observer.clone(),
+    )
+    .expect("mounted port");
+    let cancellation = live_signal();
+    let mut recall = Box::pin(port.recall_admitted(
+        request(
+            resolved_scope(Some("refs/heads/recall-port")),
+            60_000_000,
+            false,
+        ),
+        &cancellation,
+    ));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        std::future::Future::poll(recall.as_mut(), &mut context),
+        std::task::Poll::Ready(Err(CognitiveRecallPortError::Invocation(
+            tracedecay_memory_provider_registry::ProviderInvocationFaultV1::WorkerUnavailable { .. }
+        )))
+    ));
+    assert_eq!(provider.recall_calls.load(Ordering::Relaxed), 0);
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
 /// The host-owned candidate budget is the one admission enforces: when it is
 /// smaller than the application request, a provider that returns more than
 /// the host budget is refused even though it stayed under the request.

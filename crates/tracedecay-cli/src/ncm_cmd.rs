@@ -26,6 +26,7 @@ use tracedecay_memory_ncm_runtime::worker_artifact::{
 };
 use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, atomic_write, remove_conditionally};
 use tracedecay_runtime_core::config::ProfileRoot;
+use tracedecay_runtime_core::native_runtime;
 
 const CONTROL_SCHEMA_VERSION: u16 = 1;
 const CONTROL_DIRECTORY_NAME: &str = "ncm";
@@ -575,7 +576,7 @@ async fn handle_install_model(
     let admitted_root = StateRoot::new(state_root.clone()).map_err(config_error)?;
     // The runtime's installer is synchronous and checks admission before its
     // network operation; its HTTP backend owns the in-flight request timeout.
-    let identity = tokio::task::spawn_blocking(move || {
+    let identity = native_runtime::spawn_blocking(move || {
         tracedecay_memory_ncm_runtime::embedding::install(
             &admitted_root,
             Deadline {

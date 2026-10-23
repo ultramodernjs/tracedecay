@@ -27,6 +27,7 @@ use tracedecay_memory_provider_registry::{
     RestoreDispositionCheckpoint, SourceAttribution,
 };
 use tracedecay_memory_provider_registry::{HistoryRelation, SourceDisposition};
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
 use tracedecay_store::{
     AnchorDispositionStateV1, ObservationReplayRequest, ObservationStore,
@@ -2359,27 +2360,33 @@ pub(crate) async fn bounded_read<T, E>(
     let snapshot = control
         .snapshot()
         .map_err(ProviderHistoryErrorV1::Control)?;
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_millis(snapshot.remaining_millis);
-    tokio::pin!(future);
-    loop {
-        control
-            .snapshot()
-            .map_err(ProviderHistoryErrorV1::Control)?;
-        tokio::select! {
-            biased;
-            result = &mut future => {
-                control.snapshot().map_err(ProviderHistoryErrorV1::Control)?;
-                return result.map_err(|_| ProviderHistoryErrorV1::Unavailable(authority));
+    native_runtime::on_tokio("memory_provider.history_read", async {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(snapshot.remaining_millis);
+        tokio::pin!(future);
+        loop {
+            control
+                .snapshot()
+                .map_err(ProviderHistoryErrorV1::Control)?;
+            tokio::select! {
+                biased;
+                result = &mut future => {
+                    control.snapshot().map_err(ProviderHistoryErrorV1::Control)?;
+                    return result.map_err(|_| ProviderHistoryErrorV1::Unavailable(authority));
+                }
+                // ambient-tokio: on_tokio enters the owned runtime for every poll of this future.
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(ProviderHistoryErrorV1::Control(control.snapshot().err().unwrap_or(
+                        tracedecay_memory_provider_registry::TerminalCode::DeadlineExceeded,
+                    )));
+                }
+                // ambient-tokio: on_tokio enters the owned runtime for every poll of this future.
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
             }
-            () = tokio::time::sleep_until(deadline) => {
-                return Err(ProviderHistoryErrorV1::Control(control.snapshot().err().unwrap_or(
-                    tracedecay_memory_provider_registry::TerminalCode::DeadlineExceeded,
-                )));
-            }
-            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
         }
-    }
+    })
+    .ok_or(ProviderHistoryErrorV1::Unavailable(authority))?
+    .await
 }
 
 impl MountedOriginalObservationAuthorityV1 {
@@ -2794,6 +2801,50 @@ mod tests {
             Err(ProviderHistoryErrorV1::Control(
                 TerminalCode::DeadlineExceeded
             ))
+        ));
+    }
+
+    #[test]
+    fn history_read_without_a_runtime_is_unavailable_before_polling_the_authority() {
+        let control = OperationControl::new(
+            tracedecay_contracts::now_micros().0 + 30_000_000,
+            30_000,
+            CancellationToken::new(),
+        );
+        let polled = std::cell::Cell::new(false);
+        let authority = std::future::poll_fn(|_| {
+            polled.set(true);
+            std::task::Poll::Ready(Ok::<(), ()>(()))
+        });
+        let mut read = Box::pin(bounded_read(&control, authority, "history runtime"));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(read.as_mut(), &mut context),
+            std::task::Poll::Ready(Err(ProviderHistoryErrorV1::Unavailable("history runtime")))
+        ));
+        assert!(!polled.get());
+    }
+
+    #[test]
+    fn cancelled_history_read_keeps_its_terminal_without_a_runtime() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let control = OperationControl::new(
+            tracedecay_contracts::now_micros().0 + 30_000_000,
+            30_000,
+            cancellation,
+        );
+        let mut read = Box::pin(bounded_read(
+            &control,
+            std::future::pending::<Result<(), ()>>(),
+            "history runtime",
+        ));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            std::future::Future::poll(read.as_mut(), &mut context),
+            std::task::Poll::Ready(Err(ProviderHistoryErrorV1::Control(
+                TerminalCode::Cancelled
+            )))
         ));
     }
 

@@ -13,6 +13,7 @@ use tracedecay_domain::{GitHeadStateV1, RefId, RepositoryId, WorktreeId};
 use tracedecay_global_db::VerifiedGraphRuntimePortV1;
 use tracedecay_graph_db::{GraphCancellation, GraphDbError, GraphProjectorRevision};
 use tracedecay_runtime_core::git_repository::GitRepositoryAuthority;
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_rusqlite_runtime::repository::AuthorizedScopeSetSqliteStorage;
 use tracedecay_store::FactReadControl;
 
@@ -79,7 +80,15 @@ impl SessionSyncProjectContext {
                 interruption = service.wait_for_interruption(request) => {
                     return GitTopologySyncOutcome::Interrupted(interruption);
                 }
-                () = tokio::time::sleep(GRAPH_ACTIVATION_POLL) => {}
+                result = native_runtime::sleep_until(
+                    std::time::Instant::now() + GRAPH_ACTIVATION_POLL,
+                ) => {
+                    if result.is_err() {
+                        return GitTopologySyncOutcome::Finished(
+                            Err(GitTopologySyncFailure::Unavailable),
+                        );
+                    }
+                }
             }
         }
         let runtime: Arc<dyn VerifiedGraphRuntimePortV1> = Arc::new(runtime.clone());
