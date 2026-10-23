@@ -12,7 +12,7 @@
  *     The daemon really does merge two layers there, and then ships only the
  *     result. The winning layer is not on the wire.
  *   - `user` and `project.config` do not even address the same keys
- *     (`upload_enabled`/`watcher_debounce` vs `include`/`exclude`/…), so they
+ *     (`watcher_debounce`/`extraction_timeout_secs` vs `include`/`exclude`/…), so they
  *     are not competing layers over a shared namespace.
  *
  * Therefore this model does NOT rank groups into a resolution stack and does
@@ -150,7 +150,6 @@ export interface ProjectSettingsValues {
 }
 
 export interface UserSettingsValues {
-  readonly upload_enabled: boolean;
   readonly watcher_debounce: string;
   readonly extraction_timeout_secs: string;
 }
@@ -205,7 +204,6 @@ export interface ProjectSettingsChangeSet {
 
 /** The user-scope counterpart of `ProjectSettingsChangeSet`. */
 export interface UserSettingsChangeSet {
-  upload_enabled?: boolean;
   watcher_debounce?: string;
   extraction_timeout_secs?: number;
 }
@@ -443,7 +441,6 @@ export function buildSettingsEditor(payload: SettingsPayloadV1): SettingsEditor 
       auto_track_pr_poll_secs: pollSecs,
     },
     user: {
-      upload_enabled: payload.user.upload_enabled,
       watcher_debounce: payload.user.watcher_debounce,
       extraction_timeout_secs: extractionTimeout,
     },
@@ -471,11 +468,55 @@ export function settingsRevisionId(current: SettingsEditor, scope: SettingsScope
 }
 
 /**
+ * Publish the verified PATCH resource into the existing read snapshot. Worker
+ * writes are profile-global, so their response's active project must never
+ * replace the selected project's settings or its other read groups.
+ */
+export function settingsPayloadWithAppliedScope(
+  current: SettingsPayloadV1,
+  applied: SettingsPayloadV1,
+  scope: SettingsScope,
+): SettingsPayloadV1 {
+  switch (scope) {
+    case 'project':
+      // Automation is derived from the same pinned project configuration.
+      return { ...current, project: applied.project, automation: applied.automation };
+    case 'user':
+      return {
+        ...current,
+        user: {
+          ...current.user,
+          configuration_revision_id: applied.user.configuration_revision_id,
+          configuration_snapshot_id: applied.user.configuration_snapshot_id,
+          watcher_debounce: applied.user.watcher_debounce,
+          extraction_timeout_secs: applied.user.extraction_timeout_secs,
+        },
+      };
+    case 'code_index_workers':
+      return {
+        ...current,
+        user: {
+          ...current.user,
+          code_index_worker_configuration_revision_id:
+            applied.user.code_index_worker_configuration_revision_id,
+          code_index_worker_configuration_snapshot_id:
+            applied.user.code_index_worker_configuration_snapshot_id,
+          code_index_workers: applied.user.code_index_workers,
+          code_index_worker_status: applied.user.code_index_worker_status,
+        },
+      };
+    default: {
+      const exhaustive: never = scope;
+      return exhaustive;
+    }
+  }
+}
+
+/**
  * The project change a draft represents against a known-current snapshot.
  *
- * Planning against a snapshot rather than a payload is what lets the state
- * machine replan without re-parsing: replanning is how a confirmation is
- * checked against the review it was given for.
+ * Planning against a snapshot keeps edits tied to the values and revision they
+ * were based on; the resulting patch carries that revision to the server check.
  */
 export function planProjectChangeAgainst(
   current: SettingsEditor | null,
@@ -551,9 +592,6 @@ export function planUserChangeAgainst(
   if (errors.length > 0) return { outcome: 'invalid', errors };
 
   const patch: UserSettingsChangeSet = {};
-  if (values.upload_enabled !== current.user.upload_enabled) {
-    patch.upload_enabled = values.upload_enabled;
-  }
   if (values.watcher_debounce !== current.user.watcher_debounce) {
     patch.watcher_debounce = values.watcher_debounce;
   }

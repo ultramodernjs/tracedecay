@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use tracedecay_domain::errors::{ProjectOpenFailureKind, TraceDecayError};
-use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor};
+use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, Result};
 
 use super::rows::audit_read_error;
 
@@ -48,6 +48,63 @@ const OBSERVATION_IMMUTABILITY: &[Trigger] = &[
         create_sql: "CREATE TRIGGER observations_immutable_delete
             BEFORE DELETE ON observations BEGIN
                 SELECT RAISE(ABORT, 'observations are immutable');
+            END",
+    },
+];
+
+const RETIRED_SEQUENCE_AUTHORITY: &[Trigger] = &[
+    Trigger {
+        name: "retired_sequence_audit_invalidate_delete",
+        table: "observation_retired_sequences",
+        create_sql: "CREATE TRIGGER retired_sequence_audit_invalidate_delete
+            AFTER DELETE ON observation_retired_sequences BEGIN
+                DELETE FROM authority_audit_checkpoints WHERE audit_name = 'observation-authority';
+                DELETE FROM authority_projection_repair_progress;
+            END",
+    },
+    Trigger {
+        name: "observation_retired_sequences_immutable_update",
+        table: "observation_retired_sequences",
+        create_sql: "CREATE TRIGGER observation_retired_sequences_immutable_update
+            BEFORE UPDATE ON observation_retired_sequences BEGIN
+                SELECT RAISE(ABORT, 'retired observation sequences are immutable');
+            END",
+    },
+    Trigger {
+        name: "observation_retired_sequences_immutable_delete",
+        table: "observation_retired_sequences",
+        create_sql: "CREATE TRIGGER observation_retired_sequences_immutable_delete
+            BEFORE DELETE ON observation_retired_sequences BEGIN
+                SELECT RAISE(ABORT, 'retired observation sequences are immutable');
+            END",
+    },
+    Trigger {
+        name: "observation_retired_sequences_validate_insert",
+        table: "observation_retired_sequences",
+        create_sql: "CREATE TRIGGER observation_retired_sequences_validate_insert
+            BEFORE INSERT ON observation_retired_sequences
+            WHEN EXISTS (SELECT 1 FROM observations
+                         WHERE sequence BETWEEN NEW.first_sequence AND NEW.last_sequence)
+              OR EXISTS (SELECT 1 FROM (
+                    SELECT last_sequence FROM observation_retired_sequences
+                    WHERE first_sequence <= NEW.last_sequence + 1
+                    ORDER BY first_sequence DESC LIMIT 1
+                 ) WHERE last_sequence >= NEW.first_sequence - 1)
+            BEGIN
+                SELECT RAISE(ABORT, 'retired observation ranges must be absent and coalesced');
+            END",
+    },
+    Trigger {
+        name: "observations_refuse_retired_sequence",
+        table: "observations",
+        create_sql: "CREATE TRIGGER observations_refuse_retired_sequence
+            AFTER INSERT ON observations
+            WHEN EXISTS (SELECT 1 FROM (
+                SELECT last_sequence FROM observation_retired_sequences
+                WHERE first_sequence <= NEW.sequence ORDER BY first_sequence DESC LIMIT 1
+            ) WHERE last_sequence >= NEW.sequence)
+            BEGIN
+                SELECT RAISE(ABORT, 'retired observation sequences cannot be reused');
             END",
     },
 ];
@@ -1270,6 +1327,12 @@ pub(super) const FOREIGN_KEY_AUDIT_QUERY: &str = "SELECT * FROM pragma_foreign_k
 
 pub(in crate::schema_contract) const INVARIANTS: &[Invariant] = &[
     Invariant {
+        triggers: RETIRED_SEQUENCE_AUTHORITY,
+        audit_query: None,
+        violation: "retired observation sequence authority is unavailable",
+        migration_pending: false,
+    },
+    Invariant {
         triggers: OBSERVATION_IMMUTABILITY,
         audit_query: None,
         violation: "observation immutability trigger contract is unavailable",
@@ -1399,7 +1462,7 @@ pub(in crate::schema_contract) const INVARIANTS: &[Invariant] = &[
         triggers: &[],
         audit_query: Some(
             "SELECT 1 FROM observation_projection_checkpoints
-             WHERE last_sequence > (SELECT COALESCE(MAX(sequence), 0) FROM observations)
+             WHERE last_sequence > (SELECT MAX(COALESCE((SELECT MAX(sequence) FROM observations), 0), COALESCE((SELECT last_sequence FROM observation_retired_sequences ORDER BY first_sequence DESC LIMIT 1), 0)))
              LIMIT 1",
         ),
         violation: "projection checkpoint exceeds the committed observation frontier",
@@ -1649,6 +1712,15 @@ pub(super) async fn replace_trigger(
 pub(super) async fn trigger_contracts_intact(
     conn: &impl QueryExecutor,
 ) -> tracedecay_domain::errors::Result<bool> {
+    first_invalid_trigger(conn)
+        .await
+        .map(|invalid| invalid.is_none())
+        .map_err(audit_read_error)
+}
+
+pub(in crate::schema_contract) async fn first_invalid_trigger(
+    conn: &impl QueryExecutor,
+) -> Result<Option<&'static Trigger>> {
     // SQLite trigger names are unique under ASCII case folding, which is what
     // `COLLATE NOCASE` and `to_ascii_lowercase` both apply.
     let mut rows = conn
@@ -1656,20 +1728,19 @@ pub(super) async fn trigger_contracts_intact(
             "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'",
             (),
         )
-        .await
-        .map_err(audit_read_error)?;
+        .await?;
     let mut actual = HashMap::new();
-    while let Some(row) = rows.next().await.map_err(audit_read_error)? {
-        let name = row.get::<String>(0).map_err(audit_read_error)?;
-        let table = row.get::<String>(1).map_err(audit_read_error)?;
-        let sql = row.get::<String>(2).map_err(audit_read_error)?;
+    while let Some(row) = rows.next().await? {
+        let name = row.get::<String>(0)?;
+        let table = row.get::<String>(1)?;
+        let sql = row.get::<String>(2)?;
         actual.insert(name.to_ascii_lowercase(), (table, sql));
     }
     Ok(INVARIANTS
         .iter()
         .flat_map(|invariant| invariant.triggers)
-        .all(|trigger| {
-            actual
+        .find(|trigger| {
+            !actual
                 .get(&trigger.name.to_ascii_lowercase())
                 .is_some_and(|(table, sql)| {
                     table.eq_ignore_ascii_case(trigger.table)

@@ -392,10 +392,15 @@ impl ProjectRuntimeOwnerRegistryV1 {
             })?;
             match entries.get(project_id) {
                 None => return Ok(false),
-                Some(ProjectRuntimeOwnerStateV1::Ready(owners)) => owners
-                    .memory
-                    .as_ref()
-                    .map(|owner| (Arc::clone(&owner.graph), Arc::clone(&owner.graph_settled))),
+                Some(ProjectRuntimeOwnerStateV1::Ready(owners)) => {
+                    let Some(owner) = owners.memory.as_ref() else {
+                        // A session-only SQL mount owns no project memory graph.
+                        // Replay maintenance may attach its exact lazy graph owner
+                        // without waiting for an engine this mount will never open.
+                        return Ok(false);
+                    };
+                    Some((Arc::clone(&owner.graph), Arc::clone(&owner.graph_settled)))
+                }
                 Some(_) => None,
             }
         };

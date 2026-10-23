@@ -305,6 +305,14 @@ pub(super) const TABLES: &[Table] = &[
         )]
     ),
     table!(
+        "observation_retired_sequences",
+        [
+            column("first_sequence", "INTEGER", false, None, 1),
+            column("last_sequence", "INTEGER", true, None, 0),
+        ],
+        []
+    ),
+    table!(
         "remote_writer_fences",
         [
             column("authority_key", "TEXT", true, None, 1),
@@ -616,6 +624,14 @@ pub(super) const TABLES: &[Table] = &[
             "observation_id",
             "NO ACTION"
         )]
+    ),
+    table!(
+        "observation_source_descriptors",
+        [
+            column("source_key", "TEXT", true, None, 1),
+            column("descriptor_json", "TEXT", true, None, 0),
+        ],
+        []
     ),
     table!(
         "observation_source_presence",
@@ -1747,6 +1763,146 @@ pub(super) const INDEX_DESCENDING_COLUMNS: &[(&str, &[&str])] = &[
 pub(super) const INDEX_EXPRESSION_COLUMN: &str = "<expression>";
 
 pub(super) const INDEXES: &[Index] = &[
+    Index {
+        table: "session_assertions",
+        name: Some("idx_retirement_session_assertions_subject_anchor_id"),
+        unique: false,
+        origin: "c",
+        columns: &["subject_anchor_id"],
+    },
+    Index {
+        table: "session_assertions",
+        name: Some("idx_retirement_session_assertions_object_anchor_id"),
+        unique: false,
+        origin: "c",
+        columns: &["object_anchor_id"],
+    },
+    Index {
+        table: "session_derived_evidence",
+        name: Some("idx_retirement_session_derived_evidence_retrieval_anchor_id"),
+        unique: false,
+        origin: "c",
+        columns: &["retrieval_anchor_id"],
+    },
+    Index {
+        table: "session_occurrences",
+        name: Some("idx_retirement_session_occurrences_retrieval_anchor_id"),
+        unique: false,
+        origin: "c",
+        columns: &["retrieval_anchor_id"],
+    },
+    Index {
+        table: "session_summary_nodes",
+        name: Some("idx_retirement_session_summary_nodes_summary_anchor_id"),
+        unique: false,
+        origin: "c",
+        columns: &["summary_anchor_id"],
+    },
+    Index {
+        table: "retrieval_anchor_dispositions",
+        name: Some("idx_retirement_retrieval_anchor_dispositions_superseded_by"),
+        unique: false,
+        origin: "c",
+        columns: &["superseded_by"],
+    },
+    Index {
+        table: "observation_projection_provenance",
+        name: Some("idx_retirement_observation_projection_provenance_retrieval_anchor_id"),
+        unique: false,
+        origin: "c",
+        columns: &["retrieval_anchor_id"],
+    },
+    Index {
+        table: "observation_workflow_facts",
+        name: Some("idx_retirement_observation_workflow_facts_retrieval_anchor_id"),
+        unique: false,
+        origin: "c",
+        columns: &["retrieval_anchor_id"],
+    },
+    Index {
+        table: "observation_projection_rebuild_provenance",
+        name: Some("idx_retirement_observation_projection_rebuild_provenance"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_projection_rebuild_dispositions",
+        name: Some("idx_retirement_observation_projection_rebuild_dispositions"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_projection_rebuild_aliases",
+        name: Some("idx_retirement_observation_projection_rebuild_aliases"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_projection_rebuild_workflow_facts",
+        name: Some("idx_retirement_observation_projection_rebuild_workflow_facts"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_projection_rebuild_provider_usage",
+        name: Some("idx_retirement_observation_projection_rebuild_provider_usage"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_projection_provenance",
+        name: Some("idx_retirement_observation_projection_provenance"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_projection_aliases",
+        name: Some("idx_retirement_observation_projection_aliases"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_projection_dispositions",
+        name: Some("idx_retirement_observation_projection_dispositions"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_workflow_facts",
+        name: Some("idx_retirement_observation_workflow_facts"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_provider_usage",
+        name: Some("idx_retirement_observation_provider_usage"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "observation_source_presence",
+        name: Some("idx_retirement_observation_source_presence"),
+        unique: false,
+        origin: "c",
+        columns: &["observation_id"],
+    },
+    Index {
+        table: "session_occurrences",
+        name: Some("idx_retirement_occurrences"),
+        unique: false,
+        origin: "c",
+        columns: &["source_observation_id"],
+    },
     Index {
         table: "session_canonical_body_references",
         name: Some("idx_session_canonical_body_references_hash"),

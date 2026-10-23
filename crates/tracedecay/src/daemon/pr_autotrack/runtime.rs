@@ -29,6 +29,7 @@ pub(crate) struct PrAutotrackTask {
 }
 
 impl PrAutotrackTask {
+    #[cfg(unix)]
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
     }
@@ -237,7 +238,7 @@ async fn poll_project(
         &data_root,
         &discovery,
         MAX_NEW_TRACKS_PER_CYCLE,
-        PrStoreAdministration::with_control(schedulers, &graph, &command_control),
+        PrStoreAdministration::with_control(administration, schedulers, &graph, &command_control),
     )
     .await
     {
@@ -294,7 +295,7 @@ async fn teardown_disabled_project_with_administration(
         &data_root,
         &PrDiscovery::default(),
         MAX_NEW_TRACKS_PER_CYCLE,
-        PrStoreAdministration::with_control(schedulers, &graph, &command_control),
+        PrStoreAdministration::with_control(administration, schedulers, &graph, &command_control),
     )
     .await
     {

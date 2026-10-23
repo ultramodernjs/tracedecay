@@ -41,10 +41,15 @@ pub mod compaction_receipt;
 pub mod generation;
 pub mod lease;
 pub mod loop_run;
+#[cfg(unix)]
+pub mod offline_compaction;
 pub mod retention;
 pub mod store_maintenance;
 pub mod telemetry;
 pub mod tick;
+
+#[cfg(test)]
+mod distribution_profile_tests;
 
 #[cfg(test)]
 mod logging_tests {

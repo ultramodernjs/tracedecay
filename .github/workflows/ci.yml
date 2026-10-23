@@ -179,16 +179,25 @@ jobs:
       - name: Test the real-repository hot-path benchmark harness
         run: python3 scripts/test-bench-hot-paths.py
 
-      - name: Test the unused tool-context matching rules
-        run: python3 scripts/test-measure-unused-tool-context.py
-
       # Configure the output base and restore caches before the first Bazel
       # invocation so this job does not start two independent Bazel servers.
       - uses: ./.github/actions/setup-bazel
         id: bazel
         with:
           cache-key: ci-format-linux
-          tailscale-client-id: ${{ github.repository == 'ScriptedAlchemy/tracedecay' && github.actor_id == '25274700' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.TS_BAZEL_CLIENT_ID || '' }}
+          tailscale-client-id: >-
+            ${{ github.repository == 'ScriptedAlchemy/tracedecay' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+                && ((github.actor_id == '25274700' && vars.TS_BAZEL_CLIENT_ID)
+                    || (github.actor_id == '158243242' && vars.TS_BAZEL_BOT_CLIENT_ID)) || '' }}
+
+      - name: Test repository policies with Bazel workers
+        run: >-
+          bazel test --config=ci --test_output=errors
+          //scripts:unused_tool_context_measure_test
+          //scripts:sqlite_plan_stability_check_test
+          //scripts:ambient_tokio_check_test
+          //scripts:rusqlite_storage_boundary_test
+          //scripts:packaged_lsp_bridge_test
 
       - name: Test the ranked-tail trim replay against the Rust rule cases
         run: bazel run //scripts:test-measure-ranked-tail-trim.py
@@ -206,21 +215,20 @@ jobs:
       # once here instead of once per release matrix target.
       - name: Test release packagers
         run: |
-          python3 scripts/test-check-packaged-lsp-bridge.py
           python3 scripts/test-build-mcpb.py
-          python3 scripts/test-resolve-installed-binary.py
-          python3 scripts/test-check-packaged-mcp-stdio.py
-          bazel test --config=ci //scripts:distribution_feature_wiring_test --test_output=errors
-          python3 scripts/test-resolve-release-source-profile.py
           python3 scripts/test-package-release-archive.py
           python3 scripts/test-plan-release-recovery.py
           python3 scripts/test-check-release-artifacts.py
+          python3 scripts/test-generate-release-inventory.py
           python3 scripts/test-update-release-checksums.py
           python3 scripts/test-neutralize-release-pr-closing-keywords.py
-          bash scripts/test-check-distribution-clean-source.sh
-          bash scripts/test-check-distribution-snapshot.sh
-          bash scripts/test-check-distribution-reuse.sh
           bash tests/macos_stable_codesign_test.sh
+
+      # Keep the fork's NCM release protections without unpublished-crate acceptance.
+      - name: Check source features and NCM release contracts
+        run: |
+          python3 -B scripts/test-check-distribution-feature-wiring.py
+          python3 -B scripts/check-distribution-feature-wiring.py
 
       # Exercise the release guard scripts when admitting proposed changes.
       - name: Check the release guards
@@ -255,22 +263,16 @@ jobs:
 
       # Every SQLite connection plans with SQLITE_DBCONFIG_ENABLE_QPSG, so a
       # bound partial-index predicate or LIKE pattern silently scans.
-      - name: Test and check SQL plans stay index-backed under QPSG
-        run: |
-          python3 scripts/test-check-sqlite-plan-stability.py
-          python3 scripts/check-sqlite-plan-stability.py
+      - name: Check SQL plans stay index-backed under QPSG
+        run: python3 scripts/check-sqlite-plan-stability.py
 
       # `daemon run` drives its futures on native workers, which have no
       # ambient Tokio runtime; production code names its Tokio handle.
-      - name: Test and check production code has no ambient Tokio call
-        run: |
-          python3 scripts/test-check-ambient-tokio.py
-          python3 scripts/check-ambient-tokio.py
+      - name: Check production code has no ambient Tokio call
+        run: python3 scripts/check-ambient-tokio.py
 
-      - name: Test and check rusqlite stays inside storage owners
-        run: |
-          python3 scripts/test-check-rusqlite-storage-boundary.py
-          python3 scripts/check-rusqlite-storage-boundary.py
+      - name: Check rusqlite stays inside storage owners
+        run: python3 scripts/check-rusqlite-storage-boundary.py
 
   # The macOS and Windows lanes run the same Bazel workspace the Linux
   # authority does: they exercise target-specific behavior the
@@ -419,11 +421,14 @@ jobs:
   # account for its libtest worker pool.
   # cli + code-index share one critical path (65m on a warm v2 cache, run
   # 38071732620), so they keep the workspace-code shard. One shared
-  # ci-linux-test-v2 prefix; root-b alone saves (a 6.9 GiB second family
+  # ci-linux-test-v2 prefix; root-b (or fleet) saves (a 6.9 GiB second family
   # previously evicted the budget). root-b and workspace catch unlisted
   # targets in their groups. root-a and root-b split the root crate's
   # suite time evenly (run 38689933223: about 330 s each on Linux, 550-600 s
   # on Windows); unit_test stays in root-b so only one shard compiles it.
+  # A trusted fleet run submits the whole workspace from one hosted runner.
+  # Hosted-only runs retain their shards so local CPU and disk limits do not
+  # serialize the entire workspace. Both routes feed the Test Linux check.
   linux-test:
     permissions:
       contents: read
@@ -436,51 +441,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - shard: root-a
-            targets: >-
-              //crates/tracedecay:mcp_suite
-              //crates/tracedecay:storage_suite
-              //crates/tracedecay:transport_acceptance_suite
-              //crates/tracedecay:session_suite
-              //crates/tracedecay:automation_runner_test
-              //crates/tracedecay:transcript_ingest_suite
-          - shard: root-b
-            targets: >-
-              --
-              //crates/tracedecay/...
-              -//crates/tracedecay:mcp_suite
-              -//crates/tracedecay:dashboard_api_test
-              -//crates/tracedecay:daemon_suite
-              -//crates/tracedecay:storage_suite
-              -//crates/tracedecay:transport_acceptance_suite
-              -//crates/tracedecay:session_suite
-              -//crates/tracedecay:automation_runner_test
-              -//crates/tracedecay:transcript_ingest_suite
-          - shard: workspace-code
-            targets: >-
-              --
-              //crates/tracedecay-cli/...
-              //crates/tracedecay-code-extraction/...
-              //crates/tracedecay-code-index/...
-              //crates/tracedecay-code-index-retention/...
-              //crates/tracedecay-code-index-runtime/...
-          # Everything outside the root crate except the cli and code-index
-          # group, plus the two root suites that finished root-a's queue.
-          # Root-a ran its suites one at a time for eleven minutes on Linux
-          # (run 38652711787) while this shard's tests took about one.
-          - shard: workspace
-            targets: >-
-              --
-              //...
-              -//crates/tracedecay/...
-              -//crates/tracedecay-cli/...
-              -//crates/tracedecay-code-extraction/...
-              -//crates/tracedecay-code-index/...
-              -//crates/tracedecay-code-index-retention/...
-              -//crates/tracedecay-code-index-runtime/...
-              //crates/tracedecay:dashboard_api_test
-              //crates/tracedecay:daemon_suite
+        shard: ${{ fromJSON(github.repository == 'ScriptedAlchemy/tracedecay' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+          && ((github.actor_id == '25274700' && vars.TS_BAZEL_CLIENT_ID)
+            || (github.actor_id == '158243242' && vars.TS_BAZEL_BOT_CLIENT_ID))
+          && '["fleet"]' || '["root-a","root-b","workspace-code","workspace"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -512,26 +476,97 @@ jobs:
         id: bazel
         with:
           cache-key: ci-linux-test-v2
-          # Tailscale independently checks this repository and immutable actor
-          # ID. This condition avoids requesting credentials for fork PRs.
-          tailscale-client-id: ${{ github.repository == 'ScriptedAlchemy/tracedecay' && github.actor_id == '25274700' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.TS_BAZEL_CLIENT_ID || '' }}
+          # Tailscale binds each client to this repository, workflow, and actor ID.
+          # Fork PRs never receive a fleet identity.
+          tailscale-client-id: >-
+            ${{ github.repository == 'ScriptedAlchemy/tracedecay' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+                && ((github.actor_id == '25274700' && vars.TS_BAZEL_CLIENT_ID)
+                    || (github.actor_id == '158243242' && vars.TS_BAZEL_BOT_CLIENT_ID)) || '' }}
           # Prefer v2; keep legacy prefixes as restore fallbacks if still present.
           extra-restore-keys: ci-linux-test,ci-linux-workspace-test
-          save-download-caches: ${{ matrix.shard == 'root-b' }}
+          save-download-caches: ${{ matrix.shard == 'root-b' || matrix.shard == 'fleet' }}
 
-      # Every shard runs latency-sensitive daemon journeys. Finish their
-      # compilation before testing so compiler work cannot consume that budget.
-      - name: Build this shard's test binaries
+      - name: Select Linux test targets
+        id: targets
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          case "$SHARD" in
+            fleet)
+              targets=(//...)
+              ;;
+            root-a)
+              targets=(
+                //crates/tracedecay:mcp_suite
+                //crates/tracedecay:storage_suite
+                //crates/tracedecay:transport_acceptance_suite
+                //crates/tracedecay:session_suite
+                //crates/tracedecay:automation_runner_test
+                //crates/tracedecay:transcript_ingest_suite
+              )
+              ;;
+            root-b)
+              targets=(
+                --
+                //crates/tracedecay/...
+                -//crates/tracedecay:mcp_suite
+                -//crates/tracedecay:dashboard_api_test
+                -//crates/tracedecay:daemon_suite
+                -//crates/tracedecay:storage_suite
+                -//crates/tracedecay:transport_acceptance_suite
+                -//crates/tracedecay:session_suite
+                -//crates/tracedecay:automation_runner_test
+                -//crates/tracedecay:transcript_ingest_suite
+              )
+              ;;
+            workspace-code)
+              targets=(
+                --
+                //crates/tracedecay-cli/...
+                //crates/tracedecay-code-extraction/...
+                //crates/tracedecay-code-index/...
+                //crates/tracedecay-code-index-retention/...
+                //crates/tracedecay-code-index-runtime/...
+              )
+              ;;
+            workspace)
+              targets=(
+                --
+                //...
+                -//crates/tracedecay/...
+                -//crates/tracedecay-cli/...
+                -//crates/tracedecay-code-extraction/...
+                -//crates/tracedecay-code-index/...
+                -//crates/tracedecay-code-index-retention/...
+                -//crates/tracedecay-code-index-runtime/...
+                //crates/tracedecay:dashboard_api_test
+                //crates/tracedecay:daemon_suite
+              )
+              ;;
+            *) echo "Unknown Linux test shard: $SHARD" >&2; exit 1 ;;
+          esac
+          if [[ $SHARD == fleet ]]; then
+            # Keep test binaries and intermediate outputs in the remote CAS.
+            # Bazel still downloads test logs and XML for failure diagnostics.
+            echo 'build --remote_download_outputs=minimal' >> .bazelrc.local
+          fi
+          {
+            echo "patterns=${targets[*]}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Finish compilation before latency-sensitive daemon journeys run.
+      - name: Build test binaries before latency-sensitive tests
         run: >-
           bazel build --config=ci
           --profile="${{ runner.temp }}/bazel-build-profile.json.gz"
-          ${{ matrix.targets }}
+          ${{ steps.targets.outputs.patterns }}
 
-      - name: Build and test this shard
+      - name: Build and test the selected targets
         run: >-
           bazel test --config=ci
+          --default_test_resources=cpu=HOST_CPUS
           --profile="${{ runner.temp }}/bazel-test-profile.json.gz"
-          ${{ matrix.targets }}
+          ${{ steps.targets.outputs.patterns }}
 
       - name: Upload Bazel execution profiles
         if: always()
@@ -557,7 +592,7 @@ jobs:
       # that would evict this prefix (observed: 6.9 GiB workspace-only save).
       # PR merge-ref caches let later pushes to the same PR reuse this build.
       - name: Save compiled Bazel actions
-        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'root-b' && steps.bazel.outputs.disk-cache-key != ''
+        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && (matrix.shard == 'root-b' || matrix.shard == 'fleet') && steps.bazel.outputs.disk-cache-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.bazel.outputs.disk-cache-path }}
@@ -742,9 +777,12 @@ jobs:
         id: bazel
         with:
           cache-key: ci-linux-clippy
-          # Tailscale independently checks this repository and immutable actor
-          # ID. This condition avoids requesting credentials for fork PRs.
-          tailscale-client-id: ${{ github.repository == 'ScriptedAlchemy/tracedecay' && github.actor_id == '25274700' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.TS_BAZEL_CLIENT_ID || '' }}
+          # Tailscale binds each client to this repository, workflow, and actor ID.
+          # Fork PRs never receive a fleet identity.
+          tailscale-client-id: >-
+            ${{ github.repository == 'ScriptedAlchemy/tracedecay' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+                && ((github.actor_id == '25274700' && vars.TS_BAZEL_CLIENT_ID)
+                    || (github.actor_id == '158243242' && vars.TS_BAZEL_BOT_CLIENT_ID)) || '' }}
           extra-restore-keys: ci-linux-test-v2
 
       - name: Run blocking Clippy policy
@@ -775,13 +813,14 @@ jobs:
 
       - uses: ./.github/actions/setup-pnpm
 
-      # One graph walk per push. The release resolver repeats it on the tag it
-      # builds, since a release is dispatched without waiting on this run.
+      # One graph walk per push; the NCM source contract is checked in Repository
+      # gates independently of the retired unpublished-crate release resolver.
       - name: Check the production feature graph
         run: python3 scripts/check-production-feature-profile.py
 
   # The configuration users actually receive: the release build of
-  # `tracedecay-cli`, whose default features are `production`. Nothing else on
+  # `tracedecay-cli`, whose defaults include production and memory-provider-host.
+  # Nothing else on
   # a push compiles it, so a break confined to the release graph (the
   # mimalloc allocator, the embedded dashboard, opt-level 3) would otherwise
   # first appear while a release is being cut.
@@ -804,7 +843,10 @@ jobs:
           config: release
           dest: target/x86_64-unknown-linux-gnu/release
           cache-key: release-x86_64-unknown-linux-gnu
-          tailscale-client-id: ${{ github.repository == 'ScriptedAlchemy/tracedecay' && github.actor_id == '25274700' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.TS_BAZEL_CLIENT_ID || '' }}
+          tailscale-client-id: >-
+            ${{ github.repository == 'ScriptedAlchemy/tracedecay' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+                && ((github.actor_id == '25274700' && vars.TS_BAZEL_CLIENT_ID)
+                    || (github.actor_id == '158243242' && vars.TS_BAZEL_BOT_CLIENT_ID)) || '' }}
 
       - name: Read immutable packaging inputs
         id: packaging
@@ -824,6 +866,16 @@ jobs:
           archive: tar.gz
           epoch: ${{ steps.packaging.outputs.epoch }}
 
+      - name: Exercise shipped MCP and LSP transports
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$GITHUB_WORKSPACE/target/x86_64-unknown-linux-gnu/release/tracedecay"
+          smoke_work="$(mktemp -d)"
+          trap 'rm -rf -- "$smoke_work"' EXIT
+          TRACEDECAY_BIN="$binary" bazel run //scripts:mcp-conformance-smoke.sh
+          bazel run //scripts:packaged_lsp_bridge -- "$binary" "$smoke_work/lsp"
+
   # Frontend checks require no Rust compilation and must also validate drafts.
   # Do not serialize them behind repository-wide Rust formatting and gates.
   dashboard:
@@ -831,66 +883,57 @@ jobs:
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      id-token: write
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-bazel
+        id: bazel
+        with:
+          cache-key: ci-dashboard
+          tailscale-client-id: >-
+            ${{ github.repository == 'ScriptedAlchemy/tracedecay' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+                && ((github.actor_id == '25274700' && vars.TS_BAZEL_CLIENT_ID)
+                    || (github.actor_id == '158243242' && vars.TS_BAZEL_BOT_CLIENT_ID)) || '' }}
+
+      - name: Check frontend types, tests, and artifacts
+        run: >-
+          bazel test --config=ci --test_output=errors
+          //dashboard:typecheck //dashboard:unit_test
+          //dashboard:bundle_sha256 //dashboard:bundle_determinism_test
+          //sdks/typescript:typecheck //sdks/typescript:unit_test
+          //plugin/chatgpt-extension:typecheck
+          //plugin/chatgpt-extension:adapter_test
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "26"
 
+      # Committed embedded bytes are generated with the pnpm package layout.
+      # Keep this comparison in that same layout; Bazel's package paths change
+      # bundler module IDs even when the source and dependency versions match.
       - uses: ./.github/actions/setup-pnpm
 
-      - name: Typecheck dashboard consumers
-        working-directory: dashboard
-        run: pnpm run typecheck
-
-      - name: Typecheck TypeScript SDK
-        working-directory: sdks/typescript
-        run: pnpm run typecheck
-
-      - name: Run TypeScript SDK unit tests
-        working-directory: sdks/typescript
-        run: pnpm test
-
-      - name: Build dashboard assets
-        working-directory: dashboard
-        run: pnpm run build
-
-      - name: Run dashboard unit tests
-        working-directory: dashboard
-        run: pnpm test
-
-      # The dashboard is one rsbuild app emitting `app-dist/` (the legacy
-      # shell/holographic/lcm/graph/savings bundle split no longer exists), so
-      # the bundle validator is the artifact authority and the determinism
-      # check hashes whatever the build actually produced.
-      - name: Verify embedded dist artifacts
-        working-directory: dashboard
-        run: |
-          set -euo pipefail
-          python3 ../scripts/check-dashboard-bundle.py app-dist
-          (cd app-dist && find . -type f | sort | xargs sha256sum) > /tmp/dashboard-dist.sha
-          pnpm run build
-          (cd app-dist && find . -type f | sort | xargs sha256sum) | diff /tmp/dashboard-dist.sha -
-
-      - name: Build TypeScript SDK for the ChatGPT extension
+      - name: Build TypeScript SDK for the embedded artifact check
         working-directory: sdks/typescript
         run: pnpm run build
-
-      - name: Typecheck ChatGPT extension
-        working-directory: plugin/chatgpt-extension
-        run: pnpm run typecheck
-
-      # extension.test.ts needs a tracedecay binary, which this job does not
-      # build; the adapter tests run against a fake `serve`.
-      - name: Run ChatGPT extension adapter tests
-        working-directory: plugin/chatgpt-extension
-        run: pnpm exec vitest run test/adapter.test.ts
 
       - name: Verify ChatGPT extension embedded artifacts
         working-directory: plugin/chatgpt-extension
         run: pnpm run check:embedded
+
+      - name: Upload failed frontend test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-bazel-test-logs
+          path: |
+            bazel-testlogs/dashboard/**/test.log
+            bazel-testlogs/sdks/typescript/**/test.log
+            bazel-testlogs/plugin/chatgpt-extension/**/test.log
 
   hermes-integration:
     name: Hermes integration (stock)
@@ -928,7 +971,7 @@ jobs:
           git -C "$RUNNER_TEMP/hermes-upstream" fetch --depth 1 origin "$HERMES_UPSTREAM_REF"
           git -C "$RUNNER_TEMP/hermes-upstream" checkout --detach FETCH_HEAD
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           enable-cache: true
           cache-dependency-glob: ${{ runner.temp }}/hermes-upstream/uv.lock

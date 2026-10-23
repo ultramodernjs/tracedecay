@@ -59,6 +59,7 @@ use super::{
 
 mod ingress;
 mod rejection;
+mod retention_writer_recovery;
 
 use ingress::{
     AuxiliaryWork, WorkerWake, apply_wake, drain_command_ingress, drain_ingress, enqueue,
@@ -69,11 +70,27 @@ use rejection::{
     reject_incremental_vacuum, reject_unauthorized,
 };
 
-/// When the blocked writer retries its drain: the fence's short interval, or
-/// the backoff once the fence expired and the WAL passed its write ceiling.
-fn drain_retry_due(checkpoint: &WriterCheckpointController) -> Option<Instant> {
+/// Physical checkpoint attempts obey both backoffs, but neither backoff may
+/// postpone snapshot revocation or fence expiry.
+fn checkpoint_retry_due(
+    checkpoint: &WriterCheckpointController,
+    recovery: &retention_writer_recovery::CheckpointFailurePolicy,
+    now: Instant,
+) -> Option<Instant> {
+    let attempt = recovery.retry_due(checkpoint.retry_due(now));
+    match (attempt, checkpoint.fence_deadline(now)) {
+        (Some(attempt), Some(fence)) => Some(attempt.min(fence)),
+        (attempt, fence) => attempt.or(fence),
+    }
+}
+
+/// When the blocked writer next services its drain or fence lifecycle.
+fn drain_retry_due(
+    checkpoint: &WriterCheckpointController,
+    recovery: &retention_writer_recovery::CheckpointFailurePolicy,
+) -> Option<Instant> {
     if checkpoint.hard_drain_required() {
-        checkpoint.retry_due(Instant::now())
+        checkpoint_retry_due(checkpoint, recovery, Instant::now())
     } else {
         None
     }
@@ -332,6 +349,8 @@ pub(super) struct Worker {
     pub(super) watermark_publisher: CommittedWatermarkPublisher,
     pub(super) checkpoint_status: watch::Sender<CheckpointStatus>,
     pub(super) checkpoint_pressure: watch::Sender<CheckpointPressure>,
+    pub(super) ledger_status:
+        watch::Sender<super::ledger_maintenance::WriterLedgerMaintenanceStatus>,
     pub(super) checkpoint_blockers: Arc<dyn CheckpointBlockerSource>,
     pub(super) on_file_lost: Option<super::FileLossNotice>,
     pub(super) started: SyncSender<Result<Option<u64>, WriterStartError>>,
@@ -354,6 +373,33 @@ impl FileProbe {
         }
         self.due = now + FILE_PROBE_INTERVAL;
         self.file.is_lost(&self.path)
+    }
+}
+
+/// The actor's originating writer capability, not authority reacquired by
+/// pathname. The pinned descriptor and lifecycle must still be live at every
+/// cleanup boundary. Epoch release/rebind is deliberately not manufactured here.
+struct PinnedWriterLedgerAuthority<'a> {
+    state: &'a AtomicU8,
+    shutdown: &'a AtomicBool,
+    file: Option<&'a OpenedDatabaseFile>,
+    path: &'a std::path::Path,
+}
+
+impl crate::RuntimeWriteAuthority for PinnedWriterLedgerAuthority<'_> {
+    fn verify(
+        &self,
+        _stage: RuntimeWriteAuthorityStage,
+    ) -> Result<(), crate::RuntimeWriteAuthorityError> {
+        if self.state.load(Ordering::Acquire) != WriterState::Ready as u8
+            || self.shutdown.load(Ordering::Acquire)
+            || self.file.is_some_and(|file| file.is_lost(self.path))
+        {
+            return Err(crate::RuntimeWriteAuthorityError::denied(
+                "originating writer no longer owns a ready, pinned file",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -462,7 +508,13 @@ impl Worker {
             checkpoint_config(&self.config),
         ) {
             Ok(checkpoint) => checkpoint,
-            Err(_) => return self.fail_start(WriterStartError::CheckpointSetupFailed),
+            Err(error) => {
+                tracing::error!(
+                    path = %self.path.display(), operation = "checkpoint_setup", error = ?error,
+                    "checkpoint policy installation failed"
+                );
+                return self.fail_start(WriterStartError::CheckpointSetupFailed);
+            }
         };
         #[cfg(any(unix, windows))]
         if let Some(opened_database) = self._opened_database.as_deref()
@@ -523,6 +575,14 @@ impl Worker {
         let mut prefer_auxiliary = true;
         let mut next_auxiliary = AuxiliaryWork::IncrementalVacuum;
         let mut hard_checkpoint_retry_due = None;
+        let mut checkpoint_recovery = retention_writer_recovery::CheckpointFailurePolicy::default();
+        let mut ledger_maintenance = super::ledger_maintenance::WriterLedgerMaintenance::new(
+            self.binding.clone(),
+            crate::runtime_ledger::WriterReplayWindowPolicy::default(),
+            256,
+            Instant::now(),
+        )
+        .expect("fixed writer ledger maintenance budgets are valid");
         #[cfg(unix)]
         let probe_path = self.canonical_path.clone();
         #[cfg(not(unix))]
@@ -633,10 +693,14 @@ impl Worker {
                 );
                 continue;
             }
+            self.service_checkpoint_fence(&mut checkpoint, &mut checkpoint_recovery);
+            if self.state.load(Ordering::Acquire) == WriterState::Faulted as u8 {
+                continue;
+            }
             if let Some(command) = checkpoint_queue.pop_front() {
-                self.run_requested_checkpoint(&mut checkpoint, command)
+                self.run_requested_checkpoint(&mut checkpoint, &mut checkpoint_recovery, command)
                     .await;
-                hard_checkpoint_retry_due = drain_retry_due(&checkpoint);
+                hard_checkpoint_retry_due = drain_retry_due(&checkpoint, &checkpoint_recovery);
                 continue;
             }
             if checkpoint.hard_drain_required() {
@@ -645,9 +709,11 @@ impl Worker {
                 let now = Instant::now();
                 let retry_due = hard_checkpoint_retry_due.get_or_insert(now);
                 if now >= *retry_due {
-                    self.telemetry.checkpoint_hard_retry();
-                    self.run_scheduled_checkpoint(&mut checkpoint);
-                    hard_checkpoint_retry_due = drain_retry_due(&checkpoint);
+                    if !checkpoint_recovery.defers(now) {
+                        self.telemetry.checkpoint_hard_retry();
+                    }
+                    self.run_scheduled_checkpoint(&mut checkpoint, &mut checkpoint_recovery);
+                    hard_checkpoint_retry_due = drain_retry_due(&checkpoint, &checkpoint_recovery);
                     continue;
                 }
                 let wake = wait_for_work(
@@ -682,6 +748,64 @@ impl Worker {
                 continue;
             }
             hard_checkpoint_retry_due = None;
+            // One bounded page between transactions, including idle stores.
+            // Faulted writers, hard drains and shutdown never enter this path.
+            if self.state.load(Ordering::Acquire) == WriterState::Ready as u8 {
+                let authority = PinnedWriterLedgerAuthority {
+                    state: &self.state,
+                    shutdown: &self.shutdown_requested,
+                    file: self._opened_database.as_deref(),
+                    #[cfg(unix)]
+                    path: &self.canonical_path,
+                    #[cfg(not(unix))]
+                    path: &self.path,
+                };
+                match ledger_maintenance.tick(
+                    checkpoint.connection_mut(),
+                    &authority,
+                    &self.shutdown_requested,
+                    tracedecay_contracts::now_micros().0,
+                    Instant::now(),
+                ) {
+                    Ok(Some(report)) => {
+                        if report.replay_window.rotation_required {
+                            tracing::warn!(path = %self.path.display(),
+                                rotation_required = true,
+                                blocker = report.handover_blocker,
+                                "writer replay window needs owner-coordinated rotation; live receipts retained");
+                        }
+                        let wrote = report.drain.deleted_rows > 0;
+                        let _ = self.ledger_status.send(
+                            super::ledger_maintenance::WriterLedgerMaintenanceStatus {
+                                latest: Some(report),
+                                last_error: None,
+                            },
+                        );
+                        if wrote {
+                            self.run_scheduled_checkpoint(
+                                &mut checkpoint,
+                                &mut checkpoint_recovery,
+                            );
+                        }
+                        // Cleanup can itself cross the WAL pressure threshold.
+                        if checkpoint.hard_drain_required() {
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(path = %self.path.display(), error = %error,
+                            "writer ledger maintenance degraded; retry on next idle deadline");
+                        let latest = self.ledger_status.borrow().latest.clone();
+                        let _ = self.ledger_status.send(
+                            super::ledger_maintenance::WriterLedgerMaintenanceStatus {
+                                latest,
+                                last_error: Some(error.to_string()),
+                            },
+                        );
+                    }
+                }
+            }
             if let Some(auxiliary) = select_auxiliary_work(
                 !exact_sql_queue.is_empty(),
                 !incremental_vacuum_queue.is_empty(),
@@ -714,8 +838,12 @@ impl Worker {
                             // a caller's snapshot after its reply includes it.
                             reply.send();
                             self.fit_page_cache(&mut page_cache, &mut checkpoint);
-                            self.run_scheduled_checkpoint(&mut checkpoint);
-                            hard_checkpoint_retry_due = drain_retry_due(&checkpoint);
+                            self.run_scheduled_checkpoint(
+                                &mut checkpoint,
+                                &mut checkpoint_recovery,
+                            );
+                            hard_checkpoint_retry_due =
+                                drain_retry_due(&checkpoint, &checkpoint_recovery);
                         } else {
                             reject_writer_command(command);
                         }
@@ -756,7 +884,8 @@ impl Worker {
                 }
                 // An expired fence keeps retrying with backoff even while no
                 // write arrives to run the checkpoint after its batch.
-                let checkpoint_retry = checkpoint.retry_due(Instant::now());
+                let checkpoint_retry =
+                    checkpoint_retry_due(&checkpoint, &checkpoint_recovery, Instant::now());
                 let wake = wait_for_work(
                     &self.cx,
                     &mut self.receiver,
@@ -768,12 +897,19 @@ impl Worker {
                     exact_sql_closed,
                     incremental_vacuum_closed,
                     checkpoint_closed,
-                    earliest(checkpoint_retry, probe.as_ref()),
+                    earliest(
+                        Some(
+                            checkpoint_retry.map_or(ledger_maintenance.next_due(), |retry| {
+                                retry.min(ledger_maintenance.next_due())
+                            }),
+                        ),
+                        probe.as_ref(),
+                    ),
                 )
                 .await;
                 if matches!(wake, WorkerWake::CheckpointRetry) {
                     if checkpoint_retry.is_some_and(|due| Instant::now() >= due) {
-                        self.run_scheduled_checkpoint(&mut checkpoint);
+                        self.run_scheduled_checkpoint(&mut checkpoint, &mut checkpoint_recovery);
                     }
                     continue;
                 }
@@ -867,7 +1003,7 @@ impl Worker {
                     &self.watermark_publisher,
                 );
                 self.fit_page_cache(&mut page_cache, &mut checkpoint);
-                self.run_scheduled_checkpoint(&mut checkpoint);
+                self.run_scheduled_checkpoint(&mut checkpoint, &mut checkpoint_recovery);
                 if checkpoint.hard_drain_required() {
                     for pending in batches {
                         for item in pending.items {
@@ -875,7 +1011,7 @@ impl Worker {
                             let _ = enqueue(&mut queue, &mut inflight, item, &self.telemetry);
                         }
                     }
-                    hard_checkpoint_retry_due = drain_retry_due(&checkpoint);
+                    hard_checkpoint_retry_due = drain_retry_due(&checkpoint, &checkpoint_recovery);
                     break;
                 }
                 if self.state.load(Ordering::Acquire) == WriterState::Faulted as u8 {
@@ -906,9 +1042,14 @@ impl Worker {
                 self.state
                     .store(WriterState::Closed as u8, Ordering::Release);
             }
-            Err(_) => self
-                .state
-                .store(WriterState::Faulted as u8, Ordering::Release),
+            Err(error) => {
+                tracing::error!(
+                    path = %self.path.display(), operation = "shutdown_checkpoint", error = ?error,
+                    "shutdown checkpoint failed"
+                );
+                self.state
+                    .store(WriterState::Faulted as u8, Ordering::Release);
+            }
         }
     }
 
@@ -917,20 +1058,110 @@ impl Worker {
         page_cache: &mut connection::WriterPageCache,
         checkpoint: &mut WriterCheckpointController,
     ) {
-        if page_cache.fit(checkpoint.connection_mut()).is_err() {
+        if let Err(error) = page_cache.fit(checkpoint.connection_mut()) {
+            tracing::error!(
+                path = %self.path.display(), operation = "page_cache_fit", error = ?error,
+                "page cache policy failed; writer is now faulted"
+            );
             self.state
                 .store(WriterState::Faulted as u8, Ordering::Release);
         }
     }
 
-    fn run_scheduled_checkpoint(&self, checkpoint: &mut WriterCheckpointController) {
+    /// Revocation and expiry are lifecycle work, even while a resource error
+    /// defers physical checkpoint attempts. Run before command dispatch as well
+    /// as on timer wakes so incoming work cannot starve the fence deadlines.
+    fn service_checkpoint_fence(
+        &self,
+        checkpoint: &mut WriterCheckpointController,
+        recovery: &mut retention_writer_recovery::CheckpointFailurePolicy,
+    ) {
         let now = Instant::now();
-        if checkpoint.defers_scheduled(now) {
+        if self.state.load(Ordering::Acquire) != WriterState::Ready as u8 {
             return;
         }
         if checkpoint.revocation_due(now) {
             self.checkpoint_blockers
                 .revoke_snapshots_older_than(FENCE_READ_DEADLINE);
+        }
+        if !recovery.defers(now) {
+            return;
+        }
+        match checkpoint.expire_fence(now) {
+            Ok(Some(sample)) => {
+                let mut holders = self.checkpoint_blockers.checkpoint_blockers();
+                if holders.is_clear() {
+                    #[cfg(unix)]
+                    let database = &self.canonical_path;
+                    #[cfg(not(unix))]
+                    let database = &self.path;
+                    holders = foreign_wal_holders(database);
+                }
+                let wal = CheckpointWal::from_sample(sample);
+                let pressure = if checkpoint.hard_drain_required() {
+                    CheckpointPressure::BlockGeneral {
+                        wal,
+                        blockers: holders,
+                    }
+                } else {
+                    CheckpointPressure::FenceExpired { wal, holders }
+                };
+                tracing::warn!(
+                    path = %self.path.display(), wal_bytes = sample.bytes,
+                    "hard WAL fence expired while physical checkpoint is deferred"
+                );
+                // This is a lifecycle transition, not a checkpoint attempt:
+                // leave its latest result and resource backoff untouched.
+                let _ = self.checkpoint_pressure.send(pressure);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if recovery.record_failure(&self.path, "checkpoint_fence_expiry", &error, now) {
+                    self.state
+                        .store(WriterState::Faulted as u8, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    fn run_scheduled_checkpoint(
+        &self,
+        checkpoint: &mut WriterCheckpointController,
+        recovery: &mut retention_writer_recovery::CheckpointFailurePolicy,
+    ) {
+        let now = Instant::now();
+        if self.state.load(Ordering::Acquire) != WriterState::Ready as u8 {
+            return;
+        }
+        if checkpoint.defers_scheduled(now) || recovery.defers(now) {
+            // Physical checkpoint retries back off, not pressure admission.
+            // This also refreshes the twice-hard ceiling after an expired
+            // fence while new writes are allowed below that ceiling.
+            match checkpoint.sample_admission_pressure(now) {
+                Ok(sample) => {
+                    let pressure = if checkpoint.hard_drain_required() {
+                        CheckpointPressure::BlockGeneral {
+                            wal: CheckpointWal::from_sample(sample),
+                            blockers: self.checkpoint_blockers.checkpoint_blockers(),
+                        }
+                    } else if checkpoint.names_holders(now) {
+                        CheckpointPressure::FenceExpired {
+                            wal: CheckpointWal::from_sample(sample),
+                            holders: self.checkpoint_blockers.checkpoint_blockers(),
+                        }
+                    } else {
+                        CheckpointPressure::Open
+                    };
+                    let _ = self.checkpoint_pressure.send(pressure);
+                }
+                Err(error) => {
+                    if recovery.record_failure(&self.path, "wal_pressure_sample", &error, now) {
+                        self.state
+                            .store(WriterState::Faulted as u8, Ordering::Release);
+                    }
+                }
+            }
+            return;
         }
         let mut snapshot_blockers = self.checkpoint_blockers.checkpoint_blockers();
         if checkpoint.names_holders(now) && snapshot_blockers.is_clear() {
@@ -942,19 +1173,31 @@ impl Worker {
         }
         let match_result = {
             let _span = tracing::trace_span!("rusqlite.writer.checkpoint").entered();
-            checkpoint.evaluate_scheduled(snapshot_blockers)
+            #[cfg(test)]
+            let injected =
+                retention_writer_recovery::injected_failure(&self.path, "scheduled_checkpoint");
+            #[cfg(not(test))]
+            let injected = None;
+            match injected {
+                Some(error) => Err(error),
+                None => checkpoint.evaluate_scheduled(snapshot_blockers),
+            }
         };
         match match_result {
-            Ok(result) => self.publish_checkpoint_result(result),
-            // A scheduled checkpoint that could not run this time because
-            // readers still hold snapshots, the authority lapsed, or SQLite
-            // reported the WAL busy is retried on the next schedule; only a
-            // broken policy or a real driver failure faults the writer, the
-            // same classification the requested path applies.
-            Err(error) if scheduled_checkpoint_error_is_transient(&error) => {}
-            Err(_) => {
-                self.state
-                    .store(WriterState::Faulted as u8, Ordering::Release);
+            Ok(result) => {
+                recovery.record_result(&result);
+                self.publish_checkpoint_result(result);
+            }
+            Err(error) => {
+                if recovery.record_failure(
+                    &self.path,
+                    "scheduled_checkpoint",
+                    &error,
+                    Instant::now(),
+                ) {
+                    self.state
+                        .store(WriterState::Faulted as u8, Ordering::Release);
+                }
             }
         }
     }
@@ -962,6 +1205,7 @@ impl Worker {
     async fn run_requested_checkpoint(
         &mut self,
         checkpoint: &mut WriterCheckpointController,
+        recovery: &mut retention_writer_recovery::CheckpointFailurePolicy,
         command: CheckpointCommand,
     ) {
         if let Err(error) = command.verify(RuntimeWriteAuthorityStage::Dequeued) {
@@ -970,15 +1214,33 @@ impl Worker {
         }
         self.checkpoint_blockers.await_released_snapshots().await;
         let (snapshot_blockers, probe, authority, reply) = command.into_parts();
-        let result = checkpoint.evaluate_interruptible(snapshot_blockers, move || {
-            match probe.interruption() {
-                Some(RuntimeInterruptionV1::Cancelled) => Some(CheckpointInterruption::Cancelled),
-                Some(RuntimeInterruptionV1::DeadlineExceeded) => {
-                    Some(CheckpointInterruption::DeadlineExceeded)
-                }
-                None => None,
-            }
-        });
+        if let Some(error) = recovery.deferred_error(Instant::now())
+            && probe.interruption().is_none()
+        {
+            reply.settle(Err(retention_writer_recovery::with_sqlite_codes(error)));
+            return;
+        }
+        #[cfg(test)]
+        let injected =
+            retention_writer_recovery::injected_failure(&self.path, "requested_checkpoint");
+        #[cfg(not(test))]
+        let injected = None;
+        let result = injected.map_or_else(
+            || {
+                checkpoint.evaluate_interruptible(snapshot_blockers, move || {
+                    match probe.interruption() {
+                        Some(RuntimeInterruptionV1::Cancelled) => {
+                            Some(CheckpointInterruption::Cancelled)
+                        }
+                        Some(RuntimeInterruptionV1::DeadlineExceeded) => {
+                            Some(CheckpointInterruption::DeadlineExceeded)
+                        }
+                        None => None,
+                    }
+                })
+            },
+            Err,
+        );
         match result {
             Ok(result) => {
                 if authority
@@ -990,19 +1252,21 @@ impl Worker {
                     )));
                     return;
                 }
+                recovery.record_result(&result);
                 self.publish_checkpoint_result(result.clone());
                 reply.settle(Ok(result));
             }
             Err(error) => {
-                if matches!(
+                if recovery.record_failure(
+                    &self.path,
+                    "requested_checkpoint",
                     &error,
-                    crate::checkpoint::CheckpointError::Driver(_)
-                        | crate::checkpoint::CheckpointError::InvalidConfig(_)
+                    Instant::now(),
                 ) {
                     self.state
                         .store(WriterState::Faulted as u8, Ordering::Release);
                 }
-                reply.settle(Err(error));
+                reply.settle(Err(retention_writer_recovery::with_sqlite_codes(error)));
             }
         }
     }
@@ -1263,26 +1527,6 @@ fn build_batches(
         batches.push(batch);
     }
     batches
-}
-
-/// Whether a failed scheduled checkpoint is a deferral rather than a fault.
-fn scheduled_checkpoint_error_is_transient(
-    error: &crate::checkpoint::CheckpointError<crate::checkpoint::RusqliteCheckpointError>,
-) -> bool {
-    match error {
-        crate::checkpoint::CheckpointError::AuthorityDenied(_) => true,
-        crate::checkpoint::CheckpointError::Driver(
-            crate::checkpoint::RusqliteCheckpointError::Sqlite(rusqlite::Error::SqliteFailure(
-                failure,
-                _,
-            )),
-        ) => matches!(
-            failure.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        ),
-        crate::checkpoint::CheckpointError::Driver(_)
-        | crate::checkpoint::CheckpointError::InvalidConfig(_) => false,
-    }
 }
 
 #[cfg(test)]

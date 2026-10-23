@@ -1325,7 +1325,8 @@ fn attached_child_that_never_arrives_is_reaped_without_a_waiter_leak() -> TestRe
         Duration::from_secs(2),
         Duration::from_millis(200),
     )
-    .expect_err("a child that never signals arrival must fail");
+    .err()
+    .ok_or("a child that never signals arrival must fail")?;
     assert!(
         error.to_string().contains("arrival stage"),
         "unexpected failure: {error}"

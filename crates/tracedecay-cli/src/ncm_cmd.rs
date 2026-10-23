@@ -3409,6 +3409,8 @@ fn write_atomic(path: &Path, kind: &str, bytes: &[u8]) -> Result<()> {
 }
 
 fn set_worker_mode(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3569,12 +3571,15 @@ mod tests {
         ControlPaths, MODEL_ACQUISITION_MANIFEST_NAME, NcmControlJournalV1, NcmControlOperation,
         NcmJournalPhase, NcmScopeArgs, RECEIPT_FILE_PREFIX, RECEIPT_FILE_SUFFIX,
         TRUSTED_MODEL_ACQUISITION_MANIFEST, WORKER_MANIFEST_NAME, WORKER_NAME,
-        before_observer_bundle_is_available, cleanup_previous_control_worker,
-        daemon_endpoint_is_reachable, daemon_profile_has_live_owner, latest_receipt,
+        before_observer_bundle_is_available, cleanup_previous_control_worker, latest_receipt,
         namespace_binding_for_install, new_operation_id, now_unix, observer_document,
         operation_id_for_identity, publish_worker, read_verified_model_acquisition_manifest,
-        refuse_pending_journal, remove_control_worker_bundle, remove_guarded,
-        require_absolute_path, sha256_hex, validate_journal, validate_journal_document_binding,
+        remove_control_worker_bundle, remove_guarded, require_absolute_path, sha256_hex,
+        validate_journal, validate_journal_document_binding,
+    };
+    #[cfg(unix)]
+    use super::{
+        daemon_endpoint_is_reachable, daemon_profile_has_live_owner, refuse_pending_journal,
     };
     use std::fs;
     use std::io::Write;

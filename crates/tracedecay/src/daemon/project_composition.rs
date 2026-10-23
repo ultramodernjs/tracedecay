@@ -27,6 +27,7 @@ mod code_index_activation;
 mod full_owner_mount;
 #[cfg(test)]
 mod future_size_tests;
+mod hook_source_pending;
 #[cfg(feature = "memory-provider-host")]
 mod ncm_observer;
 mod runtime;
@@ -36,6 +37,7 @@ use code_index_activation::{
     code_index_freshness_probe_sink, code_index_hook_sink, code_index_reconcile_sink,
 };
 use full_owner_mount::join_independent_full_owner_mounts;
+pub(in crate::daemon) use hook_source_pending::project_hook_source_pending;
 #[cfg(feature = "memory-provider-host")]
 pub(super) use ncm_observer::NcmWorkerOwnerSlot;
 pub(in crate::daemon) use runtime::ProductionProjectCompositionRuntime;
@@ -67,6 +69,7 @@ fn project_memory_provider_activation(
 pub(super) struct ProductionProjectComposition {
     #[cfg(unix)]
     pub(super) key: ProjectServerKey,
+    #[cfg(any(unix, test, feature = "test-transport"))]
     pub(super) canonical_project_path: PathBuf,
     pub(super) server: Arc<crate::mcp::McpServer>,
     #[cfg(unix)]
@@ -532,9 +535,12 @@ async fn production_project_server_inner(
             return Err(error);
         }
     };
+    #[cfg(not(unix))]
+    let _ = inserted;
     Ok(ProductionProjectComposition {
         #[cfg(unix)]
         key: opened.key,
+        #[cfg(any(unix, test, feature = "test-transport"))]
         canonical_project_path: canonical_project_path.to_path_buf(),
         server: resolved,
         #[cfg(unix)]
@@ -1060,6 +1066,13 @@ impl ProjectOpenInputs<'_> {
         )?;
         #[cfg(feature = "memory-provider-host")]
         let memory_provider_activation = project_memory_provider_activation(runtime_configuration)?;
+        let pending_source = project_hook_source_pending(
+            self.store_administration,
+            cg,
+            self.canonical_project_path,
+            &code_index.scope,
+        )
+        .await?;
         let code_index_mount = code_index_activation_mount(CodeIndexActivationMountInputs {
             invocation: self.invocation.clone(),
             project_id: code_index.project_id.clone(),
@@ -1072,6 +1085,7 @@ impl ProjectOpenInputs<'_> {
             cancellation: route_cancellation.clone(),
             graph_runtime: Arc::clone(&graph_runtime),
             graph_publication_database: Arc::new(cg.db().clone()),
+            pending_source,
         });
         let code_index_hint_sink = code_index_activation_hint_sink(
             self.invocation.code_index_schedulers.clone(),
@@ -1141,11 +1155,13 @@ impl ProjectOpenInputs<'_> {
                 ncm_observer::construct_ncm_registration_with_authority(
                     &owners,
                     &profile_id,
-                    worker_binary,
-                    state_root,
-                    registration_revision,
-                    mode,
-                    namespace_binding,
+                    ncm_observer::NcmRegistrationSettings {
+                        worker_binary,
+                        state_root,
+                        registration_revision,
+                        mode,
+                        namespace_binding,
+                    },
                     authority,
                 )
                 .map_err(|error| error.to_string())
@@ -2285,10 +2301,11 @@ fn cached_project_composition(
     server: Arc<crate::mcp::McpServer>,
 ) -> ProductionProjectComposition {
     #[cfg(not(unix))]
-    let _ = key;
+    let _ = (key, canonical_project_path);
     ProductionProjectComposition {
         #[cfg(unix)]
         key,
+        #[cfg(any(unix, test, feature = "test-transport"))]
         canonical_project_path: canonical_project_path.to_path_buf(),
         server,
         #[cfg(unix)]

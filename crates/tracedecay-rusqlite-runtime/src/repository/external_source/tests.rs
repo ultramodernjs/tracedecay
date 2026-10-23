@@ -1716,3 +1716,5 @@ fn writer_reads_only_the_current_objects_a_commit_names() {
         naming_nothing.idempotency_key()
     );
 }
+
+mod bookkeeping_compaction;

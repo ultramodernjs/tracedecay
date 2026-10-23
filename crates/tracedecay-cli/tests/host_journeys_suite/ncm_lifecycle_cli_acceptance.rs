@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay_contracts::{ApplicationEnvelope, ApplicationOutcome, ResolvedSetting};
 use tracedecay_daemon_identity::authority::current_record;
-use tracedecay_daemon_protocol::BrokerStream;
+use tracedecay_daemon_protocol::DaemonClientStream;
 use tracedecay_runtime_core::config::ProfileRoot;
 use tracedecay_runtime_core::test_executable::link_or_copy_executable;
 
@@ -1201,7 +1201,7 @@ fn wait_for_authority(daemon: &mut Child, profile_root: &Path) {
                 matches!(
                     tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        BrokerStream::connect(&record.endpoint),
+                        DaemonClientStream::connect(&record.endpoint),
                     )
                     .await,
                     Ok(Ok(_))

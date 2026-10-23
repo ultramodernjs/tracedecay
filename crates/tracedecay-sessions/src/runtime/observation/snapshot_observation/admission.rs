@@ -866,6 +866,9 @@ fn remember_committed_cursor(
         ObservationPersistOutcome::ExactDuplicate(_) => {
             cursors.remove(source);
         }
+        ObservationPersistOutcome::SourceExcluded(cursor) => {
+            cursors.insert(source.clone(), Some(cursor.clone()));
+        }
         ObservationPersistOutcome::Committed(receipt)
         | ObservationPersistOutcome::CoveredDuplicate(receipt) => {
             cursors.insert(source.clone(), Some(receipt.committed_cursor().clone()));

@@ -23,6 +23,11 @@ use tracedecay_sessions::runtime::{SessionMessageRecord, SessionStoreAccess};
 use tracedecay_temporal_query::execution::ExecutionControl;
 use tracedecay_temporal_query::execution::TemporalPortError;
 
+struct CompressionContinuation<'a> {
+    retained: Option<compression::RetainedCompressionGuard>,
+    expected_summary: Option<&'a tracedecay_lcm::LcmSummaryRequest>,
+}
+
 fn drive_lcm_compression<'a>(
     transaction: &'a crate::RegisteredGlobalDbWriteTransaction<'a>,
     scope: &'a ObservationScopeV1,
@@ -33,8 +38,7 @@ fn drive_lcm_compression<'a>(
     storage_root: &'a Path,
     request: &'a LcmCompressionRequest,
     payload_rollback: &'a mut payload::PayloadFileRollback,
-    retained: Option<compression::RetainedCompressionGuard>,
-    expected_summary: Option<&'a tracedecay_lcm::LcmSummaryRequest>,
+    continuation: CompressionContinuation<'a>,
 ) -> Pin<
     Box<
         dyn Future<
@@ -59,8 +63,8 @@ fn drive_lcm_compression<'a>(
             storage_root,
             request,
             payload_rollback,
-            retained,
-            expected_summary,
+            continuation.retained,
+            continuation.expected_summary,
         ));
         let classified = match begun.await? {
             compression::CompressionAdmission::Finished(response) => return Ok(response),
@@ -360,8 +364,10 @@ impl RegisteredGlobalDb {
                 storage_root,
                 request,
                 &mut payload_rollback,
-                None,
-                source_guard.map(|(summary, _)| summary),
+                CompressionContinuation {
+                    retained: None,
+                    expected_summary: source_guard.map(|(summary, _)| summary),
+                },
             ),
             tracing::trace_span!("sessions.lcm.compress"),
         );
@@ -475,13 +481,15 @@ impl RegisteredGlobalDb {
                 storage_root,
                 request,
                 &mut payload_rollback,
-                Some(guard),
-                expected_summary,
+                CompressionContinuation {
+                    retained: Some(guard),
+                    expected_summary,
+                },
             ),
             tracing::trace_span!("sessions.lcm.compress"),
         );
         let bounded = compressed.await?;
-        if bounded.response.status != "needs_summary"
+        if bounded.response.outcome()? == tracedecay_lcm::LcmCompressionOutcome::Complete
             && let Some(candidate) = convergence_candidate
         {
             let state = if bounded.has_more {

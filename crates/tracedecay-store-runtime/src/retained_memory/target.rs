@@ -94,7 +94,13 @@ pub async fn open_project_retained_memory_target(
         if authority.project_id != *admitted_project_id {
             return denied();
         }
-        if authority.served_project_root != registered_root {
+        // A registered host root may be plain while the graph carries the
+        // Windows verbatim spelling. Authorize the directory identity, not its
+        // spelling; the mounted and on-disk project IDs must still agree.
+        if !tracedecay_runtime_core::path_safety::same_canonical_path(
+            &authority.served_project_root,
+            registered_root,
+        ) {
             return denied();
         }
         if authority.store_layout_project_id != *admitted_project_id {
@@ -396,6 +402,42 @@ mod tests {
             error,
             RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized
         ));
+    }
+
+    #[tokio::test]
+    async fn same_project_root_aliases_allow_reads_and_writes() {
+        let fixture = MemoryTargetFixture::new("root-aliases").await;
+        let canonical_root = fixture.project_root.canonicalize().expect("canonical root");
+        let host_root = tracedecay_runtime_core::path_safety::plain_host_path(&canonical_root);
+        let child = host_root.join("existing-child");
+        std::fs::create_dir(&child).expect("existing alias ancestor");
+        let alias_root = child.join("..");
+        assert_ne!(alias_root, canonical_root, "exercise a different spelling");
+        let roots = [host_root, alias_root];
+        for root in &roots {
+            // Exercise both graph/registry directions. On Windows the canonical
+            // root is verbatim and host_root is plain; the child/.. alias also
+            // makes the identity check nontrivial on Unix.
+            for (served, registered) in [(&canonical_root, root), (root, &canonical_root)] {
+                let authority = fixture.authority(fixture.project_id.clone(), served.clone());
+                for access in [MemoryTargetAccessV1::Read, MemoryTargetAccessV1::Write] {
+                    let target =
+                        open_same_project_with(&authority, registered, &fixture.project_id, access)
+                            .await
+                            .expect("the same directory identity must authorize");
+                    assert_eq!(
+                        target.owner(),
+                        &FactOwnerV1::Project {
+                            project_id: fixture.project_id.clone(),
+                        },
+                    );
+                    assert_eq!(
+                        target.database().is_writable(),
+                        access == MemoryTargetAccessV1::Write,
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

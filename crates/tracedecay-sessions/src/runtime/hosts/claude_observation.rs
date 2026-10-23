@@ -151,6 +151,7 @@ impl ClaudeObservationIngestStats {
 pub struct CapturedClaudeFrame {
     pub committed_cursor: ObservationSourceCursorV1,
     pub exact_duplicate: bool,
+    pub source_excluded: bool,
 }
 
 #[derive(Debug, Error)]
@@ -448,6 +449,7 @@ async fn capture_frame<A: HostAdmission + ?Sized>(
                 return Ok(FrameCaptureOutcome::Persisted(CapturedClaudeFrame {
                     committed_cursor: durable,
                     exact_duplicate: true,
+                    source_excluded: false,
                 }));
             }
             return Err(mapped.into());
@@ -456,9 +458,9 @@ async fn capture_frame<A: HostAdmission + ?Sized>(
     match captured {
         CaptureObservationOutcome::Persisted { outcome, .. }
         | CaptureObservationOutcome::AcceptedForReplay { outcome, .. } => {
-            let receipt = outcome.receipt();
             Ok(FrameCaptureOutcome::Persisted(CapturedClaudeFrame {
-                committed_cursor: receipt.committed_cursor().clone(),
+                committed_cursor: outcome.committed_cursor().clone(),
+                source_excluded: matches!(*outcome, ObservationPersistOutcome::SourceExcluded(_)),
                 exact_duplicate: matches!(
                     *outcome,
                     ObservationPersistOutcome::ExactDuplicate(_)
@@ -881,7 +883,9 @@ async fn apply_scanned_segment<A: HostAdmission + ?Sized>(
                         observation_cursor.take(),
                         &captured.committed_cursor,
                     ));
-                    if captured.exact_duplicate {
+                    if captured.source_excluded {
+                        stats.cursor_advances = stats.cursor_advances.saturating_add(1);
+                    } else if captured.exact_duplicate {
                         stats.observation_duplicates =
                             stats.observation_duplicates.saturating_add(1);
                     } else {
@@ -1039,12 +1043,13 @@ async fn capture_frame_window<A: HostAdmission + ?Sized>(
                 match outcome {
                     CaptureObservationOutcome::Persisted { outcome, .. }
                     | CaptureObservationOutcome::AcceptedForReplay { outcome, .. } => {
-                        let receipt = outcome.receipt();
                         *observation_cursor = Some(cursor_after_receipt(
                             observation_cursor.take(),
-                            receipt.committed_cursor(),
+                            outcome.committed_cursor(),
                         ));
-                        if matches!(
+                        if matches!(*outcome, ObservationPersistOutcome::SourceExcluded(_)) {
+                            stats.cursor_advances = stats.cursor_advances.saturating_add(1);
+                        } else if matches!(
                             *outcome,
                             ObservationPersistOutcome::ExactDuplicate(_)
                                 | ObservationPersistOutcome::CoveredDuplicate(_)

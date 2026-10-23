@@ -8,10 +8,6 @@ use std::time::Duration;
 
 use serde_json::json;
 use tempfile::TempDir;
-use tracing::Subscriber;
-use tracing::span::{Attributes, Id};
-use tracing_subscriber::Layer;
-use tracing_subscriber::layer::{Context, SubscriberExt};
 
 use super::SessionTemporalRefreshTestAuthority;
 use tracedecay_domain::{
@@ -29,7 +25,7 @@ use tracedecay_session_runtime::session_sync::test_harness::SessionTemporalRefre
 use tracedecay_session_runtime::session_sync::test_harness::configure_scheduler;
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::history::{
     SessionHistoricalCapacityRelease, SessionHistoricalIngestOutcome, SessionHistoricalIngestPass,
-    SessionHistoricalIngestor,
+    SessionHistoricalIngestor, SessionHistoricalPass,
 };
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::projector::{
     CanonicalSessionTemporalProjector, SessionTemporalRefreshEffect, SessionTemporalRefreshPolicy,
@@ -105,6 +101,7 @@ impl SessionHistoricalIngestor for ScriptedHistoricalIngestor {
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_front()
                 .unwrap_or(SessionHistoricalIngestOutcome::Complete)
+                .into()
         })
     }
 
@@ -212,6 +209,9 @@ impl HealthyProvidersWithBlockedCursorIngestor {
             ObservationPersistOutcome::CoveredDuplicate(_) => {
                 panic!("fixture replay must be an exact duplicate")
             }
+            ObservationPersistOutcome::SourceExcluded(_) => {
+                panic!("fixture provider source is never excluded")
+            }
         }
     }
 }
@@ -230,6 +230,7 @@ impl SessionHistoricalIngestor for HealthyProvidersWithBlockedCursorIngestor {
                 reason_code: "observation_cursor_advance_collision".to_owned(),
                 made_progress: claude_progress || codex_progress,
             }
+            .into()
         })
     }
 
@@ -254,7 +255,7 @@ impl SessionHistoricalIngestor for CompleteHealthyProvidersIngestor {
             self.0
                 .admit_healthy_provider("codex", "session.healthy.codex")
                 .await;
-            SessionHistoricalIngestOutcome::Complete
+            SessionHistoricalIngestOutcome::Complete.into()
         })
     }
 
@@ -303,7 +304,7 @@ impl SessionHistoricalIngestor for PanicOnceHistoricalIngestor {
                 self.passes.increment() != 0,
                 "historical ingest panic fixture"
             );
-            SessionHistoricalIngestOutcome::Complete
+            SessionHistoricalIngestOutcome::Complete.into()
         })
     }
 
@@ -339,7 +340,7 @@ impl BlockThirdHistoricalIngestor {
 impl SessionHistoricalIngestor for BlockThirdHistoricalIngestor {
     fn run_pass(&self) -> SessionHistoricalIngestPass<'_> {
         Box::pin(async move {
-            match self.passes.fetch_add(1, Ordering::AcqRel) {
+            let outcome = match self.passes.fetch_add(1, Ordering::AcqRel) {
                 0 => SessionHistoricalIngestOutcome::Complete,
                 1 => {
                     // The refused capacity frees while this pass is running.
@@ -359,7 +360,8 @@ impl SessionHistoricalIngestor for BlockThirdHistoricalIngestor {
                         made_progress: false,
                     }
                 }
-            }
+            };
+            outcome.into()
         })
     }
 
@@ -380,7 +382,8 @@ impl SessionHistoricalIngestor for RetryThenBlockHistoricalIngestor {
                 return SessionHistoricalIngestOutcome::Retryable {
                     reason_code: "provider_busy".to_owned(),
                     made_progress: false,
-                };
+                }
+                .into();
             }
             loop {
                 // notify_waiters covers futures created before cancellation,
@@ -391,7 +394,7 @@ impl SessionHistoricalIngestor for RetryThenBlockHistoricalIngestor {
                 }
                 notified.await;
             }
-            SessionHistoricalIngestOutcome::Cancelled
+            SessionHistoricalIngestOutcome::Cancelled.into()
         })
     }
 
@@ -417,9 +420,7 @@ impl CancelAwareHistoricalIngestor {
 }
 
 impl SessionHistoricalIngestor for CancelAwareHistoricalIngestor {
-    fn run_pass(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = SessionHistoricalIngestOutcome> + Send + '_>> {
+    fn run_pass(&self) -> Pin<Box<dyn Future<Output = SessionHistoricalPass> + Send + '_>> {
         Box::pin(async move {
             self.entered.send_replace(true);
             loop {
@@ -430,7 +431,7 @@ impl SessionHistoricalIngestor for CancelAwareHistoricalIngestor {
                 notified.await;
             }
             self.exited.store(true, Ordering::Release);
-            SessionHistoricalIngestOutcome::Cancelled
+            SessionHistoricalIngestOutcome::Cancelled.into()
         })
     }
 
@@ -554,21 +555,21 @@ async fn wait_until(predicate: impl Fn() -> bool, timeout: Duration) -> bool {
     true
 }
 
-struct SummaryConvergencePageCensus(Arc<AtomicUsize>);
-
-impl<S: Subscriber> Layer<S> for SummaryConvergencePageCensus {
-    fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
-        if attributes.metadata().name() == "daemon.lcm.summary_convergence.page" {
-            self.0.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-}
-
 #[tokio::test]
 async fn initial_projection_discovery_failure_withholds_summary_admission_until_recovery() {
     let temp = TempDir::new().unwrap();
     let authority = profile_authority(&temp, "history-initial-discovery-failure").await;
     let path = authority.database().db_path().to_path_buf();
+    let seeded = HealthyProvidersWithBlockedCursorIngestor::new(authority.database.clone());
+    assert!(
+        seeded
+            .admit_healthy_provider("claude", "session.initial-discovery-recovery")
+            .await
+    );
+    // The native worker does not inherit a thread-local tracing subscriber.
+    // Use the durable summary backfill frontier as an admission witness instead.
+    let backfill_census = "SELECT COUNT(*) FROM lcm_gc_meta
+        WHERE key = 'summary_convergence_queue_backfill_store_id_v1'";
     // Cached readers survive pathname loss. Temporarily withhold the discovery
     // table through the registered writer so the real refresh query must fail.
     authority
@@ -580,10 +581,6 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
         )
         .await
         .unwrap();
-    let pages = Arc::new(AtomicUsize::new(0));
-    let _capture = tracedecay_runtime_core::logging::set_tracing_capture(
-        tracing_subscriber::registry().with(SummaryConvergencePageCensus(Arc::clone(&pages))),
-    );
     let report = run_session_temporal_refresh_pass(
         &authority.database,
         &Arc::new(SessionTemporalRefreshWakeState::default()),
@@ -619,11 +616,11 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
     .await
     .expect("the initial failed discovery must report its stalled storage retry");
     assert_eq!(
-        pages.load(Ordering::Acquire),
+        scalar(authority.database(), backfill_census).await,
         0,
         "an unknown failed projection frontier must withhold full summary admission"
     );
-    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
+    assert_eq!(ingestor.passes.get(), 1);
 
     authority
         .database()
@@ -635,11 +632,12 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
         .await
         .unwrap();
     assert!(wake.wake_and_wait_until_idle(Duration::from_secs(2)).await);
-    assert!(
-        pages.load(Ordering::Acquire) > 0,
-        "restoring the discovery table must admit convergence and prove the census is live"
+    assert_eq!(
+        scalar(authority.database(), backfill_census).await,
+        1,
+        "restoring the discovery table must admit convergence and advance the durable census"
     );
-    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
+    assert_eq!(ingestor.passes.get(), 1);
     registry.shutdown().await;
     assert_eq!(registry.profile_worker_count().await, 0);
     assert!(
@@ -917,6 +915,15 @@ async fn saturated_history_admission_defers_the_pass_and_resumes() {
         SessionHistoricalIngestOutcome::Complete,
     ]));
     let registry = SessionTemporalRefreshSchedulerRegistry::default();
+    registry
+        .ensure_profile(
+            authority.database().db_path().to_path_buf(),
+            authority.database.clone(),
+        )
+        .await;
+    registry
+        .wait_profile_idle(authority.database().db_path())
+        .await;
     let admission = registry.historical_ingest_admission();
     let permits = u32::try_from(admission.available_permits()).unwrap();
     assert!(permits > 0, "the historical ingest admission is bounded");
@@ -931,29 +938,30 @@ async fn saturated_history_admission_defers_the_pass_and_resumes() {
             ingestor.clone(),
         )
         .await;
+    registry
+        .wait_profile_idle(authority.database().db_path())
+        .await;
 
     let saturated = SessionProjectionServingState::Stale {
         reason: SessionProjectionStaleReason::HistoricalRetry {
             reason_code: "history_admission_saturated".to_owned(),
         },
     };
+    let saturated_observed = wait_until(
+        || wake.serving_status().state == saturated,
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(
-        wait_until(
-            || wake.serving_status().state == saturated,
-            Duration::from_secs(2),
-        )
-        .await,
-        "the deferred pass must surface as typed retryable staleness"
+        saturated_observed,
+        "the deferred pass must surface as typed retryable staleness: {:?}",
+        wake.serving_status()
     );
     assert_eq!(
         ingestor.passes.get(),
         0,
         "a saturated admission must not run the historical pass"
     );
-    registry
-        .wait_profile_idle(authority.database().db_path())
-        .await;
-    assert_eq!(ingestor.passes.get(), 0);
 
     drop(held);
     ingestor.passes.wait_for(|passes| *passes >= 1).await;
@@ -977,6 +985,15 @@ async fn a_saturated_history_pass_runs_with_the_permit_its_queue_turn_grants() {
         SessionHistoricalIngestOutcome::Complete,
     ]));
     let registry = SessionTemporalRefreshSchedulerRegistry::default();
+    registry
+        .ensure_profile(
+            authority.database().db_path().to_path_buf(),
+            authority.database.clone(),
+        )
+        .await;
+    registry
+        .wait_profile_idle(authority.database().db_path())
+        .await;
     let admission = registry.historical_ingest_admission();
     let mut held = (0..admission.available_permits())
         .map(|_| {
@@ -993,22 +1010,24 @@ async fn a_saturated_history_pass_runs_with_the_permit_its_queue_turn_grants() {
             ingestor.clone(),
         )
         .await;
+    registry
+        .wait_profile_idle(authority.database().db_path())
+        .await;
     let saturated = SessionProjectionServingState::Stale {
         reason: SessionProjectionStaleReason::HistoricalRetry {
             reason_code: "history_admission_saturated".to_owned(),
         },
     };
+    let saturated_observed = wait_until(
+        || wake.serving_status().state == saturated,
+        Duration::from_secs(2),
+    )
+    .await;
     assert!(
-        wait_until(
-            || wake.serving_status().state == saturated,
-            Duration::from_secs(2),
-        )
-        .await
+        saturated_observed,
+        "the queued pass must surface as typed retryable staleness: {:?}",
+        wake.serving_status()
     );
-    registry
-        .wait_profile_idle(authority.database().db_path())
-        .await;
-
     let next_waiter = tokio::spawn(Arc::clone(&admission).acquire_owned());
     tokio::task::yield_now().await;
     held.pop();
@@ -1154,7 +1173,7 @@ async fn blocked_cursor_failure_projects_healthy_provider_progress_once_across_r
     );
     assert_eq!(ingestor.committed.load(Ordering::Acquire), 2);
     assert_eq!(ingestor.duplicates.load(Ordering::Acquire), 2);
-    assert_eq!(ingestor.passes.load(Ordering::Acquire), 2);
+    assert_eq!(ingestor.passes.get(), 2);
 
     restarted.shutdown().await;
 }
@@ -1249,7 +1268,7 @@ async fn convergence_is_published_only_after_the_last_owed_projection_commits() 
         .await;
     assert!(wake.same_route(&deferred_wake));
     assert_eq!(
-        ingestor.0.passes.load(Ordering::Acquire),
+        ingestor.0.passes.get(),
         1,
         "an explicit history wake must wait behind the held publication"
     );
@@ -1260,7 +1279,7 @@ async fn convergence_is_published_only_after_the_last_owed_projection_commits() 
         "settling the owed projection publishes one convergence event"
     );
     assert_eq!(
-        ingestor.0.passes.load(Ordering::Acquire),
+        ingestor.0.passes.get(),
         2,
         "the history wake deferred during publication must run exactly once"
     );

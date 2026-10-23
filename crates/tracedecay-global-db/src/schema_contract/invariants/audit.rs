@@ -9,6 +9,7 @@ use tracedecay_store::{
     stored_message_is_shipped_release_rendering,
 };
 
+use crate::observation_projection::state::canonical_message_location;
 use crate::observation_projection::{ProjectionOutputAuthority, ProjectionRowsBatch};
 
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, params};
@@ -20,7 +21,10 @@ use super::rows::{audit_read_error, authority_violation, decode_authority_observ
 use super::{AUDIT_PAGE_ROWS, OBSERVATION_AUDIT_PAGE_ROWS, projection_checkpoint};
 const AUDIT_NAME: &str = "observation-authority";
 
-const AUDIT_VERSION: i64 = 3;
+// Both the bounded audit journals and storage-location backfill used
+// version 3 independently. Re-audit either lineage under the combined rules;
+// storage locations were added without changing immutable output digests.
+const AUDIT_VERSION: i64 = 4;
 pub(super) const MAX_BOUNDED_AUDIT_PASSES: i64 = 64;
 const DETAILED_AUDIT_CONCURRENCY: usize = 32;
 // Amortize the page query across several bounded validation chunks.
@@ -311,7 +315,7 @@ pub(super) async fn audit_checkpoint_is_plausible(
         .query(
             "SELECT
                 COALESCE((SELECT MAX(rowid) FROM sanitization_receipts), 0),
-                COALESCE((SELECT MAX(sequence) FROM observations), 0),
+                MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'observations'), 0), COALESCE((SELECT MAX(sequence) FROM observations), 0)),
                 COALESCE((SELECT MAX(rowid) FROM source_cursors), 0),
                 COALESCE((SELECT MAX(rowid) FROM source_cursor_advances), 0),
                 COALESCE((SELECT MAX(rowid) FROM observation_projection_provenance), 0),
@@ -796,8 +800,8 @@ async fn validate_message_projection_row(
                 // Message equality is not the whole output. The row's hash and
                 // storage kind are not compared by the message record, so a
                 // matching message can still sit on stale storage columns.
-                // Protected rows are not this arm: they differ from the
-                // projected row, and that compatibility already checked them.
+                // A compatible protected body retains its own rendering;
+                // backfill only its missing storage location below.
                 let stored_matches = match resolved
                     .projection_rows
                     .message(&owner_message.provider, &owner_message.message_id)
@@ -813,6 +817,23 @@ async fn validate_message_projection_row(
                     }
                     None => false,
                 };
+                // Once normalized, a location remains historical identity even
+                // when the provider's original symlink is moved or removed.
+                if resolved
+                    .projection_rows
+                    .storage_columns(&owner_message.provider, &owner_message.message_id)
+                    .is_some_and(|raw| raw.location_path.is_none())
+                    && let Some(location) =
+                        canonical_message_location(owner_message).map_err(|error| {
+                            authority_violation(format!(
+                                "invalid projected message location: {error}"
+                            ))
+                        })?
+                {
+                    resolved
+                        .released
+                        .record_location(&owner_projection, location);
+                }
                 if stored_matches
                     && owned_storage_columns_need_rewrite(
                         &owner_projection,
@@ -1496,7 +1517,21 @@ async fn validate_projection_authority_suffix_pages(
         let mut detailed_limit_reached = false;
         while let Some(row) = rows.next().await.map_err(audit_read_error)? {
             page_rows += 1;
-            scan_cursor = row.get::<i64>(0).map_err(audit_read_error)?;
+            let sequence = row.get::<i64>(0).map_err(audit_read_error)?;
+            if sequence > scan_cursor + 1
+                && !crate::observation::retired_sequences::covers(
+                    conn,
+                    scan_cursor + 1,
+                    sequence - 1,
+                )
+                .await
+                .map_err(|error| authority_violation(error.to_string()))?
+            {
+                return Err(authority_violation(
+                    "unexplained observation sequence gap before projection frontier",
+                ));
+            }
+            scan_cursor = sequence;
             let observation_receipt_id = row.get::<String>(2).map_err(audit_read_error)?;
             let state = ProjectionAuthorityState {
                 provenance_rows: row.get(3).map_err(audit_read_error)?,
@@ -1628,6 +1663,19 @@ async fn validate_projection_authority_suffix_pages(
         pages_audited += 1;
         checkpoint.projection_checkpoint = scan_cursor;
         if page_rows < OBSERVATION_AUDIT_PAGE_ROWS && !detailed_limit_reached {
+            if scan_cursor < current_projection_checkpoint
+                && !crate::observation::retired_sequences::covers(
+                    conn,
+                    scan_cursor + 1,
+                    current_projection_checkpoint,
+                )
+                .await
+                .map_err(|error| authority_violation(error.to_string()))?
+            {
+                return Err(authority_violation(
+                    "unexplained observation sequence gap before projection frontier",
+                ));
+            }
             checkpoint.projection_checkpoint = current_projection_checkpoint;
             break;
         }
@@ -1830,9 +1878,10 @@ mod tests {
     };
 
     use super::{
-        AuditCheckpoint, BTreeSet, HashMap, ProjectionOutputOwnership, ReleasedRenderingLedger,
-        ResolvedOutputAuthority, ensure_audit_checkpoint_schema,
-        validate_projection_authority_suffix,
+        AuditCheckpoint, AuditProgress, BTreeSet, HashMap, ProjectionOutputOwnership,
+        ReleasedRenderingLedger, ResolvedOutputAuthority, ensure_audit_checkpoint_schema,
+        read_audit_checkpoint, read_audited_counts, validate_projection_authority_suffix,
+        write_audit_checkpoint,
     };
     use crate::tests::harness::{
         RegisteredGlobalDbTestFixture, open_registered_test_fixture, seed_projected_messages,
@@ -1918,6 +1967,58 @@ mod tests {
             columns,
             ["source_advance_rowid", "source_cursor_rowid"],
             "source authority scans need durable seek positions"
+        );
+    }
+
+    #[asupersync::test]
+    async fn version_three_checkpoint_requires_combined_rules_audit() {
+        let directory = TempDir::new().unwrap();
+        let connection = TestConnection::open(&directory.path().join("sessions.db"));
+        ensure_audit_checkpoint_schema(&connection).await.unwrap();
+        let progress = || AuditProgress {
+            checkpoint: AuditCheckpoint {
+                observation_sequence: 7,
+                projection_checkpoint: 7,
+                ..AuditCheckpoint::default()
+            },
+            receipts_audited: 1,
+            observations_audited: 7,
+            provenance_audited: 3,
+            dispositions_audited: 4,
+            aliases_audited: 0,
+        };
+        write_audit_checkpoint(&connection, progress())
+            .await
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE authority_audit_checkpoints SET audit_version = 3",
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert!(read_audit_checkpoint(&connection).await.unwrap().is_none());
+        assert_eq!(
+            read_audited_counts(&connection).await.unwrap(),
+            (0, 0, 0, 0, 0),
+            "neither version-three lineage covers the combined audit rules"
+        );
+
+        write_audit_checkpoint(&connection, progress())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_audit_checkpoint(&connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .observation_sequence,
+            7
+        );
+        assert_eq!(
+            read_audited_counts(&connection).await.unwrap(),
+            (1, 7, 3, 4, 0)
         );
     }
 

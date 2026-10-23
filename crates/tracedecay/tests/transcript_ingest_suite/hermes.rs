@@ -26,6 +26,7 @@ use tracedecay_sessions::runtime::{
     SessionProvider, SessionRecord, with_transcript_source_profile,
 };
 
+#[cfg(unix)]
 use crate::common::{
     canonical_existing_path, spawn_tracedecay_daemon, tracedecay_command_with_home,
 };
@@ -321,9 +322,13 @@ async fn hermes_state_db_populates_projection_for_session_cwd_project() {
             .expect("session transcript path"),
         &state_db,
     );
-    let project_path = normalize_path_text(&project.to_string_lossy());
     let results = db
-        .search_session_messages("hermes", Some(&project_path), "billing pipeline", 10)
+        .search_session_messages(
+            "hermes",
+            Some(db.project_id().as_str()),
+            "billing pipeline",
+            10,
+        )
         .await;
     assert!(
         results.iter().any(|hit| hit.message.role == "user"),
@@ -344,6 +349,29 @@ async fn hermes_state_db_populates_projection_for_session_cwd_project() {
         results
             .iter()
             .any(|hit| hit.message.timestamp == Some(1_780_629_300))
+    );
+    // Project identity includes its linked worktrees; path selectors retain
+    // the canonical directory recorded on each message.
+    let linked_path = normalize_path_text(&linked_worktree.to_string_lossy());
+    let linked_results = db
+        .search_session_messages("hermes", Some(&linked_path), "billing pipeline", 10)
+        .await;
+    assert_eq!(
+        linked_results
+            .iter()
+            .map(|hit| &hit.message.message_id)
+            .collect::<Vec<_>>(),
+        results
+            .iter()
+            .map(|hit| &hit.message.message_id)
+            .collect::<Vec<_>>()
+    );
+    let project_path = normalize_path_text(&project.to_string_lossy());
+    assert!(
+        db.search_session_messages("hermes", Some(&project_path), "billing pipeline", 10)
+            .await
+            .is_empty(),
+        "the main checkout must not alias the messages' linked-worktree directory"
     );
 
     assert_eq!(session.title.as_deref(), Some("Billing pipeline fix"));
@@ -544,17 +572,7 @@ async fn hermes_projection_sweep_does_not_mutate_runtime_owned_raw_messages() {
             stateless_session_patterns: Vec::new(),
             ignore_message_patterns: Vec::new(),
             expected_current_frontier_store_id: None,
-            threshold_tokens: None,
-            max_assembly_tokens: None,
-            leaf_chunk_tokens: None,
-            max_source_messages: None,
-            summary_fan_in: None,
-            incremental_max_depth: None,
-            fresh_tail_count: None,
-            dynamic_leaf_chunk_enabled: None,
-            dynamic_leaf_chunk_max: None,
-            context_length: None,
-            reserve_tokens_floor: None,
+            overrides: Default::default(),
             summarizer: LcmSummarizerMode::Noop,
         })
         .await

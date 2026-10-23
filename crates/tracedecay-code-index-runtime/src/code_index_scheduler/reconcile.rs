@@ -37,6 +37,8 @@ use tracedecay_domain::{
 };
 use tracedecay_graph_db::GraphConflictContextV1;
 use tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1;
+#[cfg(any(test, feature = "test-helpers"))]
+use tracedecay_runtime_core::resident_memory::ResidentMemoryPressureV1;
 use tracedecay_runtime_core::resident_memory::{
     ProcessResidentMemoryV1, RESIDENT_MEMORY_PRESSURE_ADMISSION_FLOOR_BYTES_V1,
     RESIDENT_OWNER_IDLE_WINDOW_V1, ResidentMemoryAdmissionFailureV1, ResidentMemoryComponentIdV1,
@@ -534,6 +536,7 @@ pub(crate) struct SourceFreshnessFenceV1 {
     /// never walked source instead of inferring it from elapsed time.
     #[cfg(test)]
     source_sweeps: Arc<AtomicU64>,
+    pending_source: Option<Arc<dyn super::CodeIndexSourcePendingReaderV1>>,
 }
 
 #[derive(Clone)]
@@ -573,6 +576,7 @@ impl SourceFreshnessFenceV1 {
             sweep_cache: Arc::new(Mutex::new(SourceSweepCacheV1::new(path_policy))),
             #[cfg(test)]
             source_sweeps: Arc::new(AtomicU64::new(0)),
+            pending_source: None,
         }
     }
 
@@ -580,6 +584,30 @@ impl SourceFreshnessFenceV1 {
     #[cfg(test)]
     pub(super) fn source_sweeps_for_test(&self) -> u64 {
         self.source_sweeps.load(Ordering::Acquire)
+    }
+
+    pub(super) fn pending_source_reader(
+        &self,
+    ) -> Option<Arc<dyn super::CodeIndexSourcePendingReaderV1>> {
+        self.pending_source.clone()
+    }
+
+    pub(super) fn read_pending_source(
+        &self,
+    ) -> Result<bool, tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1>
+    {
+        self.pending_source
+            .as_ref()
+            .map_or(Ok(false), |reader| reader.read_pending())
+    }
+
+    pub(super) fn read_pending_source_blocking(
+        &self,
+    ) -> Result<bool, tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReadFailureV1>
+    {
+        self.pending_source
+            .as_ref()
+            .map_or(Ok(false), |reader| reader.read_pending_blocking())
     }
 
     fn snapshot(&self) -> SourceFreshnessFenceStateV1 {
@@ -681,6 +709,9 @@ impl SourceFreshnessFenceV1 {
         project_root: &Path,
         shutting_down: &AtomicBool,
     ) -> bool {
+        if !self.read_pending_source().is_ok_and(|pending| !pending) {
+            return false;
+        }
         let state = self.snapshot();
         self.proof_is_unmoved(&state, project_root, shutting_down)
     }
@@ -1237,7 +1268,9 @@ impl HistoricalCodeIndexGenerationOwnerV1 {
 }
 
 impl CodeIndexWorktreeSchedulerV1 {
-    /// A standalone owner under the path policy a fresh profile resolves.
+    /// A standalone fixture owner under the path policy a fresh profile resolves.
+    /// Concurrent cases do not contribute measured pressure to this owner;
+    /// pressure scenarios bind their own explicit readings after opening it.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn open(
         project_id: ProjectId,
@@ -1245,14 +1278,23 @@ impl CodeIndexWorktreeSchedulerV1 {
         store_root: PathBuf,
         byte_pool: Arc<SharedCodeIndexBytePoolV1>,
     ) -> Result<Self, CodeIndexSchedulerErrorV1> {
-        Self::open_with_policy(
+        let mut scheduler = Self::open_with_policy(
             project_id,
             project_root,
             store_root,
             byte_pool,
             CodeIndexHintPolicyV1::default(),
             crate::config::registry_default_index_path_policy(),
-        )
+        )?;
+        let limit = detected_process_resident_memory_limit_v1();
+        scheduler.bind_resident_memory(Arc::new(ProcessResidentMemoryV1::with_pressure(
+            limit,
+            Arc::new(ResidentMemoryPressureV1::with_sampler(
+                limit,
+                Arc::new(|| None),
+            )),
+        )));
+        Ok(scheduler)
     }
 
     pub fn open_with_policy(
@@ -1414,6 +1456,13 @@ impl CodeIndexWorktreeSchedulerV1 {
 
     pub fn last_reconciled_at_micros_slot(&self) -> Arc<AtomicI64> {
         Arc::clone(&self.freshness_fence.last_reconciled_at_micros)
+    }
+
+    pub(super) fn bind_pending_source_reader(
+        &mut self,
+        reader: Option<Arc<dyn super::CodeIndexSourcePendingReaderV1>>,
+    ) {
+        self.freshness_fence.pending_source = reader;
     }
 
     pub(crate) fn freshness_fence(&self) -> SourceFreshnessFenceV1 {

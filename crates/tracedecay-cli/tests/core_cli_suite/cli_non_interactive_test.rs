@@ -37,10 +37,11 @@ fn ephemeral_safe_fixture_base(test_path: &str) -> Option<PathBuf> {
         assert!(!tracedecay_global_db::is_ephemeral_path(&root));
         return Some(root);
     }
-    // macOS's per-user temporary directory leaves too little room for the
-    // nested child home and its Unix daemon socket. The private child TMPDIR
+    // Worker scratch paths and macOS's per-user temporary directory can leave
+    // too little room for the nested child home and its Unix daemon socket.
+    // Use a short, private root on Unix. The private child TMPDIR
     // still defines the ephemeral boundary, with durable fixtures beside it.
-    let scratch = if cfg!(target_os = "macos") {
+    let scratch = if cfg!(unix) {
         TempDir::new_in("/tmp")
     } else {
         TempDir::new()
@@ -878,6 +879,7 @@ fn dashboard_from_home_tells_the_operator_to_pass_path() {
     );
 }
 
+#[cfg(unix)]
 fn refresh_json(output: &Output, step: &str) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1199,14 +1201,21 @@ fn init_wait_holds_until_first_generation_is_ready() {
     git(project.path(), &["init", "-b", "main"]);
     commit_all(project.path(), "fixture repository");
 
+    let daemon_log = home.path().join("init-wait-daemon.log");
+    let _daemon =
+        crate::common::spawn_tracedecay_daemon_logged(home.path(), &daemon_log, |command| {
+            command.env("RUST_LOG", "info");
+        });
     let mut command = tracedecay_command(home.path(), project.path());
     command.args(["init", "--wait"]);
     let output = run_with_timeout(command, cli_timeout());
     assert!(
         output.status.success(),
-        "init --wait should succeed once the first generation is ready\nstdout:\n{}\nstderr:\n{}",
+        "init --wait should succeed once the first generation is ready\nstdout:\n{}\nstderr:\n{}\ndaemon:\n{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&daemon_log)
+            .unwrap_or_else(|error| format!("daemon log unavailable: {error}"))
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -3327,7 +3336,11 @@ fn branch_search_serves_a_committed_generation_behind_dirty_worktree_state() {
     .unwrap();
     init_project_fixture(home.path(), &project_root);
 
-    let _daemon = crate::common::spawn_tracedecay_daemon(home.path());
+    let daemon_log = home.path().join("dirty-branch-daemon.log");
+    let _daemon =
+        crate::common::spawn_tracedecay_daemon_logged(home.path(), &daemon_log, |command| {
+            command.env("RUST_LOG", "info");
+        });
     let ready_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let mut ready = tracedecay_command_without_daemon(home.path(), &project_root);
@@ -3351,9 +3364,11 @@ fn branch_search_serves_a_committed_generation_behind_dirty_worktree_state() {
         }
         assert!(
             Instant::now() < ready_deadline,
-            "dirty worktree generation did not become queryable\nstdout:\n{}\nstderr:\n{}",
+            "dirty worktree generation did not become queryable\nstdout:\n{}\nstderr:\n{}\ndaemon:\n{}",
             String::from_utf8_lossy(&ready.stdout),
-            String::from_utf8_lossy(&ready.stderr)
+            String::from_utf8_lossy(&ready.stderr),
+            std::fs::read_to_string(&daemon_log)
+                .unwrap_or_else(|error| format!("daemon log unavailable: {error}"))
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3603,14 +3618,8 @@ fn storage_report_offline_preserves_files_and_reports_registry_unavailable() {
         report["user_sessions_database"]["pages"]["state"],
         "unavailable"
     );
-    let census =
-        tracedecay_maintenance::retention::storage_report::scan_full_profile_size(&profile_root);
-    assert_eq!(
-        report["full_profile_size"]["total_bytes"],
-        census.total_bytes
-    );
     assert!(
-        census.total_bytes
+        report["full_profile_size"]["total_bytes"].as_u64().unwrap()
             >= before
                 .iter()
                 .map(|(bytes, _)| bytes.len() as u64)

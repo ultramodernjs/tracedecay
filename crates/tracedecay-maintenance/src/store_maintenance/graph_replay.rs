@@ -7,6 +7,7 @@ use tracedecay_code_index_retention::code_index_generations::{
 };
 use tracedecay_runtime_core::logging::log_daemon_event;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconcileOutcome {
     /// The page from the cursor held no queued release event.
     Complete,
@@ -24,6 +25,16 @@ pub enum ReconcileOutcome {
     /// keeps the work safe for a later attempt.
     Deferred,
     Failed,
+}
+
+impl ReconcileOutcome {
+    pub(super) fn retention_outcome(self) -> super::CodeGenerationRetentionOutcomeV1 {
+        match self {
+            Self::Complete | Self::Retained => super::CodeGenerationRetentionOutcomeV1::Complete,
+            Self::MoreWork => super::CodeGenerationRetentionOutcomeV1::MoreWork,
+            Self::Deferred | Self::Failed => super::CodeGenerationRetentionOutcomeV1::Failed,
+        }
+    }
 }
 
 /// Every code-generation degradation is a genuine anomaly: it keeps the tick
@@ -120,6 +131,48 @@ pub fn replay_pool_is_held(replay_pool_root: &Path) -> bool {
     }
 }
 
+/// Mounted-only maintenance may recover sealed heads to shed native staging
+/// rows. Source-release reconciliation below never performs that recovery.
+pub async fn release_mounted_staging_rows(
+    lease: &ProjectStoreMaintenanceLeaseV1,
+    observations: &crate::telemetry::StoreTelemetrySamplingRegistry,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
+) {
+    let Some(project_id) = lease
+        .store_layout()
+        .identity
+        .project_id
+        .as_ref()
+        .and_then(|id| tracedecay_domain::ProjectId::new(id.clone()).ok())
+    else {
+        return;
+    };
+    let project_root = lease.project_root();
+    if !observations.graph_replay_release_attempt_admitted(project_root) {
+        return;
+    }
+    let cursor = observations.graph_staging_release_cursor(project_root);
+    match lease
+        .store_runtime()
+        .release_one_sealed_generation_staging_rows(
+            project_id,
+            lease.graph_db(),
+            cancellation,
+            cursor,
+        )
+        .await
+    {
+        Ok(continuation) => {
+            observations.record_graph_staging_release_cursor(project_root, continuation);
+        }
+        Err(error) => log_code_generation_retention_degraded_with_error(
+            observations,
+            "graph_staging_release_failed",
+            &error,
+        ),
+    }
+}
+
 #[tracing::instrument(
     name = "daemon.git.maintenance.graph_replay_release",
     level = "trace",
@@ -128,6 +181,7 @@ pub fn replay_pool_is_held(replay_pool_root: &Path) -> bool {
 pub async fn reconcile_graph_replay_releases(
     lease: &ProjectStoreMaintenanceLeaseV1,
     store_root: &Path,
+    project_root: &Path,
     observations: &crate::telemetry::StoreTelemetrySamplingRegistry,
     cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
 ) -> ReconcileOutcome {
@@ -148,35 +202,12 @@ pub async fn reconcile_graph_replay_releases(
             return ReconcileOutcome::Failed;
         }
     };
-    let project_root = lease.project_root();
     // A runtime that answered its last attempts with deadline or
     // unavailability failures is skipped for the bounded backoff window
     // instead of being polled, and timed out against, on every tick. The
     // arming failure was already reported, so skips stay quiet on the log.
     if !observations.graph_replay_release_attempt_admitted(project_root) {
         return ReconcileOutcome::Deferred;
-    }
-    let staging_cursor = observations.graph_staging_release_cursor(project_root);
-    let staging_release = lease
-        .store_runtime()
-        .release_one_sealed_generation_staging_rows(
-            project_id.clone(),
-            lease.graph_db(),
-            cancellation,
-            staging_cursor,
-        )
-        .await;
-    match staging_release {
-        Ok(continuation) => {
-            observations.record_graph_staging_release_cursor(project_root, continuation);
-        }
-        Err(error) => {
-            log_code_generation_retention_degraded_with_error(
-                observations,
-                "graph_staging_release_failed",
-                &error,
-            );
-        }
     }
     // One bounded page per pass, resumed from the durable-queue cursor of the
     // previous attempt. Retained releases fall behind the cursor instead of

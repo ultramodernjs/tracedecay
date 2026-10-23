@@ -3241,7 +3241,6 @@ const settingsPayload: Record<string, unknown> = {
     configuration_revision_id: 'user-rev-7',
     code_index_worker_configuration_snapshot_id: 'profile-worker-snap-7',
     code_index_worker_configuration_revision_id: 'profile-worker-rev-7',
-    upload_enabled: false,
     code_index_workers: { mode: 'automatic' },
     code_index_worker_status: {
       configured: { mode: 'automatic' },
@@ -3412,6 +3411,25 @@ function codeDiagnosticsSnapshot(): Record<string, unknown> {
         null,
       ),
     ],
+    coverage: {
+      rust: {
+        documents: {
+          'crates/tracedecay-dashboard-api/src/code_diagnostics_api.rs': {
+            state: 'published', version_verified: true, content_digest: `sha256:${'a1'.repeat(32)}`,
+          },
+          'crates/tracedecay-lsp/src/analyzer/broker.rs': { state: 'stale_publication' },
+        },
+        roots: { '/fast/projects/tracedecay': 'completed' },
+      },
+      typescript: {
+        documents: {
+          'dashboard/src/workspaces/code/CodeDiagnostics.tsx': {
+            state: 'published', version_verified: false, content_digest: `sha256:${'b2'.repeat(32)}`,
+          },
+        },
+        roots: { '/fast/projects/tracedecay/dashboard': 'completed' },
+      },
+    },
     backfill: {
       rust: { queued_files: 0, opened_files: 214, files_with_diagnostics: 2, last_completed_sweep: nowSecs - 900 },
       typescript: { queued_files: 12, opened_files: 388, files_with_diagnostics: 1, last_completed_sweep: null },

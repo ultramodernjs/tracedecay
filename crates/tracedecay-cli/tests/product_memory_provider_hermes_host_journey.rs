@@ -38,7 +38,7 @@ use tracedecay_contracts::{
     ApplicationUnavailableClassV1, ResolvedSetting,
 };
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
-use tracedecay_daemon_protocol::BrokerStream;
+use tracedecay_daemon_protocol::DaemonClientStream;
 use tracedecay_domain::ProjectId;
 use tracedecay_domain::configuration::{
     ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
@@ -210,9 +210,11 @@ impl HermesJourney {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
                 stderr.contains("code_index_scheduler_unavailable"),
-                "init failed outside scheduler warming window\nstdout:\n{}\nstderr:\n{}",
+                "init failed outside scheduler warming window\nstdout:\n{}\nstderr:\n{}\ndaemon log:\n{}",
                 String::from_utf8_lossy(&output.stdout),
-                stderr
+                stderr,
+                fs::read_to_string(self.home.path().join("daemon.stderr.log"))
+                    .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
             );
             assert!(Instant::now() < deadline, "init never became available");
             std::thread::sleep(Duration::from_millis(50));
@@ -412,7 +414,12 @@ impl HermesJourney {
     }
 
     fn run_provider_fixture(&self, mode: &str, timestamp_ns: u128) -> Value {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        // Bazel's launcher supplies the current runfiles package. A cached
+        // binary's compile-time manifest directory belongs to another execroot.
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let script = manifest_dir
             .join("tests/product_memory_provider_hermes_host_journey/hermes_sync_turn.py");
         let plugin = self.home.path().join(".hermes/plugins/tracedecay");
         let output = python_command()
@@ -1626,7 +1633,7 @@ fn wait_for_authority(daemon: &mut Child, path: &Path) {
                 matches!(
                     tokio::time::timeout_at(
                         tokio::time::Instant::from_std(deadline),
-                        BrokerStream::connect(&record.endpoint),
+                        DaemonClientStream::connect(&record.endpoint),
                     )
                     .await,
                     Ok(Ok(_))

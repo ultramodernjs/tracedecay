@@ -477,6 +477,10 @@ pub struct StoreTelemetrySamplingRegistry {
     /// Where table-growth state survives a restart; `None` keeps it in memory.
     table_growth_state_path: Option<PathBuf>,
     graph_replay_release: Arc<std::sync::Mutex<HashMap<PathBuf, GraphReplayReleaseProgressV1>>>,
+    scope_reconciliation: Arc<std::sync::Mutex<HashMap<PathBuf, ScopeReconciliationProgressV1>>>,
+    /// Recorded while an admitted project's scope inventory is processed, not
+    /// by a fresh all-project filesystem scan on every daemon tick.
+    maintenance_scope_owners: Arc<std::sync::Mutex<HashMap<PathBuf, PathBuf>>>,
     graph_staging_release:
         Arc<std::sync::Mutex<HashMap<PathBuf, tracedecay_store::GraphProjectionIdentityV1>>>,
     /// Whether the by-design quiet `retry` tick line has already been written.
@@ -509,6 +513,18 @@ struct GraphReplayReleaseProgressV1 {
     cursor: Option<String>,
 }
 
+/// Advisory keyset positions only; all retirement authority is re-proved.
+/// Restarting safely revisits the first page. Independent scope and graph
+/// cursors prevent a reader-held scope from starving later candidates.
+#[derive(Clone, Default)]
+pub(crate) struct ScopeReconciliationProgressV1 {
+    pub alias_after: i64,
+    pub projection_after: Option<tracedecay_store::GraphProjectionIdentityV1>,
+    pub scope_after: Option<String>,
+    pub release_after: BTreeMap<String, String>,
+    pub retained_in_census: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct StoreTelemetrySamplingOutcome {
     pub observed: u64,
@@ -516,6 +532,29 @@ pub struct StoreTelemetrySamplingOutcome {
 }
 
 impl StoreTelemetrySamplingRegistry {
+    pub(crate) fn scope_reconciliation_progress(
+        &self,
+        root: &Path,
+    ) -> ScopeReconciliationProgressV1 {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_scope_reconciliation_progress(
+        &self,
+        root: &Path,
+        progress: ScopeReconciliationProgressV1,
+    ) {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(root.to_path_buf(), progress);
+    }
+
     /// A registry whose table-growth state persists under the profile's
     /// maintenance directory.
     #[must_use]
@@ -629,6 +668,10 @@ impl StoreTelemetrySamplingRegistry {
     }
 
     pub fn release_retained_handles_for_shutdown(&self) {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.ports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -637,20 +680,54 @@ impl StoreTelemetrySamplingRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.maintenance_scope_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.quiet_retry_tick_logged.store(false, Ordering::Release);
         self.loud_retention_this_tick
             .store(false, Ordering::Release);
     }
 
+    /// Replace one admitted project's successfully inventoried scope ownership.
+    /// Failed inventories must leave the previous ownership intact.
+    pub fn record_project_maintenance_scopes(
+        &self,
+        project_root: &Path,
+        scopes: impl IntoIterator<Item = PathBuf>,
+    ) {
+        let mut owners = self
+            .maintenance_scope_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.retain(|_, owner| owner != project_root);
+        owners.extend(
+            scopes
+                .into_iter()
+                .map(|scope| (scope, project_root.to_path_buf())),
+        );
+    }
+
     pub fn retain_project_maintenance_state(&self, active_projects: &BTreeSet<PathBuf>) {
+        self.scope_reconciliation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|project, _| active_projects.contains(project));
+        let mut owners = self
+            .maintenance_scope_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        owners.retain(|_, owner| active_projects.contains(owner));
+        let active_scope =
+            |root: &PathBuf| active_projects.contains(root) || owners.contains_key(root);
         self.graph_replay_release
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|project, _| active_projects.contains(project));
+            .retain(|project, _| active_scope(project));
         self.graph_staging_release
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|project, _| active_projects.contains(project));
+            .retain(|project, _| active_scope(project));
     }
 
     /// Whether this tick may attempt the graph-replay release reconcile.
@@ -1414,28 +1491,77 @@ mod store_file_identity_tests {
 
         let replacement = temporary.path().join("replacement.db");
         std::fs::write(&replacement, b"replacement").expect("replacement file");
-        std::fs::rename(&replacement, &database_path).expect("rename over the store");
-        assert_eq!(
-            state_of(&registry, &database_path),
-            [(database_path.clone(), StoreFileIdentityStateV1::Replaced)]
-        );
+        #[cfg(windows)]
+        {
+            // The SQLite runtime deliberately pins its database without
+            // FILE_SHARE_DELETE. Neither an atomic replace nor an unlink may
+            // displace that live authority on Windows.
+            tracedecay_runtime_core::db::DatabaseAuthority::replace_file_atomically(
+                &replacement,
+                &database_path,
+                "held store replacement fixture",
+            )
+            .expect_err("a pinned Windows database must reject replacement");
+            std::fs::remove_file(&database_path)
+                .expect_err("a pinned Windows database must reject removal");
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Current)]
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix permits displacing an open inode; the guarded port must
+            // keep the mounted identity rather than adopt the new pathname.
+            std::fs::rename(&replacement, &database_path).expect("rename over the store");
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Replaced)]
+            );
+            registry.register_port(&database_path, &scope, || {
+                database.storage_telemetry_handle()
+            });
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Replaced)],
+                "a rebind through the held handle must not adopt the replacement"
+            );
+            std::fs::remove_file(&database_path).expect("remove the store file");
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Missing)]
+            );
+        }
+    }
 
-        // Profile-wide stores rebind on every project open; the held database
-        // refuses to issue a reader over the replacement, so the port keeps
-        // the identity it mounted.
-        registry.register_port(&database_path, &scope, || {
-            database.storage_telemetry_handle()
-        });
+    #[test]
+    fn a_store_file_identity_detects_replacement_and_removal() {
+        let temporary = tempfile::tempdir().expect("identity fixture root");
+        let path = temporary.path().join("store.db");
+        std::fs::write(&path, b"original").expect("original file");
+        let mounted = Some(super::store_file_identity(&path).expect("mounted file identity"));
         assert_eq!(
-            state_of(&registry, &database_path),
-            [(database_path.clone(), StoreFileIdentityStateV1::Replaced)],
-            "a rebind through the held handle must not adopt the replacement"
+            super::store_file_identity_state(&path, mounted),
+            StoreFileIdentityStateV1::Current
         );
-
-        std::fs::remove_file(&database_path).expect("remove the store file");
+        let replacement = temporary.path().join("replacement.db");
+        std::fs::write(&replacement, b"replacement").expect("replacement file");
+        // Use the same Windows-safe atomic swap as durable record publication.
+        // No SQLite pin is held here, so both hosts can exercise detection.
+        tracedecay_runtime_core::db::DatabaseAuthority::replace_file_atomically(
+            &replacement,
+            &path,
+            "store identity replacement fixture",
+        )
+        .expect("replace the unpinned store");
         assert_eq!(
-            state_of(&registry, &database_path),
-            [(database_path.clone(), StoreFileIdentityStateV1::Missing)]
+            super::store_file_identity_state(&path, mounted),
+            StoreFileIdentityStateV1::Replaced
+        );
+        std::fs::remove_file(&path).expect("remove the unpinned store");
+        assert_eq!(
+            super::store_file_identity_state(&path, mounted),
+            StoreFileIdentityStateV1::Missing
         );
     }
 }

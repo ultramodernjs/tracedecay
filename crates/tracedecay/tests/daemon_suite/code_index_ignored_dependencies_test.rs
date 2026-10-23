@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
+#[cfg(unix)]
+use tracedecay_code_index::production::MAX_IGNORED_DEPENDENCY_ENTRYPOINT_BYTES_V1;
 use tracedecay_code_index::production::{
     CodeIndexExecutionControlV1, CodeIndexIgnoredSourceAdmissionV1,
-    MAX_IGNORED_DEPENDENCY_ENTRYPOINT_BYTES_V1,
 };
 use tracedecay_contracts::ResolvedScope;
 use tracedecay_domain::{CodeGenerationId, ProjectId};
@@ -371,7 +372,10 @@ export function GenerationAnchor() { return 1; }
             graph_runtime.code_graph_seat_port(),
             project_database,
             CodeGraphActivationPolicyV1::Enabled,
-            tracedecay_code_index_runtime::registry_default_index_path_policy(),
+            tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSourceInputsV1 {
+                path_policy: tracedecay_code_index_runtime::registry_default_index_path_policy(),
+                pending_admission: None,
+            },
         )
         .await
         .expect("mount persistent graph-backed scheduler");

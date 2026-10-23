@@ -1166,7 +1166,7 @@ impl CodexRetainedScan {
                 current: None,
             },
             directories: Vec::new(),
-            epoch: CodexCorpusEpoch::initial(),
+            epoch: CodexCorpusEpoch::under_rollout_source_reading(),
             complete: true,
             skipped_oversized_entries: 0,
             files_considered: 0,
@@ -1934,6 +1934,9 @@ impl CodexSource {
     }
 }
 
+/// Bump when a rollout file's observation source mapping changes; every
+/// completion claim recorded under the old reading then misses once.
+const CODEX_ROLLOUT_SOURCE_READING: &[u8] = b"tracedecay.codex.rollout-source-reading.v2\0";
 const CODEX_FRONTIER_SWEEPING_V2: u64 = 2;
 const CODEX_FRONTIER_COMPLETE_V2: u64 = 3;
 
@@ -2059,6 +2062,12 @@ impl CodexCorpusEpoch {
         self.high == 0 && self.low == 0 && self.files == 0
     }
 
+    fn under_rollout_source_reading() -> Self {
+        let mut epoch = Self::initial();
+        epoch.fold(Sha256::digest(CODEX_ROLLOUT_SOURCE_READING).into());
+        epoch
+    }
+
     const fn from_parse_offset(offset: ParseOffset) -> Self {
         Self {
             high: offset.byte_offset,
@@ -2075,13 +2084,17 @@ impl CodexCorpusEpoch {
         }
     }
 
-    fn observe(&mut self, digest: [u8; 32]) -> TranscriptIngestResult<()> {
+    fn fold(&mut self, digest: [u8; 32]) {
         let mut high = [0u8; 8];
         let mut low = [0u8; 8];
         high.copy_from_slice(&digest[..8]);
         low.copy_from_slice(&digest[8..16]);
         self.high ^= u64::from_be_bytes(high);
         self.low ^= u64::from_be_bytes(low);
+    }
+
+    fn observe(&mut self, digest: [u8; 32]) -> TranscriptIngestResult<()> {
+        self.fold(digest);
         self.files = self.files.checked_add(1).ok_or(
             TranscriptIngestError::InvalidCodexDiscoveryFrontier {
                 detail: "Codex corpus file count overflowed",
@@ -2297,7 +2310,9 @@ fn retained_scan_step(
                                     ),
                                 });
                             } else {
-                                let child = entry.path();
+                                // Keep the source root's spelling. Windows read_dir
+                                // may expose a verbatim-prefixed DirEntry path.
+                                let child = dir.join(entry.file_name());
                                 let charge = candidate_charge(&child, metadata_charge)?;
                                 if path_byte_len(&child) > bounds.max_path_bytes
                                     || metadata_charge > bounds.max_metadata_bytes
@@ -2417,7 +2432,9 @@ fn retained_scan_step(
                                         path: scan.directories[*directory_index].path.clone(),
                                         source,
                                     })?;
-                                let path = entry.path();
+                                let path = scan.directories[*directory_index]
+                                    .path
+                                    .join(entry.file_name());
                                 if path.extension().and_then(|value| value.to_str())
                                     != Some("jsonl")
                                 {
@@ -2880,6 +2897,10 @@ fn hash_path(hasher: &mut Sha256, path: &Path) {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
+        // Match Path equality and discovery's native separator spelling.
+        // Otherwise a caller's forward-slash path can miss the quarantine
+        // witness (and cursor) recorded under its discovered backslash path.
+        let path = path.components().collect::<PathBuf>();
         for unit in path.as_os_str().encode_wide() {
             hasher.update(unit.to_le_bytes());
         }

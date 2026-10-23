@@ -196,6 +196,12 @@ mod tests {
         );
     }
 
+    fn canonical_root(root: &Path) -> std::path::PathBuf {
+        // Match the resolver's host spelling; Git for Windows also rejects
+        // the verbatim prefix returned by std::fs::canonicalize.
+        tracedecay_runtime_core::path_safety::canonical_existing_identity(root).unwrap()
+    }
+
     fn init_repo(root: &Path) {
         git(root, &["init", "-q", "-b", "main"]);
         git(root, &["config", "user.email", "t@t.com"]);
@@ -236,14 +242,15 @@ mod tests {
     #[test]
     fn subdirectory_request_converges_to_registered_canonical_root() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_root(temp.path());
         init_repo(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
         let subdir = root.join("src/deep");
         std::fs::create_dir_all(&subdir).unwrap();
         let owner = owner_for(&root, "project.mcp-scope-test");
 
-        let from_subdir = resolve_query_scope(&owner, &subdir).unwrap();
+        let (resolved_root, from_subdir) = resolve_query_scope_with_root(&owner, &subdir).unwrap();
+        assert_eq!(resolved_root, root);
         let from_root = resolve_query_scope(&owner, &root).unwrap();
 
         assert_eq!(
@@ -252,10 +259,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn enrolled_monorepo_package_retains_its_path_local_scope() {
+        let temp = TempDir::new().unwrap();
+        let repository = canonical_root(temp.path());
+        init_repo(&repository);
+        write_identity_marker(&repository, "project.enclosing-repository");
+        let package = repository.join("packages/app");
+        let subdirectory = package.join("src/deep");
+        std::fs::create_dir_all(&subdirectory).unwrap();
+        let project_id = tracedecay_runtime_core::storage::default_profile_project_id(&package);
+        assert_ne!(project_id, "project.enclosing-repository");
+        let profile = TempDir::new().unwrap();
+        let (registry, _registry_owner) =
+            tracedecay_global_db::tests::harness::open_registered_test_database_fixture(
+                &profile.path().join("profile.db"),
+                tracedecay_runtime_core::db::TestDatabaseRuntimeScope::ProfileSessions,
+            )
+            .await
+            .unwrap();
+        registry
+            .upsert_code_project(&project_id, &package, None, None, Some("main"))
+            .await
+            .unwrap();
+        let owner = registry
+            .project_registry_context_by_id(&project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (root, scope) = resolve_query_scope_with_root(&owner, &subdirectory).unwrap();
+        assert_eq!(root, package);
+        assert_eq!(scope.project_id.as_str(), project_id);
+        assert_eq!(scope, resolve_query_scope(&owner, &package).unwrap());
+        assert_ne!(
+            scope,
+            resolve_query_scope(
+                &owner_for(&repository, "project.enclosing-repository"),
+                &repository
+            )
+            .unwrap()
+        );
+    }
+
     #[test]
     fn relative_requested_root_fails_closed_without_cwd_fallback() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_root(temp.path());
         let owner = owner_for(&root, "project.mcp-scope-test");
 
         let error = resolve_query_scope(&owner, Path::new("relative/root")).unwrap_err();
@@ -269,7 +318,7 @@ mod tests {
     #[test]
     fn noncanonical_project_id_fails_closed_without_normalization() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_root(temp.path());
         let owner = owner_for(&root, " project.mcp-scope-test");
 
         let error = resolve_query_scope(&owner, &root).unwrap_err();
@@ -284,21 +333,24 @@ mod tests {
     fn sibling_root_of_another_repository_fails_closed() {
         let temp = TempDir::new().unwrap();
         let registered = temp.path().join("registered");
-        let sibling = temp.path().join("sibling");
         std::fs::create_dir_all(&registered).unwrap();
-        std::fs::create_dir_all(&sibling).unwrap();
-        let registered = registered.canonicalize().unwrap();
+        let registered = canonical_root(&registered);
         init_repo(&registered);
-        init_repo(&sibling);
-        let sibling = sibling.canonicalize().unwrap();
+        write_identity_marker(&registered, "project.mcp-scope-test");
         let owner = owner_for(&registered, "project.mcp-scope-test");
-
-        let error = resolve_query_scope(&owner, &sibling).unwrap_err();
-
-        assert!(
-            matches!(error, QueryScopeError::UnauthorizedSiblingRoot { .. }),
-            "a resolution naming a different repository must fail closed: {error}"
-        );
+        for foreign in [
+            temp.path().join("sibling"),
+            registered.join(".claude/foreign"),
+        ] {
+            std::fs::create_dir_all(&foreign).unwrap();
+            init_repo(&foreign);
+            write_identity_marker(&foreign, "project.foreign");
+            let error = resolve_query_scope(&owner, &foreign).unwrap_err();
+            assert!(
+                matches!(error, QueryScopeError::UnauthorizedSiblingRoot { .. }),
+                "a resolution naming a different repository must fail closed: {error}"
+            );
+        }
     }
 
     #[test]
@@ -307,9 +359,9 @@ mod tests {
         let root = temp.path().join("main-checkout");
         std::fs::create_dir_all(&root).unwrap();
         init_repo(&root);
-        let root = root.canonicalize().unwrap();
+        let root = canonical_root(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
-        let linked = temp.path().join("linked-feature");
+        let linked = root.join(".claude/worktrees/linked-feature");
         git(
             &root,
             &[
@@ -320,11 +372,18 @@ mod tests {
                 "feature",
             ],
         );
-        let linked = linked.canonicalize().unwrap();
+        let linked = canonical_root(&linked);
         let owner = owner_for(&root, "project.mcp-scope-test");
 
         let main_scope = resolve_query_scope(&owner, &root).unwrap();
-        let linked_scope = resolve_query_scope(&owner, &linked).unwrap();
+        let (resolved_root, linked_scope) = resolve_query_scope_with_root(&owner, &linked).unwrap();
+        assert_eq!(resolved_root, linked);
+        let subdir = linked.join("src/deep");
+        std::fs::create_dir_all(&subdir).unwrap();
+        assert_eq!(
+            resolve_query_scope_with_root(&owner, &subdir).unwrap(),
+            (linked.clone(), linked_scope.clone())
+        );
 
         assert_eq!(
             main_scope.repository_id, linked_scope.repository_id,
@@ -350,7 +409,7 @@ mod tests {
         let root = temp.path().join("main-checkout");
         std::fs::create_dir_all(&root).unwrap();
         init_repo(&root);
-        let root = root.canonicalize().unwrap();
+        let root = canonical_root(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
         let linked = temp.path().join("linked-feature");
         git(
@@ -363,7 +422,7 @@ mod tests {
                 "feature-dotdot",
             ],
         );
-        let linked = linked.canonicalize().unwrap();
+        let linked = canonical_root(&linked);
         let requested = root.join("../linked-feature");
         let owner = owner_for(&root, "project.mcp-scope-test");
         let project_id = tracedecay_domain::ProjectId::new("project.mcp-scope-test").unwrap();
@@ -388,7 +447,7 @@ mod tests {
         let root = temp.path().join("main-checkout");
         std::fs::create_dir_all(&root).unwrap();
         init_repo(&root);
-        let root = root.canonicalize().unwrap();
+        let root = canonical_root(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
         let linked = temp.path().join("linked-feature");
         git(
@@ -401,7 +460,7 @@ mod tests {
                 "feature-symlink",
             ],
         );
-        let linked = linked.canonicalize().unwrap();
+        let linked = canonical_root(&linked);
         let requested = root.join("linked-alias");
         symlink(&linked, &requested).unwrap();
         let owner = owner_for(&root, "project.mcp-scope-test");

@@ -172,13 +172,15 @@ fn try_acquire_code_generation_store_lock_unfenced(
 pub(super) fn acquire_scope_retention_lock(
     store_root: &Path,
 ) -> Result<CodeGenerationStoreLockV1, CodeGenerationRetentionErrorV1> {
-    lock_file(
+    let lock = lock_file(
         store_root,
         SCOPE_RETENTION_LOCK_FILE,
         false,
         Instant::now() + GRAPH_REPLAY_POOL_ACQUIRE_BUDGET,
         &|| false,
-    )
+    )?;
+    super::segment_release::invalidate(&lock.store_root)?;
+    Ok(lock)
 }
 
 /// Exclusive hold on the project's shared generation segments.
@@ -188,6 +190,17 @@ pub(super) fn acquire_scope_retention_lock(
 /// segments, and collecting or restoring whole scopes, runs under it, so a
 /// sweep's mark phase observes every manifest that can still be read.
 pub(super) fn acquire_generation_segments_lock_checked(
+    store_root: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<CodeGenerationStoreLockV1, CodeGenerationRetentionErrorV1> {
+    let lock = acquire_generation_segments_census_lock_checked(store_root, is_cancelled)?;
+    super::segment_release::invalidate(&lock.store_root)?;
+    Ok(lock)
+}
+
+/// Exclusive census hold that does not invalidate its own read continuation.
+/// Every manifest-mutating caller uses the invalidating wrapper above.
+pub(super) fn acquire_generation_segments_census_lock_checked(
     store_root: &Path,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<CodeGenerationStoreLockV1, CodeGenerationRetentionErrorV1> {
@@ -217,6 +230,9 @@ pub fn acquire_generation_segments_publication_lock(
         let lock = open_lock_file(&project_root.join(SCOPE_RETENTION_LOCK_FILE))?;
         match lock.try_lock_shared().map_err(std::io::Error::from) {
             Ok(()) => {
+                // The shared hold excludes a census while the epoch changes;
+                // concurrent publications may both replace it atomically.
+                super::segment_release::invalidate(&project_root)?;
                 return Ok(CodeGenerationStoreLockV1 {
                     _file: FileLease::held(lock, CODE_GENERATION_LEASE_LABEL),
                     store_root: project_root,

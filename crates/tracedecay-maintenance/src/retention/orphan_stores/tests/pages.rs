@@ -996,3 +996,73 @@ async fn unregistered_store_sweep_returns_deadline_without_mutation() {
     assert_eq!(report.outcome.collected.len(), 0);
     assert!(profile_root.join("projects/proj_deadline").is_dir());
 }
+
+#[asupersync::test]
+async fn manifestless_copied_store_with_nonempty_rollback_journal_is_protected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let profile_root = tmp.path().join("profile");
+    std::fs::create_dir_all(&profile_root).unwrap();
+    let (_runtime, db) = open_registered_db(&profile_root).await;
+    let dir = profile_root.join("projects/proj_e7ed67fa0b91899e");
+    std::fs::create_dir_all(&dir).unwrap();
+    let graph = rusqlite::Connection::open(dir.join("tracedecay.db")).unwrap();
+    graph
+        .execute_batch("CREATE TABLE memory_notes (id TEXT PRIMARY KEY);")
+        .unwrap();
+    drop(graph);
+    let journal = dir.join("tracedecay.db-journal");
+    std::fs::write(&journal, b"unreconciled rollback authority").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 30 * DAY;
+    let applied = sweep_unregistered_stores(&db, &profile_root, 7 * DAY, now, true)
+        .await
+        .unwrap();
+    assert!(
+        applied.outcome.collected.is_empty(),
+        "rollback journals must fail closed: {applied:#?}"
+    );
+    assert_eq!(
+        std::fs::read(journal).unwrap(),
+        b"unreconciled rollback authority"
+    );
+}
+
+/// A copied project leaf loses its manifest but keeps ordinary SQLite
+/// companions and branch metadata. Those files must not disable collection.
+#[asupersync::test]
+async fn copied_manifestless_project_directory_is_collected_after_retention() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let profile_root = tmp.path().join("profile");
+    std::fs::create_dir_all(&profile_root).unwrap();
+    let (_runtime, db) = open_registered_db(&profile_root).await;
+    let dir = profile_root.join("projects/proj_4941de846e7370de");
+    std::fs::create_dir_all(&dir).unwrap();
+    let graph = rusqlite::Connection::open(dir.join("tracedecay.db")).unwrap();
+    graph
+        .execute_batch("CREATE TABLE memory_notes (id TEXT PRIMARY KEY);")
+        .unwrap();
+    drop(graph);
+    // Zero-length companions are common in copied, checkpointed stores.
+    std::fs::write(dir.join("tracedecay.db-wal"), b"").unwrap();
+    std::fs::write(dir.join("tracedecay.db-shm"), b"").unwrap();
+    std::fs::write(dir.join("branch-meta.json"),
+        br#"{"default_branch":"main","branches":{"main":{"db_file":"tracedecay.db","created_at":"0","last_synced_at":"3","gc_protected":false}}}"#).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 30 * DAY;
+    let preview = sweep_unregistered_stores(&db, &profile_root, 7 * DAY, now, false)
+        .await
+        .unwrap();
+    assert_eq!(preview.plan.collect.len(), 1);
+    assert!(dir.exists());
+    let applied = sweep_unregistered_stores(&db, &profile_root, 7 * DAY, now, true)
+        .await
+        .unwrap();
+    assert_eq!(applied.outcome.collected.len(), 1, "{applied:#?}");
+    assert!(!dir.exists());
+}

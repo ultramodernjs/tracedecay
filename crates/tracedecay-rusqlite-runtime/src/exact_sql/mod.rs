@@ -24,7 +24,7 @@ use crate::{
 };
 
 const MAX_QUERY_ROWS: usize = 10_000;
-const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_QUERY_BYTES: usize = 64 * 1024 * 1024;
 /// SQLite's statement-length limit, less the authority suffix
 /// [`guard::prepare_cached`] appends to a cached statement's text.
 const MAX_SQL_BYTES: usize = 1024 * 1024 - guard::MAX_CACHE_KEY_SUFFIX_BYTES;
@@ -40,6 +40,8 @@ const ROW_ALLOCATION_OVERHEAD: usize =
 const CELL_ALLOCATION_OVERHEAD: usize = std::mem::size_of::<ExactSqlValue>();
 
 mod clock;
+#[cfg(feature = "test-runtime")]
+pub use clock::fake::StatementClock;
 #[cfg(test)]
 pub(crate) use clock::fake::TaskClock;
 mod column;
@@ -1407,17 +1409,35 @@ fn execute_statement(
     connection: &Connection,
     statement: ExactSqlStatement,
 ) -> Result<ExactSqlExecuteResult, ExactSqlError> {
+    let spill_before = temp_spill_total(connection);
     let values = statement
         .params
         .into_iter()
         .map(ExactSqlValue::into_rusqlite);
-    let mut prepared = guard::prepare_cached(connection, &statement.sql)
-        .map_err(|error| sqlite_error("prepare execute", error))?;
-    let changed_rows = prepared
+    let mut prepared = match guard::prepare_cached(connection, &statement.sql) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let error = sqlite_error("prepare execute", error);
+            observe_exact_statement(
+                &statement.sql,
+                None,
+                Some(&error),
+                temp_spill_delta(connection, spill_before),
+            );
+            return Err(error);
+        }
+    };
+    let result = prepared
         .execute(params_from_iter(values))
-        .map_err(|error| sqlite_error("execute", error))?;
-    crate::telemetry::observe_statement(&prepared);
-    Ok(ExactSqlExecuteResult { changed_rows })
+        .map(|changed_rows| ExactSqlExecuteResult { changed_rows })
+        .map_err(|error| sqlite_error("execute", error));
+    observe_exact_statement(
+        &statement.sql,
+        Some(&prepared),
+        result.as_ref().err(),
+        temp_spill_delta(connection, spill_before),
+    );
+    result
 }
 
 fn attach_database(
@@ -1472,10 +1492,48 @@ fn detach_database(
 }
 
 fn execute_batch(connection: &Connection, sql: &str) -> Result<ExactSqlBatchResult, ExactSqlError> {
+    use rusqlite::fallible_iterator::FallibleIterator;
+
     let before = connection.total_changes();
-    connection
-        .execute_batch(sql)
-        .map_err(|error| sqlite_error("execute batch", error))?;
+    let mut batch = rusqlite::Batch::new(connection, sql);
+    loop {
+        let spill_before = temp_spill_total(connection);
+        let mut statement = match batch.next() {
+            Ok(Some(statement)) => statement,
+            Ok(None) => break,
+            Err(error) => {
+                let error = sqlite_error("execute batch", error);
+                // No statement exists on a preparation failure. Identify the
+                // batch template instead, without SQL or SQLite error text.
+                observe_exact_statement(
+                    sql,
+                    None,
+                    Some(&error),
+                    temp_spill_delta(connection, spill_before),
+                );
+                return Err(error);
+            }
+        };
+        // Batch accepts no bound values, so expanded_sql contains only the
+        // submitted statement (unbound slots become NULL). Hash it only;
+        // never log it, and never use expanded_sql on the bound request paths.
+        let template = statement.expanded_sql();
+        // Match rusqlite::Connection::execute_batch: step once, ignoring any
+        // returned row, including PRAGMA/RETURNING. Keep SQLite's parser and
+        // sequential preparation, without adding a transaction or a cache.
+        let result = statement
+            .raw_query()
+            .next()
+            .map(|_| ())
+            .map_err(|error| sqlite_error("execute batch", error));
+        observe_exact_statement(
+            template.as_deref().unwrap_or(sql),
+            Some(&statement),
+            result.as_ref().err(),
+            temp_spill_delta(connection, spill_before),
+        );
+        result?;
+    }
     Ok(ExactSqlBatchResult {
         changed_rows: connection.total_changes().saturating_sub(before),
     })
@@ -1569,33 +1627,139 @@ fn execute_query_unchecked(
     connection: &Connection,
     request: ExactSqlStatement,
 ) -> Result<ExactSqlRows, ExactSqlError> {
+    let spill_before = temp_spill_total(connection);
     // A read's cost decomposes into three phases that fail and stall for
     // different reasons, so they are measured apart: acquiring a preparable
     // statement (which rides out WAL recovery), SQLite's first step under the
     // snapshot, and materializing the result set. `reader.exact_sql` alone
     // cannot distinguish a scan from a wait.
-    let mut statement = {
+    let prepared = {
         let _span = tracing::trace_span!("rusqlite.exact_sql.query.prepare").entered();
         prepare_read_statement(connection, &request.sql)
-    }?;
-    let columns = statement
-        .column_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let values = request.params.into_iter().map(ExactSqlValue::into_rusqlite);
-    let mut query = {
-        let _span = tracing::trace_span!("rusqlite.exact_sql.query.start").entered();
-        statement.query(params_from_iter(values))
+    };
+    let mut statement = match prepared {
+        Ok(statement) => statement,
+        Err(error) => {
+            observe_exact_statement(
+                &request.sql,
+                None,
+                Some(&error),
+                temp_spill_delta(connection, spill_before),
+            );
+            return Err(error);
+        }
+    };
+    let result = (|| {
+        let columns = statement
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let values = request.params.into_iter().map(ExactSqlValue::into_rusqlite);
+        let mut query = {
+            let _span = tracing::trace_span!("rusqlite.exact_sql.query.start").entered();
+            statement.query(params_from_iter(values))
+        }
+        .map_err(|error| sqlite_error("start query", error))?;
+        let rows = {
+            let _span = tracing::trace_span!("rusqlite.exact_sql.query.fetch").entered();
+            materialize_rows(&mut query, &columns)
+        }?;
+        Ok(ExactSqlRows { columns, rows })
+    })();
+    observe_exact_statement(
+        &request.sql,
+        Some(&statement),
+        result.as_ref().err(),
+        temp_spill_delta(connection, spill_before),
+    );
+    result
+}
+
+// This connection-local counter includes external-sort construction, TEMP
+// tables, and intermediate B-trees. Unlike SQLITE_STMTSTATUS_SORT, it advances
+// before a sorter produces its first row. Do not reset it: CACHE_WRITE shares
+// accounting with it, and other telemetry may sample the same connection.
+fn temp_spill_total(connection: &Connection) -> Option<u64> {
+    let mut current = 0_i64;
+    let mut highwater = 0_i64;
+    // SAFETY: this live connection is exclusively executing on its owner
+    // thread, both output pointers remain valid, and resetFlag is zero. The
+    // 64-bit API avoids truncating exactly the multi-GB attempts we diagnose.
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_db_status64(
+            connection.handle(),
+            rusqlite::ffi::SQLITE_DBSTATUS_TEMPBUF_SPILL,
+            &mut current,
+            &mut highwater,
+            0,
+        )
+    };
+    (code == rusqlite::ffi::SQLITE_OK)
+        .then(|| u64::try_from(current).ok())
+        .flatten()
+}
+
+fn temp_spill_delta(connection: &Connection, before: Option<u64>) -> Option<u64> {
+    temp_spill_total(connection)?.checked_sub(before?)
+}
+
+/// Attribute attempted work, including a failed step or materialization. A
+/// template digest is stable across processes and never includes bound values;
+/// neither SQL text nor SQLite's potentially value-bearing error text is logged.
+fn observe_exact_statement(
+    sql: &str,
+    statement: Option<&rusqlite::Statement<'_>>,
+    error: Option<&ExactSqlError>,
+    temp_spill_bytes: Option<u64>,
+) {
+    use rusqlite::StatementStatus;
+    use sha2::{Digest, Sha256};
+
+    let status = |kind| {
+        statement.map_or(0, |statement| {
+            u64::try_from(statement.get_status(kind).max(0)).unwrap_or(0)
+        })
+    };
+    let sort_steps = status(StatementStatus::Sort);
+    let fullscan_steps = status(StatementStatus::FullscanStep);
+    let vm_steps = status(StatementStatus::VmStep);
+    if let Some(statement) = statement {
+        crate::telemetry::observe_statement(statement);
     }
-    .map_err(|error| sqlite_error("start query", error))?;
-    let rows = {
-        let _span = tracing::trace_span!("rusqlite.exact_sql.query.fetch").entered();
-        materialize_rows(&mut query, &columns)
-    }?;
-    drop(query);
-    crate::telemetry::observe_statement(&statement);
-    Ok(ExactSqlRows { columns, rows })
+    let sqlite_code = match error {
+        Some(ExactSqlError::Sqlite { code, .. }) => *code,
+        _ => None,
+    };
+    let failed = error.is_some();
+    if failed
+        || temp_spill_bytes.is_some_and(|bytes| bytes > 0)
+        || vm_steps >= 1_000_000
+        || fullscan_steps >= 100_000
+    {
+        let sql_template_id = Sha256::digest(sql.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        tracing::warn!(
+            target: "tracedecay_rusqlite_runtime::exact_sql::statement_cost",
+            %sql_template_id, failed, ?sqlite_code, sort_steps, fullscan_steps, vm_steps, temp_spill_bytes,
+            "costly or failed exact SQL statement"
+        );
+    } else if tracing::enabled!(
+        target: "tracedecay_rusqlite_runtime::exact_sql::statement_cost",
+        tracing::Level::TRACE
+    ) {
+        let sql_template_id = Sha256::digest(sql.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        tracing::trace!(
+            target: "tracedecay_rusqlite_runtime::exact_sql::statement_cost",
+            %sql_template_id, failed, ?sqlite_code, sort_steps, fullscan_steps, vm_steps, temp_spill_bytes,
+            "exact SQL statement cost"
+        );
+    }
 }
 
 /// Materializes a result set under the row-count and byte ceilings.
@@ -1706,5 +1870,7 @@ fn map_transaction_send_error(
     }
 }
 
+#[cfg(test)]
+mod statement_cost_tests;
 #[cfg(test)]
 mod tests;

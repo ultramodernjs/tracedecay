@@ -959,7 +959,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[asupersync::test]
     async fn provider_control_authority_is_independent_and_admission_precedes_dispatch() {
         use crate::retained_surfaces::{
             ProviderControlHealthCheckV1, ProviderControlStateSelectorV1, ProviderHealthRequestV1,

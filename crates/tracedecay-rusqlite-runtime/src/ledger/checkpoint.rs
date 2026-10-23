@@ -127,7 +127,7 @@ pub(super) fn persist(
     Ok(())
 }
 
-fn load(
+pub(super) fn load(
     transaction: &impl LedgerTransaction,
     binding_key: &BindingKey,
 ) -> Result<Option<Checkpoint>, LedgerError> {

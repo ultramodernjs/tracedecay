@@ -420,36 +420,46 @@ async fn durable_projection_alias_survives_rebuild_without_rewriting_observation
 
 #[tokio::test]
 async fn rebuild_preserves_output_referenced_by_another_projector_version() {
-    let tmp = TempDir::new().unwrap();
-    let runtime = profile_runtime(&tmp).await;
-    let store = runtime
-        .observation_store(HostAdmissionScope::Profile)
-        .unwrap();
-    let candidate = observation(
-        "session-shared-output",
-        0,
-        100,
-        "receipt.shared-output",
-        conversational_payload("message-shared-output", "shared output canary"),
-    );
-    persist(&store, candidate.clone(), None).await;
-    drain_projection_queue(&store).await;
-    add_other_projector_owner(&tmp, candidate.observation_id()).await;
+    // Both compact receipt references and canonical body references must be
+    // compared as logical output, without changing another projector's row.
+    for text in [
+        "shared output canary".to_owned(),
+        "large shared output canary ".repeat(512),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let runtime = profile_runtime(&tmp).await;
+        let store = runtime
+            .observation_store(HostAdmissionScope::Profile)
+            .unwrap();
+        let candidate = observation(
+            "session-shared-output",
+            0,
+            100,
+            "receipt.shared-output",
+            conversational_payload("message-shared-output", &text),
+        );
+        persist(&store, candidate.clone(), None).await;
+        drain_projection_queue(&store).await;
+        add_other_projector_owner(&tmp, candidate.observation_id()).await;
+        let stored_ids = projected_raw_store_ids(&tmp).await;
+        let stored_texts = projected_message_texts(&tmp).await;
 
-    rebuild_projection_to_completion(&store, 0).await;
-    assert_eq!(table_count(&tmp, "lcm_raw_messages").await, 1);
-    assert_eq!(
-        table_count(&tmp, "observation_projection_provenance").await,
-        2
-    );
+        rebuild_projection_to_completion(&store, 0).await;
+        assert_eq!(table_count(&tmp, "lcm_raw_messages").await, 1);
+        assert_eq!(
+            table_count(&tmp, "observation_projection_provenance").await,
+            2
+        );
 
-    rebuild_projection_to_completion(&store, 1).await;
-    assert_eq!(table_count(&tmp, "lcm_raw_messages").await, 1);
-    assert_eq!(
-        table_count(&tmp, "observation_projection_provenance").await,
-        2
-    );
-    assert_eq!(projected_message_texts(&tmp).await.len(), 1);
+        rebuild_projection_to_completion(&store, 1).await;
+        assert_eq!(table_count(&tmp, "lcm_raw_messages").await, 1);
+        assert_eq!(
+            table_count(&tmp, "observation_projection_provenance").await,
+            2
+        );
+        assert_eq!(projected_message_texts(&tmp).await, stored_texts);
+        assert_eq!(projected_raw_store_ids(&tmp).await, stored_ids);
+    }
 }
 
 #[tokio::test]

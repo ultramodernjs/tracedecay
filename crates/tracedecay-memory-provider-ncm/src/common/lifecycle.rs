@@ -798,7 +798,7 @@ fn reconstruct_feedback_delivery(
         ],
     )?;
     let request: Value = serde_json::from_slice(&call.payload.bytes).ok()?;
-    let expected = project(call, &request, &namespace, None)??;
+    let expected = project(call, &request, namespace, None)??;
     let admission =
         decode_receipt_capsule(&expected["common_control"]["feedback_delivery_capsule"])?;
     let operation = string(&retained["operation_id"])?;
@@ -881,7 +881,7 @@ pub(crate) fn reconstruct(
         {
             return None;
         }
-        let projected = project(call, &request, &namespace, None)??;
+        let projected = project(call, &request, namespace, None)??;
         let after = projected["common_control"]["after"].as_u64()?;
         let offset = usize::try_from(after).ok()?;
         if offset > readiness.descriptor.capabilities.len() {
@@ -950,7 +950,7 @@ pub(crate) fn reconstruct(
         let request: Value = serde_json::from_slice(&call.payload.bytes).ok()?;
         let retained_locator = match request.get("target") {
             Some(raw_target) => {
-                let projected = target(call, raw_target, &namespace)?;
+                let projected = target(call, raw_target, namespace)?;
                 Some(string(&projected["retained_source_locator"])?.to_owned())
             }
             None => None,
@@ -984,7 +984,7 @@ pub(crate) fn reconstruct(
                     return None;
                 }
                 let item = legacy_trace_item(
-                    &namespace,
+                    namespace,
                     request["selector"]["stable_memory_ref"].as_str()?,
                     row,
                 )?;
@@ -1017,7 +1017,7 @@ pub(crate) fn reconstruct(
                 }),
             };
             let stable = stable_reference(
-                &namespace,
+                namespace,
                 row["record_id"].as_u64()?,
                 row["provenance"]["common_capsule"]["sha256"].as_str()?,
             );

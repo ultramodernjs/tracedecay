@@ -720,7 +720,7 @@ pub(crate) fn reconstruct_observation(
     }
     let original_operation = string(&delivery["operation_id"])?;
     let stable = stable_reference(
-        &namespace,
+        namespace,
         metadata["record_id"].as_u64()?,
         metadata["provenance"]["common_capsule"]["sha256"].as_str()?,
     );
@@ -877,7 +877,7 @@ fn reconstruct_recall_inner(
         let candidate_id = row["candidate_id"].as_str()?;
         if stable
             != stable_reference(
-                &namespace,
+                namespace,
                 row["record_id"].as_u64()?,
                 row["provenance"]["common_capsule"]["sha256"].as_str()?,
             )
@@ -885,7 +885,7 @@ fn reconstruct_recall_inner(
             return None;
         }
         let request_token = opaque_caller_id(
-            &namespace,
+            namespace,
             &call.exact_scope,
             b"recall-request",
             &call.request_id,
@@ -1625,9 +1625,9 @@ pub(crate) fn emit_recall_post_dispatch_control_diagnostic(
     reply: &ProviderReply,
     code: TerminalCode,
     admission: Option<&CurrentAdvisoryAdmission>,
-    diagnostic_sink: Option<&dyn NcmRecallDiagnosticSink>,
-    diagnostic_key: Option<&[u8; 32]>,
+    diagnostic: (Option<&dyn NcmRecallDiagnosticSink>, Option<&[u8; 32]>),
 ) {
+    let (diagnostic_sink, diagnostic_key) = diagnostic;
     let Some(sink) = diagnostic_sink else {
         return;
     };
@@ -1748,7 +1748,7 @@ fn retained_source(
     }
     if let Some(original) = retained.get("original_source") {
         let source = attribution(original)?;
-        validate_source_binding(&namespace, &source, provenance, actual_source)?;
+        validate_source_binding(namespace, &source, provenance, actual_source)?;
         if call.operation == tracedecay_memory_provider_api::ProviderOperation::Recall
             && let OriginScopeEvidence::Recorded { scope, .. } = &source.origin_scope
             && scope != &call.exact_scope
@@ -1759,7 +1759,7 @@ fn retained_source(
         return Some(RetainedSource::Original(Box::new(source)));
     }
     validate_current_source_binding(
-        &namespace,
+        namespace,
         &delivery_scope,
         retained,
         provenance,

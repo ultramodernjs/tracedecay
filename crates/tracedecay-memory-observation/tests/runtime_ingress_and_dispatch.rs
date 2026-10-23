@@ -1344,7 +1344,9 @@ fn non_message_checkpoint_reopens_and_refuses_conflicts_and_corruption() -> Test
         );
     }
     let store = journal(&path)?;
-    let cursor = store.replay_cursor(&stream)?.expect("durable checkpoint");
+    let cursor = store
+        .replay_cursor(&stream)?
+        .ok_or("durable checkpoint missing")?;
     assert_eq!(cursor.last_admitted_sequence, SourceSequenceV1(1));
     assert_eq!(cursor.last_disposition, ReplayDispositionV1::NonMessage);
     assert_eq!(cursor.last_source_event_id, source.source_event_id);
@@ -1381,7 +1383,7 @@ fn non_message_position_survives_a_later_append_and_reopen() -> TestResult {
     assert_eq!(
         store
             .replay_cursor(&stream)?
-            .unwrap()
+            .ok_or("durable checkpoint missing")?
             .last_admitted_sequence,
         SourceSequenceV1(2)
     );

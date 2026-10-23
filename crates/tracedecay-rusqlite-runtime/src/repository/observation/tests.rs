@@ -361,7 +361,8 @@ fn connection() -> Connection {
     let connection = Connection::open_in_memory().unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE sanitization_receipts (
+            "CREATE TABLE session_backfill_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE sanitization_receipts (
                     receipt_id TEXT PRIMARY KEY,
                     sanitizer_version TEXT NOT NULL,
                     payload_digest TEXT NOT NULL,
@@ -1508,4 +1509,108 @@ fn stored_observation_body_errors_preserve_database_and_body_causes() {
         source.downcast_ref::<tracedecay_store::CanonicalBodyError>(),
         Some(tracedecay_store::CanonicalBodyError::Corrupt { .. })
     ));
+}
+
+#[test]
+fn excluded_source_final_writer_rechecks_prepared_input_before_any_evidence_write() {
+    let mut connection = connection();
+    // Intake prepared this anchored write before the operator installed a marker.
+    let write = repository_write(1, "refs/heads/main", EvidenceClass::Observed);
+    let source = write.observation().source();
+    let scope = write.observation().scope();
+    let key = tracedecay_store::observation_source_exclusion_key(source, scope).unwrap();
+    let marker =
+        json!({"version": 1, "source": source, "scope": scope, "plan_digest": "a".repeat(64)});
+    connection
+        .execute(
+            "INSERT INTO session_backfill_meta VALUES (?1, ?2)",
+            rusqlite::params![key, marker.to_string()],
+        )
+        .unwrap();
+    execute(&mut connection, &write).expect("excluded evidence is successful terminal coverage");
+    execute(&mut connection, &write).expect("covered retry stays terminal and receiptless");
+    let stored = read(
+        &mut connection,
+        &ObservationReadOperationV1::Observation {
+            observation_id: write.observation().observation_id().clone(),
+        },
+    )
+    .unwrap();
+    assert!(matches!(stored, ObservationReadResultV1::Observation(row) if row.is_none()));
+    let cursor: ObservationSourceCursorV1 =
+        serde_json::from_str(&source_cursor_json(&connection)).unwrap();
+    assert_eq!(&cursor, write.next_cursor());
+    for table in [
+        "observations",
+        "sanitization_receipts",
+        "retrieval_anchors",
+        "retrieval_anchor_aliases",
+        "observation_retrieval_anchors",
+        "observation_repository_provenance",
+        "observation_repository_captures",
+        "projection_queue",
+        "session_canonical_bodies",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "excluded input must not write {table}");
+    }
+    let (reason, receipt): (String, Option<String>) = connection
+        .query_row(
+            "SELECT reason, receipt_id FROM source_cursor_advances",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(reason, "operator_pruned_source");
+    assert!(receipt.is_none());
+}
+
+#[test]
+fn excluded_source_cursor_admission_does_not_persist_a_sanitization_receipt() {
+    let mut connection = connection();
+    let write = observation_write("excluded duplicate", "receipt.excluded-advance");
+    let observation = write.observation();
+    let key = tracedecay_store::observation_source_exclusion_key(
+        observation.source(),
+        observation.scope(),
+    )
+    .unwrap();
+    let marker = json!({"version": 1, "source": observation.source(), "scope": observation.scope(), "plan_digest": "a".repeat(64)});
+    connection
+        .execute(
+            "INSERT INTO session_backfill_meta VALUES (?1, ?2)",
+            rusqlite::params![key, marker.to_string()],
+        )
+        .unwrap();
+    let advance = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
+        observation.source().clone(),
+        observation.scope().clone(),
+        observation.identity().generation(),
+        observation.identity().ordering_domain(),
+        None,
+        observation.identity().position(),
+        ObservationCoverageReason::DuplicateObservation,
+        observation.receipt().clone(),
+    )
+    .unwrap();
+    execute_cursor_advance(&mut connection, &advance).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT count(*) FROM sanitization_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "excluded cursor coverage must not resurrect sanitization receipts"
+    );
+    let reason: String = connection
+        .query_row("SELECT reason FROM source_cursor_advances", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(reason, "operator_pruned_source");
 }

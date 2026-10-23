@@ -15,14 +15,15 @@ import { setupServer, type SetupServer } from 'msw/node';
 import { lookupFixture } from './data.ts';
 
 /**
- * The fixture for a request, or nothing. A resolver that returns nothing leaves
- * the request unhandled, so a server listening with `onUnhandledFrame:
- * 'error'` fails on a path no fixture models instead of answering it.
+ * Refuse an unmodelled path inside the catch-all handler. Returning undefined
+ * from a matched MSW handler bypasses to the network; onUnhandledFrame only
+ * guards requests with no matching handler. A fixture must never reach a real
+ * service that happens to be listening on localhost.
  */
-function fixtureResponse(request: Request): Response | undefined {
+function fixtureResponse(request: Request): Response {
   const url = new URL(request.url);
   const payload = lookupFixture(url.pathname, url.search);
-  return payload === undefined ? undefined : HttpResponse.json(payload as JsonBodyType);
+  return payload === undefined ? HttpResponse.error() : HttpResponse.json(payload as JsonBodyType);
 }
 
 /** Every modelled `/api` GET, resolved from the pathname to its fixture payload. */

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for distribution feature ownership validation."""
+"""Regression tests for source features and NCM release contract validation."""
 
 from __future__ import annotations
 
@@ -58,52 +58,6 @@ medium = ["lang-dart"]
 full = ["medium", "lang-markdown"]
 lang-dart = []
 lang-markdown = []
-"""
-
-EXTRACTION_BUILD_MANIFEST = """[package]
-name = "tracedecay-code-extraction"
-version = "0.1.0"
-edition = "2024"
-
-[features]
-default = []
-lang-dart = ["dep:dart-grammar"]
-lang-markdown = ["dep:markdown-grammar"]
-
-[dependencies]
-dart-grammar = { path = "dart-grammar", optional = true }
-markdown-grammar = { path = "markdown-grammar", optional = true }
-
-# Standalone: a temp root inside a checkout (Bazel on Windows) must not be
-# claimed by the enclosing workspace.
-[workspace]
-"""
-
-EXTRACTION_BUILD_LIB = """#[cfg(feature = "lang-dart")]
-pub fn dart() -> dart_grammar::Language {
-    dart_grammar::language()
-}
-
-#[cfg(feature = "lang-markdown")]
-pub fn markdown() -> markdown_grammar::Language {
-    markdown_grammar::language()
-}
-"""
-
-GRAMMAR_MANIFEST = """[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-path = "lib.rs"
-"""
-
-GRAMMAR_LIB = """pub struct Language;
-
-pub fn language() -> Language {
-    Language
-}
 """
 
 CLI_MANIFEST = """[package]
@@ -425,7 +379,7 @@ def run_fixture(
     extraction_packaged: str = EXTRACTION_MANIFEST,
     cli_source: str | None = None,
     cli_packaged: str | None = None,
-    extraction_build_manifest: str | None = None,
+    source_only: bool = False,
     ncm_files: dict[str, object] | None = None,
     ncm_workflows: list[Path] | None = None,
 ) -> FixtureResult:
@@ -450,6 +404,7 @@ def run_fixture(
             root.joinpath(name).write_text(contents, encoding="utf-8")
         command = [
             sys.executable,
+            "-B",
             str(VALIDATOR),
             "--root-source",
             str(root / "root-source.toml"),
@@ -498,27 +453,10 @@ def run_fixture(
             )
             for workflow in ncm_workflows or []:
                 command.extend(["--ncm-release-workflow", str(workflow)])
-        if extraction_build_manifest is not None:
-            extraction = root / "extraction-build"
-            extraction.joinpath("src").mkdir(parents=True)
-            extraction.joinpath("Cargo.toml").write_text(
-                extraction_build_manifest, encoding="utf-8"
-            )
-            extraction.joinpath("src/lib.rs").write_text(
-                EXTRACTION_BUILD_LIB, encoding="utf-8"
-            )
-            for grammar in ("dart-grammar", "markdown-grammar"):
-                dependency = extraction / grammar
-                dependency.mkdir()
-                dependency.joinpath("Cargo.toml").write_text(
-                    GRAMMAR_MANIFEST.format(name=grammar), encoding="utf-8"
-                )
-                dependency.joinpath("lib.rs").write_text(
-                    GRAMMAR_LIB, encoding="utf-8"
-                )
-            command.extend(
-                ["--check-extraction-manifest", str(extraction / "Cargo.toml")]
-            )
+        if source_only:
+            for option in ("--root-packaged", "--code-index-packaged", "--extraction-packaged", "--cli-packaged"):
+                index = command.index(option)
+                del command[index:index + 2]
         completed = subprocess.run(
             command,
             check=False,
@@ -630,6 +568,28 @@ def check_ncm_release_profiles() -> None:
 
 
 def main() -> int:
+    source_contract = run_fixture(source_only=True)
+    if source_contract.returncode != 0:
+        raise SystemExit("source-only feature contract was rejected: " + source_contract.stderr)
+    ncm_source_contract = run_fixture(
+        root_source=NCM_ROOT_MANIFEST,
+        ncm_files=ncm_fixture(),
+        source_only=True,
+    )
+    if ncm_source_contract.returncode != 0:
+        raise SystemExit("source-only NCM contract was rejected: " + ncm_source_contract.stderr)
+    source_without_host = run_fixture(
+        root_source=NCM_ROOT_MANIFEST,
+        cli_source=NCM_CLI_MANIFEST.replace(
+            'default = ["production", "memory-provider-host"]',
+            'default = ["production"]',
+        ),
+        ncm_files=ncm_fixture(),
+        source_only=True,
+    )
+    if source_without_host.returncode == 0 or "CLI default must enable memory-provider-host" not in source_without_host.stderr:
+        raise SystemExit("source-only NCM check did not reject a missing host: " + source_without_host.stderr)
+
     extracted_owner = run_fixture()
     if extracted_owner.returncode != 0:
         raise SystemExit(extracted_owner.stderr)
@@ -714,29 +674,6 @@ def main() -> int:
     if "root language features differ" not in unforwarded_language.stderr:
         raise SystemExit("unforwarded language failed for an unexpected reason")
 
-    isolated_languages = run_fixture(
-        extraction_build_manifest=EXTRACTION_BUILD_MANIFEST
-    )
-    if isolated_languages.returncode != 0:
-        raise SystemExit(isolated_languages.stderr)
-
-    extraction_with_miswired_language = EXTRACTION_BUILD_MANIFEST.replace(
-        'lang-dart = ["dep:dart-grammar"]',
-        'lang-dart = ["dep:markdown-grammar"]',
-    )
-    miswired_language = run_fixture(
-        extraction_build_manifest=extraction_with_miswired_language
-    )
-    if miswired_language.returncode == 0:
-        raise SystemExit("miswired isolated extraction language was accepted")
-    if "lang-dart does not compile in isolation" not in miswired_language.stderr:
-        raise SystemExit("miswired extraction language failed for an unexpected reason")
-    if "dart_grammar" not in miswired_language.stderr or not any(
-        diagnostic in miswired_language.stderr
-        for diagnostic in ("unresolved module", "unresolved import")
-    ):
-        raise SystemExit("miswired extraction language did not fail on its missing grammar")
-
     check_ncm_release_profiles()
 
     ncm_valid = run_fixture(
@@ -750,6 +687,41 @@ def main() -> int:
     )
     if ncm_valid.returncode != 0:
         raise SystemExit("valid NCM distribution matrix was rejected: " + ncm_valid.stderr)
+
+    # Both ordinary releases and inventory-only recovery must retain the
+    # supported-target restriction. Check each step independently so an
+    # intact packaging guard cannot hide an unguarded installed verification.
+    workflow = (VALIDATOR.parent.parent / ".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
+    supported_guard = "matrix.ncm == 'supported'"
+    recovery_guard = supported_guard + " && matrix.inventory_only != true"
+    for step in ("Package NCM worker sidecar", "Verify installed NCM release"):
+        original = f"- name: {step}\n        if: {recovery_guard}\n"
+        if original not in workflow:
+            raise SystemExit(f"NCM recovery workflow fixture no longer guards {step!r}")
+        for guard, accepted in (
+            (supported_guard, True),
+            ("matrix.inventory_only != true", False),
+            (supported_guard + " || matrix.inventory_only != true", False),
+            ("matrix.ncm == 'native-only'", False),
+        ):
+            with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as directory:
+                path = Path(directory) / "release.yml"
+                path.write_text(
+                    workflow.replace(original, f"- name: {step}\n        if: {guard}\n"),
+                    encoding="utf-8",
+                )
+                result = run_fixture(
+                    root_source=NCM_ROOT_MANIFEST,
+                    root_packaged=NCM_ROOT_MANIFEST,
+                    ncm_files=ncm_fixture(),
+                    ncm_workflows=[path],
+                )
+            if (result.returncode == 0) != accepted:
+                raise SystemExit(f"unexpected NCM guard verdict for {step!r}: {guard}: {result.stderr}")
+            if not accepted and "supported sidecar target" not in result.stderr:
+                raise SystemExit("NCM guard failed for an unexpected reason: " + result.stderr)
 
     ncm_without_receipt_digest = ncm_fixture()
     acquisition_without_receipt_digest = ncm_without_receipt_digest["model-acquisition.json"]
@@ -932,7 +904,7 @@ def main() -> int:
             + missing_archive_companion.stderr
         )
 
-    print("distribution feature wiring fixtures passed")
+    print("source feature wiring and NCM release contract fixtures passed")
     return 0
 
 

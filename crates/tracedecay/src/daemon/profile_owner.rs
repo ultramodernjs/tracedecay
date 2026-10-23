@@ -22,7 +22,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
 use tracedecay_contracts::retrieval::{
-    AdminCliSurfaceRequestV1, AdminProjectResultV1, AdminProjectSurfaceRequestV1,
+    AdminCliResultV1, AdminCliSurfaceRequestV1, AdminProjectResultV1, AdminProjectSurfaceRequestV1,
     AutomationReconcileScope, HookRuntimeResultV1, ProfileAutomationReconcileReport,
     UncachedProjectReconcileOutcome,
 };
@@ -48,6 +48,7 @@ use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 use super::StoreAdministration;
 use super::profile_retained::profile_session_scope;
+mod graph_replay_release;
 use crate::mcp::tools::graph_tool_error_problem;
 use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
 
@@ -65,6 +66,12 @@ pub(super) async fn invoke_profile_owner_operation(
     cancellation: CancellationContext,
     request_cancellation: Option<CancellationToken>,
 ) -> DaemonInvocationResponse {
+    let maintenance_cancellation = request_cancellation.clone().unwrap_or_default();
+    let request_cancellation = if is_graph_replay_release(operation, &arguments) {
+        Some(maintenance_cancellation.clone())
+    } else {
+        request_cancellation
+    };
     answer_profile_owner_operation(
         request_id,
         operation,
@@ -79,6 +86,7 @@ pub(super) async fn invoke_profile_owner_operation(
                 active_project_root,
                 operation,
                 arguments,
+                &maintenance_cancellation,
             )
         },
     )
@@ -93,6 +101,7 @@ async fn compute_profile_owner_operation(
     active_project_root: Option<&Path>,
     operation: ApplicationSurfaceOperation,
     arguments: Map<String, Value>,
+    maintenance_cancellation: &CancellationToken,
 ) -> Result<(ResolvedScope, GraphToolCompletionV1)> {
     let profile_identity = store_administration.profile_identity()?;
     let scope = profile_session_scope(profile_identity)?;
@@ -139,28 +148,15 @@ async fn compute_profile_owner_operation(
         ApplicationSurfaceOperation::AdminCli => {
             let request: AdminCliSurfaceRequestV1 =
                 decode_primitive_request(&Value::Object(arguments), operation.mcp_tool_name())?;
-            let registry = Box::pin(store_administration.registered_profile_database()).await?;
-            let session_databases =
-                if matches!(request, AdminCliSurfaceRequestV1::StorageReport { .. }) {
-                    store_administration
-                        .mounted_registered_session_databases()
-                        .await?
-                } else {
-                    Vec::new()
-                };
             GraphToolResultV1::AdminCli(Box::new(
-                Box::pin(
-                    tracedecay_mcp::handlers::admin_cli::compute_projectless_admin_cli(
-                        request,
-                        &registry,
-                        tracedecay_global_db::global_accounting_enabled()
-                            .then_some(registry.as_ref()),
-                        profile_identity.profile_root(),
-                        active_project_root,
-                        code_index_schedulers,
-                        &session_databases,
-                    ),
-                )
+                Box::pin(profile_admin_cli(
+                    store_administration,
+                    profile_identity,
+                    active_project_root,
+                    code_index_schedulers,
+                    request,
+                    maintenance_cancellation,
+                ))
                 .await?,
             ))
         }
@@ -184,6 +180,54 @@ async fn compute_profile_owner_operation(
             cost: None,
         },
     ))
+}
+
+/// Profile CLI actions share transport completion but retain distinct store authority.
+async fn profile_admin_cli(
+    administration: &StoreAdministration,
+    profile_identity: &LocalProfileIdentityAuthorityV1,
+    active_project_root: Option<&Path>,
+    schedulers: Option<&CodeIndexSchedulerRegistryV1>,
+    request: AdminCliSurfaceRequestV1,
+    cancellation: &CancellationToken,
+) -> Result<AdminCliResultV1> {
+    if let AdminCliSurfaceRequestV1::ReleaseGraphReplays {
+        project_id,
+        project_root,
+        after,
+        plan_digest,
+    } = &request
+    {
+        return graph_replay_release::release(
+            administration,
+            project_id,
+            project_root,
+            after.as_deref(),
+            plan_digest.as_deref(),
+            cancellation,
+        )
+        .await;
+    }
+    let registry = Box::pin(administration.registered_profile_database()).await?;
+    let session_databases = if matches!(request, AdminCliSurfaceRequestV1::StorageReport { .. }) {
+        administration
+            .mounted_registered_session_databases()
+            .await?
+    } else {
+        Vec::new()
+    };
+    Box::pin(
+        tracedecay_mcp::handlers::admin_cli::compute_projectless_admin_cli(
+            request,
+            &registry,
+            tracedecay_global_db::global_accounting_enabled().then_some(registry.as_ref()),
+            profile_identity.profile_root(),
+            active_project_root,
+            schedulers,
+            &session_databases,
+        ),
+    )
+    .await
 }
 
 /// One hook action with no project route. It lands in the profile's user
@@ -240,6 +284,14 @@ pub(crate) async fn registry_read(
     .await
 }
 
+fn is_graph_replay_release(
+    operation: ApplicationSurfaceOperation,
+    arguments: &Map<String, Value>,
+) -> bool {
+    operation == ApplicationSurfaceOperation::AdminCli
+        && arguments.get("action").and_then(Value::as_str) == Some("release_graph_replays")
+}
+
 /// Admit one profile-owner request, run `compute` within its dispatch
 /// ceiling, and settle its typed terminal.
 ///
@@ -278,9 +330,23 @@ where
             ApplicationProblem::timed_out_before_admission(),
         );
     };
+    let release_cancellation = request_cancellation
+        .as_ref()
+        .filter(|_| is_graph_replay_release(operation, &arguments))
+        .cloned();
     let computed = compute(arguments);
     let bounded = async {
-        match native_runtime::timeout(budget, computed).await {
+        let mut computed = Box::pin(computed);
+        let outcome = native_runtime::timeout(budget, computed.as_mut()).await;
+        if outcome.is_err()
+            && let Some(token) = release_cancellation
+        {
+            // A timeout must not detach blocking retirement or let its SQL
+            // owner/writer guard drop while mutation is still settling.
+            token.cancel();
+            let _ = computed.await;
+        }
+        match outcome {
             Ok(result) => result,
             Err(TimeoutError::Elapsed) => Err(tool_dispatch_deadline_error(tool_name, budget)),
             Err(error @ TimeoutError::TimerUnavailable(_)) => Err(TraceDecayError::Config {

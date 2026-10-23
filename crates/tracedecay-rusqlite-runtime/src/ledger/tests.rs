@@ -1,5 +1,95 @@
 use rusqlite::Connection;
 
+mod maintenance;
+
+fn ledger_test_directory() -> tempfile::TempDir {
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .or_else(|| std::env::var_os("TEST_TMPDIR"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&root).unwrap();
+    tempfile::tempdir_in(root).unwrap()
+}
+
+#[test]
+fn maintenance_drains_superseded_backlog_without_foreground_commits() {
+    use crate::runtime_ledger::preview_writer_ledger_cleanup;
+
+    let directory = ledger_test_directory();
+    let mut connection = Connection::open(directory.path().join("sessions.db")).unwrap();
+    let advanced = at_authority("operation.drain.advance", "key.drain.advance", 'b', 1, 8);
+    let binding = binding(&advanced);
+    let receipt = {
+        let transaction = connection.transaction().unwrap();
+        initialize_schema(&transaction).unwrap();
+        transaction
+            .execute_batch(
+                "CREATE TABLE domain_marker(value INTEGER); INSERT INTO domain_marker VALUES(42)",
+            )
+            .unwrap();
+        for index in 0..279 {
+            commit(
+                &transaction,
+                &at_authority(
+                    &format!("operation.drain.{index}"),
+                    &format!("key.drain.{index}"),
+                    'a',
+                    1,
+                    7,
+                ),
+            );
+        }
+        let receipt = commit(&transaction, &advanced);
+        transaction.commit().unwrap();
+        receipt
+    };
+    let before = connection.total_changes();
+    {
+        let transaction = connection.transaction().unwrap();
+        let plan = preview_writer_ledger_cleanup(&transaction, &binding, 10).unwrap();
+        assert_eq!(plan.report().eligible_rows, 10);
+        assert!(plan.report().has_more);
+        transaction.rollback().unwrap();
+    }
+    assert_eq!(
+        connection.total_changes(),
+        before,
+        "preview must be read-only"
+    );
+    let mut deleted = Vec::new();
+    for _ in 0..4 {
+        let transaction = connection.transaction().unwrap();
+        let plan = preview_writer_ledger_cleanup(&transaction, &binding, 10).unwrap();
+        deleted.push(plan.apply(&binding).unwrap());
+        assert_eq!(
+            current_watermark(&transaction, &binding)
+                .unwrap()
+                .unwrap()
+                .commit_sequence,
+            receipt.commit_sequence
+        );
+        assert_eq!(
+            lookup_receipt(&transaction, &binding, &advanced.idempotency).unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            transaction
+                .query_row("SELECT value FROM domain_marker", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        transaction.commit().unwrap();
+    }
+    assert_eq!(deleted, vec![10, 10, 3, 0]);
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
 use super::*;
 use crate::test_support::{binding, metadata, scope};
 
@@ -444,5 +534,390 @@ fn the_live_incarnation_keeps_replaying_its_own_receipts_past_the_window() {
             LedgerDisposition::Replay(found) if found == receipt
         ),
         "a two-week-old receipt of the live incarnation still replays"
+    );
+}
+
+#[test]
+fn replay_window_requests_rotation_without_expiring_exact_once_receipts() {
+    use crate::runtime_ledger::{WriterReplayWindow, WriterReplayWindowPolicy};
+    use std::time::{Duration, Instant};
+
+    let week = prune::RETIRED_INCARNATION_QUIET_MICROS;
+    let original = admitted(metadata("operation.window", "key.window", 'a'), 100);
+    let binding = binding(&original);
+    let mut connection = Connection::open_in_memory().unwrap();
+    let transaction = connection.transaction().unwrap();
+    initialize_schema(&transaction).unwrap();
+    let receipt = commit(&transaction, &original);
+    let policy = WriterReplayWindowPolicy::new(2, Duration::from_secs(7 * 24 * 60 * 60)).unwrap();
+    let now = Instant::now();
+    let mut monitor = WriterReplayWindow::new(binding.clone(), policy);
+    assert!(
+        !monitor
+            .inspect_at(&transaction, 100, now)
+            .unwrap()
+            .rotation_required
+    );
+    let aged = monitor
+        .inspect_at(&transaction, 0, now + Duration::from_secs(7 * 24 * 60 * 60))
+        .unwrap();
+    assert!(
+        aged.age_limit_reached,
+        "clock rollback must not extend the in-process replay window"
+    );
+    assert!(aged.rotation_required);
+    let fresh_retry = admitted(
+        metadata("operation.window.retry", "key.window", 'a'),
+        100 + 2 * week,
+    );
+    assert!(
+        matches!(record_commit(&transaction, &fresh_retry, &scope(&fresh_retry)).unwrap(), LedgerDisposition::Replay(found) if found == receipt)
+    );
+    assert_eq!(
+        lookup_receipt(&transaction, &binding, &original.idempotency).unwrap(),
+        Some(receipt)
+    );
+    commit(
+        &transaction,
+        &admitted(
+            metadata("operation.window.second", "key.window.second", 'b'),
+            101,
+        ),
+    );
+    let mut reopened = WriterReplayWindow::new(binding.clone(), policy);
+    let standing = reopened.inspect_at(&transaction, 101, now).unwrap();
+    assert_eq!(standing.receipt_rows_at_least, 2);
+    assert!(
+        standing.count_limit_reached,
+        "recreating a writer must not reset the persisted allowance"
+    );
+    assert!(standing.rotation_required);
+    let mut reopened = WriterReplayWindow::new(binding, policy);
+    assert!(
+        reopened
+            .inspect_at(&transaction, 100 + week, now)
+            .unwrap()
+            .age_limit_reached,
+        "an idle epoch must recover its oldest receipt age after reopen"
+    );
+    assert_eq!(
+        idempotency_rows(&transaction).len(),
+        2,
+        "detection never deletes live receipts"
+    );
+}
+
+#[test]
+fn replay_window_reopen_requests_rotation_when_persisted_clock_is_ahead() {
+    use crate::runtime_ledger::{WriterReplayWindow, WriterReplayWindowPolicy};
+    use std::time::{Duration, Instant};
+
+    let original = admitted(metadata("operation.clock", "key.clock", 'a'), 100);
+    let binding = binding(&original);
+    let mut connection = Connection::open_in_memory().unwrap();
+    let receipt = {
+        let transaction = connection.transaction().unwrap();
+        initialize_schema(&transaction).unwrap();
+        let receipt = commit(&transaction, &original);
+        commit(
+            &transaction,
+            &admitted(
+                metadata("operation.clock.second", "key.clock.second", 'b'),
+                300,
+            ),
+        );
+        transaction.commit().unwrap();
+        receipt
+    };
+    let policy = WriterReplayWindowPolicy::new(3, Duration::from_secs(1)).unwrap();
+    let now = Instant::now();
+    {
+        let transaction = connection.transaction().unwrap();
+        let mut monitor = WriterReplayWindow::new(binding.clone(), policy);
+        assert!(
+            !monitor
+                .inspect_at(&transaction, 300, now)
+                .unwrap()
+                .rotation_required
+        );
+        let exhausted = monitor
+            .inspect_at(&transaction, 1_000_100, now + Duration::from_secs(1))
+            .unwrap();
+        assert!(exhausted.age_limit_reached);
+        assert!(!exhausted.count_limit_reached);
+        assert!(exhausted.rotation_required);
+    }
+    // Reconstruct the same binding with no retained in-process clock state.
+    // Check rollback behind all receipts and behind only the newest receipt.
+    for rolled_back_wall in [99, 200] {
+        let transaction = connection.transaction().unwrap();
+        let mut reopened = WriterReplayWindow::new(binding.clone(), policy);
+        let standing = reopened
+            .inspect_at(&transaction, rolled_back_wall, now + Duration::from_secs(2))
+            .unwrap();
+        assert!(!standing.count_limit_reached);
+        assert!(!standing.age_limit_reached);
+        assert!(standing.clock_uncertain);
+        assert!(
+            standing.rotation_required,
+            "clock uncertainty after reopen must not clear an exhausted epoch's rotation signal"
+        );
+        let retry = admitted(
+            metadata("operation.clock.retry", "key.clock", 'a'),
+            1_000_101,
+        );
+        assert!(
+            matches!(record_commit(&transaction, &retry, &scope(&retry)).unwrap(), LedgerDisposition::Replay(found) if found == receipt)
+        );
+        assert_eq!(
+            lookup_receipt(&transaction, &binding, &original.idempotency).unwrap(),
+            Some(receipt.clone())
+        );
+        assert_eq!(idempotency_rows(&transaction).len(), 2);
+    }
+}
+
+#[test]
+fn retired_cleanup_requires_owner_fence_and_revalidates_checkpoint() {
+    use crate::{
+        RuntimeWriteAuthorityError,
+        runtime_ledger::{
+            WriterLedgerRetirementAuthority, preview_retired_writer_ledger_cleanup,
+            preview_writer_ledger_cleanup,
+        },
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct OwnerFence(AtomicBool);
+    impl WriterLedgerRetirementAuthority for OwnerFence {
+        fn verify_retired(
+            &self,
+            _live: &tracedecay_store::StoreRuntimeBindingV1,
+            _retired: &tracedecay_store::StoreRuntimeBindingV1,
+        ) -> Result<(), RuntimeWriteAuthorityError> {
+            if self.0.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(RuntimeWriteAuthorityError::denied("retirement revoked"))
+            }
+        }
+    }
+    let mut connection = Connection::open_in_memory().unwrap();
+    let transaction = connection.transaction().unwrap();
+    initialize_schema(&transaction).unwrap();
+    let old = at_authority("operation.retired", "key.retired", 'a', 1, 7);
+    let live = at_authority("operation.live", "key.live", 'b', 2, 7);
+    commit(&transaction, &old);
+    commit(&transaction, &live);
+    let retired = binding(&old);
+    let live = binding(&live);
+    let fence = OwnerFence(AtomicBool::new(true));
+    assert_eq!(
+        preview_writer_ledger_cleanup(&transaction, &live, 10)
+            .unwrap()
+            .report()
+            .eligible_rows,
+        0
+    );
+    let before = transaction.total_changes();
+    let plan =
+        preview_retired_writer_ledger_cleanup(&transaction, &live, &retired, &fence, 10).unwrap();
+    assert_eq!(plan.report().eligible_rows, 1);
+    assert!(plan.report().eligible_payload_bytes > 0);
+    assert_eq!(transaction.total_changes(), before);
+    fence.0.store(false, Ordering::Release);
+    assert!(
+        plan.apply(&live).is_err(),
+        "an expired owner fence must fail before deleting"
+    );
+    assert_eq!(idempotency_rows(&transaction), vec![(1, 7), (2, 7)]);
+    fence.0.store(true, Ordering::Release);
+    transaction
+        .execute(
+            "UPDATE td_runtime_writer_checkpoint_v1 SET authority_epoch=999 WHERE incarnation=1",
+            [],
+        )
+        .unwrap();
+    assert!(
+        preview_retired_writer_ledger_cleanup(&transaction, &live, &retired, &fence, 10).is_err(),
+        "raw neighbouring checkpoint scalars are not authority"
+    );
+    transaction
+        .execute(
+            "UPDATE td_runtime_writer_checkpoint_v1 SET authority_epoch=7 WHERE incarnation=1",
+            [],
+        )
+        .unwrap();
+    assert!(
+        preview_retired_writer_ledger_cleanup(&transaction, &live, &live, &fence, 10).is_err(),
+        "the live incarnation cannot retire itself"
+    );
+    let plan =
+        preview_retired_writer_ledger_cleanup(&transaction, &live, &retired, &fence, 10).unwrap();
+    assert_eq!(plan.apply(&live).unwrap(), 1);
+    assert_eq!(idempotency_rows(&transaction), vec![(2, 7)]);
+    assert!(
+        current_watermark(&transaction, &retired).unwrap().is_some(),
+        "cleanup must preserve the old checkpoint fence"
+    );
+    assert_eq!(
+        preview_retired_writer_ledger_cleanup(&transaction, &live, &retired, &fence, 10)
+            .unwrap()
+            .apply(&live)
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn interrupted_writer_owned_drain_rolls_back_and_resumes_after_reopen() {
+    use crate::{
+        RuntimeWriteAuthority, RuntimeWriteAuthorityError, RuntimeWriteAuthorityStage,
+        runtime_ledger::{
+            WriterLedgerMaintenance, WriterReplayWindowPolicy, drain_writer_ledger_page,
+            preview_writer_ledger_cleanup,
+        },
+    };
+    struct Authority(bool);
+    impl RuntimeWriteAuthority for Authority {
+        fn verify(
+            &self,
+            stage: RuntimeWriteAuthorityStage,
+        ) -> Result<(), RuntimeWriteAuthorityError> {
+            if !self.0 && stage == RuntimeWriteAuthorityStage::BeforeCommit {
+                Err(RuntimeWriteAuthorityError::denied(
+                    "fixture cancellation before commit",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let directory = ledger_test_directory();
+    let path = directory.path().join("sessions.db");
+    let mut connection = Connection::open(&path).unwrap();
+    let live = at_authority("operation.resume.advance", "key.resume.advance", 'b', 1, 8);
+    let binding = binding(&live);
+    let receipt = {
+        let transaction = connection.transaction().unwrap();
+        initialize_schema(&transaction).unwrap();
+        transaction
+            .execute_batch(
+                "CREATE TABLE domain_marker(value INTEGER); INSERT INTO domain_marker VALUES(42)",
+            )
+            .unwrap();
+        for index in 0..261 {
+            commit(
+                &transaction,
+                &at_authority(
+                    &format!("operation.resume.{index}"),
+                    &format!("key.resume.{index}"),
+                    'a',
+                    1,
+                    7,
+                ),
+            );
+        }
+        let receipt = commit(&transaction, &live);
+        transaction.commit().unwrap();
+        receipt
+    };
+    let error =
+        drain_writer_ledger_page(&mut connection, &binding, &Authority(false), 2).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("fixture cancellation before commit")
+    );
+    drop(connection);
+    let mut connection = Connection::open(&path).unwrap();
+    {
+        let transaction = connection.transaction().unwrap();
+        assert_eq!(
+            idempotency_rows(&transaction).len(),
+            6,
+            "cancelled page is rolled back"
+        );
+        let plan = preview_writer_ledger_cleanup(&transaction, &binding, 2).unwrap();
+        let mut wrong = binding.clone();
+        wrong.authority_epoch = serde_json::from_value(serde_json::json!(9)).unwrap();
+        assert!(
+            plan.apply(&wrong).is_err(),
+            "apply requires the preview's exact binding"
+        );
+        let plan = preview_writer_ledger_cleanup(&transaction, &binding, 2).unwrap();
+        commit(
+            &transaction,
+            &at_authority(
+                "operation.invalidate.plan",
+                "key.invalidate.plan",
+                'c',
+                1,
+                8,
+            ),
+        );
+        assert!(
+            plan.apply(&binding).is_err(),
+            "checkpoint progress invalidates an earlier plan"
+        );
+        transaction.rollback().unwrap();
+    }
+    let mut deleted = Vec::new();
+    let now = std::time::Instant::now();
+    let mut maintenance =
+        WriterLedgerMaintenance::new(binding.clone(), WriterReplayWindowPolicy::default(), 2, now)
+            .unwrap();
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    assert!(
+        maintenance
+            .tick(&mut connection, &Authority(true), &cancelled, 1, now)
+            .unwrap()
+            .is_none()
+    );
+    cancelled.store(false, std::sync::atomic::Ordering::Release);
+    for tick in 0..4 {
+        let due = now + std::time::Duration::from_secs(tick * 60);
+        let report = maintenance
+            .tick(&mut connection, &Authority(true), &cancelled, 1, due)
+            .unwrap()
+            .unwrap();
+        deleted.push(report.drain.deleted_rows);
+        assert!(!report.replay_window.rotation_required);
+        assert!(
+            maintenance
+                .tick(&mut connection, &Authority(true), &cancelled, 1, due)
+                .unwrap()
+                .is_none(),
+            "only one page is allowed per tick"
+        );
+        drop(connection);
+        connection = Connection::open(&path).unwrap();
+    }
+    assert_eq!(deleted, vec![2, 2, 1, 0]);
+    assert!(drain_writer_ledger_page(&mut connection, &binding, &Authority(true), 0).is_err());
+    assert!(drain_writer_ledger_page(&mut connection, &binding, &Authority(true), 4097).is_err());
+    let transaction = connection.transaction().unwrap();
+    assert_eq!(
+        current_watermark(&transaction, &binding)
+            .unwrap()
+            .unwrap()
+            .commit_sequence,
+        receipt.commit_sequence
+    );
+    assert_eq!(
+        lookup_receipt(&transaction, &binding, &live.idempotency).unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(
+        transaction
+            .query_row("SELECT value FROM domain_marker", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        42
+    );
+    assert_eq!(
+        transaction
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
     );
 }

@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 pub enum MaintenanceContinuation {
     /// Resume bounded code-generation retention over the normal graph window.
     CodeGenerationRetention,
+    /// Resume bounded profile startup expiry and duplicate journal normalization.
+    SessionJournalRetention,
     /// Resume bounded observation policy, canonical references and content collection.
     SessionContentRetention,
 }
@@ -47,6 +49,9 @@ impl MaintenanceTickOutcome {
             }
             Self::Continue(MaintenanceContinuation::SessionContentRetention) => {
                 "session_content_progress"
+            }
+            Self::Continue(MaintenanceContinuation::SessionJournalRetention) => {
+                "session_journal_progress"
             }
             Self::Retry => "retry",
         }

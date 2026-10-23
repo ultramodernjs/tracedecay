@@ -83,22 +83,23 @@ pub async fn run_compiler(
         max_stdout_bytes: usize::MAX,
         max_stderr_bytes: usize::MAX,
     };
-    let output = native_runtime::spawn_blocking(move || bounded_command_output(cmd, None, &bounds))
-        .await
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("failed to run `{}`: {error}", compiler.display()),
-        })?
-        .map_err(|error| TraceDecayError::Config {
-            message: match error {
-                GitCommandError::Unavailable(error) => {
-                    format!("failed to spawn `{}`: {error}", compiler.display())
-                }
-                GitCommandError::ReadOutput { stream, source } => {
-                    format!("failed to read `{}` {stream}: {source}", compiler.display())
-                }
-                other => format!("`{}` did not finish: {other}", compiler.display()),
-            },
-        })?;
+    let output =
+        native_runtime::spawn_owned_blocking(move || bounded_command_output(cmd, None, &bounds))
+            .await
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("failed to run `{}`: {error}", compiler.display()),
+            })?
+            .map_err(|error| TraceDecayError::Config {
+                message: match error {
+                    GitCommandError::Unavailable(error) => {
+                        format!("failed to spawn `{}`: {error}", compiler.display())
+                    }
+                    GitCommandError::ReadOutput { stream, source } => {
+                        format!("failed to read `{}` {stream}: {source}", compiler.display())
+                    }
+                    other => format!("`{}` did not finish: {other}", compiler.display()),
+                },
+            })?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Some(global) = stdout
         .lines()
@@ -364,6 +365,7 @@ src/b.ts(2,2): warning TS6133: Second.
         );
     }
 
+    #[cfg(unix)]
     fn block<T>(future: impl Future<Output = T>) -> T {
         native_runtime::block_on(future).expect("native runtime")
     }

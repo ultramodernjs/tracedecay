@@ -73,6 +73,17 @@ fn expected_worker_reservation_on(runtime: &CodeIndexWorkerRuntimeV1, remaining_
     )
 }
 
+/// Ledger scenarios own their measured input independently of sibling tests.
+pub(super) fn ledger_memory(limit: NonZeroU64) -> Arc<ProcessResidentMemoryV1> {
+    Arc::new(ProcessResidentMemoryV1::with_pressure(
+        limit,
+        Arc::new(ResidentMemoryPressureV1::with_sampler(
+            limit,
+            Arc::new(|| None),
+        )),
+    ))
+}
+
 #[test]
 fn captured_source_bytes_are_charged_until_the_snapshot_drops() {
     let project = fixture();
@@ -84,9 +95,7 @@ fn captured_source_bytes_are_charged_until_the_snapshot_drops() {
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     )
     .expect("open scheduler");
-    let authority = Arc::new(ProcessResidentMemoryV1::new(
-        NonZeroU64::new(1024 * 1024).expect("source memory limit"),
-    ));
+    let authority = ledger_memory(NonZeroU64::new(1024 * 1024).expect("source memory limit"));
     scheduler.bind_resident_memory(Arc::clone(&authority));
 
     let captured = scheduler
@@ -119,9 +128,7 @@ fn reconcile_leaves_no_captured_source_charged_after_the_build() {
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     )
     .expect("open scheduler");
-    let authority = Arc::new(ProcessResidentMemoryV1::new(
-        DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
-    ));
+    let authority = ledger_memory(DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1);
     scheduler.bind_resident_memory(Arc::clone(&authority));
     let captured = scheduler
         .capture_authoritative_snapshot(None)
@@ -171,7 +178,7 @@ fn source_capture_refuses_before_build_when_retention_cannot_be_charged() {
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     )
     .expect("open scheduler");
-    let authority = Arc::new(ProcessResidentMemoryV1::new(NonZeroU64::MIN));
+    let authority = ledger_memory(NonZeroU64::MIN);
     scheduler.bind_resident_memory(Arc::clone(&authority));
 
     assert!(matches!(
@@ -291,9 +298,7 @@ fn worker_memory_reservation_is_charged_and_released_by_raii() {
         2,
         DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1.get(),
     );
-    let authority = Arc::new(ProcessResidentMemoryV1::new(
-        DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
-    ));
+    let authority = ledger_memory(DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1);
     scheduler.bind_resident_memory(Arc::clone(&authority));
     let reservation = scheduler
         .reserve_worker_memory()
@@ -325,14 +330,7 @@ fn default_authority_worker_reserve_leaves_typed_snapshot_headroom() {
     let runtime = bind_automatic_worker_runtime(&scheduler, 128, 128 * 1024 * 1024 * 1024);
     // This case isolates the ledger's worker/snapshot split. Live process
     // pressure can narrow the slab and is exercised with explicit samples below.
-    let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
-        DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
-        Arc::new(|| None),
-    ));
-    let authority = Arc::new(ProcessResidentMemoryV1::with_pressure(
-        DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
-        pressure,
-    ));
+    let authority = ledger_memory(DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1);
     scheduler.bind_resident_memory(Arc::clone(&authority));
 
     let _worker = scheduler
@@ -376,12 +374,12 @@ fn worker_memory_reservation_refusal_is_typed() {
         2,
         DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1.get(),
     );
-    let authority = Arc::new(ProcessResidentMemoryV1::new(
+    let authority = ledger_memory(
         NonZeroU64::new(
             tracedecay_code_index::parallelism::INDEX_WORKER_RESIDENT_BUDGET_BYTES_V1 - 1,
         )
         .expect("positive test limit"),
-    ));
+    );
     scheduler.bind_resident_memory(authority);
     assert!(matches!(
         scheduler.reserve_worker_memory(),
@@ -490,7 +488,7 @@ fn measured_rss_pressure_refuses_worker_admission_and_readmits_as_it_falls() {
                     resident_bytes: unreclaimable_bytes,
                     unreclaimable_bytes,
                     swapped_bytes: 0,
-                    cgroup_committed_bytes: None,
+                    cgroup_headroom_bytes: None,
                 })
         }),
     ));
@@ -577,7 +575,7 @@ fn a_refresh_after_cold_index_sizes_its_worker_slab_to_measured_headroom() {
                 resident_bytes: unreclaimable_bytes,
                 unreclaimable_bytes,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     ));
@@ -655,7 +653,7 @@ fn a_refresh_decodes_its_parent_before_planning_its_worker_slab() {
                 resident_bytes: 0,
                 unreclaimable_bytes: 0,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     ));
@@ -745,7 +743,7 @@ fn a_released_generation_decodes_again_only_once_its_bytes_fit_the_budget() {
                 resident_bytes: 0,
                 unreclaimable_bytes: 0,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     ));
@@ -829,7 +827,7 @@ fn a_decode_is_admitted_against_unreclaimable_bytes_not_clean_file_pages() {
         resident_bytes: GIB,
         unreclaimable_bytes: GIB,
         swapped_bytes: 0,
-        cgroup_committed_bytes: None,
+        cgroup_headroom_bytes: None,
     }));
     let sampled = Arc::clone(&view);
     let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
@@ -853,7 +851,7 @@ fn a_decode_is_admitted_against_unreclaimable_bytes_not_clean_file_pages() {
         resident_bytes: high_watermark - 1,
         unreclaimable_bytes: 2 * GIB,
         swapped_bytes: 0,
-        cgroup_committed_bytes: None,
+        cgroup_headroom_bytes: None,
     };
     let decoded = scheduler
         .latest_complete()
@@ -879,7 +877,7 @@ fn a_decode_is_admitted_against_unreclaimable_bytes_not_clean_file_pages() {
         resident_bytes: high_watermark - 1,
         unreclaimable_bytes: high_watermark - 1,
         swapped_bytes: 0,
-        cgroup_committed_bytes: None,
+        cgroup_headroom_bytes: None,
     };
     assert!(matches!(
         scheduler.publication.load_active_shared(),
@@ -920,7 +918,7 @@ fn reconcile_stops_when_resident_memory_crosses_the_watermark() {
                 resident_bytes: unreclaimable_bytes,
                 unreclaimable_bytes,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     ));

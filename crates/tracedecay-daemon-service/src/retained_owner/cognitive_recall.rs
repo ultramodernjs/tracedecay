@@ -3497,16 +3497,16 @@ async fn advisory_context_recall_with_retention(
     // The context handler already rendered these canonical facts as
     // `memory_matches`; a provider candidate naming one of them is the same
     // fact, not advisory memory, and is withheld rather than shown twice.
-    let memory_match_fact_ids = inputs
-        .context_memory_contribution
-        .map(|contribution| {
+    let memory_match_fact_ids = inputs.context_memory_contribution.map_or_else(
+        std::collections::BTreeSet::new,
+        |contribution| {
             contribution
                 .facts()
                 .iter()
                 .map(|fact| fact.fact_id.as_str().to_owned())
                 .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+        },
+    );
     for candidate in result.candidates() {
         if duplicates_memory_match(candidate, &memory_match_fact_ids) {
             host_withheld.push(RecallExplainHostWithholdingV1 {

@@ -109,6 +109,90 @@ fn configuration_finding_reports_a_stored_pattern_the_pin_leaves_unapplied() {
     );
 }
 
+#[asupersync::test]
+async fn sealed_generation_census_distinguishes_retired_payloads_from_live_replays() {
+    use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
+
+    let directory = tempfile::TempDir::new().expect("journal census fixture");
+    let path = directory.path().join("graph.db");
+    tracedecay_global_db::register_registered_schema_installer();
+    let authority =
+        DatabaseAuthority::acquire_test(&path, "doctor replay census").expect("fixture authority");
+    let (graph, _runtime) = Database::publish_profile_memory_test_runtime(
+        &path,
+        &authority,
+        TestDatabaseRuntimeMode::Initialize,
+    )
+    .await
+    .expect("fixture graph database");
+    graph
+        .execute_write_batch(
+            "seed replay census",
+            r"
+        INSERT INTO graph_publication_replay_v1 (
+            sequence, shard_id, namespace, projection, generation, idempotency_key,
+            input_digest, dependency_generation_closure_digest, direct_dependency_bytes,
+            expected_recovered_digest, canonical_replay_source_digest, canonical_replay_source
+        ) SELECT sequence, 'shard', namespace, 'projection', generation, generation,
+                 'input', 'closure', 2, 'recovered', 'source', X'01'
+          FROM (
+            SELECT 1 AS sequence, 'main' AS namespace, 'superseded' AS generation
+            UNION ALL SELECT 2, 'dependency', 'live-dependency'
+            UNION ALL SELECT 3, 'dead-dependency', 'retired-owner-dependency'
+            UNION ALL SELECT 4, 'main', 'retired-behind-head'
+            UNION ALL SELECT 5, 'headless', 'retired-headless'
+            UNION ALL SELECT 6, 'finalized', 'finalized'
+            UNION ALL SELECT 20, 'main', 'head'
+            UNION ALL SELECT 21, 'dependency', 'dependency-head'
+            UNION ALL SELECT 22, 'dead-dependency', 'other-head'
+            UNION ALL SELECT 30, 'main', 'pending'
+          );
+        INSERT INTO graph_verified_heads_v1
+          VALUES ('shard', 'main', 'projection', 20, 'recovered'),
+                 ('shard', 'dependency', 'projection', 21, 'recovered'),
+                 ('shard', 'dead-dependency', 'projection', 22, 'recovered');
+        INSERT INTO graph_publication_replay_dependencies_v1
+          VALUES (20, 0, 2, 'shard', 'dependency', 'projection', 'live-dependency'),
+                 (4, 0, 3, 'shard', 'dead-dependency', 'projection', 'retired-owner-dependency');
+        INSERT INTO graph_publication_replay_tombstones_v1
+          SELECT sequence, shard_id, namespace, projection, generation, idempotency_key,
+                 input_digest, dependency_generation_closure_digest, direct_dependency_bytes,
+                 expected_prior_head, expected_recovered_digest, canonical_replay_source_digest
+          FROM graph_publication_replay_v1 WHERE sequence IN (4, 5, 6);
+        DELETE FROM graph_publication_replay_v1 WHERE sequence = 6;
+    ",
+        )
+        .await
+        .expect("real journal states");
+
+    let expected = BTreeSet::from([
+        "head".to_owned(),
+        "pending".to_owned(),
+        "live-dependency".to_owned(),
+        "dependency-head".to_owned(),
+        "other-head".to_owned(),
+    ]);
+    assert_eq!(
+        live_sealed_generations(&graph).await,
+        Some(expected.clone())
+    );
+    assert_eq!(deferred_native_retirements(&graph).await, Some(2));
+
+    graph
+        .execute_write_batch(
+            "finalize retired payloads",
+            "DELETE FROM graph_publication_replay_v1 WHERE sequence IN (4, 5);",
+        )
+        .await
+        .expect("finish native cleanup");
+    assert_eq!(live_sealed_generations(&graph).await, Some(expected));
+    assert_eq!(
+        deferred_native_retirements(&graph).await,
+        Some(0),
+        "permanent payload-free tombstones are not native cleanup debt"
+    );
+}
+
 async fn audit_verdict(database: &tracedecay_runtime_core::db::Database) -> Option<bool> {
     tracedecay_global_db::schema_stages::audit_observation_authority(
         database,

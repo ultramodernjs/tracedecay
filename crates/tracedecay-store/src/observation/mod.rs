@@ -17,6 +17,11 @@ use tracedecay_domain::{
 };
 
 mod anchored_write;
+mod source_exclusion;
+pub use source_exclusion::{
+    observation_source_exclusion_key, observation_source_exclusion_metadata,
+    validate_observation_source_exclusion,
+};
 
 use anchored_write::validate_retrieval_anchor_binding;
 pub use anchored_write::{
@@ -299,6 +304,8 @@ pub enum ObservationCoverageReason {
     /// an earlier generation of this source already committed, so the records
     /// in that range stay retained under the generation that admitted them.
     RetainedPrefix,
+    /// Operator-approved source exclusion; successful terminal cursor-only coverage.
+    OperatorPrunedSource,
 }
 
 impl ObservationCoverageReason {
@@ -317,6 +324,7 @@ impl ObservationCoverageReason {
             Self::AdmissionRefused => "admission_refused",
             Self::ObservationIdentityCollision => "observation_identity_collision",
             Self::RetainedPrefix => "retained_prefix",
+            Self::OperatorPrunedSource => "operator_pruned_source",
         }
     }
 
@@ -373,7 +381,8 @@ impl ObservationCoverageReason {
                     | Self::UnsupportedFact
                     | Self::AdmissionRefused
                     | Self::ObservationIdentityCollision
-                    | Self::RetainedPrefix,
+                    | Self::RetainedPrefix
+                    | Self::OperatorPrunedSource,
                 None
             )
         )
@@ -417,6 +426,7 @@ impl FromStr for ObservationCoverageReason {
             "admission_refused" => Ok(Self::AdmissionRefused),
             "observation_identity_collision" => Ok(Self::ObservationIdentityCollision),
             "retained_prefix" => Ok(Self::RetainedPrefix),
+            "operator_pruned_source" => Ok(Self::OperatorPrunedSource),
             other => Err(UnknownObservationCoverageReason {
                 fingerprint: CursorAdvanceLedgerOpaqueValueHashV1::for_raw_value(other),
             }),
@@ -919,14 +929,26 @@ pub enum ObservationPersistOutcome {
     Committed(ObservationCommitReceipt),
     ExactDuplicate(ObservationCommitReceipt),
     CoveredDuplicate(ObservationCommitReceipt),
+    /// No observation evidence was persisted. Only source coverage is durable.
+    SourceExcluded(ObservationSourceCursorV1),
 }
 
 impl ObservationPersistOutcome {
-    pub fn receipt(&self) -> &ObservationCommitReceipt {
+    pub fn receipt(&self) -> Option<&ObservationCommitReceipt> {
         match self {
             Self::Committed(receipt)
             | Self::ExactDuplicate(receipt)
-            | Self::CoveredDuplicate(receipt) => receipt,
+            | Self::CoveredDuplicate(receipt) => Some(receipt),
+            Self::SourceExcluded(_) => None,
+        }
+    }
+
+    pub fn committed_cursor(&self) -> &ObservationSourceCursorV1 {
+        match self {
+            Self::Committed(receipt)
+            | Self::ExactDuplicate(receipt)
+            | Self::CoveredDuplicate(receipt) => receipt.committed_cursor(),
+            Self::SourceExcluded(cursor) => cursor,
         }
     }
 }

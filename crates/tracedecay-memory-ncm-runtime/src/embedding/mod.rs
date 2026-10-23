@@ -1751,6 +1751,7 @@ fn append_canonical_json(
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::{
         CACHE_REPOSITORY_DIR, EncoderFile, MODEL_REVISION, cache_snapshot, digest_bytes,

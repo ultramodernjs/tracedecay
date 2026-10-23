@@ -399,11 +399,9 @@ impl HoldUnchangedGenerationCache {
 #[cfg(test)]
 pub(in crate::runtime) fn spin_until_jsonl_change_settled(path: &Path) -> bool {
     for _ in 0..10_000_000u32 {
-        let Ok(file) = std::fs::File::open(path) else {
-            std::thread::yield_now();
-            continue;
-        };
-        let Ok(metadata) = file.metadata() else {
+        // This helper also settles snapshot directories. File::open cannot
+        // open a directory on Windows without FILE_FLAG_BACKUP_SEMANTICS.
+        let Ok(metadata) = std::fs::metadata(path) else {
             std::thread::yield_now();
             continue;
         };
@@ -2126,6 +2124,17 @@ mod tests {
             );
             assert_eq!(cache.len(), UNCHANGED_GENERATION_CACHE_CAP);
             assert_eq!(cache.admission_len(), UNCHANGED_GENERATION_CACHE_CAP);
+        }
+    }
+
+    #[test]
+    fn settling_a_directory_does_not_require_opening_it_as_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        // Unix change times can settle; Windows has no directory rewrite
+        // witness. Both cases must return, rather than retrying a failed open.
+        let settled = spin_until_jsonl_change_settled(directory.path());
+        if RewriteWitness::NATIVE.proves_unchanged_bytes() {
+            assert!(settled);
         }
     }
 

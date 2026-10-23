@@ -1944,6 +1944,70 @@ fn host_capture_request_in_scope_with_expected_cursor(
     .unwrap()
 }
 
+#[test]
+fn native_host_event_fixtures_validate_plain_text_feedback_independent_of_daemon_timing() {
+    let notice = json!({
+        "scope": {
+            "project_id": "project.host-fixture",
+            "repository_id": "repository.host-fixture",
+            "worktree_id": "worktree.host-fixture",
+            "branch_ref": "refs/heads/main",
+            "head_commit_id": "a".repeat(40),
+        },
+        "result_id": "result.host-fixture",
+        "cycle_id": "cycle.host-fixture",
+        "generation_id": "generation.host-fixture",
+        "generation_digest": format!("sha256:{}", "a".repeat(64)),
+        "returned_findings": 0,
+        "omitted_findings": 0,
+    });
+    let output = |stdout: &str| Output {
+        status: Default::default(),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    };
+    for (provider, fixture) in FIXTURES {
+        if !matches!(provider, "kiro" | "pi") {
+            continue;
+        }
+        let document: Value = serde_json::from_str(fixture).unwrap();
+        for case in document["cases"].as_array().unwrap() {
+            let state = case["state"].as_str().unwrap();
+            let expected = &case["response"];
+            for stdout in [
+                expected["stdout"].as_str().unwrap().to_owned(),
+                format!("TraceDecay feedback ready for authorized lookup: {notice}\n"),
+            ] {
+                assert_legal_host_response(provider, state, expected, output(&stdout));
+            }
+        }
+        let mut findings = notice.clone();
+        findings["returned_findings"] = json!(1);
+        let mut invalid_scope = notice.clone();
+        invalid_scope["scope"]["project_id"] = json!("");
+        let mut payload = notice.clone();
+        payload["guidance"] = json!("unexpected content");
+        for stdout in [
+            "unexpected guidance".to_owned(),
+            "TraceDecay feedback ready for authorized lookup: {}".to_owned(),
+            format!("TraceDecay feedback ready for authorized lookup: {findings}"),
+            format!("TraceDecay feedback ready for authorized lookup: {invalid_scope}"),
+            format!("TraceDecay feedback ready for authorized lookup: {payload}"),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| assert_legal_host_response(
+                    provider,
+                    "supported",
+                    &document["cases"][0]["response"],
+                    output(&stdout),
+                ))
+                .is_err(),
+                "{provider} accepted invalid fixture stdout: {stdout}"
+            );
+        }
+    }
+}
+
 fn assert_legal_host_response(provider: &str, state: &str, expected: &Value, output: Output) {
     assert_eq!(
         output.status.code().unwrap_or(-1),
@@ -1997,6 +2061,23 @@ fn assert_legal_host_response(provider: &str, state: &str, expected: &Value, out
             *project_root = Value::String("<PROJECT_ROOT>".to_string());
         }
         assert_eq!(document, expected, "{provider}/{state} stdout");
+    } else if matches!(provider, "kiro" | "pi") && stdout != expected["stdout"].as_str().unwrap() {
+        // The real daemon can finish its advisory cycle before this hook.
+        // Kiro and Pi carry that notice as plain text, with "{}" and ""
+        // respectively as their no-guidance fallback. Accept either timing,
+        // but this fixture seeds no findings: reject arbitrary guidance or payloads.
+        assert_eq!(
+            expected["stdout"].as_str().unwrap(),
+            if provider == "kiro" { "{}" } else { "" }
+        );
+        let encoded = stdout
+            .strip_prefix("TraceDecay feedback ready for authorized lookup: ")
+            .unwrap_or_else(|| panic!("{provider}/{state} emitted unexpected context: {stdout}"));
+        let notice: tracedecay_application::advisory::AdvisoryHookLookupNoticeV1 =
+            serde_json::from_str(encoded).expect("feedback notice must match its typed contract");
+        notice.validate().expect("feedback notice must be valid");
+        assert_eq!(notice.returned_findings, 0);
+        assert_eq!(notice.omitted_findings, 0);
     } else {
         assert_eq!(
             stdout,

@@ -1,10 +1,14 @@
+pub mod bookkeeping;
 mod canonical_bodies;
 pub mod canonical_lifecycle;
 mod codec;
+pub(crate) mod ownership_read;
 mod persist;
 mod refusal_census;
 pub mod retention;
+pub(crate) mod retired_sequences;
 mod schema;
+pub mod unsupported_codex;
 
 pub use canonical_bodies::decode_observation_json;
 pub(crate) use canonical_bodies::{compact_lcm_bodies, converge_canonical_bodies};

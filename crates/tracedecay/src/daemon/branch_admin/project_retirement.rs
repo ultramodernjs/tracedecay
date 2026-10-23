@@ -1,7 +1,9 @@
 use super::{StoreAdministration, StoreOwnerKey};
 use std::time::Instant;
 
-use tracedecay_runtime_core::native_runtime::{self, NativeTask, NativeTaskOutcome, TimeoutError};
+#[cfg(any(unix, test))]
+use tracedecay_runtime_core::native_runtime::NativeTaskOutcome;
+use tracedecay_runtime_core::native_runtime::{self, NativeTask, TimeoutError};
 use tracedecay_store_runtime::{ShutdownStatus, ShutdownTaskOutcome, ShutdownTaskReceipt};
 
 /// Drops the process-global Context Scout owner when this project's other
@@ -237,6 +239,7 @@ async fn tokio_retirement_status(
 
 /// The receipt of a native owner aborted for retirement: its cancellation is
 /// the clean outcome.
+#[cfg(any(unix, test))]
 async fn aborted_native_retirement_status(task: NativeTask<()>) -> ProjectServerRetirementStatus {
     match task.wait().await {
         NativeTaskOutcome::Completed(()) | NativeTaskOutcome::Cancelled => {
@@ -302,6 +305,7 @@ pub(super) async fn track_tokio_retirement(
     track_project_server_retirement(retirements, owner, spawn_tokio_retirement(retirement)).await;
 }
 
+#[cfg(any(unix, test))]
 pub(super) async fn track_aborted_native_retirement_task(
     retirements: &tokio::sync::Mutex<Vec<ProjectServerRetirement>>,
     owner: StoreOwnerKey,
@@ -387,7 +391,7 @@ impl StoreAdministration {
 
     // pub(crate): daemon bootstrap tests register retirements from outside
     // branch_admin to exercise the shutdown join path.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn track_project_server_retirement(
         &self,
         owner: StoreOwnerKey,

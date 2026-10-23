@@ -133,8 +133,14 @@ TEST_DATA = {
         ":build-support/source_provenance_git.rs",
         ":build-support/watched_input_file.rs",
     ],
+    ("tracedecay-cli", "product_memory_provider_hermes_host_journey"): [
+        ":tests/product_memory_provider_hermes_host_journey/hermes_sync_turn.py",
+    ],
     ("tracedecay-cli", "tracedecay_unit_test"): ["//:.github/release-targets.json"],
     ("tracedecay-memory-conformance", "baseline"): [
+        "product/evaluation/coding-memory-scenarios.v1.json",
+    ],
+    ("tracedecay-memory-evaluation", "metrics"): [
         "product/evaluation/coding-memory-scenarios.v1.json",
     ],
     ("tracedecay-code-index", "code_index_suite"): [
@@ -821,7 +827,14 @@ def main():
 
     def group_label(repo_rel, *, sources=False):
         """filegroup label + pkg-relative file label for an out-of-package
-        file, registering the group for emission in the owning package."""
+        file, registering the group for emission in the owning package.
+
+        Repository-root files already have exported source labels. They have
+        no directory to group, and must not become packages named Cargo.toml
+        or .bazelrc when include_str! reaches out of a member crate.
+        """
+        if len(repo_rel.parts) == 1:
+            return f"//:{repo_rel.name}", "", repo_rel.name
         pkg_dir, group_rel = owner_pkg(repo_rel)
         pkg_rel = "/".join(repo_rel.parts[len(pkg_dir.split("/")):])
         gname = group_rel.replace("/", "_") or pkg_dir
@@ -1574,6 +1587,11 @@ def main():
                 'filegroup(\n    name = "fixtures",\n'
                 '    srcs = glob(["fixtures/**"]),\n'
                 '    visibility = ["//visibility:public"],\n)'
+            )
+        if pkg_dir == "benchmark_data":
+            rules.append(
+                'exports_files(["run_benchmarks.py"],\n'
+                '    visibility = ["//evals/memory:__pkg__"],\n)'
             )
         return rules
 

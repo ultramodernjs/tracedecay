@@ -6,6 +6,10 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_sessions::serving::SessionRefreshWorkerPort;
 
 const LIVE_TRANSCRIPT_REFRESH_DEADLINE: Duration = Duration::from_secs(5);
+/// Hosts kill a hook at its own timeout (Codex: 5 s), so a hook must not spend
+/// that whole budget waiting for a shared refresh worker to go idle. The ingest
+/// is already durable; on a busy store the refresh publishes after the hook.
+const HOOK_INGEST_REFRESH_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum LiveTranscriptRefreshScope {
@@ -54,9 +58,15 @@ pub async fn join_required_live_transcript_refresh(
     let Some(scope) = required_refresh_scope(tool_name, arguments) else {
         return Ok(LiveTranscriptRefreshJoin::NotRequired);
     };
-    join_scope(scope, project_wake, user_wake, || TraceDecayError::Config {
-        message: REFRESH_UNAVAILABLE.to_owned(),
-    })
+    join_scope(
+        scope,
+        LIVE_TRANSCRIPT_REFRESH_DEADLINE,
+        project_wake,
+        user_wake,
+        || TraceDecayError::Config {
+            message: REFRESH_UNAVAILABLE.to_owned(),
+        },
+    )
     .await
 }
 
@@ -73,20 +83,27 @@ pub async fn join_hook_ingest_refresh(
     } else {
         LiveTranscriptRefreshScope::Project
     };
-    join_scope(scope, project_wake, user_wake, || {
-        TraceDecayError::hook_runtime_with_status(
-            "temporal_refresh_unavailable",
-            true,
-            REFRESH_UNAVAILABLE,
-            tracedecay_sessions::admission::HostAdmissionStatus::Unavailable.as_wire(),
-        )
-    })
+    join_scope(
+        scope,
+        HOOK_INGEST_REFRESH_DEADLINE,
+        project_wake,
+        user_wake,
+        || {
+            TraceDecayError::hook_runtime_with_status(
+                "temporal_refresh_unavailable",
+                true,
+                REFRESH_UNAVAILABLE,
+                tracedecay_sessions::admission::HostAdmissionStatus::Unavailable.as_wire(),
+            )
+        },
+    )
     .await
     .map(|_| ())
 }
 
 async fn join_scope(
     scope: LiveTranscriptRefreshScope,
+    deadline: Duration,
     project_wake: Option<&dyn SessionRefreshWorkerPort>,
     user_wake: Option<&dyn SessionRefreshWorkerPort>,
     unavailable: impl Fn() -> TraceDecayError,
@@ -96,10 +113,7 @@ async fn join_scope(
         LiveTranscriptRefreshScope::User => user_wake,
     }
     .ok_or_else(&unavailable)?;
-    if wake
-        .wake_and_wait_until_idle(LIVE_TRANSCRIPT_REFRESH_DEADLINE)
-        .await
-    {
+    if wake.wake_and_wait_until_idle(deadline).await {
         Ok(LiveTranscriptRefreshJoin::PublicationJoined)
     } else {
         Err(unavailable())
@@ -167,6 +181,7 @@ mod tests {
                 blocker: None,
                 retry_class: None,
                 convergence: SessionConvergenceStatus::unavailable(),
+                history: None,
             }
         }
     }

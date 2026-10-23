@@ -720,6 +720,7 @@ pub(super) fn same_projection_lineage(
 ) -> bool {
     (candidate.source() == owner.source() && candidate.scope() == owner.scope())
         || tracedecay_domain::prove_cline_native_source_transition(owner, candidate).is_some()
+        || tracedecay_domain::codex_rollout_siblings(owner, candidate)
 }
 
 pub(super) async fn verify_output_state(
@@ -769,6 +770,7 @@ pub(in super::super) struct ProjectionStorageColumns {
     pub(in super::super) content_hash: String,
     pub(in super::super) snippet_text: String,
     pub(in super::super) index_text: String,
+    pub(in super::super) location_path: Option<String>,
 }
 
 pub(in super::super) struct ProjectionRowsBatch {
@@ -825,7 +827,8 @@ pub(in super::super) async fn read_projection_rows_batch(
         .map_err(|error| storage("encode projected message request", error))?;
         let sql = format!(
             "SELECT {}, message.storage_kind, COALESCE(message.content, ''),
-                    message.content_hash, message.snippet_text, message.index_text
+                    message.content_hash, message.snippet_text, message.index_text,
+                    message.location_path
              FROM json_each(?1) AS requested
              CROSS JOIN lcm_raw_messages AS message
              WHERE message.provider = json_extract(requested.value, '$.provider')
@@ -860,6 +863,9 @@ pub(in super::super) async fn read_projection_rows_batch(
                 content_hash: decode(21)?,
                 snippet_text: decode(22)?,
                 index_text: decode(23)?,
+                location_path: row
+                    .get(24)
+                    .map_err(|error| storage("decode projected message location", error))?,
             };
             let key = (message.provider.clone(), message.message_id.clone());
             storage_columns.insert(key.clone(), columns);
@@ -1082,6 +1088,23 @@ pub(in super::super) async fn resolve_output_projection(
     Ok(owner_projection)
 }
 
+/// Canonical location captured at the storage write boundary, outside the
+/// immutable provider rendering and its provenance digest.
+pub(in super::super) fn canonical_message_location(
+    message: &SessionMessageRecord,
+) -> ProjectionStoreResult<Option<String>> {
+    let Some(json) = message.metadata_json.as_deref() else {
+        return Ok(None);
+    };
+    let metadata: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| storage("decode projected message location", error))?;
+    Ok(metadata
+        .get(format!("{}_session_cwd", message.provider))
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(durable_project_path_key))
+}
+
 /// Normalize projection rows through the same authority as runtime session writes
 /// and project-scoped reads. Host/display spellings are not durable identity.
 /// Reconciliation remains pure over the normalized stored strings.
@@ -1156,10 +1179,14 @@ pub(super) fn reconcile_session_rows_detailed(
         // A rebind whose paths are both project ids takes the current id.
         // A stored path-shaped key takes the incoming path.
         expected.project_path.clone()
-    } else if expected.project_path == expected.project_key {
-        actual.project_path.clone()
     } else {
-        return Err(SessionReconcileConflict("project_path"));
+        // Two concrete working directories name one session: it was read
+        // through another rollout, or a resumed rollout moved its cwd. The
+        // stored cwd stays, like the session's title and annotations, and each
+        // message row keeps its own source. Replaying the same records in the
+        // same order therefore reaches the same row, instead of dropping every
+        // later message of the session as a collision.
+        actual.project_path.clone()
     };
     Ok(SessionRecord {
         provider: actual.provider.clone(),
@@ -1173,8 +1200,7 @@ pub(super) fn reconcile_session_rows_detailed(
             .chain(expected.started_at)
             .min(),
         ended_at: actual.ended_at.into_iter().chain(expected.ended_at).max(),
-        transcript_path: reconcile_optional(
-            "transcript_path",
+        transcript_path: reconcile_transcript_path(
             actual.transcript_path.as_ref(),
             expected.transcript_path.as_ref(),
         )?,
@@ -1203,6 +1229,25 @@ pub(super) fn reconcile_session_rows_detailed(
 
 fn project_key_is_directory(session: &SessionRecord) -> bool {
     session.project_key == session.project_path
+}
+
+/// Transcript locators retain their stored display spelling, but Windows drive,
+/// separator and verbatim-prefix aliases must not become session collisions.
+/// Use the shared lexical identity policy: reconciliation also runs during
+/// audit/rebuild, when the original file may no longer exist.
+fn reconcile_transcript_path(
+    actual: Option<&String>,
+    expected: Option<&String>,
+) -> Result<Option<String>, SessionReconcileConflict> {
+    use tracedecay_sessions::runtime::shared::path_identity_key;
+
+    if let (Some(actual), Some(expected)) = (actual, expected)
+        && actual != expected
+        && path_identity_key(actual) == path_identity_key(expected)
+    {
+        return Ok(Some(actual.clone()));
+    }
+    reconcile_optional("transcript_path", actual, expected)
 }
 
 fn reconcile_optional<T: Clone + Eq>(
@@ -1569,20 +1614,23 @@ mod reconcile_tests {
             super::durable_project_path_key(&expected.project_path)
         );
 
+        // Another directory under the same project key is the same session
+        // seen from another cwd: the stored path stays and nothing collides.
         let other = tmp.path().join("other-project");
         std::fs::create_dir_all(&other).unwrap();
         expected.project_path = other.to_string_lossy().into_owned();
         let transaction = harness.registered.begin_write_transaction().await.unwrap();
-        assert!(matches!(
-            super::super::apply::apply_session(&transaction, &expected).await,
-            Err(
-                tracedecay_store::ProjectionStoreError::SessionOutputCollision {
-                    field: "project_path",
-                    ..
-                }
-            )
-        ));
-        transaction.rollback().await.unwrap();
+        super::super::apply::apply_session(&transaction, &expected)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let kept = harness
+            .registered
+            .get_session(&original.provider, &original.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.project_path, persisted.project_path);
     }
 
     #[cfg(target_os = "macos")]
@@ -1733,6 +1781,62 @@ mod reconcile_tests {
             "project_key",
             "distinct directories must never merge"
         );
+    }
+
+    #[test]
+    fn transcript_path_reconciliation_accepts_windows_display_spellings() {
+        for (stored_path, projected_path) in [
+            (
+                r"C:\home\.codex/sessions/2026/01/01\rollout.jsonl",
+                r"C:\home\.codex\sessions\2026\01\01\rollout.jsonl",
+            ),
+            (
+                r"C:\sessions\rollout.jsonl",
+                r"\\?\c:\sessions\rollout.jsonl",
+            ),
+            (
+                r"\\server\share\sessions/rollout.jsonl",
+                r"\\?\UNC\server\share\sessions\rollout.jsonl",
+            ),
+        ] {
+            let mut stored = record("/earlier-cwd");
+            stored.project_key = "user".to_owned();
+            stored.transcript_path = Some(stored_path.to_owned());
+            let mut projected = record("/current-cwd");
+            projected.project_key = "user".to_owned();
+            projected.transcript_path = Some(projected_path.to_owned());
+
+            let merged = reconcile_session_rows_detailed(&stored, &projected)
+                .expect("Windows display spellings name the same transcript");
+            assert_eq!(merged.project_path, stored.project_path);
+            assert_eq!(merged.transcript_path, stored.transcript_path);
+            assert!(reconcile_session_rows_detailed(&projected, &stored).is_ok());
+        }
+    }
+
+    #[test]
+    fn transcript_path_reconciliation_preserves_distinct_path_identities() {
+        for (stored_path, projected_path) in [
+            (r"C:\sessions\one.jsonl", r"\\?\c:\sessions\two.jsonl"),
+            (r"C:\sessions\rollout.jsonl", r"D:\sessions\rollout.jsonl"),
+            (
+                r"\\server\share\rollout.jsonl",
+                r"\\server\other\rollout.jsonl",
+            ),
+            (
+                r"/sessions/literal\rollout.jsonl",
+                "/sessions/literal/rollout.jsonl",
+            ),
+        ] {
+            let mut stored = record("/project");
+            stored.transcript_path = Some(stored_path.to_owned());
+            let mut projected = stored.clone();
+            projected.transcript_path = Some(projected_path.to_owned());
+
+            let conflict = reconcile_session_rows_detailed(&stored, &projected)
+                .expect_err("different transcript identities must not merge");
+            assert_eq!(conflict.field(), "transcript_path");
+        }
     }
 
     #[test]

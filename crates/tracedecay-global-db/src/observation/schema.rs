@@ -134,6 +134,10 @@ const OBSERVATION_AUTHORITY_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS sanit
             committed_cursor_json TEXT NOT NULL,
             FOREIGN KEY(receipt_id) REFERENCES sanitization_receipts(receipt_id)
         );
+        CREATE TABLE IF NOT EXISTS observation_retired_sequences (
+            first_sequence INTEGER PRIMARY KEY CHECK(first_sequence > 0),
+            last_sequence INTEGER NOT NULL CHECK(last_sequence >= first_sequence)
+        );
         CREATE TABLE IF NOT EXISTS remote_writer_fences (
             authority_key TEXT PRIMARY KEY,
             writer_fence_json TEXT NOT NULL CHECK(json_valid(writer_fence_json)),
@@ -281,6 +285,12 @@ pub async fn ensure_observation_schema(
             .await
             .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
         record_marker(conn, OBSERVATION_REPOSITORY_CAPTURE_DEDUPE_MIGRATION).await?;
+    }
+    conn.execute_batch(super::bookkeeping::source_keys::SOURCE_DESCRIPTOR_SCHEMA)
+        .await
+        .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
+    if !migration_recorded(conn, "observation-source-descriptors-v1").await? {
+        record_marker(conn, "observation-source-descriptors-v1").await?;
     }
     super::canonical_bodies::ensure_canonical_bodies_table(conn).await?;
     super::canonical_lifecycle::ensure_schema(conn).await?;

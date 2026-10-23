@@ -31,6 +31,8 @@ use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 use tracedecay_domain::process_heap::request_idle_thread_collection_v1;
 use tracedecay_runtime_core::logging::log_daemon_event;
 use tracedecay_runtime_core::native_runtime::{self, NativeTask, TimeoutError};
+mod journal_retention;
+
 const MAINTENANCE_STORE_PAGE_LIMIT: usize = 8;
 const REGISTERED_PROJECT_PAGE_LIMIT: usize = 64;
 
@@ -293,11 +295,11 @@ fn log_registered_store_retention_outcome(report: &RegisteredStoreRetentionRepor
                 );
             }
         }
-        Some(Err(_)) => log_daemon_event(
+        Some(Err(error)) => log_daemon_event(
             "retention_degraded",
             &[
                 ("pass", "session_lcm".to_owned()),
-                ("failure", "retention_pass_failed".to_owned()),
+                ("failure", error.to_string()),
             ],
         ),
         None => {}
@@ -316,11 +318,11 @@ fn log_registered_store_retention_outcome(report: &RegisteredStoreRetentionRepor
                 );
             }
         }
-        Some(Err(_)) => log_daemon_event(
+        Some(Err(error)) => log_daemon_event(
             "retention_degraded",
             &[
                 ("pass", "observation".to_owned()),
-                ("failure", "retention_pass_failed".to_owned()),
+                ("failure", error.to_string()),
             ],
         ),
         None => {}
@@ -686,6 +688,7 @@ pub(super) struct MaintenanceCoordinator {
     /// last store processed. The next tick resumes immediately after it so no
     /// store is starved when the mounted set exceeds `MAINTENANCE_STORE_PAGE_LIMIT`.
     store_cursor: Arc<Mutex<Option<String>>>,
+    journal_retention: Arc<Mutex<journal_retention::JournalRetentionProgress>>,
     /// Content catch-up cannot advance the full-policy fairness frontier.
     continuation_store_cursor: Arc<Mutex<Option<String>>>,
     /// Exact mounted session paths with unfinished bounded canonical work.
@@ -711,6 +714,7 @@ impl Default for MaintenanceCoordinator {
             task: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(MaintenanceMetricsV1::default())),
             store_cursor: Arc::new(Mutex::new(None)),
+            journal_retention: Arc::default(),
             continuation_store_cursor: Arc::new(Mutex::new(None)),
             canonical_gc_pending: Arc::new(Mutex::new(BTreeSet::new())),
             observation_retention_pending: Arc::new(Mutex::new(BTreeSet::new())),
@@ -754,6 +758,24 @@ struct MountedGraphListing {
     project_root: PathBuf,
     data_root: PathBuf,
     code_index_store_root: PathBuf,
+}
+
+fn active_project_maintenance_roots(
+    mounted: &[MountedGraphListing],
+    work: &[(String, MaintenanceStoreWork)],
+) -> BTreeSet<PathBuf> {
+    let mut roots = mounted
+        .iter()
+        .map(|graph| graph.project_root.clone())
+        .collect::<BTreeSet<_>>();
+    for (_, unit) in work {
+        if let MaintenanceStoreWork::Registered(store) = unit {
+            roots.insert(store.canonical_root.clone());
+            // Linked scopes inherit this owner through the inventory recorded
+            // by its admitted maintenance unit. Listing never scans the store.
+        }
+    }
+    roots
 }
 
 /// The work-list key of a mounted project graph: its root and serving branch.
@@ -1007,6 +1029,48 @@ impl MaintenanceCoordinator {
         .await;
     }
 
+    async fn run_journal_retention(
+        &self,
+        database: &tracedecay_global_db::RegisteredGlobalDb,
+        administration: &StoreAdministration,
+        start_if_idle: bool,
+    ) -> MaintenanceTickOutcome {
+        if self.cancellation.is_cancelled() {
+            return MaintenanceTickOutcome::Complete;
+        }
+        let result = administration
+            .try_with_writer(|| async {
+                let mut progress = self.journal_retention.lock().await;
+                progress
+                    .tick(
+                        database,
+                        &administration.session_sync_service(),
+                        &self.cancellation,
+                        start_if_idle,
+                    )
+                    .await
+            })
+            .await;
+        let failure = match result {
+            Some(Ok(true)) => {
+                return MaintenanceTickOutcome::Continue(
+                    MaintenanceContinuation::SessionJournalRetention,
+                );
+            }
+            Some(Ok(false)) => return MaintenanceTickOutcome::Complete,
+            Some(Err(error)) => error.to_string(),
+            None => "writer_admission_busy".to_owned(),
+        };
+        log_daemon_event(
+            "retention_degraded",
+            &[
+                ("pass", "session_journals".to_owned()),
+                ("failure", failure),
+            ],
+        );
+        MaintenanceTickOutcome::Retry
+    }
+
     #[tracing::instrument(name = "daemon.maintenance.tick", level = "trace", skip_all)]
     #[allow(
         clippy::too_many_arguments,
@@ -1036,6 +1100,14 @@ impl MaintenanceCoordinator {
             );
             return MaintenanceTickOutcome::Retry;
         };
+        if continuation == Some(MaintenanceContinuation::SessionJournalRetention) {
+            let Some(_background_cpu) = background_cpu.try_acquire() else {
+                return MaintenanceTickOutcome::Retry;
+            };
+            return self
+                .run_journal_retention(profile_database, administration, false)
+                .await;
+        }
         administration
             .store_telemetry_sampling()
             .begin_retention_tick_log_window();
@@ -1189,11 +1261,11 @@ impl MaintenanceCoordinator {
                 .filter_map(|index| work[*index].1.database_path().map(Path::to_path_buf)),
         );
         let maintenance_observations = administration.store_telemetry_sampling();
-        let active_maintenance_projects = project_graphs
-            .iter()
-            .map(|graph| graph.project_root.clone())
-            .collect::<BTreeSet<_>>();
-        maintenance_observations.retain_project_maintenance_state(&active_maintenance_projects);
+        let active_maintenance_projects = active_project_maintenance_roots(&project_graphs, &work);
+        // Only a complete registry listing can retire an owner's scope state.
+        if registry_listed {
+            maintenance_observations.retain_project_maintenance_state(&active_maintenance_projects);
+        }
         // A capacity retirement releasing stores skips this pass: sampling
         // leases every sampled store until it ends.
         let telemetry_sampling = if continuation.is_none()
@@ -1326,11 +1398,65 @@ impl MaintenanceCoordinator {
                             .await
                         }
                         MaintenanceStoreWork::Registered(store) => {
+                            let scopes = match tracedecay_code_index_retention::code_index_generations::code_index_scopes(&store.data_root) {
+                                Ok(scopes) => scopes,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "scope_inventory_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            if scopes.is_empty() {
+                                return MaintenanceTickOutcome::Complete;
+                            }
+                            let Some(project_id) = key.strip_prefix("r:") else {
+                                return MaintenanceTickOutcome::Retry;
+                            };
+                            let project_id = match tracedecay_domain::ProjectId::new(project_id) {
+                                Ok(project_id) => project_id,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "project_identity_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let layout = match tracedecay_runtime_core::storage::profile_sharded_layout(&store.canonical_root, profile_root, project_id.as_str()) {
+                                Ok(layout) => layout,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "project_layout_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let registry = match administration.registered_runtime_registry().await {
+                                Ok(registry) => registry,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "registered_runtime_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            // The owner must outlive every SQL/replay operation below.
+                            // This admission opens only an existing SQL store, not native staging.
+                            let (_owner, database) = match registry.admit_code_graph_maintenance_database(project_id, [store.canonical_root.clone()]).await {
+                                Ok(admitted) => admitted,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "registered_store_admission_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let profile = match registry.profile_database().await {
+                                Ok(profile) => profile,
+                                Err(error) => {
+                                    log_daemon_event("retention_degraded", &[("failure", "profile_lease_unavailable".to_owned()), ("error", error.to_string())]);
+                                    return MaintenanceTickOutcome::Retry;
+                                }
+                            };
+                            let lease = ProjectStoreMaintenanceLeaseV1::new(store.canonical_root.clone(), layout, database, registry, profile);
+                            // Generation pins belong to the admitted session store,
+                            // not the profile registry used by journal retention.
                             run_registered_project_generation_maintenance(
                                 store,
+                                &lease,
                                 &mounted_store_roots,
                                 code_index_schedulers,
-                                profile_database,
+                                lease.profile_database(),
                                 &maintenance_observations,
                                 &self.cancellation,
                             )
@@ -1379,6 +1505,13 @@ impl MaintenanceCoordinator {
             outcome = outcome.combine(MaintenanceTickOutcome::Continue(
                 MaintenanceContinuation::SessionContentRetention,
             ));
+        }
+
+        if continuation.is_none() && !self.cancellation.is_cancelled() {
+            outcome = outcome.combine(
+                self.run_journal_retention(profile_database, administration, true)
+                    .await,
+            );
         }
 
         // Profile-wide maintenance is intentionally excluded from a bounded
@@ -1499,6 +1632,12 @@ impl MaintenanceCoordinator {
                     outcome = MaintenanceTickOutcome::Retry;
                 }
             }
+        }
+
+        if self.journal_retention.lock().await.pending() {
+            outcome = outcome.combine(MaintenanceTickOutcome::Continue(
+                MaintenanceContinuation::SessionJournalRetention,
+            ));
         }
 
         let mut metrics = self.metrics.lock().await;
@@ -1706,6 +1845,7 @@ pub(super) fn retention_maintenance_enabled(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex as StdMutex};
@@ -1719,6 +1859,43 @@ mod tests {
         MaintenanceCadence, MaintenanceContinuation, MaintenanceTickOutcome,
         cursor_after_attempted_units, select_store_window,
     };
+
+    use tracedecay_runtime_core::db::{
+        Database, DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
+        TestRuntimeProfileIdentityV1,
+    };
+
+    async fn seed_registered_graph_sql(profile_root: &Path, checkout: &Path, project_id: &str) {
+        let identity = tracedecay_daemon_identity::profile_identity::load_or_create(profile_root)
+            .expect("fixture profile identity");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(checkout, project_id)
+            .expect("fixture project enrollment");
+        let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+            checkout,
+            profile_root,
+            project_id,
+        )
+        .expect("fixture layout");
+        tracedecay_runtime_core::storage::PrivateStoreIo::create_dir_all(&layout.data_root)
+            .expect("fixture data root");
+        let authority = DatabaseAuthority::acquire_test(&layout.graph_db_path, "seed graph SQL")
+            .expect("fixture authority");
+        let (database, _) = Database::publish_registered_test_runtime_for_profile_identity(
+            &layout.graph_db_path,
+            &authority,
+            TestDatabaseRuntimeMode::Initialize,
+            TestRuntimeProfileIdentityV1::new(
+                identity.brain_id().clone(),
+                identity.profile_id().clone(),
+            ),
+            TestDatabaseRuntimeScope::Project {
+                project_id: tracedecay_domain::ProjectId::new(project_id).expect("project id"),
+            },
+        )
+        .await
+        .expect("seed existing graph SQL without native staging");
+        drop(database);
+    }
 
     #[test]
     fn cadence_rate_limits_failures_and_successes() {
@@ -1839,6 +2016,42 @@ mod tests {
     }
 
     #[test]
+    fn registered_and_linked_scope_progress_survives_a_maintenance_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let linked = temp.path().join("linked");
+        // No store directory exists: listing preserves already-admitted scope
+        // ownership without doing another filesystem inventory.
+        let data_root = temp.path().join("absent-data");
+        let work = vec![(
+            "r:proj_fixture".to_owned(),
+            super::MaintenanceStoreWork::Registered(
+                tracedecay_maintenance::store_maintenance::RegisteredProjectStoreV1 {
+                    data_root,
+                    canonical_root: checkout.clone(),
+                },
+            ),
+        )];
+        let observations = StoreTelemetrySamplingRegistry::default();
+        observations.record_project_maintenance_scopes(&checkout, [linked.clone()]);
+        for root in [&checkout, &linked] {
+            observations
+                .record_graph_replay_release_served(root, Some("release-000000ff.json".to_owned()));
+            observations.record_graph_replay_release_unhealthy(root);
+        }
+        let roots = super::active_project_maintenance_roots(&[], &work);
+        assert_eq!(roots, BTreeSet::from([checkout.clone()]));
+        observations.retain_project_maintenance_state(&roots);
+        for root in [&checkout, &linked] {
+            assert_eq!(
+                observations.graph_replay_release_cursor(root).as_deref(),
+                Some("release-000000ff.json")
+            );
+            assert!(!observations.graph_replay_release_attempt_admitted(root));
+        }
+    }
+
+    #[test]
     fn project_maintenance_state_is_pruned_with_the_active_set() {
         let registry = StoreTelemetrySamplingRegistry::default();
         let retained = std::path::Path::new("/retained");
@@ -1893,6 +2106,9 @@ mod tests {
         }
     }
 
+    // Unlinking a mounted SQLite file is Unix-only: Windows denies deletion
+    // while SQLite holds the file open, so this failure cannot be induced there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_mounted_store_deleted_under_the_daemon_requires_a_restart() {
         let temporary = tempfile::tempdir().expect("store identity fixture root");
@@ -2146,6 +2362,8 @@ mod tests {
             .expect("sampler joins after cancellation");
     }
 
+    mod journal_retention_tests;
+
     /// A registered project nothing has mounted since the daemon started is
     /// collected by the first full tick and converges on its continuation,
     /// instead of waiting for a client to mount it. A tick that runs while a
@@ -2167,16 +2385,22 @@ mod tests {
         let checkout = temp.path().join("checkout");
         std::fs::create_dir_all(&checkout).expect("checkout");
         let checkout = checkout.canonicalize().expect("canonical checkout");
-        let runtime = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
-            &profile_root,
-        )
-        .await
-        .expect("profile database");
-        let profile_database = runtime.profile_database_arc();
+        // The passed profile lease must be the same admitted profile the
+        // maintenance registry owns, not a second harness's synthetic identity.
+        let administration = super::StoreAdministration::default().with_profile_identity(
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+                .expect("canonical profile identity"),
+        );
+        administration
+            .retain_authenticated_profile_database_scope(&profile_root)
+            .await
+            .unwrap();
+        let profile_database = administration.registered_profile_database().await.unwrap();
         let project = profile_database
             .upsert_code_project("proj_unmounted", &checkout, None, None, None)
             .await
             .expect("register project");
+        seed_registered_graph_sql(&profile_root, &checkout, &project.project_id).await;
         // The scope hash is derived from the registry's stored canonical
         // root, spelled plainly. Hashing the verbatim `\\?\` spelling
         // `canonicalize` returns on Windows names a directory the tick's
@@ -2206,10 +2430,6 @@ mod tests {
             )),
             ..MaintenanceCoordinator::default()
         };
-        let administration = super::StoreAdministration::default().with_profile_identity(
-            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
-                .expect("canonical profile identity"),
-        );
         let schedulers =
             tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::new(
                 1,
@@ -2500,6 +2720,7 @@ mod tests {
                         ),
                         Path::new(&project.canonical_root),
                     );
+                seed_registered_graph_sql(&profile_root, &checkout, &project.project_id).await;
                 tracedecay_code_index_retention::code_index_generations::fixture::write_generation_store_fixture(&root, 6);
                 generation_root = Some(root);
             }
@@ -2846,13 +3067,17 @@ mod tests {
             let profile_root = temp.path().join("profile");
             let checkout = temp.path().join("checkout");
             std::fs::create_dir_all(&checkout).expect("checkout");
-            let runtime =
+            let _runtime =
                 tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
                     &profile_root,
                 )
                 .await
                 .expect("profile database");
-            let profile_database = runtime.profile_database_arc();
+            let (profile_database, _registry_owner) =
+                tracedecay_global_db::tests::harness::open_registered_test_database_fixture(
+                    &profile_root.join("global.db"),
+                    tracedecay_runtime_core::db::TestDatabaseRuntimeScope::Profile,
+                ).await.expect("profile registry");
             let project = profile_database
                 .upsert_code_project("proj_handles", &checkout, None, None, None)
                 .await

@@ -221,7 +221,7 @@ mod tests {
             },
             revision_id: id("revision.project.1"),
             entries: BTreeMap::from([(
-                id("user.upload_enabled.v1"),
+                id("user.repeated_query_hints.v1"),
                 ConfigurationValueV1::Boolean(true),
             )]),
         };
@@ -229,7 +229,7 @@ mod tests {
             resolve_configuration(&registry, &[layer])
                 .unwrap_err()
                 .to_string(),
-            "setting user.upload_enabled.v1 cannot be placed in Project { project_id: ProjectId(\"project.fixture\") }"
+            "setting user.repeated_query_hints.v1 cannot be placed in Project { project_id: ProjectId(\"project.fixture\") }"
         );
 
         let user_layer = ConfigurationLayerV1 {
@@ -238,7 +238,7 @@ mod tests {
             },
             revision_id: id("revision.profile.1"),
             entries: BTreeMap::from([(
-                id("user.upload_enabled.v1"),
+                id("user.repeated_query_hints.v1"),
                 ConfigurationValueV1::Boolean(true),
             )]),
         };

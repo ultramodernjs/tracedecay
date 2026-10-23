@@ -7,8 +7,10 @@ async fn tcp_broker_transport_preserves_bidirectional_line_framing() {
     let (listener, endpoint) = BrokerListener::bind(&default_loopback_endpoint())
         .await
         .expect("bind loopback listener");
-    let DaemonEndpoint::Loopback(address) = endpoint else {
-        panic!("loopback bind returned {endpoint}");
+    let address = match endpoint {
+        DaemonEndpoint::Loopback(address) => address,
+        #[cfg(unix)]
+        DaemonEndpoint::Unix(path) => panic!("loopback bind returned {}", path.display()),
     };
     let mut client = tokio::net::TcpStream::connect(address)
         .await

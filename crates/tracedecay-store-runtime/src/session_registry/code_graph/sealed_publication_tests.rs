@@ -18,7 +18,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use tracedecay_code_index_retention::code_index_generations::{
-    DurablePublicationPointerV1, code_generation_segments_root,
+    CodeGenerationRetentionModeV1, DurablePublicationPointerV1,
+    code_generation_graph_replay_release_page, code_generation_segments_root,
+    complete_code_generation_graph_replay_release, execute_code_generation_retention,
+    plan_code_generation_retention,
 };
 use tracedecay_domain::{
     CodeGenerationId, ProjectId, RefId, RepositoryId, WorktreeId, canonical_sha256,
@@ -48,6 +51,9 @@ use tracedecay_code_index_runtime::code_index_scheduler::{
     CodeIndexWorktreeSchedulerV1, SharedCodeIndexBytePoolV1, scoped_code_index_store_root,
 };
 use tracedecay_daemon_identity::profile_identity;
+use tracedecay_runtime_core::branch::{BranchAdminAction, prepare_branch_admin_mutation};
+use tracedecay_runtime_core::branch_meta::{BranchMeta, load_branch_meta, save_branch_meta};
+use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_runtime_core::resident_memory::{
     ProcessResidentSampleV1, RESIDENT_MEMORY_CHECKPOINT_SAMPLE_INTERVAL_V1,
     ResidentMemoryPressureV1,
@@ -266,7 +272,7 @@ fn pressure_from_sample(
             resident_bytes: 0,
             unreclaimable_bytes: 0,
             swapped_bytes: 0,
-            cgroup_committed_bytes: None,
+            cgroup_headroom_bytes: None,
         },
     ));
     let sampled = Arc::clone(&sample);
@@ -288,7 +294,7 @@ fn set_sample(
             resident_bytes: unreclaimable_bytes,
             unreclaimable_bytes,
             swapped_bytes: 0,
-            cgroup_committed_bytes: None,
+            cgroup_headroom_bytes: None,
         };
 }
 
@@ -1250,6 +1256,509 @@ async fn sealed_generation_fixture(project: &str, source: &str) -> SealedGenerat
     }
 }
 
+async fn seal_fixture_revision(
+    fixture: &SealedGenerationFixture,
+    project_root: &Path,
+    value: usize,
+) -> RetainedCodeGraphRuntimeV1 {
+    std::fs::write(
+        project_root.join("src/lib.rs"),
+        format!("pub fn release_fixture_value() -> usize {{ {value} }}\n"),
+    )
+    .expect("revision source");
+    git(project_root, &["add", "src/lib.rs"]);
+    git(project_root, &["commit", "-qm", "release fixture revision"]);
+    let mut scheduler = CodeIndexWorktreeSchedulerV1::open(
+        fixture.project_id.clone(),
+        project_root,
+        fixture.scoped_store.clone(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    )
+    .expect("revision scheduler");
+    scheduler.reconcile_now().expect("seal revision");
+    let latest = scheduler.latest_complete().expect("complete revision");
+    let pointer: DurablePublicationPointerV1 = serde_json::from_slice(
+        &std::fs::read(fixture.scoped_store.join("active-code-generation-v1.json"))
+            .expect("revision pointer"),
+    )
+    .expect("decode revision pointer");
+    fixture
+        .registry
+        .retain_code_graph_runtime(
+            fixture.project_id.clone(),
+            latest.generation().snapshot().repository.clone(),
+            scheduler.identity().worktree_id().clone(),
+            latest.generation().snapshot().reference.clone(),
+            latest.generation().manifest().generation_id.clone(),
+            Arc::clone(&fixture.project_database),
+            CodeGraphReplayBindingV1 {
+                generations_root: fixture.generations_root.clone(),
+                sealed_state_digest: SealedGraphStateDigest::try_from(pointer.state_digest)
+                    .expect("revision digest"),
+            },
+        )
+        .await
+        .expect("revision graph runtime")
+}
+
+/// Real Git branches, sealed segments, persisted SQL publication heads and a
+/// direct sealed reader exercise the same source-release authority used by
+/// daemon maintenance. Branch GC does not make a verified graph head expendable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn branch_gc_release_preserves_heads_and_an_open_sealed_reader() {
+    let fixture = sealed_generation_fixture(
+        "project.branch-gc-release",
+        "pub fn release_fixture_value() -> usize { 1 }\n",
+    )
+    .await;
+    let project_root = fixture
+        ._temporary
+        .path()
+        .join("project")
+        .canonicalize()
+        .unwrap();
+    let held_reader = fixture
+        .runtime
+        .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+        .expect("main predecessor reader");
+    let held_generation = held_reader.generation().clone();
+    git(&project_root, &["branch", "live"]);
+    git(&project_root, &["checkout", "-qb", "feature"]);
+    let feature_old = seal_fixture_revision(&fixture, &project_root, 2).await;
+    drop(
+        feature_old
+            .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+            .expect("feature predecessor publication"),
+    );
+    let feature_old_id = feature_old.generation_id.clone();
+    let feature_head = seal_fixture_revision(&fixture, &project_root, 3).await;
+    let snapshot = feature_head
+        .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+        .expect("feature head publication");
+    let feature_head_generation = snapshot.generation().clone();
+    drop(snapshot); // The persisted head alone must protect this source.
+    git(&project_root, &["checkout", "-q", "main"]);
+    let main_head = seal_fixture_revision(&fixture, &project_root, 4).await;
+    let main_snapshot = main_head
+        .publish_verified_snapshot(Arc::new(AtomicBool::new(false)))
+        .expect("main head publication");
+    let main_generation = main_snapshot.generation().clone();
+    drop(main_snapshot);
+
+    let data_root = fixture.project_database.database_path().parent().unwrap();
+    let mut metadata = BranchMeta::new("main");
+    for branch in ["feature", "live"] {
+        metadata.add_branch(branch, "main");
+        metadata.branches.get_mut(branch).unwrap().last_synced_at = "0".to_owned();
+    }
+    save_branch_meta(data_root, &metadata).expect("tracked branch metadata");
+    git(&project_root, &["branch", "-D", "feature"]);
+    // This is the canonical planner/CAS commit used by `tracedecay branch gc`.
+    let gc = prepare_branch_admin_mutation(&project_root, data_root, BranchAdminAction::Gc, 0)
+        .expect("branch gc plan");
+    assert_eq!(gc.report().removed_branches, vec!["feature"]);
+    gc.commit().expect("branch gc commit");
+    let metadata = load_branch_meta(data_root).expect("metadata after gc");
+    assert!(!metadata.is_tracked("feature"));
+    assert!(metadata.is_tracked("main") && metadata.is_tracked("live"));
+
+    let pool = fixture
+        .project_database
+        .database_path()
+        .with_extension("graph-replay");
+    let plan = plan_code_generation_retention(&fixture.scoped_store, &BTreeSet::new())
+        .expect("superseded manifest plan");
+    execute_code_generation_retention(
+        &fixture.scoped_store,
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        tracedecay_contracts::clock::now_micros(),
+        Some(&pool),
+    )
+    .expect("collect superseded manifests into the replay pool");
+    let queued = code_generation_graph_replay_release_page(&fixture.scoped_store, None)
+        .expect("durable release queue")
+        .releases;
+    assert_eq!(
+        queued.len(),
+        3,
+        "main predecessor and both old feature manifests"
+    );
+    let feature_old_release = queued
+        .iter()
+        .find(|release| release.generation.generation_id == feature_old_id)
+        .unwrap();
+    let held_release = queued
+        .iter()
+        .find(|release| release.generation.generation_id == fixture.generation_id)
+        .unwrap();
+    assert!(
+        pool.join(&feature_old_release.generation.generation_file)
+            .is_file()
+    );
+    assert!(
+        pool.join(&held_release.generation.generation_file)
+            .is_file()
+    );
+    drop(feature_old);
+    drop(fixture.runtime); // Only the explicit reader protects the old main generation.
+    let cancellation = CancellationToken::new();
+    let mut released = 0;
+    for release in &queued {
+        if fixture
+            .registry
+            .reconcile_deleted_code_generation_graph_replays(
+                fixture.project_id.clone(),
+                &fixture.project_database,
+                &release.generation.generation_id,
+                &release.generation.generation_file,
+                &cancellation,
+            )
+            .await
+            .expect("registered source release")
+        {
+            assert_ne!(
+                release.generation.generation_id, fixture.generation_id,
+                "an open main predecessor reader must retain its source"
+            );
+            assert_eq!(
+                release.generation.generation_id, feature_old_id,
+                "the feature head must remain protected by persisted serving authority"
+            );
+            complete_code_generation_graph_replay_release(&fixture.scoped_store, release)
+                .expect("acknowledge released source");
+            released += 1;
+        }
+    }
+    assert_eq!(
+        released, 1,
+        "only the deleted branch's superseded graph can retire"
+    );
+    assert!(
+        !pool
+            .join(&feature_old_release.generation.generation_file)
+            .exists()
+    );
+    assert!(
+        pool.join(&held_release.generation.generation_file)
+            .is_file()
+    );
+    assert_eq!(
+        held_reader.generation(),
+        &held_generation,
+        "leased reader survives"
+    );
+    assert_eq!(
+        feature_head
+            .recover_verified_snapshot_from_head(Arc::new(AtomicBool::new(false)))
+            .expect("feature verified head survives")
+            .generation(),
+        &feature_head_generation
+    );
+    assert_eq!(
+        main_head
+            .recover_verified_snapshot_from_head(Arc::new(AtomicBool::new(false)))
+            .expect("main verified head survives")
+            .generation(),
+        &main_generation
+    );
+    drop(held_reader);
+    assert!(
+        fixture
+            .registry
+            .reconcile_deleted_code_generation_graph_replays(
+                fixture.project_id.clone(),
+                &fixture.project_database,
+                &held_release.generation.generation_id,
+                &held_release.generation.generation_file,
+                &cancellation,
+            )
+            .await
+            .expect("release after reader closes")
+    );
+    complete_code_generation_graph_replay_release(&fixture.scoped_store, held_release)
+        .expect("acknowledge closed reader source");
+    assert!(!pool.join(&held_release.generation.generation_file).exists());
+    assert_eq!(
+        code_generation_graph_replay_release_page(&fixture.scoped_store, None)
+            .expect("only persisted feature head remains")
+            .releases
+            .len(),
+        1
+    );
+}
+
+struct RemovedScopeFixture {
+    fixture: SealedGenerationFixture,
+    project_root: PathBuf,
+    removed_root: PathBuf,
+    removed_store: PathBuf,
+    scheduler: CodeIndexWorktreeSchedulerV1,
+    removed_runtime: RetainedCodeGraphRuntimeV1,
+    pointer: DurablePublicationPointerV1,
+}
+
+async fn removed_scope_fixture(project: &str) -> RemovedScopeFixture {
+    let fixture =
+        sealed_generation_fixture(project, "pub fn live_scope_value() -> usize { 1 }\n").await;
+    let project_root = fixture
+        ._temporary
+        .path()
+        .join("project")
+        .canonicalize()
+        .unwrap();
+    let removed_root = fixture._temporary.path().join("removed");
+    git(
+        &project_root,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "removed",
+            removed_root.to_str().unwrap(),
+        ],
+    );
+    // Scope hashes and the scheduler's worktree id use the plain canonical
+    // identity, not Windows canonicalize's `\\?\` verbatim spelling.
+    let removed_root =
+        tracedecay_runtime_core::path_safety::canonical_existing_identity(&removed_root).unwrap();
+    let removed_store =
+        scoped_code_index_store_root(fixture.scoped_store.parent().unwrap(), &removed_root);
+    let mut scheduler = CodeIndexWorktreeSchedulerV1::open(
+        fixture.project_id.clone(),
+        &removed_root,
+        removed_store.clone(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    )
+    .unwrap();
+    scheduler.reconcile_now().unwrap();
+    let latest = scheduler.latest_complete().unwrap();
+    let generation = latest.generation().manifest().generation_id.clone();
+    let pointer: DurablePublicationPointerV1 = serde_json::from_slice(
+        &std::fs::read(removed_store.join("active-code-generation-v1.json")).unwrap(),
+    )
+    .unwrap();
+    let removed_runtime = fixture
+        .registry
+        .retain_code_graph_runtime(
+            fixture.project_id.clone(),
+            latest.generation().snapshot().repository.clone(),
+            scheduler.identity().worktree_id().clone(),
+            latest.generation().snapshot().reference.clone(),
+            generation,
+            Arc::clone(&fixture.project_database),
+            CodeGraphReplayBindingV1 {
+                generations_root: removed_store.join("code-generations-v1"),
+                sealed_state_digest: SealedGraphStateDigest::try_from(pointer.state_digest.clone())
+                    .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    RemovedScopeFixture {
+        fixture,
+        project_root,
+        removed_root,
+        removed_store,
+        scheduler,
+        removed_runtime,
+        pointer,
+    }
+}
+
+/// Scope reconciliation may retire a vanished checkout's serving head, but
+/// never a live checkout or a generation still held by a sealed reader.
+#[test]
+fn removed_scope_reconciliation_reclaims_heads_after_reader_closes() {
+    let executor = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .blocking_threads(1, 2)
+        .enable_time()
+        .enable_platform_reactor(true)
+        .build()
+        .unwrap();
+    let daemon_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _daemon_context = daemon_runtime.enter();
+    executor.block_on(async {
+    let RemovedScopeFixture { fixture, project_root, removed_root, removed_store,
+        scheduler, removed_runtime, pointer: _ } = removed_scope_fixture("project.removed-scope-heads").await;
+    drop(scheduler);
+    let live_reader = fixture.runtime.publish_verified_snapshot(Arc::new(AtomicBool::new(false))).unwrap();
+    let removed_reader = removed_runtime.publish_verified_snapshot(Arc::new(AtomicBool::new(false))).unwrap();
+    let removed_head = removed_reader.verified_head().key.projection.clone();
+    let sealed_root = fixture.project_database.database_path().with_extension("sealed");
+    let sealed_count = || std::fs::read_dir(&sealed_root).unwrap().filter_map(Result::ok)
+        .filter(|entry| entry.file_type().unwrap().is_dir() && entry.path().join("sealed.json").is_file()).count();
+    assert_eq!(sealed_count(), 2);
+    let cancellation = CancellationToken::new();
+    let mounted = tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::with_resident_memory_and_progress_producer_incarnation(
+        1, Arc::new(tracedecay_runtime_core::resident_memory::ProcessResidentMemoryV1::new(
+            tracedecay_runtime_core::resident_memory::DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1)), 1,
+    );
+    assert!(!fixture.registry.reconcile_removed_code_scope_graph_replays(
+        fixture.project_id.clone(), &fixture.project_database, &removed_store,
+        &project_root, &mounted, &cancellation, None,
+    ).await.unwrap().0, "an existing worktree must not authorize head retirement");
+    git(&project_root, &["worktree", "remove", removed_root.to_str().unwrap()]);
+    drop(removed_runtime);
+    assert!(!fixture.registry.reconcile_removed_code_scope_graph_replays(
+        fixture.project_id.clone(), &fixture.project_database, &removed_store,
+        &project_root, &mounted, &cancellation, None,
+    ).await.unwrap().0, "an open removed-scope reader must defer reclamation");
+    assert_eq!(sealed_count(), 2);
+    drop(removed_reader);
+    let mut drained = false;
+    for _ in 0..8 {
+        if fixture.registry.reconcile_removed_code_scope_graph_replays(
+            fixture.project_id.clone(), &fixture.project_database, &removed_store,
+            &project_root, &mounted, &cancellation, None,
+        ).await.unwrap().0 { drained = true; break; }
+    }
+    assert!(drained, "removed scope head must retire after its last reader closes");
+    assert_eq!(sealed_count(), 1, "the removed scope's sealed graph bytes must be unlinked");
+    let mut storage = fixture.project_database.graph_publication_storage().unwrap();
+    with_publication_context("removed-scope-check", |context| {
+        assert!(storage.verified_head(&removed_head, context).unwrap().is_none());
+    });
+    assert_eq!(fixture.runtime.recover_verified_snapshot_from_head(Arc::new(AtomicBool::new(false)))
+        .unwrap().generation(), live_reader.generation());
+    });
+}
+
+#[test]
+fn collected_scope_reconciliation_recovers_head_from_retained_source() {
+    let executor = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .blocking_threads(1, 2)
+        .enable_time()
+        .enable_platform_reactor(true)
+        .build()
+        .unwrap();
+    let daemon_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _daemon_context = daemon_runtime.enter();
+    executor.block_on(async {
+    let RemovedScopeFixture { fixture, project_root, removed_root, removed_store,
+        scheduler, removed_runtime, pointer } = removed_scope_fixture("project.collected-scope-heads").await;
+    drop(scheduler);
+    let live_reader = fixture.runtime.publish_verified_snapshot(Arc::new(AtomicBool::new(false))).unwrap();
+    let removed_reader = removed_runtime.publish_verified_snapshot(Arc::new(AtomicBool::new(false))).unwrap();
+    let removed_head = removed_reader.verified_head().key.projection.clone();
+    let sealed_root = fixture.project_database.database_path().with_extension("sealed");
+    let sealed_count = || std::fs::read_dir(&sealed_root).unwrap().filter_map(Result::ok)
+        .filter(|entry| entry.file_type().unwrap().is_dir() && entry.path().join("sealed.json").is_file()).count();
+    assert_eq!(sealed_count(), 2);
+    let cancellation = CancellationToken::new();
+    let mounted = tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::with_resident_memory_and_progress_producer_incarnation(
+        1, Arc::new(tracedecay_runtime_core::resident_memory::ProcessResidentMemoryV1::new(
+            tracedecay_runtime_core::resident_memory::DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1)), 1,
+    );
+    async fn sweep(fixture: &SealedGenerationFixture, roots: &[PathBuf], repository: &Path,
+        mounted: &tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1, cancellation: &CancellationToken) {
+        let mut after = None;
+        for _ in 0..8 {
+            after = fixture.registry.reconcile_removed_code_graph_head_page(
+                fixture.project_id.clone(), &fixture.project_database, roots, repository,
+                mounted, after, cancellation,
+            ).await.unwrap().0;
+            if after.is_none() { return; }
+        }
+        panic!("bounded projection sweep did not finish");
+    }
+    let roots = vec![project_root.clone(), removed_root.clone()];
+    sweep(&fixture, &roots, &project_root, &mounted, &cancellation).await;
+    assert_eq!(sealed_count(), 2, "existing checkouts remain serving authority");
+    git(&project_root, &["worktree", "remove", removed_root.to_str().unwrap()]);
+    drop(removed_runtime);
+    // Simulate the observed old backlog: a retained replay hardlink and
+    // historical registry root survive, not scope-root.v1 or the active pointer.
+    let pool = fixture.project_database.database_path().with_extension("graph-replay");
+    let pool_lock = super::seals::lock_project_graph_replay_pool(&pool, &|| Ok(())).unwrap();
+    std::fs::hard_link(removed_store.join("code-generations-v1").join(&pointer.generation_file),
+        pool.join(&pointer.generation_file)).unwrap();
+    drop(pool_lock);
+    std::fs::remove_dir_all(&removed_store).unwrap();
+    sweep(&fixture, &roots, &project_root, &mounted, &cancellation).await;
+    assert_eq!(sealed_count(), 2, "the removed reader still pins its generation");
+    drop(removed_reader);
+    sweep(&fixture, &roots, &project_root, &mounted, &cancellation).await;
+    assert_eq!(sealed_count(), 1, "the removed scope's sealed graph bytes must be unlinked");
+    let mut storage = fixture.project_database.graph_publication_storage().unwrap();
+    with_publication_context("removed-scope-check", |context| {
+        assert!(storage.verified_head(&removed_head, context).unwrap().is_none());
+    });
+    assert_eq!(fixture.runtime.recover_verified_snapshot_from_head(Arc::new(AtomicBool::new(false)))
+        .unwrap().generation(), live_reader.generation());
+    });
+}
+
+/// Retry after the graph/source transaction completed but its durable queue
+/// receipt was not acknowledged. Reclaimed bytes must not be needed to prove
+/// that already-retired work is complete.
+#[test]
+fn removed_scope_release_retry_does_not_require_an_unlinked_source() {
+    let executor = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .blocking_threads(1, 2)
+        .enable_time()
+        .enable_platform_reactor(true)
+        .build()
+        .unwrap();
+    let daemon = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = daemon.enter();
+    executor.block_on(async {
+        let RemovedScopeFixture { fixture, project_root, removed_root, removed_store,
+            mut scheduler, removed_runtime, pointer: _ } = removed_scope_fixture("project.scope-release-retry").await;
+        let live = fixture.runtime.publish_verified_snapshot(Arc::new(AtomicBool::new(false))).unwrap();
+        drop(removed_runtime.publish_verified_snapshot(Arc::new(AtomicBool::new(false))).unwrap());
+        drop(removed_runtime);
+        std::fs::write(removed_root.join("lib.rs"), "pub fn successor() -> usize { 2 }\n").unwrap();
+        scheduler.reconcile_now().unwrap();
+        drop(scheduler);
+        let pool = fixture.project_database.database_path().with_extension("graph-replay");
+        drop(super::seals::lock_project_graph_replay_pool(&pool, &|| Ok(())).unwrap());
+        let plan = plan_code_generation_retention(&removed_store, &BTreeSet::new()).unwrap();
+        execute_code_generation_retention(&removed_store, plan, CodeGenerationRetentionModeV1::Apply,
+            tracedecay_contracts::clock::now_micros(), Some(&pool)).unwrap();
+        let queue = code_generation_graph_replay_release_page(&removed_store, None).unwrap();
+        assert_eq!(queue.releases.len(), 1);
+        git(&project_root, &["worktree", "remove", "--force", removed_root.to_str().unwrap()]);
+        let schedulers = tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::with_resident_memory_and_progress_producer_incarnation(
+            1, Arc::new(tracedecay_runtime_core::resident_memory::ProcessResidentMemoryV1::new(
+                tracedecay_runtime_core::resident_memory::DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1)), 1,
+        );
+        let cancellation = CancellationToken::new();
+        let mut after = None;
+        for _ in 0..8 {
+            after = fixture.registry.reconcile_removed_code_graph_head_page(fixture.project_id.clone(),
+                &fixture.project_database, std::slice::from_ref(&removed_root), &project_root,
+                &schedulers, after, &cancellation).await.unwrap().0;
+            if after.is_none() { break; }
+        }
+        assert!(!pool.join(&queue.releases[0].generation.generation_file).exists());
+        assert_eq!(code_generation_graph_replay_release_page(&removed_store, None).unwrap().releases.len(), 1);
+        for _ in 0..2 {
+            assert!(fixture.registry.reconcile_removed_code_scope_graph_replays(fixture.project_id.clone(),
+                &fixture.project_database, &removed_store, &project_root, &schedulers,
+                &cancellation, None).await.unwrap().0);
+        }
+        assert!(code_generation_graph_replay_release_page(&removed_store, None).unwrap().releases.is_empty());
+        assert_eq!(fixture.runtime.recover_verified_snapshot_from_head(Arc::new(AtomicBool::new(false)))
+            .unwrap().generation(), live.generation());
+    });
+}
+
 /// The graph store is the only owner of symbol, file, and import records:
 /// sealing writes no second copy of them beside the generation, and the
 /// interactive catalog is derived from the sealed projection itself.
@@ -2206,7 +2715,7 @@ async fn sealed_publication_refuses_over_the_resident_memory_watermark() {
             resident_bytes: 0,
             unreclaimable_bytes: 0,
             swapped_bytes: 0,
-            cgroup_committed_bytes: None,
+            cgroup_headroom_bytes: None,
         },
     ));
     let refuse_once_projecting = Arc::new(AtomicBool::new(true));
@@ -2227,7 +2736,7 @@ async fn sealed_publication_refuses_over_the_resident_memory_watermark() {
                             resident_bytes: limit_bytes,
                             unreclaimable_bytes: limit_bytes,
                             swapped_bytes: 0,
-                            cgroup_committed_bytes: None,
+                            cgroup_headroom_bytes: None,
                         },
                     );
                 }
@@ -2383,7 +2892,7 @@ async fn sealed_publication_samples_resident_memory_per_interval_not_per_row() {
                 resident_bytes: 0,
                 unreclaimable_bytes: 0,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     ));

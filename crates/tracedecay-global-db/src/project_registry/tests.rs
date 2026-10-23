@@ -3,9 +3,9 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,9 @@ use tracedecay_runtime_core::db::engine::{
 };
 
 use crate::RegisteredGlobalDb;
-use crate::tests::harness::{RegisteredGlobalDbHarness, RegisteredGlobalDbTestRuntime};
+use crate::tests::harness::RegisteredGlobalDbHarness;
+#[cfg(unix)]
+use crate::tests::harness::RegisteredGlobalDbTestRuntime;
 
 #[cfg(unix)]
 #[test]
@@ -657,7 +659,7 @@ async fn dashboard_membership_returns_only_requested_registered_projects() {
 
 fn git(dir: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
-        .args(args)
+        .args(tracedecay_runtime_core::path_safety::plain_git_args(args))
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -770,17 +772,21 @@ async fn full_clone_adopts_a_shallow_first_project_and_enriches_its_history() {
     let (original, full) = cloned_repository(&harness, "shallow-first");
     std::fs::write(original.join("lib.rs"), "pub fn next() {}\n").unwrap();
     git(&original, &["commit", "-q", "-am", "advance history"]);
-    let url = format!("file://{}/", original.display());
-    git(&full, &["remote", "set-url", "origin", &url]);
+    let remote = tracedecay_runtime_core::path_safety::plain_host_path(&original);
+    let url = remote.to_str().expect("utf-8 fixture remote");
+    git(&full, &["remote", "set-url", "origin", url]);
     let shallow = original.with_file_name("shallow-first-shallow");
+    // Force the upload-pack transport so depth applies to a local path without
+    // inventing a file:// URL from a Windows drive or verbatim spelling.
     git(
         original.parent().unwrap(),
         &[
             "clone",
             "-q",
+            "--no-local",
             "--depth",
             "1",
-            &url,
+            url,
             shallow.to_str().unwrap(),
         ],
     );
@@ -821,7 +827,7 @@ async fn full_clone_adopts_a_shallow_first_project_and_enriches_its_history() {
         &unrelated,
         &["commit", "-q", "--amend", "-am", "unrelated root"],
     );
-    git(&unrelated, &["remote", "add", "origin", &url]);
+    git(&unrelated, &["remote", "add", "origin", url]);
     assert!(
         harness
             .registered
@@ -971,7 +977,8 @@ async fn anchors_do_not_keep_a_missing_project_alive_but_its_store_does() {
     );
 }
 
-#[cfg(unix)]
+// APFS rejects the non-UTF-8 directory name before registry admission.
+#[cfg(target_os = "linux")]
 #[asupersync::test]
 async fn native_path_aliases_protect_roots_from_lossy_registry_reaping() {
     let harness = RegisteredGlobalDbHarness::open("project-registry-native-reap").await;

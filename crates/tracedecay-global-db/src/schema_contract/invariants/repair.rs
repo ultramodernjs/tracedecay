@@ -19,8 +19,9 @@ struct CommittedCursorCandidate {
     cursor: ObservationSourceCursorV1,
 }
 
-/// Reads the current observation frontier: `COALESCE(MAX(sequence), 0)` over
-/// `observations`. The row cursor lives only inside this function, so it is
+/// Reads the allocated high-water to detect missing committed tails as well
+/// as retained rows. Allocation is not retirement proof: the coverage pass
+/// verifies every absent interval separately. The row cursor is
 /// fully consumed and dropped before returning, see
 /// `observation_projection::rebuild::read_observation_frontier` for why a
 /// caller doing further reads or writes on the same connection depends on
@@ -29,7 +30,7 @@ async fn read_observation_frontier(
     conn: &impl QueryExecutor,
 ) -> tracedecay_domain::errors::Result<i64> {
     let mut rows = conn
-        .query("SELECT COALESCE(MAX(sequence), 0) FROM observations", ())
+        .query("SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'observations'), 0), COALESCE(MAX(sequence), 0)) FROM observations", ())
         .await
         .map_err(audit_read_error)?;
     rows.next()
@@ -160,7 +161,17 @@ pub(super) async fn repair_projection_frontier_page(
             let mut count = 0;
             let mut gap = false;
             while let Some(row) = rows.next().await.map_err(audit_read_error)? {
-                scan = row.get(0).map_err(audit_read_error)?;
+                let sequence = row.get::<i64>(0).map_err(audit_read_error)?;
+                if sequence > scan + 1
+                    && !crate::observation::retired_sequences::covers(conn, scan + 1, sequence - 1)
+                        .await
+                        .map_err(|error| authority_violation(error.to_string()))?
+                {
+                    return Err(authority_violation(
+                        "unexplained observation sequence gap before projection frontier",
+                    ));
+                }
+                scan = sequence;
                 count += 1;
                 if row.get::<i64>(1).map_err(audit_read_error)? != 1 {
                     gap = true;
@@ -170,6 +181,20 @@ pub(super) async fn repair_projection_frontier_page(
             }
             drop(rows);
             if gap || count < AUDIT_PAGE_ROWS {
+                if !gap {
+                    let target = original.min(frontier);
+                    if scan < target
+                        && !crate::observation::retired_sequences::covers(conn, scan + 1, target)
+                            .await
+                            .map_err(|error| authority_violation(error.to_string()))?
+                    {
+                        return Err(authority_violation(
+                            "unexplained observation sequence gap before projection frontier",
+                        ));
+                    }
+                    repaired = target;
+                    scan = scan.max(repaired);
+                }
                 conn.execute(
                     "UPDATE observation_projection_checkpoints SET last_sequence = ?2
                      WHERE projector_version = ?1 AND last_sequence = ?3",
@@ -370,7 +395,21 @@ pub(super) async fn repair_pending_source_cursor_page(
     conn: &impl Executor,
     audited_sequence: i64,
 ) -> tracedecay_domain::errors::Result<CursorAuditPage> {
-    if read_observation_frontier(conn).await? > audited_sequence {
+    // Cursor reconstruction scans retained payloads, not allocated identities.
+    // A retired tail still exists in sqlite_sequence, but has no row to audit.
+    let mut newest = conn
+        .query("SELECT COALESCE(MAX(sequence), 0) FROM observations", ())
+        .await
+        .map_err(audit_read_error)?;
+    let retained_frontier: i64 = newest
+        .next()
+        .await
+        .map_err(audit_read_error)?
+        .ok_or_else(|| authority_violation("retained frontier query returned no row"))?
+        .get(0)
+        .map_err(audit_read_error)?;
+    drop(newest);
+    if retained_frontier > audited_sequence {
         return Ok(CursorAuditPage::ObservationsAppended);
     }
     let mut rows = conn

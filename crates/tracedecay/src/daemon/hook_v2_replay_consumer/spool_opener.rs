@@ -546,7 +546,7 @@ mod tests {
         )
         .unwrap();
         ledger
-            .stage_admission(&event, Some(&event), now)
+            .stage_admission(&event, Some(&event), None, Some(0), now)
             .unwrap()
             .commit
             .wait()
@@ -581,7 +581,7 @@ mod tests {
         )
         .unwrap();
         ledger
-            .stage_admission(&claude_event, Some(&claude_event), now)
+            .stage_admission(&claude_event, Some(&claude_event), None, Some(0), now)
             .unwrap()
             .commit
             .wait()

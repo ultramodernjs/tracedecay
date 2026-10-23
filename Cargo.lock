@@ -6522,7 +6522,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tracedecay"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "asupersync",
  "axum",
@@ -6806,7 +6806,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-cli"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "asupersync",
  "aws-lc-rs",
@@ -6871,6 +6871,7 @@ dependencies = [
  "tracedecay-session-memory",
  "tracedecay-session-temporal-store",
  "tracedecay-sessions",
+ "tracedecay-store",
  "tracedecay-store-runtime",
  "tracedecay-tool-catalog",
  "tracing",
@@ -7322,6 +7323,7 @@ dependencies = [
  "tracedecay-domain",
  "tracedecay-framing",
  "tracedecay-private-fs",
+ "tracedecay-runtime-core",
  "tracing",
 ]
 
@@ -7484,6 +7486,7 @@ dependencies = [
  "tracedecay-project",
  "tracedecay-query",
  "tracedecay-runtime-core",
+ "tracedecay-rusqlite-runtime",
  "tracedecay-session-memory",
  "tracedecay-session-runtime",
  "tracedecay-session-temporal-store",
@@ -7515,7 +7518,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-conformance"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "serde",
  "serde_json",
@@ -7526,7 +7529,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-evaluation"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "serde",
  "serde_json",
@@ -7538,7 +7541,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-fabric"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "tracedecay-memory-provider-api",
  "tracing",
@@ -7546,7 +7549,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-hygiene"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "regex",
  "serde",
@@ -7561,7 +7564,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-ncm-core"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "serde",
  "serde_json",
@@ -7569,7 +7572,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-ncm-runtime"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -7588,7 +7591,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-observation"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "rusqlite",
  "serde",
@@ -7601,14 +7604,14 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-provider-api"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "sha2 0.11.1",
 ]
 
 [[package]]
 name = "tracedecay-memory-provider-native"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "serde_json",
  "tracedecay-memory-provider-api",
@@ -7616,7 +7619,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-provider-ncm"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "chrono",
  "serde_json",
@@ -7629,7 +7632,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-memory-provider-registry"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "chrono",
  "getrandom 0.2.17",
@@ -7703,7 +7706,7 @@ dependencies = [
 
 [[package]]
 name = "tracedecay-project"
-version = "1.0.0-beta.88"
+version = "1.0.0-beta.89"
 dependencies = [
  "asupersync",
  "rusqlite",

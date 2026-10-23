@@ -19,6 +19,7 @@ mod production_daemon;
 mod remote_journey;
 mod semantic_replay;
 
+#[cfg(unix)]
 fn production_binary() -> std::path::PathBuf {
     let path = std::env::var_os("TRACEDECAY_TEST_BIN").map_or_else(
         || std::path::PathBuf::from("../../target/debug/tracedecay"),
@@ -28,6 +29,7 @@ fn production_binary() -> std::path::PathBuf {
         .unwrap_or_else(|error| panic!("missing production daemon {}: {error}", path.display()))
 }
 
+#[cfg(unix)]
 fn run(command: &mut std::process::Command) -> Vec<u8> {
     isolated_profile::run_ok(command, "command")
 }

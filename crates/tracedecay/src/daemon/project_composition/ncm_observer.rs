@@ -232,18 +232,30 @@ impl ObservationInstanceProofV1 for NcmInstanceProof {
     }
 }
 
+/// Validated provider settings passed together at the composition boundary.
+pub(in crate::daemon) struct NcmRegistrationSettings {
+    pub(in crate::daemon) worker_binary: PathBuf,
+    pub(in crate::daemon) state_root: PathBuf,
+    pub(in crate::daemon) registration_revision: u64,
+    pub(in crate::daemon) mode: EnabledProviderMode,
+    pub(in crate::daemon) namespace_binding: MemoryProviderNcmNamespaceBindingV1,
+}
+
 /// Builds one lazy registration over the existing NCM worker slot. The mode is
 /// passed by validated composition; Native advisory authority is optional.
 pub(in crate::daemon) fn construct_ncm_registration_with_authority(
     owners: &NcmWorkerOwnerSlot,
     profile_id: &UserProfileId,
-    worker_binary: PathBuf,
-    state_root: PathBuf,
-    registration_revision: u64,
-    mode: EnabledProviderMode,
-    namespace_binding: MemoryProviderNcmNamespaceBindingV1,
+    settings: NcmRegistrationSettings,
     authority: Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
 ) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
+    let NcmRegistrationSettings {
+        worker_binary,
+        state_root,
+        registration_revision,
+        mode,
+        namespace_binding,
+    } = settings;
     let worker = owners.acquire(profile_id, &worker_binary, &state_root)?;
     let lifecycle =
         ProviderLifecycleOwnershipV1::Owned(Arc::new(NcmLifecycleOwner::new(Arc::clone(&worker))));
@@ -312,11 +324,13 @@ mod tests {
         construct_ncm_registration_with_authority(
             owners,
             profile_id,
-            worker_binary,
-            state_root,
-            1,
-            EnabledProviderMode::Observer,
-            MemoryProviderNcmNamespaceBindingV1::ExactSessionV1,
+            NcmRegistrationSettings {
+                worker_binary,
+                state_root,
+                registration_revision: 1,
+                mode: EnabledProviderMode::Observer,
+                namespace_binding: MemoryProviderNcmNamespaceBindingV1::ExactSessionV1,
+            },
             None,
         )
         .map(|(_, mount)| mount)
@@ -419,11 +433,13 @@ mod tests {
             let (registration, mount) = construct_ncm_registration_with_authority(
                 &slot,
                 &profile,
-                worker.clone(),
-                root.clone(),
-                1,
-                EnabledProviderMode::Observer,
-                binding,
+                NcmRegistrationSettings {
+                    worker_binary: worker.clone(),
+                    state_root: root.clone(),
+                    registration_revision: 1,
+                    mode: EnabledProviderMode::Observer,
+                    namespace_binding: binding,
+                },
                 None,
             )
             .unwrap();

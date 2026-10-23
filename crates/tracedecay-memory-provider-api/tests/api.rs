@@ -326,8 +326,11 @@ fn exact_scope_rejects_malformed_resolved_scope_digests() {
             "session-1",
             invalid,
         )
-        .expect_err("malformed resolved scope digest must fail closed");
-        assert_eq!(error, ApiError::InvalidSha256("resolved_scope_digest"));
+        .err();
+        assert_eq!(
+            error,
+            Some(ApiError::InvalidSha256("resolved_scope_digest"))
+        );
     }
 }
 
@@ -587,9 +590,12 @@ fn request_accounting_frames_every_exact_scope_string() -> Result<(), ApiError> 
     // it from the accounted value rather than by lengthening it: a call whose
     // resolved scope digest is absent from the accounting would be admitted at
     // a budget that cannot hold it.
-    let without_seventh = baseline_bytes
-        .checked_sub(8 + RESOLVED_SCOPE_DIGEST.len() as u64)
-        .expect("resolved_scope_digest must be inside the accounted aggregate");
+    let seventh_bytes = 8 + RESOLVED_SCOPE_DIGEST.len() as u64;
+    assert!(
+        baseline_bytes >= seventh_bytes,
+        "resolved_scope_digest must be inside the accounted aggregate"
+    );
+    let without_seventh = baseline_bytes - seventh_bytes;
     assert_eq!(
         baseline.validate_request_bytes(without_seventh),
         Err(ApiError::BoundaryBytesExceeded {

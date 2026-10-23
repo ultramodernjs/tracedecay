@@ -1,3 +1,5 @@
+mod retirement;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracedecay_runtime_core::config::ProfileRoot;
@@ -9,6 +11,10 @@ use tracedecay_contracts::retrieval::{
     SessionDatabaseSizeV1, StorageReportRegistryV1,
 };
 use tracedecay_global_db::profile_registry_maintenance::remove_store_directory;
+use tracedecay_maintenance::retention::storage_report::{
+    StorageReport, StorageReportCoverageState, StorageReportSizeCoverageV1,
+    StorageReportSizeReasonV1, StorageReportSizeStateV1, StoreSizeReportEntry,
+};
 use tracedecay_runtime_core::lifecycle_lease::{
     ExclusiveLeaseAttempt, try_acquire_exclusive_for_profile,
 };
@@ -21,17 +27,181 @@ pub(crate) async fn handle_profile_storage_action(
     assume_yes: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     match action {
+        ProfileStorageAction::CleanupCodex {
+            apply,
+            cursor,
+            page_size,
+            json,
+        } => {
+            Box::pin(retirement::cleanup_codex(
+                profile, apply, cursor, page_size, json,
+            ))
+            .await
+        }
+        ProfileStorageAction::PrepareRetirementIndexes { apply, json } => {
+            Box::pin(retirement::prepare_indexes(profile, apply, json)).await
+        }
         ProfileStorageAction::StorageReport {
             profile_root,
             project_id,
             project_root,
             json,
         } => handle_storage_report(profile, profile_root, project_id, project_root, json).await,
+        ProfileStorageAction::ReleaseGraphReplays {
+            project_id,
+            project_root,
+            after,
+            apply,
+            json,
+        } => {
+            let result = super::daemon::admin_cli_result(
+                profile,
+                None,
+                AdminCliSurfaceRequestV1::ReleaseGraphReplays {
+                    project_id,
+                    project_root,
+                    after,
+                    plan_digest: apply,
+                },
+            )
+            .await?;
+            let AdminCliResultV1::GraphReplayRelease(result) = result else {
+                return Err(super::daemon::admin_cli_result_mismatch(
+                    "release_graph_replays",
+                ));
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result.graph_replay_release)?
+                );
+            } else {
+                let result: tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1 =
+                    serde_json::from_value(result.graph_replay_release)?;
+                match result {
+                    tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1::DryRun { plan } => {
+                        println!("Dry-run: {} queued source(s) in this bounded page; graph authority unvalidated", plan.releases.len());
+                        println!("Plan digest: {}", plan.plan_digest);
+                        println!("Reclaimable bytes: {}", plan.reclaimable_bytes.map_or_else(|| "unknown until authority revalidation".to_owned(), format_bytes));
+                        println!("Continuation: {}", plan.continuation.as_deref().unwrap_or("end"));
+                    }
+                    tracedecay_maintenance::store_maintenance::GraphReplayReleaseRunV1::Applied { released, retained, continuation, segment_sweep_more_work, .. } => {
+                        println!("Released {released} source(s); retained {retained} by live graph authority");
+                        println!("Continuation: {}; segment sweep more work: {segment_sweep_more_work}", continuation.as_deref().unwrap_or("end"));
+                    }
+                }
+            }
+            Ok(())
+        }
         ProfileStorageAction::ResetProjectStore {
             project_root,
             project_id,
         } => handle_reset_project_store(profile, project_root, project_id, assume_yes),
+        ProfileStorageAction::JournalGc {
+            cursor,
+            apply,
+            json,
+        } => handle_journal_gc(profile, cursor, apply, json).await,
+        ProfileStorageAction::Compact {
+            database,
+            max_pages,
+            apply,
+        } => compact_database(profile.data_dir(), &database, max_pages, apply.as_deref()),
     }
+}
+
+/// The daemon keeps the sole admitted registry writer; this CLI never opens a database.
+async fn handle_journal_gc(
+    profile: &ProfileRoot,
+    cursor: Option<String>,
+    apply: Option<String>,
+    json: bool,
+) -> tracedecay_domain::errors::Result<()> {
+    let result = super::daemon::admin_cli_result(
+        profile,
+        None,
+        AdminCliSurfaceRequestV1::StorageJournalGc { cursor, apply },
+    )
+    .await?;
+    let AdminCliResultV1::JournalGc(page) = result else {
+        return Err(super::daemon::admin_cli_result_mismatch(
+            "storage_journal_gc",
+        ));
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+    } else {
+        println!(
+            "{}: {} candidates, {} logical bytes; scanned {}, skipped {}, oversized {}",
+            if page.applied { "Applied" } else { "Preview" },
+            page.candidates.len(),
+            page.logical_bytes_released,
+            page.scanned,
+            page.skipped,
+            page.oversized
+        );
+        for candidate in &page.candidates {
+            println!(
+                "  {}: {} payload bytes, {} releasable bytes",
+                candidate.key, candidate.payload_bytes, candidate.logical_bytes_released
+            );
+        }
+        println!("digest: {}", page.digest);
+        if let Some(cursor) = page.cursor {
+            println!("cursor (reuse with --apply): {cursor}");
+        }
+        if let Some(next) = page.next_cursor {
+            println!("next_cursor: {next}");
+        } else {
+            println!("exhausted: true");
+        }
+    }
+    Ok(())
+}
+
+/// Preview or apply an offline repack. The maintenance crate owns every safety
+/// check (exclusive profile lease, digest, sidecars, validation, atomic swap).
+#[cfg(unix)]
+fn compact_database(
+    profile_root: &Path,
+    database: &str,
+    max_pages: u64,
+    apply: Option<&str>,
+) -> tracedecay_domain::errors::Result<()> {
+    use tracedecay_maintenance::offline_compaction::{
+        compact_offline_v1, inspect_compaction_candidate_v1,
+    };
+    let database = profile_root.join(database);
+    let output = match apply {
+        None => serde_json::to_string_pretty(&inspect_compaction_candidate_v1(
+            profile_root,
+            &database,
+            max_pages,
+        )?),
+        Some(digest) => serde_json::to_string_pretty(&compact_offline_v1(
+            profile_root,
+            &database,
+            digest,
+            max_pages,
+        )?),
+    }
+    .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+        message: format!("cannot render compaction result: {error}"),
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn compact_database(
+    _profile_root: &Path,
+    _database: &str,
+    _max_pages: u64,
+    _apply: Option<&str>,
+) -> tracedecay_domain::errors::Result<()> {
+    Err(tracedecay_domain::errors::TraceDecayError::Config {
+        message: "offline database compaction requires Unix directory durability support".into(),
+    })
 }
 
 /// Scoped operator recovery for a project graph store whose open failed with
@@ -313,14 +483,28 @@ async fn brokered_storage_report(
     Ok(report)
 }
 
-fn merge_storage_report_page(
-    report: &mut tracedecay_maintenance::retention::storage_report::StorageReport,
-    page: tracedecay_maintenance::retention::storage_report::StorageReport,
-) {
+fn merge_storage_report_page(report: &mut StorageReport, page: StorageReport) {
+    // Project pages and empty directory pages carry no backlog sample. Their
+    // default Complete coverage is neutral, not evidence of measured bytes.
+    let unregistered_size = if !has_unregistered_size_sample(report) {
+        page.coverage.unregistered_size
+    } else if !has_unregistered_size_sample(&page) {
+        report.coverage.unregistered_size
+    } else {
+        report
+            .coverage
+            .unregistered_size
+            .merge(page.coverage.unregistered_size)
+    };
+    let unregistered_count_is_lower_bound = report.coverage.unregistered_count_is_lower_bound
+        || page.coverage.unregistered_count_is_lower_bound;
     if report.profile_root.is_empty() {
         report.profile_root = page.profile_root;
     }
     report.stores.extend(page.stores);
+    report
+        .graph_replay_release
+        .extend(page.graph_replay_release);
     report
         .code_generation_retention
         .extend(page.code_generation_retention);
@@ -344,6 +528,14 @@ fn merge_storage_report_page(
         report.registry = page.registry;
     }
     report.coverage = page.coverage;
+    report.coverage.unregistered_size = unregistered_size;
+    report.coverage.unregistered_count_is_lower_bound = unregistered_count_is_lower_bound;
+}
+
+fn has_unregistered_size_sample(report: &StorageReport) -> bool {
+    report.unregistered_dir_count > 0
+        || report.unregistered_bytes > 0
+        || report.coverage.unregistered_size != StorageReportSizeCoverageV1::default()
 }
 
 /// Read-only per-store size / free-page-ratio / unregistered-directory report
@@ -479,11 +671,12 @@ async fn handle_storage_report(
         let root_state = store
             .root_state
             .map_or("root not probed", |state| state.label());
+        let size_coverage = effective_store_size_coverage(store);
         println!(
-            "    {} ({}, {root_state}): {} total, {free}",
+            "    {} ({}, {root_state}): {}, {free}",
             store.project_id,
             store.canonical_root,
-            format_bytes(store.total_bytes),
+            storage_size_label(store.total_bytes, size_coverage),
         );
         let kinds = &store.kinds;
         for (family, bytes) in [
@@ -506,6 +699,17 @@ async fn handle_storage_report(
             println!(
                 "      not sized: {} unreadable or non-regular entries",
                 store.unavailable_entry_count
+            );
+        }
+        if size_coverage.state
+            != tracedecay_maintenance::retention::storage_report::StorageReportSizeStateV1::Complete
+        {
+            println!(
+                "      sizing: {} ({})",
+                storage_coverage_state_label(size_coverage.state),
+                size_coverage
+                    .reason
+                    .map_or("unspecified", storage_coverage_reason_label)
             );
         }
     }
@@ -550,6 +754,25 @@ async fn handle_storage_report(
             );
         }
     }
+    for backlog in &report.graph_replay_release {
+        println!(
+            "  graph replay release for {} ({}): {} queued in this bounded page, authority unvalidated, reclaimable segment bytes {}",
+            backlog.project_id,
+            backlog.store_root,
+            backlog
+                .pending_release_count
+                .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+            backlog
+                .reclaimable_segment_bytes
+                .map_or_else(|| "unknown".to_owned(), format_bytes)
+        );
+        if let Some(cursor) = &backlog.continuation {
+            println!("    queue continues after {cursor}");
+        }
+        if let Some(reason) = &backlog.unavailable_reason {
+            println!("    unavailable: {reason}");
+        }
+    }
     for availability in &report.code_generation_retention_availability {
         if availability.state
             == tracedecay_maintenance::retention::storage_report::StorageReportAvailabilityState::Unavailable
@@ -563,12 +786,36 @@ async fn handle_storage_report(
     }
     println!(
         "  unregistered directories: {} ({})",
-        report.unregistered_dir_count,
-        format_bytes(report.unregistered_bytes)
+        storage_directory_count_label(
+            report.unregistered_dir_count,
+            report.coverage.unregistered_count_is_lower_bound
+                || report.coverage.state == StorageReportCoverageState::Partial,
+        ),
+        storage_size_label(report.unregistered_bytes, report.coverage.unregistered_size)
     );
+    if report.coverage.unregistered_size.state
+        != tracedecay_maintenance::retention::storage_report::StorageReportSizeStateV1::Complete
+    {
+        println!(
+            "    sizing: {} ({})",
+            storage_coverage_state_label(report.coverage.unregistered_size.state),
+            report
+                .coverage
+                .unregistered_size
+                .reason
+                .map_or("unspecified", storage_coverage_reason_label)
+        );
+    }
+    if report.coverage.unregistered_size.unavailable_entry_count > 0 {
+        println!(
+            "    not sized: {} unreadable or non-regular entries",
+            report.coverage.unregistered_size.unavailable_entry_count
+        );
+    }
     if report.unregistered_dir_count > 0 {
         println!("  run the daemon's automatic sweep to reclaim unregistered directories");
     }
+
     if let Some(footprint) = &report.footprint {
         for line in footprint_lines(footprint) {
             println!("{line}");
@@ -657,6 +904,7 @@ mod storage_report_tests {
                     total_bytes: 10 + index,
                     kinds: StoreKindBytesV1::default(),
                     unavailable_entry_count: 0,
+                    size_coverage: StorageReportSizeCoverageV1::default(),
                     free_bytes: Some(0),
                     free_page_ratio: Some(0.0),
                     sessions_database: session_database(10 + index),
@@ -713,6 +961,61 @@ mod storage_report_tests {
         );
         database.pages = SessionDatabasePagesV1::Missing;
         assert!(session_database_text(&database).contains("page telemetry missing"));
+    }
+}
+
+fn storage_size_label(bytes: u64, coverage: StorageReportSizeCoverageV1) -> String {
+    match coverage.state {
+        StorageReportSizeStateV1::Complete => format!("{} total", format_bytes(bytes)),
+        StorageReportSizeStateV1::Partial => format!("at least {} (partial)", format_bytes(bytes)),
+        StorageReportSizeStateV1::Unavailable => {
+            format!("size unavailable ({} measured)", format_bytes(bytes))
+        }
+    }
+}
+
+fn storage_directory_count_label(count: usize, is_lower_bound: bool) -> String {
+    if is_lower_bound {
+        format!("at least {count}")
+    } else {
+        count.to_string()
+    }
+}
+
+fn effective_store_size_coverage(store: &StoreSizeReportEntry) -> StorageReportSizeCoverageV1 {
+    let mut coverage = store.size_coverage;
+    coverage.unavailable_entry_count = coverage
+        .unavailable_entry_count
+        .max(store.unavailable_entry_count);
+    if coverage.state == StorageReportSizeStateV1::Complete && store.unavailable_entry_count > 0 {
+        coverage.state = if store.total_bytes == 0 {
+            StorageReportSizeStateV1::Unavailable
+        } else {
+            StorageReportSizeStateV1::Partial
+        };
+        coverage.reason = Some(StorageReportSizeReasonV1::UnreadableEntries);
+    }
+    if coverage.state == StorageReportSizeStateV1::Complete && coverage.unavailable_entry_count == 0
+    {
+        return StorageReportSizeCoverageV1::default();
+    }
+    coverage
+}
+
+fn storage_coverage_state_label(state: StorageReportSizeStateV1) -> &'static str {
+    match state {
+        StorageReportSizeStateV1::Complete => "complete",
+        StorageReportSizeStateV1::Partial => "partial lower bound",
+        StorageReportSizeStateV1::Unavailable => "unavailable",
+    }
+}
+
+fn storage_coverage_reason_label(reason: StorageReportSizeReasonV1) -> &'static str {
+    match reason {
+        StorageReportSizeReasonV1::UnreadableEntries => "unreadable entries",
+        StorageReportSizeReasonV1::EntryBudgetExceeded => "entry budget exceeded",
+        StorageReportSizeReasonV1::Cancelled => "cancelled",
+        StorageReportSizeReasonV1::DeadlineExceeded => "deadline exceeded",
     }
 }
 
@@ -793,6 +1096,136 @@ mod footprint_output_tests {
                 "    profile total: 2.0 KB of 4.0 KB",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod storage_coverage_output_tests {
+    use tracedecay_maintenance::retention::storage_report::{
+        StorageReport, StorageReportCoverage, StorageReportSizeCoverageV1,
+        StorageReportSizeReasonV1, StorageReportSizeStateV1,
+    };
+
+    use super::{merge_storage_report_page, storage_directory_count_label, storage_size_label};
+
+    #[test]
+    fn unavailable_backlog_stays_unavailable_across_empty_and_unavailable_pages() {
+        let mut report = StorageReport::default();
+        let empty_page = StorageReport {
+            profile_root: "/profile".to_owned(),
+            ..StorageReport::default()
+        };
+        merge_storage_report_page(&mut report, empty_page.clone());
+        let unavailable_page = StorageReport {
+            profile_root: "/profile".to_owned(),
+            unregistered_dir_count: 1,
+            coverage: StorageReportCoverage {
+                unregistered_size: StorageReportSizeCoverageV1 {
+                    state: StorageReportSizeStateV1::Unavailable,
+                    reason: Some(StorageReportSizeReasonV1::UnreadableEntries),
+                    unavailable_entry_count: 1,
+                },
+                ..StorageReportCoverage::default()
+            },
+            ..StorageReport::default()
+        };
+        merge_storage_report_page(&mut report, unavailable_page.clone());
+        assert_eq!(
+            report.coverage.unregistered_size.state,
+            StorageReportSizeStateV1::Unavailable
+        );
+        merge_storage_report_page(&mut report, unavailable_page);
+        merge_storage_report_page(&mut report, empty_page);
+        assert_eq!(report.unregistered_dir_count, 2);
+        assert_eq!(report.unregistered_bytes, 0);
+        assert_eq!(
+            report.coverage.unregistered_size.state,
+            StorageReportSizeStateV1::Unavailable
+        );
+        assert_eq!(report.coverage.unregistered_size.unavailable_entry_count, 2);
+
+        merge_storage_report_page(
+            &mut report,
+            StorageReport {
+                profile_root: "/profile".to_owned(),
+                unregistered_dir_count: 1,
+                unregistered_bytes: 7,
+                ..StorageReport::default()
+            },
+        );
+        assert_eq!(report.unregistered_bytes, 7);
+        assert_eq!(
+            report.coverage.unregistered_size.state,
+            StorageReportSizeStateV1::Partial
+        );
+    }
+
+    #[test]
+    fn truncated_directory_counts_remain_lower_bounds_after_page_aggregation() {
+        let mut report = StorageReport::default();
+        merge_storage_report_page(
+            &mut report,
+            StorageReport {
+                coverage: StorageReportCoverage {
+                    unregistered_count_is_lower_bound: true,
+                    ..StorageReportCoverage::default()
+                },
+                ..StorageReport::default()
+            },
+        );
+        merge_storage_report_page(
+            &mut report,
+            StorageReport {
+                unregistered_dir_count: 2,
+                ..StorageReport::default()
+            },
+        );
+        assert!(report.coverage.unregistered_count_is_lower_bound);
+        assert_eq!(storage_directory_count_label(0, true), "at least 0");
+        assert_eq!(
+            storage_directory_count_label(
+                report.unregistered_dir_count,
+                report.coverage.unregistered_count_is_lower_bound
+            ),
+            "at least 2"
+        );
+        assert_eq!(storage_directory_count_label(2, false), "2");
+    }
+
+    #[test]
+    fn partial_sizes_render_as_lower_bounds_not_exact_totals() {
+        let label = storage_size_label(
+            0,
+            StorageReportSizeCoverageV1 {
+                state: StorageReportSizeStateV1::Partial,
+                reason: Some(StorageReportSizeReasonV1::EntryBudgetExceeded),
+                unavailable_entry_count: 0,
+            },
+        );
+
+        assert!(label.starts_with("at least "));
+        assert!(label.ends_with("(partial)"));
+        assert!(!label.contains("total"));
+    }
+
+    #[test]
+    fn page_aggregation_preserves_a_budget_reason_and_unavailable_count() {
+        let merged = StorageReportSizeCoverageV1 {
+            state: StorageReportSizeStateV1::Partial,
+            reason: Some(StorageReportSizeReasonV1::UnreadableEntries),
+            unavailable_entry_count: 1,
+        }
+        .merge(StorageReportSizeCoverageV1 {
+            state: StorageReportSizeStateV1::Partial,
+            reason: Some(StorageReportSizeReasonV1::EntryBudgetExceeded),
+            unavailable_entry_count: 0,
+        });
+
+        assert_eq!(
+            merged.reason,
+            Some(StorageReportSizeReasonV1::EntryBudgetExceeded)
+        );
+        assert_eq!(merged.unavailable_entry_count, 1);
     }
 }
 
@@ -1070,3 +1503,54 @@ mod reset_project_store_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn compact_previews_without_writing_and_applies_only_the_previewed_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().canonicalize().unwrap();
+        let database = profile.join("user-sessions.db");
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=DELETE;
+                     CREATE TABLE t(id INTEGER PRIMARY KEY, body TEXT);
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+                     INSERT INTO t SELECT i, hex(randomblob(512)) FROM n;
+                     DELETE FROM t WHERE id % 2 = 0;",
+                )
+                .unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+        compact_database(&profile, "user-sessions.db", 1 << 20, None).unwrap();
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            before,
+            "preview never writes"
+        );
+        assert!(compact_database(&profile, "user-sessions.db", 1 << 20, Some("stale")).is_err());
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+
+        let plan = tracedecay_maintenance::offline_compaction::inspect_compaction_candidate_v1(
+            &profile,
+            &database,
+            1 << 20,
+        )
+        .unwrap();
+        compact_database(&profile, "user-sessions.db", 1 << 20, Some(&plan.digest)).unwrap();
+        let after = std::fs::metadata(&database).unwrap().len();
+        assert!(after < before.len() as u64, "{after} >= {}", before.len());
+        let rows: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1000);
+    }
+}
+
+#[cfg(test)]
+mod journal_gc_tests;

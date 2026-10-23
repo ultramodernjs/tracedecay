@@ -10,6 +10,14 @@ from unittest import mock
 from pathlib import Path
 
 
+# Bazel's Windows sandbox may have no USERPROFILE/HOMEDRIVE. Give both the
+# imported runner and its isolation assertions a real, throwaway user home.
+TEST_HOME = tempfile.TemporaryDirectory(prefix="real-model-runner-home-")
+HOME_ENV = mock.patch.dict("os.environ", {"HOME": TEST_HOME.name, "USERPROFILE": TEST_HOME.name})
+HOME_ENV.start()
+unittest.addModuleCleanup(TEST_HOME.cleanup)
+unittest.addModuleCleanup(HOME_ENV.stop)
+
 MODULE_PATH = Path(__file__).with_name("run_real_model.py")
 SPEC = importlib.util.spec_from_file_location("run_real_model", MODULE_PATH)
 run_real_model = importlib.util.module_from_spec(SPEC)
@@ -24,6 +32,14 @@ SCORE_PATH = MODULE_PATH.parent.parent / "hermetic" / "score.py"
 SCORE_SPEC = importlib.util.spec_from_file_location("hermetic_score", SCORE_PATH)
 hermetic_score = importlib.util.module_from_spec(SCORE_SPEC)
 SCORE_SPEC.loader.exec_module(hermetic_score)
+
+
+def setUpModule():
+    runs = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(runs.cleanup)
+    patch = mock.patch.object(run_real_model, "RUNS_DIR", Path(runs.name))
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
 
 
 class HermesHomeSelectionTest(unittest.TestCase):
@@ -69,6 +85,51 @@ class HermesHomeSelectionTest(unittest.TestCase):
         self.assertNotIn("--project-root", cmd)
         self.assertEqual(run_mock.call_args.kwargs["cwd"], fixture)
         self.assertEqual(run_mock.call_args.kwargs["env"], env.env)
+
+
+class BinaryResolutionTest(unittest.TestCase):
+    def test_blocked_run_writes_report_without_resolving_a_binary(self):
+        for flags in ([], ["--agent-turn"], ["--i-understand-model-cost"]):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as tmp:
+                with (
+                    mock.patch.object(run_real_model, "RUNS_DIR", Path(tmp)),
+                    mock.patch.object(run_real_model, "resolve_tracedecay_bin") as resolve,
+                    mock.patch.object(run_real_model, "load_scenarios", return_value=[{"id": "test"}]),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(run_real_model.main(flags), 2)
+                resolve.assert_not_called()
+                reports = list(Path(tmp).glob("*/report.json"))
+                self.assertEqual(len(reports), 1)
+                report = json.loads(reports[0].read_text())
+                self.assertEqual(report["status"], "blocked")
+                self.assertIsNone(report["tracedecay_bin"])
+
+    def test_explicit_binary_is_used_and_must_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "tracedecay"
+            binary.write_text("#!/bin/sh\necho tracedecay 0.0.0\n")
+            binary.chmod(0o755)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    Path(run_real_model.resolve_tracedecay_bin(binary)), binary
+                )
+                with self.assertRaises(SystemExit):
+                    run_real_model.resolve_tracedecay_bin(Path(tmp) / "missing")
+
+    def test_default_never_falls_back_to_a_prebuilt_or_path_binary(self):
+        failed = subprocess.CompletedProcess([], 2, stdout="")
+        with tempfile.TemporaryDirectory() as tmp:
+            path_binary = Path(tmp) / "tracedecay"
+            path_binary.write_text("#!/bin/sh\n")
+            path_binary.chmod(0o755)
+            with (
+                mock.patch.dict("os.environ", {"PATH": tmp}),
+                mock.patch.object(run_real_model.subprocess, "run", return_value=failed),
+                self.assertRaises(SystemExit),
+            ):
+                run_real_model.resolve_tracedecay_bin(None)
 
 
 class CursorComposerSelectionTest(unittest.TestCase):

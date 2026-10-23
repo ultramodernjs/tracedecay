@@ -101,7 +101,10 @@ struct RescanRow {
     content: Option<String>,
     storage_kind: LcmStorageKind,
     payload_ref: Option<String>,
+    /// Hydrated receipts for semantic inspection and re-ingestion.
     metadata_json: Option<String>,
+    /// Exact at-rest bytes, kept separate for compare-and-swap.
+    stored_metadata_json: Option<String>,
     kind: Option<String>,
     model: Option<String>,
     tool_names: Option<String>,
@@ -283,6 +286,7 @@ impl RegisteredGlobalDb {
                 source_path: row.get(11)?,
                 source_offset: row.get(12)?,
                 metadata_json: row.get(13)?,
+                stored_metadata_json: raw::stored_metadata_bytes_from_record_row(&row, 1)?,
                 storage_kind,
                 payload_ref: row.get(20)?,
             });
@@ -348,23 +352,23 @@ impl RegisteredGlobalDb {
 
     /// Changes metadata without rewriting or deleting the independently receipted body.
     async fn remediate_row_metadata(&self, row: &RescanRow) -> Result<(), LcmError> {
-        let stored = row.metadata_json.as_deref().ok_or_else(|| {
+        let hydrated = row.metadata_json.as_deref().ok_or_else(|| {
             LcmError::Db("metadata remediation requires stored metadata".to_owned())
         })?;
-        let sanitized = raw::resanitize_stored_provider_metadata_json(stored)?;
+        let sanitized = raw::resanitize_stored_provider_metadata_json(hydrated)?;
         let transaction = self
             .begin_write_transaction()
             .await
             .map_err(|error| LcmError::Db(error.to_string()))?;
-        let changed = transaction.execute(
-            "UPDATE lcm_raw_messages SET metadata_json = ?1 WHERE store_id = ?2 AND provider = ?3 AND message_id = ?4 AND metadata_json IS ?5",
-            params![sanitized, row.store_id, row.provider.as_str(), row.message_id.as_str(), stored],
-        ).await?;
-        if changed != 1 {
-            return Err(LcmError::Db(
-                "stored metadata changed during privacy remediation".to_owned(),
-            ));
-        }
+        raw::compare_and_swap_raw_metadata(
+            &transaction,
+            row.store_id,
+            &row.provider,
+            &row.message_id,
+            row.stored_metadata_json.as_deref(),
+            Some(&sanitized),
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }

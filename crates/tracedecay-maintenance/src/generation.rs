@@ -20,9 +20,9 @@ use tracedecay_contracts::storage::compaction::CompactionThresholdConfig;
 /// the scopes of removed worktrees, then the independent compaction passes.
 /// A collected scope continues on the short cadence so the next
 /// code-generation pass sweeps the shared segments and text artifacts only it
-/// named. A code-generation continuation runs only the bounded
-/// code-generation unit, draining a superseded backlog without re-running
-/// scope reconciliation or compaction.
+/// named. A code-generation continuation also resumes bounded scope/head
+/// draining, including scopes held by readers and already-collected scopes.
+/// It still skips compaction.
 #[tracing::instrument(name = "daemon.maintenance.generation", level = "trace", skip_all)]
 pub async fn run_project_generation_maintenance(
     lease: &ProjectStoreMaintenanceLeaseV1,
@@ -59,18 +59,23 @@ pub async fn run_project_generation_maintenance(
         }
         CodeGenerationRetentionOutcomeV1::Failed => MaintenanceTickOutcome::Retry,
     };
-    if continuation == Some(MaintenanceContinuation::CodeGenerationRetention) {
-        return finalize_generation_outcome(outcome, cancellation);
-    }
     if !cancellation.is_cancelled() {
         outcome = outcome.combine({
             use tracing::Instrument as _;
-            run_code_index_scope_reconciliation(lease, code_index_schedulers)
-                .instrument(tracing::trace_span!(
-                    "daemon.maintenance.scope_reconciliation"
-                ))
-                .await
+            run_code_index_scope_reconciliation(
+                lease,
+                code_index_schedulers,
+                maintenance_observations,
+                cancellation,
+            )
+            .instrument(tracing::trace_span!(
+                "daemon.maintenance.scope_reconciliation"
+            ))
+            .await
         });
+    }
+    if continuation == Some(MaintenanceContinuation::CodeGenerationRetention) {
+        return finalize_generation_outcome(outcome, cancellation);
     }
     if !cancellation.is_cancelled()
         && let Some(compaction) = compaction
@@ -106,14 +111,16 @@ pub async fn run_project_generation_maintenance(
 )]
 pub async fn run_registered_project_generation_maintenance(
     store: &RegisteredProjectStoreV1,
+    lease: &ProjectStoreMaintenanceLeaseV1,
     mounted_store_roots: &BTreeSet<PathBuf>,
     code_index_schedulers: &tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1,
     profile_database: &tracedecay_global_db::RegisteredGlobalDb,
     maintenance_observations: &StoreTelemetrySamplingRegistry,
     cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
 ) -> MaintenanceTickOutcome {
-    let outcome = match run_registered_code_generation_retention(
+    let mut outcome = match run_registered_code_generation_retention(
         store,
+        lease,
         mounted_store_roots,
         code_index_schedulers,
         profile_database,
@@ -128,6 +135,17 @@ pub async fn run_registered_project_generation_maintenance(
         }
         CodeGenerationRetentionOutcomeV1::Failed => MaintenanceTickOutcome::Retry,
     };
+    if !cancellation.is_cancelled() {
+        outcome = outcome.combine(
+            run_code_index_scope_reconciliation(
+                lease,
+                code_index_schedulers,
+                maintenance_observations,
+                cancellation,
+            )
+            .await,
+        );
+    }
     finalize_generation_outcome(outcome, cancellation)
 }
 

@@ -382,14 +382,27 @@ async fn mounted_graph_listing_takes_no_server_lease_while_it_reads() {
         handles,
         "a parked graph listing must hold no server handle"
     );
-    assert!(
-        engine
-            .store_administration
-            .project_servers()
-            .try_lock()
-            .is_ok(),
-        "a parked graph listing must not hold the registry lock, or every route bind waits on the swap"
-    );
+    // Project-open background owners also use this fair mutex. A queued
+    // owner can reserve its permit as the listing releases it, so try_lock
+    // cannot tell that contention from a lock retained by the listing. Keep
+    // polling the listing (it may initially park on the registry itself) and
+    // require another registry user to make progress while the swap is held.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::select! {
+            biased;
+            _ = listing.as_mut() => panic!("the listing must still await the held graph swap"),
+            registry = engine.store_administration.project_servers().lock() => {
+                assert_eq!(
+                    Arc::strong_count(&server),
+                    handles,
+                    "a parked graph listing must hold no server handle"
+                );
+                drop(registry);
+            }
+        }
+    })
+    .await
+    .expect("a parked graph listing must not hold the registry lock, or every route bind waits on the swap");
     drop(swap);
     assert_eq!(listing.await.len(), 1);
 }

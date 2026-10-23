@@ -974,19 +974,21 @@ fn an_expired_queued_dispatch_preserves_the_shared_runtime() {
     let request = handshake_request(exact_scope("worktree-ready"));
     let dispatch = readiness
         .ready_dispatch_with_evidence(&request, 1_000)
-        .unwrap();
+        .expect("queued dispatch fixture must complete its setup and synchronization");
     let mut queued = handshake_request(exact_scope("worktree-queued"));
     queued.control = OperationControl::new(i64::MAX, 50, CancellationToken::new());
     let queued_control = queued.control.clone();
     let queued_readiness = Arc::clone(&readiness);
     let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
     let caller = std::thread::spawn(move || {
-        entered.send(()).unwrap();
+        entered
+            .send(())
+            .expect("queued dispatch fixture must complete its setup and synchronization");
         queued_readiness.ready_target(&queued, 1_000)
     });
     entered_rx
         .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
+        .expect("queued dispatch fixture must complete its setup and synchronization");
     let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while queued_control.snapshot().is_ok() && std::time::Instant::now() < until {
         std::thread::yield_now();
@@ -997,7 +999,9 @@ fn an_expired_queued_dispatch_preserves_the_shared_runtime() {
     ));
     drop(dispatch);
     assert!(matches!(
-        caller.join().unwrap(),
+        caller
+            .join()
+            .expect("queued dispatch fixture must complete its setup and synchronization"),
         Err(SupervisedReadinessError::RequestTerminal {
             terminal_code: TerminalCode::DeadlineExceeded,
             ..
@@ -1011,7 +1015,7 @@ fn an_expired_queued_dispatch_preserves_the_shared_runtime() {
     assert!(readiness.quarantined_scopes().is_empty());
     readiness
         .ready_target(&handshake_request(exact_scope("worktree-ready")), 2_000)
-        .unwrap();
+        .expect("queued dispatch fixture must complete its setup and synchronization");
     assert_eq!(port.handshake_calls.load(Ordering::Relaxed), 2);
 }
 
@@ -1026,22 +1030,26 @@ fn a_cancelled_queued_dispatch_preserves_the_shared_runtime() {
     let request = handshake_request(exact_scope("worktree-ready"));
     let dispatch = readiness
         .ready_dispatch_with_evidence(&request, 1_000)
-        .unwrap();
+        .expect("queued dispatch fixture must complete its setup and synchronization");
     let queued = handshake_request(exact_scope("worktree-queued"));
     let cancellation = queued.control.cancellation();
     let queued_readiness = Arc::clone(&readiness);
     let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
     let caller = std::thread::spawn(move || {
-        entered.send(()).unwrap();
+        entered
+            .send(())
+            .expect("queued dispatch fixture must complete its setup and synchronization");
         queued_readiness.ready_target(&queued, 1_000)
     });
     entered_rx
         .recv_timeout(std::time::Duration::from_secs(1))
-        .unwrap();
+        .expect("queued dispatch fixture must complete its setup and synchronization");
     cancellation.cancel();
     drop(dispatch);
     assert!(matches!(
-        caller.join().unwrap(),
+        caller
+            .join()
+            .expect("queued dispatch fixture must complete its setup and synchronization"),
         Err(SupervisedReadinessError::RequestTerminal {
             terminal_code: TerminalCode::Cancelled,
             ..
@@ -1055,7 +1063,7 @@ fn a_cancelled_queued_dispatch_preserves_the_shared_runtime() {
     assert!(readiness.quarantined_scopes().is_empty());
     readiness
         .ready_target(&handshake_request(exact_scope("worktree-ready")), 2_000)
-        .unwrap();
+        .expect("queued dispatch fixture must complete its setup and synchronization");
     assert_eq!(port.handshake_calls.load(Ordering::Relaxed), 2);
 }
 

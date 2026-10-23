@@ -41,6 +41,8 @@ pub struct HermesTurnCallbackOutcome {
     pub committed: u64,
     /// Messages already durable before this call.
     pub duplicates: u64,
+    /// Inputs successfully covered without retaining observation evidence.
+    pub excluded: u64,
 }
 
 /// Admits one inlined Hermes turn under `scope`. `project_path` is the admitted
@@ -144,6 +146,7 @@ pub async fn capture_turn_callback(
                 outcome: persisted, ..
             } => match *persisted {
                 ObservationPersistOutcome::Committed(_) => outcome.committed += 1,
+                ObservationPersistOutcome::SourceExcluded(_) => outcome.excluded += 1,
                 ObservationPersistOutcome::ExactDuplicate(_)
                 | ObservationPersistOutcome::CoveredDuplicate(_) => outcome.duplicates += 1,
             },

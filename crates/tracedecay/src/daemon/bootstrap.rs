@@ -1,7 +1,9 @@
 //! Foreground daemon bootstrap: `run_foreground` entry points, the Unix
 //! accept/serve loop, socket preparation, and client-task draining.
 
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -825,16 +827,26 @@ async fn run_foreground_unix(
         hook_v2_replay_consumer::spawn_spooled_hook_opener(engine.clone(), profile.clone());
     let admission = DaemonClientAdmission::new(MAX_CONCURRENT_DAEMON_CLIENTS);
     let mut client_tasks = ClientTasks::default();
-    // launchd appends this daemon's stderr to a plain file with no rotation
-    // of its own; the journal (systemd) or a terminal is not a regular file
-    // and is left alone. Detection is truthful about what fd 2 is, so a
-    // failure to inspect it is reported, not treated as "not a file".
+    // launchd appends this daemon's stderr and stdout to plain files with no
+    // rotation of its own. Leave journals, terminals and protocol pipes alone;
+    // report inspection failures instead of treating them as "not a file".
     let stderr_log_rotation = match BoundedStderrLog::detect() {
         Ok(Some(log)) => log.spawn_rotation(),
         Ok(None) => None,
         Err(error) => {
             log_daemon_event(
                 "daemon_stderr_log_unbounded",
+                &[("error", error.to_string())],
+            );
+            None
+        }
+    };
+    let stdout_log_rotation = match BoundedStderrLog::detect_stdout() {
+        Ok(Some(log)) => log.spawn_rotation(),
+        Ok(None) => None,
+        Err(error) => {
+            log_daemon_event(
+                "daemon_stdout_log_unbounded",
                 &[("error", error.to_string())],
             );
             None
@@ -921,6 +933,9 @@ async fn run_foreground_unix(
         opener.abort();
     }
     if let Some(rotation) = stderr_log_rotation {
+        rotation.abort();
+    }
+    if let Some(rotation) = stdout_log_rotation {
         rotation.abort();
     }
     if let Some(canary) = lateness_canary {

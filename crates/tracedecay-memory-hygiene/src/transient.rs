@@ -1,9 +1,7 @@
 //! Transient-noise detection with byte spans.
 //!
-//! `tracedecay_session_memory::memory::hygiene::detect_transient` answers whether
-//! a string looks transient, which is all the curation planner needs. Redacting
-//! a span needs the span, and the upstream span finder is crate-internal, so
-//! this module owns the four transient patterns.
+//! Redacting a transient span needs its byte range, so this module owns the
+//! four transient patterns.
 //!
 //! This is deliberate, bounded duplication of exactly four expressions, kept
 //! here rather than reached for upstream because reaching for it would mean

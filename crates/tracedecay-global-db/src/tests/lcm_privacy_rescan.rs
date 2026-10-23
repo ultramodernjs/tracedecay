@@ -6,6 +6,7 @@ use tracedecay_domain::{
     ComponentVersion, PayloadReferenceV1, SanitizationReceiptId, SanitizationReceiptRefV1,
     SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
 };
+use tracedecay_lcm::raw::{self, receipt_store};
 use tracedecay_lcm::retrieval_content::projected_content_hash;
 use tracedecay_lcm::{payload, schema};
 use tracedecay_privacy::{
@@ -476,7 +477,12 @@ async fn rescan_remediates_external_metadata_even_when_body_is_unavailable() {
         let row = rows.next().await.expect("row").expect("present");
         let metadata: String = row.get(0).expect("metadata");
         assert!(!metadata.contains(&secret()));
-        let parsed: Value = serde_json::from_str(&metadata).expect("JSON");
+        let hydrated =
+            tracedecay_lcm::raw::receipt_store::hydrate_metadata(&snapshot, Some(&metadata))
+                .await
+                .expect("hydrate receipts")
+                .expect("metadata present");
+        let parsed: Value = serde_json::from_str(&hydrated).expect("JSON");
         assert_eq!(
             parsed["ingest_protection"]["sanitization_receipt"],
             json!(legacy_receipt(body))
@@ -488,6 +494,135 @@ async fn rescan_remediates_external_metadata_even_when_body_is_unavailable() {
             assert_eq!(std::fs::read(&path).expect("payload retained"), before);
         }
     }
+}
+
+#[asupersync::test]
+async fn rescan_remediates_receipt_compacted_metadata_without_rewriting_bodies() {
+    let harness = RegisteredGlobalDbHarness::open("privacy-compacted-metadata").await;
+    let root = harness.registered.db_path().parent().unwrap().to_path_buf();
+    seed_session(&harness, "compacted-session").await;
+    let body = "clean historical body";
+    seed_legacy_inline_row(&harness, "compacted-session", "inline", body).await;
+    let available =
+        seed_legacy_external_row(&harness, "compacted-session", "available", body).await;
+    let unavailable =
+        seed_legacy_external_row(&harness, "compacted-session", "unavailable", body).await;
+    let available_path = payload::payload_dir(&root).join(&available);
+    let available_bytes = std::fs::read(&available_path).unwrap();
+    let unavailable_path = payload::payload_dir(&root).join(&unavailable);
+    std::fs::remove_file(&unavailable_path).expect("offload fixture");
+
+    let transaction = harness.registered.begin_write_transaction().await.unwrap();
+    let mut rows = transaction
+        .query("SELECT store_id, metadata_json FROM lcm_raw_messages", ())
+        .await
+        .unwrap();
+    let mut legacy_metadata = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        let mut metadata: Value = serde_json::from_str(&row.get::<String>(1).unwrap()).unwrap();
+        metadata["provider_note"] = json!(format!("api_key={}", secret()));
+        legacy_metadata.push((row.get::<i64>(0).unwrap(), metadata.to_string()));
+    }
+    drop(rows);
+    for (store_id, metadata) in legacy_metadata {
+        transaction
+            .execute(
+                "UPDATE lcm_raw_messages SET metadata_json = ?1 WHERE store_id = ?2",
+                params![metadata, store_id],
+            )
+            .await
+            .unwrap();
+    }
+    let plan = receipt_store::plan_receipt_compaction(&transaction, 0, 3, 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(plan.changed_rows(), 3);
+    assert_eq!(
+        receipt_store::apply_receipt_compaction(&transaction, &plan, plan.digest())
+            .await
+            .unwrap(),
+        3
+    );
+    transaction.commit().await.unwrap();
+
+    let snapshot = harness.registered.lcm_read_snapshot().await.unwrap();
+    let mut rows = snapshot
+        .query(
+            "SELECT count(*) FROM lcm_raw_messages WHERE json_type(metadata_json,
+         '$.ingest_protection.sanitization_receipt.lcm_receipt_v1') = 'text'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        3
+    );
+    drop(rows);
+    drop(snapshot);
+
+    let outcome = harness
+        .registered
+        .lcm_privacy_rescan_raw_messages()
+        .await
+        .expect("registered rescan must compare exact compact metadata bytes");
+    let LcmPrivacyRescanOutcomeV1::Completed(receipt) = outcome else {
+        panic!("first scan must run")
+    };
+    assert_eq!(receipt.scanned_rows, 3);
+    assert_eq!(receipt.remediated_rows, 3);
+    assert_eq!(receipt.unavailable_payload_rows, 1);
+    assert_eq!(receipt.protected_rows, 0);
+    assert_eq!(count_rows_holding(&harness, &secret()).await, 0);
+
+    let snapshot = harness.registered.lcm_read_snapshot().await.unwrap();
+    let columns = raw::stored_message_record_select_columns("r");
+    let mut rows = snapshot
+        .query(
+            &format!(
+                "SELECT {columns}, r.payload_ref FROM lcm_raw_messages r ORDER BY r.message_id"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    let mut count = 0;
+    while let Some(row) = rows.next().await.unwrap() {
+        count += 1;
+        let message_id: String = row.get(1).unwrap();
+        let hydrated: Value = serde_json::from_str(&row.get::<String>(12).unwrap()).unwrap();
+        let stored = raw::stored_metadata_bytes_from_record_row(&row, 0)
+            .unwrap()
+            .unwrap();
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            hydrated["ingest_protection"]["sanitization_receipt"],
+            json!(legacy_receipt(body))
+        );
+        for field in ["sanitization_receipt", "metadata_sanitization_receipt"] {
+            assert!(
+                stored["ingest_protection"][field]["lcm_receipt_v1"].is_string(),
+                "remediation must preserve receipt normalization"
+            );
+        }
+        match message_id.as_str() {
+            "inline" => assert_eq!(raw::message_body_from_record_row(&row, 0).unwrap(), body),
+            "available" => assert_eq!(row.get::<String>(19).unwrap(), available),
+            "unavailable" => assert_eq!(row.get::<String>(19).unwrap(), unavailable),
+            other => panic!("unexpected message {other}"),
+        }
+    }
+    assert_eq!(count, 3);
+    assert_eq!(std::fs::read(&available_path).unwrap(), available_bytes);
+    assert!(!unavailable_path.exists());
+    assert!(matches!(
+        harness
+            .registered
+            .lcm_privacy_rescan_raw_messages()
+            .await
+            .unwrap(),
+        LcmPrivacyRescanOutcomeV1::AlreadyCurrent
+    ));
 }
 
 #[asupersync::test]

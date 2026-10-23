@@ -89,7 +89,11 @@ def run(
         for line in (root / "github-output").read_text(encoding="utf-8").splitlines()
     )
     retained = (root / "retained").read_text(encoding="utf-8").splitlines()
-    return outputs["build_required"], json.loads(outputs["matrix"]), retained
+    matrix = json.loads(outputs["matrix"])
+    packages_required = any(not target.get("inventory_only", False)
+                            for target in matrix["include"])
+    assert outputs["package_build_required"] == ("true" if packages_required else "false")
+    return outputs["build_required"], matrix, retained
 
 
 def refuses(root: Path, assets: tuple[str, ...], reason: str, profile: str) -> None:
@@ -124,7 +128,12 @@ def check_profile(root: Path, profile: str) -> None:
         f"{cli_prefix}-v1.2.3-x86_64-windows.zip",
         f"{cli_prefix}-v1.2.3-x86_64-windows.mcpb",
     )
-    complete_macos = (macos_binary, macos_mcpb, macos_worker, macos_checksum)
+    macos_inventory = f"{cli_prefix}-v1.2.3-aarch64-macos.spdx.json"
+    complete_macos = (macos_binary, macos_mcpb, macos_worker, macos_checksum, macos_inventory)
+    native_assets += tuple(
+        f"{cli_prefix}-v1.2.3-{target['name']}.spdx.json"
+        for target in TARGETS["include"][1:]
+    )
     all_assets = complete_macos + native_assets
 
     build_required, matrix, retained = run(root, (), profile)
@@ -159,6 +168,39 @@ def check_profile(root: Path, profile: str) -> None:
     assert build_required == "false"
     assert matrix == {"include": []}
     assert retained == sorted(all_assets)
+
+    # A missing inventory alone never rebuilds immutable CLI or NCM packages,
+    # even when the previous release already has its final metadata.
+    for target in TARGETS["include"]:
+        inventory = f"{cli_prefix}-v1.2.3-{target['name']}.spdx.json"
+        partial = tuple(asset for asset in all_assets if asset != inventory)
+        for metadata in ((), ("SHA256SUMS", "install.sh")):
+            build_required, matrix, retained = run(root, partial + metadata, profile)
+            assert build_required == "true"
+            assert matrix == {"include": [{**target, "inventory_only": True}]}
+            assert retained == sorted(partial)
+
+    packages_only = tuple(asset for asset in all_assets if not asset.endswith(".spdx.json"))
+    build_required, matrix, retained = run(
+        root, packages_only + ("SHA256SUMS", "install.sh"), profile
+    )
+    assert build_required == "true"
+    assert matrix == {"include": [
+        {**target, "inventory_only": True} for target in TARGETS["include"]
+    ]}
+    assert retained == sorted(packages_only)
+
+    # Mixed recovery still rebuilds a missing worker/checksum, not just inventory.
+    partial = tuple(asset for asset in all_assets if asset not in (
+        macos_worker, f"{cli_prefix}-v1.2.3-x86_64-linux.spdx.json"
+    ))
+    build_required, matrix, retained = run(root, partial, profile)
+    assert build_required == "true"
+    assert matrix == {"include": [
+        TARGETS["include"][0],
+        {**TARGETS["include"][1], "inventory_only": True},
+    ]}
+    assert retained == sorted(partial)
 
     foreign_worker = f"{worker_prefix}-v1.2.3-x86_64-linux.tar.gz"
     refuses(

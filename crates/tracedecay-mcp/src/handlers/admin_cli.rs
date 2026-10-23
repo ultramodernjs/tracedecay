@@ -30,6 +30,8 @@ use tracedecay_project::project::TraceDecay;
 
 use crate::handlers::SessionAuthorities;
 
+mod journal_gc;
+
 struct AdminCliContext<'a> {
     global_db: &'a RegisteredGlobalDbLeaseV1,
     accounting_db: Option<&'a RegisteredGlobalDb>,
@@ -417,6 +419,15 @@ async fn dispatch_admin_cli(
             };
             AdminCliResultV1::RegistryGc(serde_json::from_value(serde_json::to_value(report)?)?)
         }
+        AdminCliSurfaceRequestV1::StorageJournalGc { cursor, apply } => {
+            AdminCliResultV1::JournalGc(journal_gc::run(global_db, cursor, apply.as_deref()).await?)
+        }
+        AdminCliSurfaceRequestV1::ReleaseGraphReplays { .. } => {
+            return Err(TraceDecayError::Config {
+                message: "graph replay release requires the daemon profile maintenance owner"
+                    .to_owned(),
+            });
+        }
         AdminCliSurfaceRequestV1::StorageReport {
             project_id,
             project_root,
@@ -456,17 +467,21 @@ async fn dispatch_admin_cli(
                         global_db,
                         context.code_index_schedulers,
                         &session_databases,
+                        context.cancellation.clone(),
+                        context.deadline.clone(),
                     )
                     .await?
                 }
                 (None, None) => {
-                    tracedecay_maintenance::retention::storage_report::build_storage_report_page_from_registered_global_db(
+                    tracedecay_maintenance::retention::storage_report::build_storage_report_page_from_registered_global_db_controlled(
                         profile_root,
                         global_db,
                         context.code_index_schedulers,
                         cursor.as_deref(),
                         limit,
                         &session_databases,
+                        context.cancellation.clone(),
+                        context.deadline.clone(),
                     )
                     .await?
                 }
@@ -1084,6 +1099,18 @@ mod tests {
             unregistered_dir_count: 3,
             unregistered_bytes: 4096,
             global_db_bytes: 8192,
+            graph_replay_release: vec![
+                tracedecay_maintenance::retention::storage_report::GraphReplayReleaseBacklogEntryV1 {
+                    project_id: "project.gone".to_owned(),
+                    store_root: "/profile/projects/project.gone/code-index-v1/scope".to_owned(),
+                    pending_release_count: Some(2),
+                    continuation: Some("next-release".to_owned()),
+                    source_liveness: tracedecay_maintenance::store_maintenance::GraphReplayReleaseAuthorityV1::Unvalidated,
+                    reclaimable_segment_bytes: None,
+                    plan: None,
+                    unavailable_reason: None,
+                },
+            ],
             ..Default::default()
         };
         storage.full_profile_size = Some(
@@ -1100,7 +1127,12 @@ mod tests {
         assert_eq!(typed.unregistered_bytes, 4096);
         assert_eq!(
             typed.coverage,
-            serde_json::json!({"state": "complete", "next_cursor": null})
+            serde_json::json!({
+                "state": "complete",
+                "next_cursor": null,
+                "unregistered_size": {"state": "complete", "unavailable_entry_count": 0},
+                "unregistered_count_is_lower_bound": false
+            })
         );
     }
 }

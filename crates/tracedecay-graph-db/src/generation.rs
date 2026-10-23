@@ -347,11 +347,14 @@ impl RecoveredGenerationDigestMemo {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum GraphReplayCollectionOutcome {
+    /// One replay retired logically; native cleanup can remain durable debt.
+    /// The caller must continue until every matching replay is absent.
     Retired(Box<GraphGenerationReplaySource>),
     Retained,
+    /// No active matching replay needs the source, independently of native debt.
     Absent,
-    /// Relational retirement can proceed, but native row delete needs the
-    /// staging engine already resident. The release-queue entry stays queued.
+    /// A source-retaining deferral. Native cleanup alone no longer produces
+    /// this outcome; retained tombstoned payloads are independent cleanup debt.
     RetentionPending,
 }
 

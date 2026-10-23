@@ -732,7 +732,6 @@ impl DaemonSessionSyncService {
             journal.status = SessionSyncJournalStatusV1::Complete;
             journal.stats = stats.clone();
             journal.coverage.clone_from(&coverage);
-            journal.source_frontiers.clone_from(&source_frontiers);
             journal.completion = Some(SessionSyncCompletionReceiptV1 {
                 admission: journal.admission.clone(),
                 coalesced_primary: journal.coalesced_primary.clone(),
@@ -743,6 +742,9 @@ impl DaemonSessionSyncService {
                 source_frontiers: source_frontiers.clone(),
                 failure_codes: failure_codes.clone(),
             });
+            // Terminal replay and coalesced aliases use the completion receipt.
+            // Retain the complete frontier inventory there, not a second copy.
+            journal.source_frontiers.clear();
             journal.updated_at = completed_at;
         })
         .await
@@ -965,13 +967,18 @@ impl SessionSyncServicePort for DaemonSessionSyncService {
 }
 
 pub mod git_topology;
+pub mod journal_retention;
 mod project_lifecycle;
 pub mod work;
 
 #[cfg(test)]
 mod import_admission_tests;
 #[cfg(test)]
+mod journal_retention_tests;
+#[cfg(test)]
 mod shutdown_tests;
+#[cfg(test)]
+mod startup_retention_tests;
 
 pub use project_lifecycle::{SessionSyncProjectContext, SessionSyncTaskV1};
 

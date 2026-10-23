@@ -1814,6 +1814,25 @@ mod recent_first_discovery_tests {
         read_codex_history_frontier, read_host_provider_coverage,
     };
 
+    #[cfg(windows)]
+    #[test]
+    fn cursor_and_corpus_hashes_match_both_windows_separators() {
+        use sha2::{Digest, Sha256};
+
+        let native = Path::new(r"C:\home\.codex\sessions\2026\10\09\rollout.jsonl");
+        let supplied = Path::new(r"C:\home\.codex/sessions/2026/10/09/rollout.jsonl");
+        assert_eq!(
+            crate::runtime::hosts::codex::codex_cursor_key(native),
+            crate::runtime::hosts::codex::codex_cursor_key(supplied),
+        );
+        let digest = |path: &Path| {
+            let mut hasher = Sha256::new();
+            crate::runtime::hosts::codex::hash_path(&mut hasher, path);
+            hasher.finalize()
+        };
+        assert_eq!(digest(native), digest(supplied));
+    }
+
     /// Creates `sessions/YYYY/MM/DD/rollout-<name>.jsonl` under the Codex home.
     fn write_dated_rollout(home: &Path, date: (&str, &str, &str), name: &str) -> PathBuf {
         let dir = home
@@ -3377,6 +3396,59 @@ mod recent_first_discovery_tests {
             error,
             crate::runtime::source::TranscriptIngestError::ScanIo { .. }
         ));
+    }
+
+    #[test]
+    fn a_completion_claim_from_the_shipped_reading_offers_every_rollout_again() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        let sorted = |mut paths: Vec<PathBuf>| {
+            paths.sort();
+            paths
+        };
+        let rollouts = sorted(vec![
+            write_dated_rollout(home, ("2026", "01", "01"), "2026-01-01T00-00-00-thread"),
+            write_dated_rollout(
+                home,
+                ("2026", "01", "02"),
+                "2026-01-02T00-00-00-thread_revert",
+            ),
+        ]);
+        let source = CodexSource::with_home(home);
+        let bounds = TranscriptDiscoveryBounds::from_discovered_units(8);
+
+        let first = source
+            .discover_transcript_paths_with_frontier(bounds, CodexDiscoveryFrontier::initial())
+            .unwrap();
+        assert_eq!(sorted(first.report.paths.clone()), rollouts);
+        assert!(first.next_frontier.is_complete());
+
+        let mut shipped = CodexCorpusEpoch::initial();
+        for file in &first.selected_sources {
+            shipped.observe(file.identity).unwrap();
+        }
+        let upgraded = source
+            .discover_transcript_paths_with_frontier(
+                bounds,
+                CodexDiscoveryFrontier::complete(shipped),
+            )
+            .unwrap();
+        assert_eq!(
+            sorted(upgraded.report.paths),
+            rollouts,
+            "the shipped binary's claim covers nothing this binary reads"
+        );
+        assert!(!upgraded.next_frontier.is_complete());
+
+        let unchanged = source
+            .discover_transcript_paths_with_frontier(bounds, first.next_frontier)
+            .unwrap();
+        assert!(
+            unchanged.report.paths.is_empty(),
+            "this binary's own claim still covers the unchanged corpus: {:?}",
+            unchanged.report.paths
+        );
+        assert!(unchanged.next_frontier.is_complete());
     }
 
     /// The durable epoch stores both digest halves directly. This catches a

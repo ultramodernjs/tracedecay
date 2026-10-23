@@ -12,15 +12,15 @@ esac
 [[ "$build_required" == true || "$build_required" == false ]]
 retained_dir="$(mktemp -d)"
 trap 'rm -rf -- "$retained_dir"' EXIT
-mkdir binaries mcpbs ncm-workers
+mkdir binaries mcpbs ncm-workers inventories new-inventories
 
 gh api "repos/${repo}/releases/tags/${tag}" --jq '.assets[].name' > "$retained_dir/remote-names"
-python3 scripts/plan-release-recovery.py \
+python3 .release-automation/scripts/plan-release-recovery.py \
   --manifest .github/release-targets.json --tag "$tag" --profile "$profile" \
   --asset-names "$retained_dir/remote-names" \
   --retained-output "$retained_dir/names" --github-output "$retained_dir/planner-output"
 mkdir "$retained_dir/assets"
-scripts/verify-retained-release-assets.sh \
+.release-automation/scripts/verify-retained-release-assets.sh \
   --tag "$tag" --repo "$repo" --signer-workflow "$signer_workflow" \
   --source-digest "$source_sha" \
   --signer-ref "refs/tags/${tag}" --signer-ref refs/heads/master \
@@ -31,6 +31,8 @@ while IFS= read -r asset; do
     cp "$retained_dir/assets/$asset" "mcpbs/$asset"
   elif [[ "$asset" == tracedecay-ncm-worker-* ]]; then
     cp "$retained_dir/assets/$asset" "ncm-workers/$asset"
+  elif [[ "$asset" == *.spdx.json ]]; then
+    cp "$retained_dir/assets/$asset" "inventories/$asset"
   else
     cp "$retained_dir/assets/$asset" "binaries/$asset"
   fi
@@ -50,13 +52,47 @@ if [[ "$build_required" == true ]]; then
     destination="mcpbs/$(basename "$artifact")"
     [[ -e "$destination" ]] || cp "$artifact" "$destination"
   done
+  for scope in new-inventory-scopes/*.json; do
+    [[ -f "$scope" ]] || continue
+    platform="$(jq -r '.platform' "$scope")"
+    archive_format="$(jq -r --arg platform "$platform" \
+      '.include[] | select(.name == $platform) | .archive' .github/release-targets.json)"
+    archive="${prefix}-${tag}-${platform}.${archive_format}"
+    mcpb="${prefix}-${tag}-${platform}.mcpb"
+    inventory="${prefix}-${tag}-${platform}.spdx.json"
+    if [[ -e "inventories/$inventory" ]]; then
+      continue
+    fi
+    python3 .release-automation/scripts/generate-release-inventory.py document \
+      --source-root . \
+      --scope "$scope" \
+      --archive "binaries/$archive" \
+      --mcpb "mcpbs/$mcpb" \
+      --tag "$tag" \
+      --source-sha "$source_sha" \
+      --source-epoch "$(git show -s --format=%ct "$source_sha")" \
+      --repository "$repo" \
+      --output "new-inventories/$inventory"
+    cp "new-inventories/$inventory" "inventories/$inventory"
+  done
 fi
-python3 scripts/check-release-artifacts.py \
+python3 .release-automation/scripts/check-release-artifacts.py \
   --manifest .github/release-targets.json --tag "$tag" --profile "$profile" \
-  --binaries binaries --mcpbs mcpbs --ncm-workers ncm-workers --allow-missing-targets
+  --binaries binaries --mcpbs mcpbs --ncm-workers ncm-workers \
+  --inventories inventories --allow-missing-targets
 for bundle in mcpbs/*.mcpb; do
   platform="${bundle#mcpbs/"${prefix}-${tag}-"}"
   platform="${platform%.mcpb}"
   python3 scripts/build-mcpb.py verify \
     --bundle "$bundle" --version "${tag#v}" --platform "$platform"
+done
+for inventory in inventories/*.spdx.json; do
+  platform="${inventory#inventories/${prefix}-${tag}-}"
+  platform="${platform%.spdx.json}"
+  archive_format="$(jq -r --arg platform "$platform" \
+    '.include[] | select(.name == $platform) | .archive' .github/release-targets.json)"
+  python3 .release-automation/scripts/generate-release-inventory.py verify \
+    --inventory "$inventory" \
+    --archive "binaries/${prefix}-${tag}-${platform}.${archive_format}" \
+    --mcpb "mcpbs/${prefix}-${tag}-${platform}.mcpb"
 done

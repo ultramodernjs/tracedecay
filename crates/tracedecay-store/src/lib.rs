@@ -7,6 +7,7 @@
 pub mod canonical_body;
 mod canonical_projection;
 mod codex_goal_context;
+pub mod codex_observation_policy;
 pub mod configuration;
 pub mod cursor_dispatch;
 pub mod diagnostics;
@@ -151,6 +152,8 @@ pub use observation::{
     RepositoryProvenanceAttachmentV1, StoredObservation,
     build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
     build_scope_resolution_authorization_v1, observation_capture_access_policy_digest_v1,
+    observation_source_exclusion_key, observation_source_exclusion_metadata,
+    validate_observation_source_exclusion,
 };
 pub use projection::{
     CLAUDE_SESSION_MESSAGE_PROJECTOR_VERSION, ObservationProjection, ObservationProjectionStore,

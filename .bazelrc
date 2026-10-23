@@ -5,6 +5,9 @@ startup --windows_enable_symlinks
 common --enable_bzlmod
 common --announce_rc
 common --show_progress_rate_limit=15
+# The shared fleet CAS uses size-based eviction, so it cannot guarantee
+# Bazel's default three-hour retention. Revalidate remote outputs before reuse.
+build --experimental_remote_cache_ttl=0s
 # crate_universe re-fetches git dependencies into an empty CARGO_HOME on every
 # splice. libgit2 indexes asupersync's ~1 GB history on one thread for over 25
 # minutes; the git CLI indexes it in about 2.
@@ -69,6 +72,7 @@ build:clippy --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
 
 # Externals return to opt-level 3 over the perf overrides below.
 build:release --compilation_mode=opt
+build:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
 build:release --@rules_rust//rust/settings:per_crate_rustc_flag=external/@-Copt-level=3
 
 build:dist --compilation_mode=opt

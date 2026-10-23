@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
+use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
 
@@ -19,6 +20,7 @@ use tracedecay_domain::{
     ObservationScopeV1, ObservationSourceIdentityV1, ProjectId, ProviderId, RetentionClass,
     SessionId,
 };
+use tracedecay_store::codex_observation_policy::unsupported_codex_record;
 use tracedecay_store::observation::ObservationCoverageReason;
 
 use super::PROVIDER;
@@ -31,7 +33,7 @@ use crate::runtime::jsonl_observation_admission::{
     SharedJsonlFileIdentity, admit_jsonl_observations, reserve_shared_jsonl_page,
     shared_jsonl_background_cpu, shared_jsonl_file_identity, shared_jsonl_preparation_capacity,
 };
-use crate::runtime::shared::TranscriptScopeMatcher;
+use crate::runtime::shared::{ProjectMembership, TranscriptScopeMatcher};
 use crate::runtime::source::{JsonlIoAccounting, TranscriptIngestError, TranscriptIngestResult};
 use tracedecay_privacy::{ObservationRecordParseErrorV1, normalize_prepared_observation_record_v1};
 use tracedecay_runtime_core::resident_memory::ProcessSharedMemoryReservationV1;
@@ -42,7 +44,13 @@ mod forked_session_tests;
 #[cfg(test)]
 mod meta_cache_tests;
 #[cfg(test)]
+mod ownership_tests;
+#[cfg(test)]
 mod retired_source_tests;
+#[cfg(test)]
+mod rollout_source_tests;
+#[cfg(test)]
+mod unsupported_tests;
 
 const CODEX_OBSERVATION_RETENTION: &str = "retention.provider-observation";
 pub const CODEX_HOOK_MAX_NEW_BYTES: u64 = crate::runtime::source::MAX_JSONL_RECORD_BYTES as u64;
@@ -452,7 +460,7 @@ impl CodexObservationAdmission<'_> {
         &'b self,
         session_cwd: &'b Path,
         record_cwd: &'b Path,
-        transcript_path: &'b Path,
+        transcript_path: Option<&'b Path>,
         model: Option<&'b str>,
     ) -> CodexObservationContext<'b> {
         let project_path = match self {
@@ -462,7 +470,7 @@ impl CodexObservationAdmission<'_> {
         CodexObservationContext {
             project_path: Some(project_path),
             location_path: Some(record_cwd),
-            transcript_path: Some(transcript_path),
+            transcript_path,
             model,
         }
     }
@@ -471,7 +479,7 @@ impl CodexObservationAdmission<'_> {
 #[derive(Clone)]
 struct CodexAdmissionState {
     context: CodexContextState,
-    scope_verdict: Option<bool>,
+    scope_verdict: Option<ProjectMembership>,
 }
 
 #[derive(Clone, Copy)]
@@ -481,12 +489,11 @@ struct CodexAdmissionContext<'a> {
     admission: &'a dyn HostAdmission,
     meta: &'a super::meta::CodexMeta,
     native_thread_id: Option<&'a str>,
+    rollout: CodexRolloutFile<'a>,
     cancellation: &'a ObservationCancellation,
 }
 
 fn replay_identity(session_id: &str, domain: &[u8]) -> String {
-    use sha2::{Digest as _, Sha256};
-
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update([0]);
@@ -505,6 +512,55 @@ pub fn codex_observation_source_v2(
             b"tracedecay.codex.observation-source.v2",
         ))?,
     )?)
+}
+
+/// Codex `thread/revert` keeps the thread id and writes a new rollout named
+/// `rollout-<ts>-<thread>_<rollout>.jsonl` and leaves the original
+/// `rollout-<ts>-<thread>.jsonl` in place.
+#[derive(Clone, Copy)]
+enum CodexRolloutFile<'a> {
+    Thread,
+    Revert { rollout_id: &'a str },
+}
+
+impl<'a> CodexRolloutFile<'a> {
+    fn of(rollout: &'a Path, session_id: &str) -> Self {
+        rollout
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("rollout-"))
+            .and_then(|name| name.strip_suffix(".jsonl"))
+            .filter(|stem| stem.get(19..20) == Some("-"))
+            .and_then(|stem| stem.get(20..))
+            .and_then(|ids| ids.strip_prefix(session_id))
+            .and_then(|ids| ids.strip_prefix('_'))
+            .filter(|rollout_id| !rollout_id.is_empty() && *rollout_id != session_id)
+            .map_or(Self::Thread, |rollout_id| Self::Revert { rollout_id })
+    }
+
+    fn source(self, session_id: &str) -> TranscriptIngestResult<ObservationSourceIdentityV1> {
+        let Self::Revert { rollout_id } = self else {
+            return codex_observation_source_v2(session_id);
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(b"tracedecay.codex.observation-source.revert-rollout.v1");
+        hasher.update([0]);
+        hasher.update(session_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(rollout_id.as_bytes());
+        Ok(ObservationSourceIdentityV1::for_provider_source(
+            ProviderId::new(PROVIDER)?,
+            SessionId::new(session_id.to_string())?,
+            SessionId::new(format!(
+                "sha256:{}",
+                encode_lowercase_hex(&hasher.finalize())
+            ))?,
+        )?)
+    }
+
+    fn session_transcript(self, rollout: &Path) -> Option<&Path> {
+        matches!(self, Self::Thread).then_some(rollout)
+    }
 }
 
 async fn shared_session_meta_with_provenance(
@@ -664,13 +720,15 @@ async fn try_admit_codex_jsonl_observations(
         }
         profile @ CodexObservationAdmission::Profile { .. } => profile,
     };
-    let canonical_source = codex_observation_source_v2(&meta.session_id)?;
+    let rollout = CodexRolloutFile::of(path, &meta.session_id);
+    let canonical_source = rollout.source(&meta.session_id)?;
     let context = CodexAdmissionContext {
         path,
         scope: &admission_scope,
         admission,
         meta: &meta,
         native_thread_id: native_thread_id.as_deref(),
+        rollout,
         cancellation,
     };
     let scope = admission_scope.scope();
@@ -682,11 +740,58 @@ async fn try_admit_codex_jsonl_observations(
     admit_codex_jsonl_page(context, canonical_source, max_new_bytes, max_frames).await
 }
 
+fn scope_membership_pending() -> TranscriptIngestError {
+    TranscriptIngestError::HostAdmission {
+        provider: PROVIDER,
+        reason: "scope_membership_pending",
+        retryable: true,
+        status: HostAdmissionStatus::Unavailable,
+        detail: None,
+    }
+}
+
 async fn admit_codex_jsonl_page(
     context: CodexAdmissionContext<'_>,
     source: ObservationSourceIdentityV1,
     max_new_bytes: Option<u64>,
     max_frames: Option<usize>,
+) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
+    #[cfg(test)]
+    let resolver = crate::runtime::ingest::codex_scope_pending_tests::SCOPE_IDENTITY_RESOLVER
+        .try_with(|resolver| *resolver)
+        .ok();
+    admit_codex_jsonl_page_with_matcher(context, source, max_new_bytes, max_frames, || {
+        #[cfg(test)]
+        if let Some(resolver) = resolver {
+            use crate::runtime::shared::ProjectRootMatcher;
+
+            let matcher = |root: &Path| {
+                Arc::new(ProjectRootMatcher::new_with_identity_resolver(
+                    root, resolver,
+                ))
+            };
+            return match context.scope {
+                CodexObservationAdmission::Project { root, .. } => {
+                    TranscriptScopeMatcher::Project(matcher(root))
+                }
+                CodexObservationAdmission::Profile {
+                    registered_roots, ..
+                } => TranscriptScopeMatcher::Profile(
+                    registered_roots.iter().map(|root| matcher(root)).collect(),
+                ),
+            };
+        }
+        context.scope.scope_matcher()
+    })
+    .await
+}
+
+async fn admit_codex_jsonl_page_with_matcher(
+    context: CodexAdmissionContext<'_>,
+    source: ObservationSourceIdentityV1,
+    max_new_bytes: Option<u64>,
+    max_frames: Option<usize>,
+    matcher: impl Fn() -> TranscriptScopeMatcher,
 ) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
     let CodexAdmissionContext {
         path,
@@ -694,13 +799,14 @@ async fn admit_codex_jsonl_page(
         admission,
         meta,
         native_thread_id,
+        rollout,
         cancellation,
     } = context;
     let scope = admission_scope.scope();
     // Resolving the scope runs git for the root. An unchanged rollout admits
     // no frame and must not pay it on every pass.
     let resolved_scope = OnceLock::new();
-    let scope_matcher = || resolved_scope.get_or_init(|| admission_scope.scope_matcher());
+    let scope_matcher = || resolved_scope.get_or_init(&matcher);
     let mut request = JsonlObservationAdmissionRequest::new(
         PROVIDER,
         path,
@@ -747,17 +853,22 @@ async fn admit_codex_jsonl_page(
             // rollout that belongs to another project answers the same verdict
             // for every one of its frames, and the old order paid a full JSON
             // decode per frame to reach it.
-            let in_scope = *state
-                .scope_verdict
-                .get_or_insert_with(|| scope_matcher().accepts(Some(state.context.cwd.as_path())));
-            if !in_scope && !hints.may_change_codex_context {
-                return Ok(JsonlFrameAdmission::non_durable_before_decode(
-                    ObservationCoverageReason::OutOfScope,
-                ));
+            let membership = *state.scope_verdict.get_or_insert_with(|| {
+                scope_matcher().membership(Some(state.context.cwd.as_path()))
+            });
+            match membership {
+                ProjectMembership::Unknown => return Err(scope_membership_pending()),
+                ProjectMembership::NoMatch if !hints.may_change_codex_context => {
+                    return Ok(JsonlFrameAdmission::non_durable_before_decode(
+                        ObservationCoverageReason::OutOfScope,
+                    ));
+                }
+                ProjectMembership::Match | ProjectMembership::NoMatch => {}
             }
             let Some(prepared) = prepared else {
                 return Ok(JsonlFrameAdmission::needs_preparation());
             };
+            let mut membership_pending = false;
             let parsed = normalize_prepared_observation_record_v1(prepared, |native| {
                 if state.context.observe_context_record(native, path, meta) {
                     // Only a context record can move the rollout's cwd,
@@ -765,11 +876,18 @@ async fn admit_codex_jsonl_page(
                     // can no longer be trusted.
                     state.scope_verdict = None;
                 }
-                if !*state.scope_verdict.get_or_insert_with(|| {
-                    scope_matcher().accepts(Some(state.context.cwd.as_path()))
+                match *state.scope_verdict.get_or_insert_with(|| {
+                    scope_matcher().membership(Some(state.context.cwd.as_path()))
                 }) {
-                    non_durable_reason = Some(ObservationCoverageReason::OutOfScope);
-                    return Err(ObservationRecordParseErrorV1::NormalizationFailed);
+                    ProjectMembership::Match => {}
+                    ProjectMembership::NoMatch => {
+                        non_durable_reason = Some(ObservationCoverageReason::OutOfScope);
+                        return Err(ObservationRecordParseErrorV1::NormalizationFailed);
+                    }
+                    ProjectMembership::Unknown => {
+                        membership_pending = true;
+                        return Err(ObservationRecordParseErrorV1::NormalizationFailed);
+                    }
                 }
                 if !codex_observation_record_supported(native) {
                     non_durable_reason = Some(ObservationCoverageReason::UnsupportedFact);
@@ -786,13 +904,20 @@ async fn admit_codex_jsonl_page(
                     admission_scope.observation_context(
                         meta.cwd.as_path(),
                         state.context.cwd.as_path(),
-                        path,
+                        rollout.session_transcript(path),
                         state.context.model.as_deref(),
                     ),
                 )?;
+                if unsupported_codex_record(&envelope) {
+                    non_durable_reason = Some(ObservationCoverageReason::UnsupportedFact);
+                    return Err(ObservationRecordParseErrorV1::NormalizationFailed);
+                }
                 stable_record_id = Some(record_id);
                 Ok(envelope)
             });
+            if membership_pending {
+                return Err(scope_membership_pending());
+            }
             match parsed {
                 Ok(parsed) => {
                     let record_id = stable_record_id

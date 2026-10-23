@@ -759,6 +759,16 @@ async fn check_durable_memory_rows(
         return DurableMemoryCheck::Unverifiable;
     }
     let graph_db_path = root.join(db_relpath);
+    // The snapshot reader folds WAL, not rollback journals. An immutable
+    // read of only the main file cannot establish what an unreconciled
+    // journal would restore, even when SQLite ignores its header as invalid.
+    let mut rollback_journal = graph_db_path.as_os_str().to_os_string();
+    rollback_journal.push("-journal");
+    match std::fs::symlink_metadata(&rollback_journal) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 0 => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return DurableMemoryCheck::Unverifiable,
+    }
     match std::fs::symlink_metadata(&graph_db_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
             return DurableMemoryCheck::Unverifiable;
@@ -1101,8 +1111,9 @@ async fn check_manifestless_store_durable_memory(
 
 /// Finds only regular `.db` files below a store and never follows symlinks.
 /// The manifestless path deliberately does not guess a single filename, so a
-/// custom legacy graph cannot be mistaken for payload-only debris. Any other
-/// file shape is an unverifiable durable-data candidate, not disposable dust.
+/// custom legacy graph cannot be mistaken for payload-only debris. Validated
+/// root branch metadata and companions of regular SQLite files are inventory
+/// metadata, not separate durable authorities. Other file shapes fail closed.
 /// Files of the retired `branches/` store layout are old data with no current
 /// owner: they are neither candidates nor unrecognized payload, and they are
 /// deleted with the directory.
@@ -1136,6 +1147,20 @@ fn collect_sqlite_candidates(
             && path.extension().and_then(|extension| extension.to_str()) == Some("db")
         {
             output.push(relative.to_path_buf());
+        } else if file_type.is_file() && sqlite_companion_has_regular_database(&path) {
+            // The sibling database is inspected with its WAL through the
+            // canonical snapshot reader; nonempty rollback journals fail closed.
+        } else if file_type.is_file()
+            && current == root
+            && entry.file_name() == tracedecay_runtime_core::storage::BRANCH_META_FILENAME
+        {
+            let RegularFileSnapshot::Bytes(bytes) = read_regular_file(&path) else {
+                return Err(std::io::Error::other(
+                    "manifestless store branch metadata is unreadable",
+                ));
+            };
+            let content = std::str::from_utf8(&bytes).map_err(std::io::Error::other)?;
+            tracedecay_runtime_core::branch_meta::parse(content).map_err(std::io::Error::other)?;
         } else {
             return Err(std::io::Error::other(
                 "manifestless store contains an unrecognized payload",
@@ -1144,4 +1169,19 @@ fn collect_sqlite_candidates(
     }
     output.sort();
     Ok(())
+}
+
+fn sqlite_companion_has_regular_database(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(database_name) = ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .filter(|name| name.ends_with(".db"))
+    else {
+        return false;
+    };
+    std::fs::symlink_metadata(path.with_file_name(database_name))
+        .is_ok_and(|metadata| metadata.file_type().is_file())
 }

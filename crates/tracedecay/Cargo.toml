@@ -11,59 +11,6 @@ homepage = "https://github.com/ScriptedAlchemy/tracedecay"
 readme = "../../README.md"
 keywords = ["code-intelligence", "knowledge-graph", "mcp", "tree-sitter", "semantic-search"]
 categories = ["development-tools", "command-line-utilities"]
-# Explicit source-archive whitelist retained for local distribution validation.
-# Frontend sources and the prebuilt dashboard/app-dist are deliberately
-# excluded: the CLI package stages and embeds the dashboard bundle and
-# registers it into this library at process start.
-include = [
-    "/CHANGELOG.md",
-    "/LICENSE",
-    "/README.md",
-    "/rust-toolchain.toml",
-    "/.cargo/config.toml",
-    "/src/**",
-    "/benches/**",
-    "/examples/**",
-    "/tests/fixtures/analytics/**",
-    "/tests/fixtures/packaged_host_events/**",
-    "/tests/fixtures/provider_normalization/**",
-    "/tests/fixtures/redundancy_eval_labeled.json",
-    "/tests/fixtures/transcript_golden/cline_like/**",
-    "/benchmark_data/claude-observation/**",
-    "/benchmark_data/session-temporal/**",
-    "/benchmark_data/query-code-index/**",
-    "/scripts/run-session-temporal-benchmark.sh",
-    "/plugin/.claude-plugin/**",
-    "/plugin/.cursor-plugin/**",
-    "/plugin/.codex-plugin/**",
-    "/plugin/.kimi-plugin/**",
-    "/plugin/.lsp.json",
-    "/plugin/.mcp.json",
-    "/plugin/plugin.json",
-    "/plugin/mcp.json",
-    "/plugin/README*.md",
-    "/plugin/chatgpt-extension/README.md",
-    "/plugin/chatgpt-extension/assets/icon.svg",
-    "/plugin/chatgpt-extension/embedded/app.html",
-    "/plugin/chatgpt-extension/embedded/server.mjs",
-    "/plugin/agents/**",
-    "/plugin/commands/**",
-    "/plugin/hooks/**",
-    "/plugin/mcp-cursor.json",
-    "/plugin/opencode/**",
-    "/plugin/overlays/**",
-    "/plugin/rules/**",
-    "/plugin/skills/**",
-    "/plugin/cursor-native-extension/package.json",
-    "/plugin/cursor-native-extension/README.md",
-    "/plugin/cursor-native-extension/LICENSE",
-    "/plugin/cursor-native-extension/embedded/extension.js",
-    "/vendor/**",
-    "/dashboard/hermes-wrapper/manifest.json",
-    "/dashboard/hermes-wrapper/plugin_api.py",
-    "/dashboard/hermes-wrapper/embed_proxy.py",
-    "/dashboard/hermes-wrapper/src/**",
-]
 
 # Measured aggregate suites exceed the native five-minute medium limit.
 [package.metadata.bazel.test_sizes]
@@ -319,12 +266,12 @@ path = "../../tests/storage_runtime_rusqlite_suite/main.rs"
 
 [dependencies]
 asupersync.workspace = true
-axum = "0.8"
+axum.workspace = true
+tower.workspace = true
+constant_time_eq.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
-tower = "0.5"
-constant_time_eq = "0.6"
 # Wakes the hook replay drain when a callback appends to a spool.
-notify = "8"
+notify.workspace = true
 tracedecay-agent-hosts = { path = "../tracedecay-agent-hosts" }
 tracedecay-api = { path = "../tracedecay-api" }
 tracedecay-contracts = { path = "../tracedecay-contracts" }
@@ -375,24 +322,24 @@ tracedecay-store = { path = "../tracedecay-store" }
 tracedecay-tool-catalog = { path = "../tracedecay-tool-catalog" }
 tracedecay-sdk = { path = "../tracedecay-sdk" }
 tracedecay-application = { path = "../tracedecay-application" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-ureq = { version = "3", features = ["json"] }
-url = "2"
-thiserror = { version = "2", optional = true }
-tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-tracing = "0.1"
-sha2 = "0.11"
-walkdir = "2"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+ureq = { workspace = true, features = ["json"] }
+url.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
 gix.workspace = true
+zeroize.workspace = true
+thiserror = { version = "2", optional = true }
 # Recall diagnostic-key entropy for the NCM provider observer (src/daemon/project_composition/ncm_observer.rs).
 getrandom = "0.2"
-zeroize = "1.9.0"
 keyring = { version = "4.1.5", features = ["v1"] }
-tempfile = "3"
-futures-util = "0.3.33"
-rmcp = { version = "3.5.1", default-features = false, features = ["server"] }
+tempfile.workspace = true
+futures-util.workspace = true
+rmcp = { workspace = true, features = ["server"] }
 # Opt-in. Cargo rejects optional dev-dependencies, and an unconditional one
 # links the evaluator into every test target. Default and `production` builds
 # leave it off, so the shipped CLI does not link it.
@@ -401,26 +348,29 @@ tracedecay-search-eval = { path = "../tracedecay-search-eval", optional = true }
 # `kill(2)` for the daemon integration suites' physical-restart journeys
 # (tests/daemon_suite). Store-locality detection lives in tracedecay-store-runtime.
 [target.'cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))'.dev-dependencies]
-libc = "0.2"
+libc.workspace = true
 
 [dev-dependencies]
-rusqlite = { version = "0.40.1", default-features = false }
-tree-sitter = "0.27"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Focused integration tests need the native runtime without workspace-wide
+# dev-dependency feature unification from the storage crate's own tests.
+tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", features = ["test-runtime"] }
+rusqlite.workspace = true
+tree-sitter.workspace = true
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-hex = "0.4"
-toml = "1"
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+hex.workspace = true
+toml.workspace = true
 regex = "1.12.3"
-filetime = "0.2"
-shell-words = "1.1"
-socket2 = "0.6"
-rmcp = { version = "3.5.1", default-features = false, features = ["client", "server", "transport-async-rw"] }
-criterion = { version = "0.8", features = ["async_tokio"] }
+filetime.workspace = true
+shell-words.workspace = true
+socket2.workspace = true
+rmcp = { workspace = true, features = ["client", "server", "transport-async-rw"] }
+criterion = { workspace = true, features = ["async_tokio"] }
 # test-util enables tokio::test(start_paused = true) so timer-driven unit
 # tests (daemon restart-grace windows) run on virtual time instead of real
 # sleeps.
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 jsonschema = { version = "0.58.6", default-features = false }
 tracedecay-sdk = { path = "../tracedecay-sdk" }
 # Root-only Native baseline over the coding-memory scenario corpus (tdmem-0902).

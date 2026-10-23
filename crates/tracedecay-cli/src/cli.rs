@@ -580,20 +580,6 @@ pub enum Commands {
         #[arg(short, long)]
         path: Option<String>,
     },
-    /// Disable uploading token counts to the worldwide counter
-    #[command(
-        name = "disable-upload-counter",
-        long_about = DISABLE_UPLOAD_COUNTER_LONG_ABOUT,
-        after_help = DISABLE_UPLOAD_COUNTER_AFTER_HELP
-    )]
-    DisableUploadCounter,
-    /// Enable uploading token counts to the worldwide counter
-    #[command(
-        name = "enable-upload-counter",
-        long_about = ENABLE_UPLOAD_COUNTER_LONG_ABOUT,
-        after_help = ENABLE_UPLOAD_COUNTER_AFTER_HELP
-    )]
-    EnableUploadCounter,
     /// Check tracedecay installation, configuration, and agent integration
     #[command(long_about = DOCTOR_LONG_ABOUT, after_help = DOCTOR_AFTER_HELP)]
     Doctor {
@@ -1235,6 +1221,34 @@ pub enum MemoryAction {
 
 #[derive(Subcommand)]
 pub enum ProfileStorageAction {
+    /// Review one bounded page of historical unsupported-only Codex records
+    /// offline. Dry-run by default; --apply confirms the exact page digest.
+    #[command(name = "cleanup-codex")]
+    CleanupCodex {
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
+        /// JSON cursor from the reviewed/previous page; binds a fixed high water.
+        #[arg(long, value_name = "JSON")]
+        cursor: Option<String>,
+        /// Maximum observations examined in this invocation (1..=128).
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..=128))]
+        page_size: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prepare one missing retirement reverse index offline. Dry-run by
+    /// default; --apply confirms its digest. Native indexes are atomic and
+    /// capped at 8,000,000 rows / 512 MiB key bytes; completed indexes are the
+    /// resume cursor. Never starts/stops the daemon or builds at startup.
+    #[command(name = "prepare-retirement-indexes")]
+    PrepareRetirementIndexes {
+        /// Confirm the digest from a fresh dry-run for this one index.
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
+        /// Output the review plan and completion state as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read-only per-store size, free-page ratio, and retention-backlog report
     /// (plan 38 §7). Never mutates anything; use `branch gc` and the daemon's
     /// automatic sweeps to reclaim what this reports.
@@ -1250,6 +1264,24 @@ pub enum ProfileStorageAction {
         #[arg(long = "project-root", requires = "project_id")]
         project_root: Option<String>,
         /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview one bounded page of collected graph replays; apply only with
+    /// the digest returned by that exact preview. Uses the running daemon.
+    #[command(name = "release-graph-replays")]
+    ReleaseGraphReplays {
+        #[arg(long)]
+        project_id: String,
+        /// Recorded checkout/worktree root of the scope to release.
+        #[arg(long)]
+        project_root: PathBuf,
+        /// Continuation returned by the previous page.
+        #[arg(long)]
+        after: Option<String>,
+        /// Execute only the exact preview identified by this digest.
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1275,6 +1307,39 @@ pub enum ProfileStorageAction {
         /// be reset, for a root that is no longer reachable.
         #[arg(long = "project-id")]
         project_id: Option<String>,
+    },
+    /// Preview redundant completed startup-journal frontiers through the daemon.
+    /// One bounded page; --apply requires its unchanged preview digest. This
+    /// releases logical bytes, not physical file space, and never deletes receipts.
+    #[command(name = "journal-gc")]
+    JournalGc {
+        /// Opaque continuation from the previous page's next_cursor. Reuse
+        /// the preview's cursor (not next_cursor) when applying its digest.
+        #[arg(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+        /// Normalize the preview with this exact digest; absent means read-only.
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
+        /// Output the bounded page as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Offline repack of one profile SQLite database (VACUUM INTO a validated
+    /// same-volume copy, atomically swapped in). Without --apply it only
+    /// previews and prints the digest to confirm. Apply requires the daemon
+    /// stopped and a cleanly closed database without WAL/journal sidecars.
+    #[command(name = "compact")]
+    Compact {
+        /// Database inside the profile root, e.g. user-sessions.db or
+        /// projects/<proj_id>/sessions.db.
+        #[arg(long)]
+        database: String,
+        /// Whole-database page budget; larger databases are refused.
+        #[arg(long = "max-pages", default_value_t = 1 << 26)]
+        max_pages: u64,
+        /// Apply the preview with this exact digest.
+        #[arg(long, value_name = "DIGEST")]
+        apply: Option<String>,
     },
 }
 

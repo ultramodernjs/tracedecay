@@ -13,6 +13,11 @@ pub(super) fn claude_source_id(path: &Path) -> Option<String> {
 
 pub(super) fn claude_observation_path_source_id(projects_dir: &Path, path: &Path) -> String {
     let relative = path.strip_prefix(projects_dir).unwrap_or(path);
+    // Windows accepts either separator, but discovery constructs native
+    // backslashes. Hash the same spelling for a supplied path and its
+    // discovered counterpart; keep Unix filename bytes untouched.
+    #[cfg(windows)]
+    let relative = relative.components().collect::<std::path::PathBuf>();
     observation_path_source_id(&tracedecay_runtime_core::os_str_bytes::native_os_str_bytes(
         relative.as_os_str(),
     ))
@@ -65,4 +70,20 @@ fn claude_native_platform() -> &'static str {
 #[cfg(not(any(unix, windows)))]
 fn claude_native_platform() -> &'static str {
     "rust-os-str"
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::*;
+
+    #[test]
+    fn observation_path_identity_matches_both_windows_separators() {
+        let projects = Path::new(r"C:\home\.claude\projects");
+        let native = Path::new(r"C:\home\.claude\projects\other-project\session.jsonl");
+        let supplied = Path::new(r"C:\home\.claude/projects/other-project/session.jsonl");
+        assert_eq!(
+            claude_observation_path_source_id(projects, native),
+            claude_observation_path_source_id(projects, supplied),
+        );
+    }
 }

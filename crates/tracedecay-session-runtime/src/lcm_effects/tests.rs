@@ -1,12 +1,13 @@
 use super::*;
 use serde_json::Value;
 use tracedecay_domain::ProjectId;
+#[cfg(unix)]
+use tracedecay_domain::configuration::LcmSummarizerExecutablesV1;
 use tracedecay_domain::configuration::{
     ConfigurationGrantId, ConfigurationGrantReceiptId, ConfigurationIdempotencyKey,
     ConfigurationLayerIdV1, ConfigurationMutationEffectV1, ConfigurationMutationGrantReceiptV1,
     ConfigurationMutationOperationV1, ConfigurationMutationSinkV1, ConfigurationValueV1,
-    LcmSummarizerExecutableV1, LcmSummarizerExecutablesV1, SettingKey,
-    USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
+    LcmSummarizerExecutableV1, SettingKey, USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
 };
 use tracedecay_domain::test_fixtures::id;
 use tracedecay_domain::{AccessPolicyDigest, ActorId, canonical_sha256};
@@ -31,10 +32,12 @@ use tracedecay_runtime_core::db::engine::params;
 #[cfg(unix)]
 use tracedecay_runtime_core::test_executable::write_executable_script;
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
+#[cfg(unix)]
+use tracedecay_store::SessionRefreshStore as _;
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationProjectionStore, ObservationStore, ObservationWrite,
-    SessionRefreshStore as _, build_observation_resolution_authorization_v1,
-    build_observation_retrieval_anchor, derive_canonical_projection,
+    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
+    derive_canonical_projection,
 };
 
 mod compression_ownership;
@@ -129,20 +132,21 @@ fn compression_request(session_id: &str) -> LcmCompressionRequest {
         stateless_session_patterns: Vec::new(),
         ignore_message_patterns: Vec::new(),
         expected_current_frontier_store_id: None,
-        threshold_tokens: None,
-        max_assembly_tokens: None,
-        leaf_chunk_tokens: Some(1),
-        max_source_messages: Some(8),
-        summary_fan_in: None,
-        incremental_max_depth: None,
-        fresh_tail_count: Some(1),
-        dynamic_leaf_chunk_enabled: None,
-        dynamic_leaf_chunk_max: None,
-        context_length: None,
-        reserve_tokens_floor: None,
-        summarizer: LcmSummarizerMode::Fake {
-            summary_text: "fixture summary preserving canonical historical context".to_string(),
+        overrides: tracedecay_lcm::LcmCompressionOverrides {
+            leaf_chunk_tokens: Some(1),
+            max_source_messages: Some(8),
+            fresh_tail_count: Some(1),
+            ..Default::default()
         },
+        summarizer: provided_summary("fixture summary preserving canonical historical context"),
+    }
+}
+
+fn provided_summary(summary_text: impl Into<String>) -> LcmSummarizerMode {
+    LcmSummarizerMode::Provided {
+        summary_text: summary_text.into(),
+        route: None,
+        extraction_result: None,
     }
 }
 
@@ -172,6 +176,7 @@ fn retained_guard(
 
 /// A configured fake summarizer on the shortest admitted run budget, so a
 /// fake that stops answering fails the test quickly instead of at the default.
+#[cfg(unix)]
 fn fake_summarizer(executable: &std::path::Path) -> LcmSummarizerExecutableV1 {
     LcmSummarizerExecutableV1::configured_with(
         executable.to_path_buf(),
@@ -188,7 +193,7 @@ fn fake_summarizer(executable: &std::path::Path) -> LcmSummarizerExecutableV1 {
 struct ProjectSummarizerFixture {
     runtime: RegisteredGlobalDbTestRuntime,
     project_id: ProjectId,
-    root: tempfile::TempDir,
+    _root: tempfile::TempDir,
 }
 
 impl ProjectSummarizerFixture {
@@ -208,7 +213,7 @@ impl ProjectSummarizerFixture {
         Self {
             runtime,
             project_id,
-            root,
+            _root: root,
         }
     }
 
@@ -216,15 +221,17 @@ impl ProjectSummarizerFixture {
         self.runtime.project_database_arc().unwrap()
     }
 
+    #[cfg(unix)]
     fn pin(&self, executables: LcmSummarizerExecutablesV1) {
         tracedecay_configuration::test_support::pin_lcm_summarizer_executables(
             &self.db(),
-            &self.root.path().join("project"),
+            &self._root.path().join("project"),
             executables,
         )
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn pin_cursor_agent(&self, cursor_agent: &std::path::Path) {
         self.pin(LcmSummarizerExecutablesV1 {
             cursor_agent: fake_summarizer(cursor_agent),
@@ -232,6 +239,7 @@ impl ProjectSummarizerFixture {
         });
     }
 
+    #[cfg(unix)]
     fn pin_codex(&self, codex: &std::path::Path) {
         self.pin(LcmSummarizerExecutablesV1 {
             cursor_agent: LcmSummarizerExecutableV1::Unconfigured,
@@ -240,11 +248,12 @@ impl ProjectSummarizerFixture {
     }
 
     /// Reopens the same project shard, as a daemon restart would.
+    #[cfg(unix)]
     async fn restart(self) -> Self {
         let Self {
             runtime,
             project_id,
-            root,
+            _root: root,
         } = self;
         drop(runtime);
         let runtime = RegisteredGlobalDbTestRuntime::project(
@@ -257,7 +266,7 @@ impl ProjectSummarizerFixture {
         Self {
             runtime,
             project_id,
-            root,
+            _root: root,
         }
     }
 }
@@ -497,17 +506,7 @@ async fn preflight_reads_canonical_state_without_creating_or_ingesting_a_session
             session_id: "missing-session".to_string(),
             messages: Vec::new(),
             current_tokens: Some(1_000),
-            threshold_tokens: None,
-            max_assembly_tokens: None,
-            leaf_chunk_tokens: None,
-            max_source_messages: None,
-            summary_fan_in: None,
-            incremental_max_depth: None,
-            fresh_tail_count: None,
-            dynamic_leaf_chunk_enabled: None,
-            dynamic_leaf_chunk_max: None,
-            context_length: None,
-            reserve_tokens_floor: None,
+            overrides: Default::default(),
             ignore_session_patterns: Vec::new(),
             stateless_session_patterns: Vec::new(),
         })
@@ -1382,6 +1381,7 @@ async fn interrupted_atomic_summary_settlement_resumes_without_duplicate() {
     interrupted_request.summarizer = LcmSummarizerMode::Provided {
         summary_text: summary_text.to_string(),
         route: Some("codex_native_compaction".to_string()),
+        extraction_result: None,
     };
     let interrupted = db
         .lcm_compress_retained_page_guarded(
@@ -1419,6 +1419,58 @@ async fn interrupted_atomic_summary_settlement_resumes_without_duplicate() {
 }
 
 #[tokio::test]
+async fn retained_pressure_recovery_commits_ok_and_best_effort_summaries() {
+    for (cap, expected_status) in [(1, "best_effort"), (10_000, "ok")] {
+        let harness = RegisteredGlobalDbHarness::open("lcm-retained-pressure-recovery").await;
+        let db = harness.registered.clone();
+        let storage_root = db.db_path().parent().unwrap();
+        let session_id = "retained-pressure-recovery-session";
+        assert!(db.upsert_session(&session("cursor", session_id)).await);
+        for ordinal in 1..=4 {
+            db.lcm_ingest_raw_message(storage_root, &message(session_id, ordinal))
+                .await
+                .unwrap();
+        }
+        let mut request = compression_request(session_id);
+        request.current_tokens = Some(20_000);
+        request.overrides.max_assembly_tokens = Some(cap);
+        let bounded = db
+            .lcm_compress_retained_page_guarded(
+                &request,
+                &execution_control(),
+                || Ok(()),
+                retained_guard(None),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bounded.response.status, expected_status);
+        assert_eq!(
+            bounded.response.retry_status.as_deref(),
+            Some("critical_pressure_catch_up")
+        );
+        assert!(bounded.response.summary_nodes_created > 0);
+        assert_eq!(
+            bounded.response.replay_over_budget,
+            expected_status == "best_effort"
+        );
+
+        drop(db);
+        let restarted = harness.restart().await;
+        let status = restarted
+            .registered
+            .lcm_status("cursor", Some(session_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            status.summary_node_count,
+            bounded.response.summary_nodes_created as i64
+        );
+    }
+}
+
+#[tokio::test]
 async fn retained_commit_defers_whole_session_replay_and_relation_application() {
     let harness = RegisteredGlobalDbHarness::open("lcm-retained-deferred-maintenance").await;
     let db = harness.registered.clone();
@@ -1433,9 +1485,7 @@ async fn retained_commit_defers_whole_session_replay_and_relation_application() 
             .unwrap();
     }
     let mut initial = compression_request(session_id);
-    initial.summarizer = LcmSummarizerMode::Fake {
-        summary_text: "old whole-session replay sentinel".to_string(),
-    };
+    initial.summarizer = provided_summary("old whole-session replay sentinel");
     DaemonLcmEffectService::new(db.clone(), None, None)
         .compress(initial)
         .await
@@ -1454,9 +1504,7 @@ async fn retained_commit_defers_whole_session_replay_and_relation_application() 
         .unwrap();
     drop(snapshot);
     let mut retained = compression_request(session_id);
-    retained.summarizer = LcmSummarizerMode::Fake {
-        summary_text: "new bounded-page summary".to_string(),
-    };
+    retained.summarizer = provided_summary("new bounded-page summary");
     let bounded = db
         .lcm_compress_retained_page_guarded(
             &retained,
@@ -1648,6 +1696,7 @@ fn parked_sessions_converge_once_the_summarizer_becomes_available_without_restar
     });
 }
 
+#[cfg(unix)]
 async fn active_projection_frontier(db: &RegisteredGlobalDb, session_id: &str) -> Option<i64> {
     let snapshot = db.read_snapshot().await.unwrap();
     let mut rows = snapshot
@@ -1694,6 +1743,7 @@ fn explicit_refresh_request(
     .with_refresh_key(refresh_key)
 }
 
+#[cfg(unix)]
 async fn eventually<F, Fut>(what: &str, mut ready: F)
 where
     F: FnMut() -> Fut,
@@ -2059,6 +2109,7 @@ async fn partial_revision_invalidation_hides_replay_and_yields_to_a_due_peer() {
     request.summarizer = LcmSummarizerMode::Provided {
         summary_text: "summary before the raw revision".to_string(),
         route: Some("test_partial_invalidation_fairness".to_string()),
+        extraction_result: None,
     };
     db.lcm_compress_retained_page_guarded(
         &request,
@@ -2190,6 +2241,7 @@ async fn malformed_relation_receipt_is_permanent_without_starving_summary_work()
     poison_request.summarizer = LcmSummarizerMode::Provided {
         summary_text: "summary with a poisoned relation receipt".to_string(),
         route: Some("test_relation_poison".to_string()),
+        extraction_result: None,
     };
     let poison = db
         .lcm_compress_retained_page_guarded(
@@ -2542,6 +2594,7 @@ fn protected_in_place_revision_stales_old_summary_before_reconvergence() {
         initial_request.summarizer = LcmSummarizerMode::Provided {
             summary_text: old_text.to_string(),
             route: Some("test_exact_source_summary".to_string()),
+            extraction_result: None,
         };
         let initial = db
             .lcm_compress_retained_page_guarded(
@@ -2695,11 +2748,12 @@ fn disjoint_published_summary_revisions_both_reconverge_across_restart() {
                     .unwrap();
             drop(snapshot);
             let mut request = daemon_summary_request("cursor", session_id);
-            request.max_source_messages = Some(4);
-            request.fresh_tail_count = Some(0);
+            request.overrides.max_source_messages = Some(4);
+            request.overrides.fresh_tail_count = Some(0);
             request.summarizer = LcmSummarizerMode::Provided {
                 summary_text: summary_text.to_string(),
                 route: Some("test_disjoint_revision".to_string()),
+                extraction_result: None,
             };
             let compressed = db
                 .lcm_compress_retained_page_guarded(
@@ -2975,6 +3029,7 @@ async fn raw_message_identity_cannot_move_between_sessions_after_summary_publica
     request.summarizer = LcmSummarizerMode::Provided {
         summary_text: "summary owned by the original session".to_string(),
         route: Some("test_exact_source_summary".to_string()),
+        extraction_result: None,
     };
     let initial = db
         .lcm_compress_retained_page_guarded(
@@ -3060,6 +3115,7 @@ async fn retained_summary_publication_requires_the_exact_planned_source_range() 
     request.summarizer = LcmSummarizerMode::Provided {
         summary_text: "summary generated for a different page".to_string(),
         route: Some("test_exact_source_summary".to_string()),
+        extraction_result: None,
     };
     let error = db
         .lcm_compress_retained_page_guarded(

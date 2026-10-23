@@ -2,6 +2,34 @@ use super::{Cli, Commands, DaemonAction, ProfileStorageAction, RemoteAction};
 use clap::{Parser, error::ErrorKind};
 
 #[test]
+fn graph_replay_release_defaults_to_preview_and_requires_a_digest_to_apply() {
+    let base = [
+        "tracedecay",
+        "storage",
+        "release-graph-replays",
+        "--project-id",
+        "proj_fixture",
+        "--project-root",
+        "/tmp/checkout",
+        "--json",
+    ];
+    assert!(Cli::try_parse_from(base).is_ok(), "default is a preview");
+    let digest = format!("sha256:{}", "1".repeat(64));
+    let mut confirmed = base.to_vec();
+    confirmed.extend(["--apply", &digest]);
+    assert!(
+        Cli::try_parse_from(confirmed).is_ok(),
+        "--apply takes the exact preview digest"
+    );
+    let mut unconfirmed = base.to_vec();
+    unconfirmed.push("--apply");
+    assert!(
+        Cli::try_parse_from(unconfirmed).is_err(),
+        "bare --apply cannot mutate"
+    );
+}
+
+#[test]
 fn tool_command_preserves_trailing_help_and_reserved_args() {
     let cli = Cli::try_parse_from([
         "tracedecay",
@@ -424,4 +452,124 @@ fn every_help_example_is_accepted_by_the_parser() {
         .filter_map(|(owner, example)| parser_rejection(owner, example))
         .collect();
     assert_eq!(rejected, Vec::<String>::new());
+}
+
+#[test]
+fn storage_compact_previews_by_default_and_applies_with_a_digest() {
+    let parsed = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "compact",
+        "--database",
+        "user-sessions.db",
+    ])
+    .expect("preview parses")
+    .command;
+    let Some(Commands::Storage {
+        action:
+            ProfileStorageAction::Compact {
+                database,
+                apply,
+                max_pages,
+            },
+    }) = parsed
+    else {
+        panic!("storage compact must parse");
+    };
+    assert_eq!(
+        (database.as_str(), apply, max_pages),
+        ("user-sessions.db", None, 1 << 26)
+    );
+    let parsed = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "compact",
+        "--database",
+        "global.db",
+        "--apply",
+        "abc",
+    ])
+    .expect("apply parses")
+    .command;
+    let Some(Commands::Storage {
+        action: ProfileStorageAction::Compact { apply, .. },
+    }) = parsed
+    else {
+        panic!("storage compact --apply must parse");
+    };
+    assert_eq!(apply.as_deref(), Some("abc"));
+}
+
+#[test]
+fn storage_retirement_index_preparation_defaults_to_dry_run() {
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "prepare-retirement-indexes",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Storage {
+            action: ProfileStorageAction::PrepareRetirementIndexes {
+                apply: None,
+                json: true
+            }
+        })
+    ));
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "prepare-retirement-indexes",
+        "--apply",
+        "reviewed-digest",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.command, Some(Commands::Storage { action: ProfileStorageAction::PrepareRetirementIndexes { apply: Some(digest), .. } }) if digest == "reviewed-digest")
+    );
+}
+
+#[test]
+fn storage_cleanup_codex_defaults_to_bounded_dry_run_and_resumes_a_cursor() {
+    let cli = Cli::try_parse_from(["tracedecay", "storage", "cleanup-codex", "--json"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Commands::Storage {
+            action: ProfileStorageAction::CleanupCodex {
+                apply: None,
+                cursor: None,
+                page_size: 128,
+                json: true
+            }
+        })
+    ));
+    let cli = Cli::try_parse_from([
+        "tracedecay",
+        "storage",
+        "cleanup-codex",
+        "--apply",
+        "reviewed-digest",
+        "--cursor",
+        "{\"after_sequence\":128}",
+        "--page-size",
+        "7",
+    ])
+    .unwrap();
+    assert!(matches!(cli.command, Some(Commands::Storage {
+        action: ProfileStorageAction::CleanupCodex { apply: Some(digest), cursor: Some(cursor), page_size: 7, .. }
+    }) if digest == "reviewed-digest" && cursor == "{\"after_sequence\":128}"));
+    for invalid in ["0", "129"] {
+        assert!(
+            Cli::try_parse_from([
+                "tracedecay",
+                "storage",
+                "cleanup-codex",
+                "--page-size",
+                invalid
+            ])
+            .is_err()
+        );
+    }
 }

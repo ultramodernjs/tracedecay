@@ -52,6 +52,8 @@
 //! actually owns: the forwarded argv, the instructions on stdin, the sealed
 //! terminal state, and the requested-versus-actual route.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -376,13 +378,13 @@ impl ProductionDaemon {
         (status, parsed)
     }
 
-    /// Follows only the daemon's explicit same-request warming contract. A
-    /// terminal problem or malformed retry response is returned immediately,
+    /// Follows the daemon's explicit same-request warming and capacity retry
+    /// contract. A terminal problem or malformed retry response returns immediately,
     /// so callers still prove their exact success or refusal below.
     fn post_settled(&self, label: &str, route_path: &str, body: &Value) -> (u16, Value) {
         poll_until(label, || {
             let (status, answer) = self.post(route_path, body);
-            if status == 503
+            if matches!(status, 429 | 503)
                 && answer["kind"] == "problem"
                 && answer["value"]["problem"]["retryable"] == true
                 && answer["value"]["problem"]["retry_scope"] == "same_request"

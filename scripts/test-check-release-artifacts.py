@@ -50,6 +50,7 @@ def run(
     *,
     allow_missing: bool = False,
     include_workers: bool = True,
+    include_inventories: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
@@ -71,6 +72,8 @@ def run(
     ]
     if include_workers:
         command.extend(("--ncm-workers", str(root / "ncm-workers")))
+    if include_inventories:
+        command.extend(("--inventories", str(root / "inventories")))
     if allow_missing:
         command.append("--allow-missing-targets")
     return subprocess.run(command, capture_output=True, text=True)
@@ -84,10 +87,12 @@ def expect(
     *,
     allow_missing: bool = False,
     include_workers: bool = True,
+    include_inventories: bool = False,
 ) -> None:
     """Success reports on stdout and a refusal on stderr, each as one line."""
     completed = run(
-        root, profile, allow_missing=allow_missing, include_workers=include_workers
+        root, profile, allow_missing=allow_missing, include_workers=include_workers,
+        include_inventories=include_inventories,
     )
     output = completed.stdout if status == 0 else completed.stderr
     if completed.returncode != status or output != f"{message}\n":
@@ -110,7 +115,7 @@ def write_worker(root: Path, profile: str) -> None:
 
 
 def populate(root: Path, manifest: dict, profile: str) -> None:
-    for child in ("binaries", "mcpbs", "ncm-workers"):
+    for child in ("binaries", "mcpbs", "ncm-workers", "inventories"):
         for item in (root / child).iterdir():
             item.unlink()
     prefix = "tracedecay-beta" if profile == "beta" else "tracedecay"
@@ -119,6 +124,7 @@ def populate(root: Path, manifest: dict, profile: str) -> None:
             f"{prefix}-{TAG}-{target['name']}.{target['archive']}"
         )).write_bytes(b"CLI archive")
         (root / "mcpbs" / f"{prefix}-{TAG}-{target['name']}.mcpb").write_bytes(b"MCPB")
+        (root / "inventories" / f"{prefix}-{TAG}-{target['name']}.spdx.json").write_bytes(b"inventory")
     write_worker(root, profile)
 
 
@@ -131,12 +137,72 @@ def checker_module():
     return module
 
 
+def check_inventories(root: Path, manifest: dict, profile: str) -> None:
+    prefix = "tracedecay-beta" if profile == "beta" else "tracedecay"
+    checker = checker_module()
+    populate(root, manifest, profile)
+    for partial in (False, True):
+        expect(root, 0, "release artifact coverage matches target manifest", profile,
+               allow_missing=partial, include_inventories=True)
+
+    for target in manifest["include"]:
+        name = target["name"]
+        inventory = f"{prefix}-{TAG}-{name}.spdx.json"
+        assert checker.target_inventory(target, TAG, profile) == inventory
+        path = root / "inventories" / inventory
+        path.unlink()
+        expect(root, 1, f"component inventory coverage mismatch: missing {inventory}",
+               profile, include_inventories=True)
+        presence = "archive=present, mcpb=present"
+        if target["ncm"] == "supported":
+            presence += ", worker=present, checksum=present"
+        expect(root, 1, f"release target {name} is half built: {presence}, inventory=missing",
+               profile, allow_missing=True, include_inventories=True)
+        # The inventory directory remains optional for callers not checking it.
+        expect(root, 0, "release artifact coverage matches target manifest", profile)
+        path.write_bytes(b"")
+        expect(root, 1, f"empty release artifacts: {inventory}", profile,
+               include_inventories=True)
+        path.write_bytes(b"inventory")
+
+    foreign = root / "inventories" / "unexpected.spdx.json"
+    foreign.write_bytes(b"foreign inventory")
+    expect(root, 1, "component inventory coverage mismatch: unexpected unexpected.spdx.json",
+           profile, include_inventories=True)
+    expect(root, 1, "unexpected release artifacts: unexpected.spdx.json", profile,
+           allow_missing=True, include_inventories=True)
+    foreign.unlink()
+
+    # Inventories take part in the same whole-target rule as packages and sidecars.
+    for target in manifest["include"]:
+        populate(root, manifest, profile)
+        name = target["name"]
+        archive = root / "binaries" / f"{prefix}-{TAG}-{name}.{target['archive']}"
+        archive.unlink()
+        presence = "archive=missing, mcpb=present"
+        if target["ncm"] == "supported":
+            presence += ", worker=present, checksum=present"
+        expect(root, 1, f"release target {name} is half built: {presence}, inventory=present",
+               profile, allow_missing=True, include_inventories=True)
+        for child in ("binaries", "mcpbs", "ncm-workers", "inventories"):
+            for item in (root / child).iterdir():
+                if f"-{name}." in item.name:
+                    item.unlink()
+        expect(root, 0, f"release artifact coverage is partial; missing targets: {name}",
+               profile, allow_missing=True, include_inventories=True)
+    for child in ("binaries", "mcpbs", "ncm-workers", "inventories"):
+        for item in (root / child).iterdir():
+            item.unlink()
+    expect(root, 1, "no release target is complete; nothing to publish", profile,
+           allow_missing=True, include_inventories=True)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         manifest = fixture_manifest()
         write_manifest(root, manifest)
-        for child in ("binaries", "mcpbs", "ncm-workers"):
+        for child in ("binaries", "mcpbs", "ncm-workers", "inventories"):
             (root / child).mkdir()
 
         checker = checker_module()
@@ -244,11 +310,14 @@ def main() -> int:
             (root / "mcpbs" / windows_mcpb).unlink()
             expect(root, 0, "release artifact coverage is partial; missing targets: x86_64-windows",
                    profile, allow_missing=True)
-            for child in ("binaries", "mcpbs", "ncm-workers"):
+            for child in ("binaries", "mcpbs", "ncm-workers", "inventories"):
                 for item in (root / child).iterdir():
                     item.unlink()
             expect(root, 1, "no release target is complete; nothing to publish", profile,
                    allow_missing=True)
+
+        for profile in ("stable", "beta"):
+            check_inventories(root, manifest, profile)
 
         populate(root, manifest, "stable")
         expect(root, 1, "release validation requires an NCM worker directory", include_workers=False)

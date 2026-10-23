@@ -196,6 +196,11 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
     );
     let store = TempDir::new().expect("store root");
     let (registry, request, _) = admit_package(&fixture, &store).await;
+    // Freeze the retained publication before invalidating its ignored-source
+    // proof. Reconciling the changed checkout first may legally publish a
+    // successor with an empty roster (see the test above), leaving nothing for
+    // the restart to refuse and making the park wait depend on host timing.
+    registry.shutdown().await;
     git(
         fixture.path(),
         &["add", "-f", "node_modules/pkg/index.d.ts"],
@@ -204,8 +209,6 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
         fixture.path(),
         &["commit", "-qm", "track dependency source"],
     );
-    reconcile_through_worker(&registry, fixture.path(), &request.scope).await;
-    registry.shutdown().await;
 
     let restarted = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
     let (projection_entered, release_projection) =
@@ -223,17 +226,27 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
     // only restoring the retained generation.
     restarted.notify_hook_overflow(fixture.path()).await;
     drop(admission);
-    projection_entered
+    tokio::time::timeout(Duration::from_secs(10), projection_entered)
         .await
+        .expect("restart must enter the retained text projection gate")
         .expect("restart projects its retained text owner");
-    let parked = wait_for_owner(&restarted, fixture.path(), || {
-        restarted.convergence_park(fixture.path())
-    })
-    .await;
+    let parked = tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_for_owner(&restarted, fixture.path(), || {
+            restarted.convergence_park(fixture.path())
+        }),
+    )
+    .await
+    .expect("the invalid retained roster must park before text finishes");
     release_projection
         .send(())
         .expect("release the retained text projection");
-    wait_for_reconciling(&restarted, fixture.path(), 0).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        wait_for_reconciling(&restarted, fixture.path(), 0),
+    )
+    .await
+    .expect("the released retained projection must settle");
     assert_eq!(
         restarted
             .convergence_park(fixture.path())
@@ -242,9 +255,14 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
         Some(parked.reason),
         "the roster refusal park outlives the retained text projection"
     );
-    let error = index_dependency(&restarted, fixture.path(), request, StaticControl::active())
-        .await
-        .expect_err("the parked restart refuses re-admission");
+    let error = index_dependency(
+        &restarted,
+        fixture.path(),
+        request,
+        RequestBudget::within(Duration::from_secs(10)),
+    )
+    .await
+    .expect_err("the parked restart refuses re-admission");
     assert!(
         matches!(
             &error,

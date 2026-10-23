@@ -12,8 +12,9 @@ use tracedecay_domain::{
     ObservationSourceIdentityV1, PayloadDigestV1, PayloadReferenceV1, ProjectionGenerationId,
     RetrievalAnchorId, RetrievalAnchorRecord, SanitizationReceiptV1, canonical_json_bytes,
     canonical_json_bytes_and_sha256, canonical_sha256, classify_observation_collision,
-    cline_native_source_successor_id, cline_task_native_observation_id,
-    is_canonical_payload_revision_replay, prove_cline_native_source_transition, sha256_hex_suffix,
+    cline_native_source_successor_id, cline_task_native_observation_id, codex_rollout_siblings,
+    is_canonical_payload_revision_replay, is_codex_rollout_source,
+    prove_cline_native_source_transition, sha256_hex_suffix,
 };
 use tracedecay_store::observation::{
     CursorAdvanceOutcome, ObservationCoverageReason, ObservationCursorAdvance,
@@ -132,6 +133,22 @@ impl GlobalDbObservationStore {
             .begin_write_transaction(OPERATION)
             .await
             .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        if source_is_excluded(
+            &transaction,
+            candidate.source(),
+            candidate.scope(),
+            OPERATION,
+        )
+        .await?
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| runtime_storage_error(OPERATION, error))?;
+            return Ok(RefusalCoverageOutcome::SourceExcluded(Box::new(
+                self.persist_excluded_write(write).await?,
+            )));
+        }
         // Exact compare-and-set under the write lock: the durable cursor must
         // still be the caller's expected frontier.
         let mut cursor_rows = transaction
@@ -321,15 +338,37 @@ impl GlobalDbObservationStore {
         crate::converge_projection_predecessor(&self.database).await
     }
 
+    async fn persist_excluded_write(
+        &self,
+        write: &AnchoredObservationWrite,
+    ) -> ObservationStoreResult<ObservationBatchPersistOutcome> {
+        self.advance_source_cursor(write.write().source_exclusion_advance()?)
+            .await?;
+        // The accepted cursor command is the coverage authority. A later
+        // generation may already own the mutable frontier before we acknowledge.
+        Ok(ObservationBatchPersistOutcome::new(
+            ObservationPersistOutcome::SourceExcluded(write.next_cursor().clone()),
+            None,
+        ))
+    }
+
     async fn prepare_observation_persist(
         &self,
-        write: AnchoredObservationWrite,
+        write: &AnchoredObservationWrite,
         preflight: &ObservationPreflightSnapshot,
         batch_state: &mut ObservationBatchState,
         known_cursor: Option<Option<ObservationSourceCursorV1>>,
     ) -> ObservationStoreResult<PreparedObservationPersist> {
         let observation = write.observation();
         let observation_id = observation.observation_id().clone();
+        if preflight
+            .excluded_sources
+            .contains(&(observation.source().clone(), observation.scope().clone()))
+        {
+            return Ok(PreparedObservationPersist::Ready(Box::new(
+                self.persist_excluded_write(write).await?,
+            )));
+        }
         let actual_cursor = || {
             known_cursor.clone().unwrap_or_else(|| {
                 preflight.source_cursor(observation.source(), observation.scope())
@@ -343,7 +382,7 @@ impl GlobalDbObservationStore {
                 == ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity
             {
                 if matches!(
-                    refused_scan_frontier(&write, cursor.as_ref())?,
+                    refused_scan_frontier(write, cursor.as_ref())?,
                     RefusedScanFrontier::NotAtFrontier
                 ) {
                     return Err(ObservationStoreError::CursorConflict {
@@ -360,9 +399,12 @@ impl GlobalDbObservationStore {
             // The exact refusal marker is already durable. A later stale
             // reader may no longer stand at its original scan frontier, but
             // that does not invalidate the terminal content verdict.
-            let _ = self
-                .record_refusal_with_coverage(&write, retained_digest, cursor.as_ref())
-                .await?;
+            if let RefusalCoverageOutcome::SourceExcluded(outcome) = self
+                .record_refusal_with_coverage(write, retained_digest, cursor.as_ref())
+                .await?
+            {
+                return Ok(PreparedObservationPersist::Ready(outcome));
+            }
             return Err(identity_collision(
                 observation_id,
                 retained_digest.clone(),
@@ -397,7 +439,7 @@ impl GlobalDbObservationStore {
         {
             if pending.is_some() {
                 return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
-                    Box::new(write),
+                    Box::new(write.clone()),
                 ));
             }
             let retained_digest = pending
@@ -422,7 +464,7 @@ impl GlobalDbObservationStore {
                     == ObservationIdentityCollisionDispositionV1::RetryWithAlternateIdentity
                 {
                     if matches!(
-                        refused_scan_frontier(&write, cursor.as_ref())?,
+                        refused_scan_frontier(write, cursor.as_ref())?,
                         RefusedScanFrontier::NotAtFrontier
                     ) {
                         return Err(ObservationStoreError::CursorConflict {
@@ -438,17 +480,23 @@ impl GlobalDbObservationStore {
                 }
                 if known_cursor.is_some() {
                     return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
-                        Box::new(write),
+                        Box::new(write.clone()),
                     ));
                 }
-                if let RefusalCoverageOutcome::NotAtFrontier { actual } = self
-                    .record_refusal_with_coverage(&write, retained_digest, cursor.as_ref())
+                match self
+                    .record_refusal_with_coverage(write, retained_digest, cursor.as_ref())
                     .await?
                 {
-                    return Err(ObservationStoreError::CursorConflict {
-                        expected: Box::new(write.expected_cursor().cloned()),
-                        actual: Box::new(actual),
-                    });
+                    RefusalCoverageOutcome::SourceExcluded(outcome) => {
+                        return Ok(PreparedObservationPersist::Ready(outcome));
+                    }
+                    RefusalCoverageOutcome::NotAtFrontier { actual } => {
+                        return Err(ObservationStoreError::CursorConflict {
+                            expected: Box::new(write.expected_cursor().cloned()),
+                            actual: Box::new(actual),
+                        });
+                    }
+                    RefusalCoverageOutcome::Recorded => {}
                 }
             }
             return Err(identity_collision(
@@ -490,7 +538,7 @@ impl GlobalDbObservationStore {
             }
             if known_cursor.is_some() {
                 return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
-                    Box::new(write),
+                    Box::new(write.clone()),
                 ));
             }
             let mut advance = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
@@ -551,7 +599,7 @@ impl GlobalDbObservationStore {
         {
             if pending.is_some() {
                 return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
-                    Box::new(write),
+                    Box::new(write.clone()),
                 ));
             }
             return Err(ObservationStoreError::SanitizationReceiptCollision);
@@ -561,7 +609,7 @@ impl GlobalDbObservationStore {
             .is_some_and(|retained| retained != observation.receipt())
         {
             return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
-                Box::new(write),
+                Box::new(write.clone()),
             ));
         }
         for alias in write.retrieval_anchor().aliases() {
@@ -571,10 +619,12 @@ impl GlobalDbObservationStore {
             {
                 if existing.pending {
                     return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
-                        Box::new(write),
+                        Box::new(write.clone()),
                     ));
                 }
-                if !preflight.accepts_pending_cline_alias(&write, &existing.anchor_id)? {
+                if !preflight.accepts_pending_cline_alias(write, &existing.anchor_id)?
+                    && !preflight.accepts_codex_rollout_sibling_alias(write, &existing.anchor_id)
+                {
                     return Err(ObservationStoreError::RetrievalAnchorAliasCollision {
                         alias: Box::new(alias.clone()),
                         existing_anchor_id: Box::new(existing.anchor_id),
@@ -606,7 +656,7 @@ impl GlobalDbObservationStore {
         if existed_exact {
             if pending.is_some() {
                 return Ok(PreparedObservationPersist::DeferredExactDuplicate(
-                    Box::new(write),
+                    Box::new(write.clone()),
                 ));
             }
             let Some(existing) = existing.as_ref() else {
@@ -623,7 +673,7 @@ impl GlobalDbObservationStore {
             {
                 if known_cursor.is_some() {
                     return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
-                        Box::new(write),
+                        Box::new(write.clone()),
                     ));
                 }
                 // Observation replay is settled by the repository, including
@@ -643,9 +693,9 @@ impl GlobalDbObservationStore {
             ));
         }
         if pending.is_none() && existing.is_none() {
-            batch_state.register_pending(&write)?;
+            batch_state.register_pending(write)?;
         }
-        Ok(PreparedObservationPersist::Submit(Box::new(write)))
+        Ok(PreparedObservationPersist::Submit(Box::new(write.clone())))
     }
 
     /// Persists the longest prefix of `writes` that settles in one runtime
@@ -686,6 +736,7 @@ impl GlobalDbObservationStore {
         let mut submits = Vec::new();
         let mut deferred_exact_duplicates = Vec::new();
         let mut awaiting = Vec::new();
+        let mut readied_writes = Vec::new();
         let mut writes = writes.into_iter();
         while let Some(write) = writes.next() {
             let key = (
@@ -703,11 +754,42 @@ impl GlobalDbObservationStore {
                 Some(cursor) if cursor.reached(write.next_cursor()) => cursor,
                 _ => write.next_cursor().clone(),
             };
-            match self
-                .prepare_observation_persist(write, &preflight, &mut batch_state, known_cursor)
-                .await?
+            let prepared = match self
+                .prepare_observation_persist(&write, &preflight, &mut batch_state, known_cursor)
+                .await
             {
-                PreparedObservationPersist::Ready(outcome) => outcomes.push(Some(*outcome)),
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let snapshot = begin_observation_read_snapshot(
+                        &self.database,
+                        "recheck excluded admission",
+                    )
+                    .await?;
+                    let excluded = source_is_excluded(
+                        &snapshot,
+                        write.observation().source(),
+                        write.observation().scope(),
+                        "recheck excluded admission",
+                    )
+                    .await?;
+                    snapshot.commit().await.map_err(|error| {
+                        runtime_storage_error("recheck excluded admission", error)
+                    })?;
+                    if !excluded {
+                        return Err(error);
+                    }
+                    PreparedObservationPersist::Ready(Box::new(
+                        self.persist_excluded_write(&write).await?,
+                    ))
+                }
+            };
+            match prepared {
+                PreparedObservationPersist::Ready(outcome) => {
+                    if outcome.outcome().receipt().is_some() {
+                        readied_writes.push((outcomes.len(), write));
+                    }
+                    outcomes.push(Some(*outcome));
+                }
                 PreparedObservationPersist::Submit(write) => {
                     submits.push((outcomes.len(), *write));
                     outcomes.push(None);
@@ -747,6 +829,36 @@ impl GlobalDbObservationStore {
                 "deferred duplicate has no preceding batch submission",
             ));
         }
+        if !readied_writes.is_empty() {
+            let snapshot = begin_observation_read_snapshot(
+                &self.database,
+                "recheck duplicate source exclusions",
+            )
+            .await?;
+            let writes = readied_writes
+                .iter()
+                .map(|(_, write)| write.clone())
+                .collect::<Vec<_>>();
+            let excluded = read_source_exclusions_from_snapshot(
+                &snapshot,
+                &writes,
+                "recheck duplicate source exclusions",
+            )
+            .await?;
+            for (slot, write) in readied_writes {
+                // Preparation already proved this duplicate's accepted coverage.
+                // Do not replace that proof with a later mutable generation.
+                let accepted = outcomes[slot]
+                    .as_ref()
+                    .map(|outcome| outcome.outcome().committed_cursor());
+                if let Some(excluded) = excluded_readback(&write, &excluded, accepted)? {
+                    outcomes[slot] = Some(excluded);
+                }
+            }
+            snapshot.commit().await.map_err(|error| {
+                runtime_storage_error("recheck duplicate source exclusions", error)
+            })?;
+        }
         let outcomes = outcomes
             .into_iter()
             .map(|outcome| {
@@ -768,9 +880,11 @@ impl GlobalDbObservationStore {
 /// ordered fold still publishes source cursors in input order. The writer
 /// transaction remains the final collision and compare-and-set authority.
 struct ObservationPreflightSnapshot {
+    excluded_sources: HashSet<(ObservationSourceIdentityV1, ObservationScopeV1)>,
     admission_refusals: HashMap<(String, String), PayloadDigestV1>,
     stored_observations: HashMap<String, StoredObservation>,
     retrieval_aliases: HashMap<(String, String, String), RetrievalAnchorId>,
+    alias_owners: HashMap<RetrievalAnchorId, CanonicalObservationIdV1>,
     cline_supersessions: HashMap<RetrievalAnchorId, RetrievalAnchorId>,
     source_cursors:
         HashMap<(ObservationSourceIdentityV1, ObservationScopeV1), ObservationSourceCursorV1>,
@@ -801,6 +915,23 @@ impl ObservationPreflightSnapshot {
         observation_id: &CanonicalObservationIdV1,
     ) -> Option<&StoredObservation> {
         self.stored_observations.get(observation_id.as_str())
+    }
+
+    fn accepts_codex_rollout_sibling_alias(
+        &self,
+        write: &AnchoredObservationWrite,
+        existing_anchor: &RetrievalAnchorId,
+    ) -> bool {
+        let Some(owner) = self
+            .alias_owners
+            .get(existing_anchor)
+            .and_then(|owner_id| self.stored_observation(owner_id))
+        else {
+            return false;
+        };
+        owner.retrieval_anchor_id() == existing_anchor
+            && anchors_share_access(owner.retrieval_anchor(), write.retrieval_anchor())
+            && codex_rollout_siblings(owner.observation(), write.observation())
     }
 
     fn accepts_pending_cline_alias(
@@ -834,19 +965,8 @@ impl ObservationPreflightSnapshot {
             return Ok(false);
         };
         let prior_anchor = predecessor.retrieval_anchor();
-        let next_anchor = write.retrieval_anchor();
-        let prior_auth = prior_anchor.authorization();
-        let next_auth = next_anchor.authorization();
         Ok(prior_anchor.anchor_id() == existing_anchor
-            && prior_anchor.owner() == next_anchor.owner()
-            && prior_anchor.aliases() == next_anchor.aliases()
-            && prior_anchor.payload_access() == next_anchor.payload_access()
-            && prior_anchor.retention_class() == next_anchor.retention_class()
-            && prior_anchor.durability() == next_anchor.durability()
-            && prior_auth.resolved_scope_id == next_auth.resolved_scope_id
-            && prior_auth.privacy_domain_id == next_auth.privacy_domain_id
-            && prior_auth.access_policy_digest == next_auth.access_policy_digest
-            && prior_auth.capability_id == next_auth.capability_id
+            && anchors_share_access(prior_anchor, write.retrieval_anchor())
             && prove_cline_native_source_transition(predecessor.observation(), write.observation())
                 .is_some())
     }
@@ -969,9 +1089,29 @@ async fn load_observation_preflight(
 ) -> ObservationStoreResult<ObservationPreflightSnapshot> {
     const OPERATION: &str = "load observation batch preflight";
     let snapshot = begin_observation_read_snapshot(database, OPERATION).await?;
+    let excluded_sources =
+        read_source_exclusions_from_snapshot(&snapshot, writes, OPERATION).await?;
+    let all_writes = writes;
+    let admitted_writes;
+    let writes = if excluded_sources.is_empty() {
+        writes
+    } else {
+        admitted_writes = writes
+            .iter()
+            .filter(|write| {
+                !excluded_sources.contains(&(
+                    write.observation().source().clone(),
+                    write.observation().scope().clone(),
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        admitted_writes.as_slice()
+    };
     let admission_refusals =
         read_admission_refusals_from_snapshot(&snapshot, writes, OPERATION).await?;
     let mut seen_observation_ids = HashSet::new();
+    let mut refused_observation_ids = HashSet::new();
     let mut observation_ids = Vec::new();
     for write in writes {
         let observation = write.observation();
@@ -980,9 +1120,9 @@ async fn load_observation_preflight(
             observation_id.to_owned(),
             observation.payload_reference().digest().as_str().to_owned(),
         );
-        if !admission_refusals.contains_key(&refusal_key)
-            && seen_observation_ids.insert(observation_id.to_owned())
-        {
+        if admission_refusals.contains_key(&refusal_key) {
+            refused_observation_ids.insert(observation_id.to_owned());
+        } else if seen_observation_ids.insert(observation_id.to_owned()) {
             observation_ids.push(observation.observation_id().clone());
         }
         for counterpart in [
@@ -1001,11 +1141,35 @@ async fn load_observation_preflight(
             }
         }
     }
+    let (retrieval_aliases, alias_owners) =
+        read_retrieval_aliases_from_snapshot(&snapshot, writes, &admission_refusals, OPERATION)
+            .await?;
+    let mut sibling_candidate_anchors = HashSet::new();
+    for write in writes {
+        let observation = write.observation();
+        if !is_codex_rollout_source(observation.source()) {
+            continue;
+        }
+        for alias in write.retrieval_anchor().aliases() {
+            if let Some(anchor_id) =
+                retrieval_aliases.get(&retrieval_alias_key(observation.scope(), alias)?)
+            {
+                sibling_candidate_anchors.insert(anchor_id.clone());
+            }
+        }
+    }
+    for (anchor_id, owner_id) in &alias_owners {
+        if sibling_candidate_anchors.contains(anchor_id)
+            && !refused_observation_ids.contains(owner_id.as_str())
+            && seen_observation_ids.insert(owner_id.as_str().to_owned())
+        {
+            observation_ids.push(owner_id.clone());
+        }
+    }
     let stored_observations =
         read_stored_observations_from_snapshot(&snapshot, &observation_ids, OPERATION).await?;
-    let retrieval_aliases =
-        read_retrieval_aliases_from_snapshot(&snapshot, writes, OPERATION).await?;
-    let source_cursors = read_source_cursors_from_snapshot(&snapshot, writes, OPERATION).await?;
+    let source_cursors =
+        read_source_cursors_from_snapshot(&snapshot, all_writes, OPERATION).await?;
     let cline_supersessions =
         read_cline_supersessions_from_snapshot(&snapshot, &stored_observations, writes, OPERATION)
             .await?;
@@ -1014,12 +1178,113 @@ async fn load_observation_preflight(
         .await
         .map_err(|error| runtime_storage_error(OPERATION, error))?;
     Ok(ObservationPreflightSnapshot {
+        excluded_sources,
         admission_refusals,
         stored_observations,
         retrieval_aliases,
+        alias_owners,
         cline_supersessions,
         source_cursors,
     })
+}
+
+async fn source_is_excluded(
+    conn: &impl tracedecay_runtime_core::db::engine::QueryExecutor,
+    source: &ObservationSourceIdentityV1,
+    scope: &ObservationScopeV1,
+    operation: &'static str,
+) -> ObservationStoreResult<bool> {
+    let key = tracedecay_store::observation_source_exclusion_key(source, scope)?;
+    let mut rows = conn
+        .query(
+            "SELECT value FROM session_backfill_meta WHERE key = ?1",
+            [key],
+        )
+        .await
+        .map_err(|error| runtime_storage_error(operation, error))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| runtime_storage_error(operation, error))?
+    else {
+        return Ok(false);
+    };
+    let value: String = row
+        .get(0)
+        .map_err(|error| runtime_storage_error(operation, error))?;
+    tracedecay_store::validate_observation_source_exclusion(&value, source, scope)?;
+    Ok(true)
+}
+
+fn excluded_readback(
+    write: &AnchoredObservationWrite,
+    excluded: &HashSet<(ObservationSourceIdentityV1, ObservationScopeV1)>,
+    accepted_cursor: Option<&ObservationSourceCursorV1>,
+) -> ObservationStoreResult<Option<ObservationBatchPersistOutcome>> {
+    let key = (
+        write.observation().source().clone(),
+        write.observation().scope().clone(),
+    );
+    if !excluded.contains(&key) {
+        return Ok(None);
+    }
+    let cursor = accepted_cursor
+        .filter(|cursor| cursor.reached(write.next_cursor()))
+        .ok_or_else(|| {
+            runtime_storage_error("acknowledge excluded source", "cursor coverage unavailable")
+        })?;
+    Ok(Some(ObservationBatchPersistOutcome::new(
+        ObservationPersistOutcome::SourceExcluded(cursor.clone()),
+        None,
+    )))
+}
+
+async fn read_source_exclusions_from_snapshot(
+    snapshot: &DatabaseEngineReadSnapshot,
+    writes: &[AnchoredObservationWrite],
+    operation: &'static str,
+) -> ObservationStoreResult<HashSet<(ObservationSourceIdentityV1, ObservationScopeV1)>> {
+    let mut requested = HashMap::new();
+    for write in writes {
+        let observation = write.observation();
+        requested.insert(
+            tracedecay_store::observation_source_exclusion_key(
+                observation.source(),
+                observation.scope(),
+            )?,
+            (observation.source().clone(), observation.scope().clone()),
+        );
+    }
+    let keys = serde_json::to_string(&requested.keys().collect::<Vec<_>>())
+        .map_err(|error| runtime_storage_error(operation, error))?;
+    record_observation_snapshot_probe();
+    let mut rows = snapshot
+        .query(
+            "SELECT meta.key, meta.value FROM session_backfill_meta AS meta
+         JOIN json_each(?1) AS requested ON meta.key = requested.value",
+            [keys],
+        )
+        .await
+        .map_err(|error| runtime_storage_error(operation, error))?;
+    let mut excluded = HashSet::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| runtime_storage_error(operation, error))?
+    {
+        let key: String = row
+            .get(0)
+            .map_err(|error| runtime_storage_error(operation, error))?;
+        let value: String = row
+            .get(1)
+            .map_err(|error| runtime_storage_error(operation, error))?;
+        let (source, scope) = requested
+            .get(&key)
+            .ok_or_else(|| runtime_storage_error(operation, "unrequested source exclusion"))?;
+        tracedecay_store::validate_observation_source_exclusion(&value, source, scope)?;
+        excluded.insert((source.clone(), scope.clone()));
+    }
+    Ok(excluded)
 }
 
 async fn read_cline_supersessions_from_snapshot(
@@ -1219,6 +1484,20 @@ async fn read_source_cursors_from_snapshot(
     Ok(cursors)
 }
 
+fn anchors_share_access(prior: &RetrievalAnchorRecord, next: &RetrievalAnchorRecord) -> bool {
+    let prior_auth = prior.authorization();
+    let next_auth = next.authorization();
+    prior.owner() == next.owner()
+        && prior.aliases() == next.aliases()
+        && prior.payload_access() == next.payload_access()
+        && prior.retention_class() == next.retention_class()
+        && prior.durability() == next.durability()
+        && prior_auth.resolved_scope_id == next_auth.resolved_scope_id
+        && prior_auth.privacy_domain_id == next_auth.privacy_domain_id
+        && prior_auth.access_policy_digest == next_auth.access_policy_digest
+        && prior_auth.capability_id == next_auth.capability_id
+}
+
 fn retrieval_alias_key(
     scope: &ObservationScopeV1,
     alias: &tracedecay_domain::NativeAlias,
@@ -1236,16 +1515,27 @@ fn retrieval_alias_key(
 async fn read_retrieval_aliases_from_snapshot(
     snapshot: &DatabaseEngineReadSnapshot,
     writes: &[AnchoredObservationWrite],
+    admission_refusals: &HashMap<(String, String), PayloadDigestV1>,
     operation: &'static str,
-) -> ObservationStoreResult<HashMap<(String, String, String), RetrievalAnchorId>> {
+) -> ObservationStoreResult<(
+    HashMap<(String, String, String), RetrievalAnchorId>,
+    HashMap<RetrievalAnchorId, CanonicalObservationIdV1>,
+)> {
     let mut requested = HashSet::new();
     for write in writes {
+        let observation = write.observation();
+        if admission_refusals.contains_key(&(
+            observation.observation_id().as_str().to_owned(),
+            observation.payload_reference().digest().as_str().to_owned(),
+        )) {
+            continue;
+        }
         for alias in write.retrieval_anchor().aliases() {
             requested.insert(retrieval_alias_key(write.observation().scope(), alias)?);
         }
     }
     if requested.is_empty() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashMap::new()));
     }
     let requested = requested
         .into_iter()
@@ -1263,8 +1553,13 @@ async fn read_retrieval_aliases_from_snapshot(
     let mut rows = snapshot
         .query(
             "SELECT alias.owner_json, alias.alias_kind, alias.locator_digest,
-                    alias.anchor_id
+                    alias.anchor_id, owner.observation_id
              FROM retrieval_anchor_aliases AS alias
+             LEFT JOIN observation_retrieval_anchors AS binding
+               ON binding.anchor_id = alias.anchor_id
+             LEFT JOIN observations AS owner
+               ON owner.observation_id = binding.observation_id
+              AND json_extract(owner.observation_json, '$.__retention_released') IS NULL
              JOIN json_each(?1) AS requested
                ON alias.owner_json =
                     json_extract(requested.value, '$.scope_json')
@@ -1277,6 +1572,7 @@ async fn read_retrieval_aliases_from_snapshot(
         .await
         .map_err(|error| runtime_storage_error(operation, error))?;
     let mut aliases = HashMap::new();
+    let mut owners = HashMap::new();
     while let Some(row) = rows
         .next()
         .await
@@ -1295,9 +1591,19 @@ async fn read_retrieval_aliases_from_snapshot(
                 .map_err(|error| runtime_storage_error(operation, error))?,
         )
         .map_err(|error| runtime_storage_error(operation, error))?;
+        if let Some(owner_id) = row
+            .get::<Option<String>>(4)
+            .map_err(|error| runtime_storage_error(operation, error))?
+        {
+            owners.insert(
+                anchor_id.clone(),
+                CanonicalObservationIdV1::new(owner_id)
+                    .map_err(|error| runtime_storage_error(operation, error))?,
+            );
+        }
         aliases.insert(key, anchor_id);
     }
-    Ok(aliases)
+    Ok((aliases, owners))
 }
 
 fn observation_batch_row_projection() -> String {
@@ -1936,6 +2242,7 @@ enum RefusedScanFrontier {
 
 enum RefusalCoverageOutcome {
     Recorded,
+    SourceExcluded(Box<ObservationBatchPersistOutcome>),
     NotAtFrontier {
         actual: Option<ObservationSourceCursorV1>,
     },
@@ -1999,6 +2306,7 @@ async fn submit_observation_writes(
     let batches = partition_observation_writes(writes)?;
     let mut deferred_exact_duplicates = Some(deferred_exact_duplicates);
     let mut outcomes = Vec::new();
+    let mut accepted_cursors = Vec::new();
     let batch_count = batches.len();
     for (index, batch) in batches.into_iter().enumerate() {
         let deferred = if index + 1 == batch_count {
@@ -2006,7 +2314,15 @@ async fn submit_observation_writes(
         } else {
             Vec::new()
         };
-        outcomes.extend(submit_observation_write_batch(database, runtime, batch, deferred).await?);
+        let committed =
+            submit_observation_write_batch(database, runtime, batch, deferred, &accepted_cursors)
+                .await?;
+        accepted_cursors.extend(
+            committed
+                .iter()
+                .map(|(_, outcome)| outcome.outcome().committed_cursor().clone()),
+        );
+        outcomes.extend(committed);
     }
     Ok(outcomes)
 }
@@ -2069,6 +2385,7 @@ async fn submit_observation_write_batch(
     runtime: &DatabaseRuntimeClientV1,
     writes: Vec<(usize, AnchoredObservationWrite)>,
     deferred_exact_duplicates: Vec<(usize, AnchoredObservationWrite)>,
+    previously_accepted_cursors: &[ObservationSourceCursorV1],
 ) -> ObservationStoreResult<Vec<(usize, ObservationBatchPersistOutcome)>> {
     let admitted_at = now_micros();
     let command = serde_json::json!({
@@ -2142,12 +2459,26 @@ async fn submit_observation_write_batch(
         ));
     }
     const READBACK_OPERATION: &str = "read committed observation batch";
-    let observation_ids = writes
+    let all_writes = writes
         .iter()
         .chain(deferred_exact_duplicates.iter())
-        .map(|(_, write)| write.observation().observation_id().clone())
+        .map(|(_, write)| write.clone())
         .collect::<Vec<_>>();
     let snapshot = begin_observation_read_snapshot(database, READBACK_OPERATION).await?;
+    let excluded_sources =
+        read_source_exclusions_from_snapshot(&snapshot, &all_writes, READBACK_OPERATION).await?;
+    let cursors =
+        read_source_cursors_from_snapshot(&snapshot, &all_writes, READBACK_OPERATION).await?;
+    let observation_ids = all_writes
+        .iter()
+        .filter(|write| {
+            !excluded_sources.contains(&(
+                write.observation().source().clone(),
+                write.observation().scope().clone(),
+            ))
+        })
+        .map(|write| write.observation().observation_id().clone())
+        .collect::<Vec<_>>();
     let stored =
         read_stored_observations_from_snapshot(&snapshot, &observation_ids, READBACK_OPERATION)
             .await?;
@@ -2155,9 +2486,21 @@ async fn submit_observation_write_batch(
         .commit()
         .await
         .map_err(|error| runtime_storage_error(READBACK_OPERATION, error))?;
+    // Only submitted writes carry the successful runtime outcome above.
+    // Deferred duplicates need a matching submitted coverage proof (or a
+    // same-generation durable frontier), not blanket success from the batch.
+    let accepted_cursors = writes
+        .iter()
+        .map(|(_, write)| write.next_cursor().clone())
+        .collect::<Vec<_>>();
     let mut outcomes = writes
         .into_iter()
         .map(|(slot, write)| {
+            if let Some(excluded) =
+                excluded_readback(&write, &excluded_sources, Some(write.next_cursor()))?
+            {
+                return Ok((slot, excluded));
+            }
             let retained = stored
                 .get(write.observation().observation_id().as_str())
                 .ok_or_else(|| {
@@ -2178,6 +2521,20 @@ async fn submit_observation_write_batch(
         })
         .collect::<ObservationStoreResult<Vec<_>>>()?;
     for (slot, write) in deferred_exact_duplicates {
+        let accepted = accepted_cursors
+            .iter()
+            .chain(previously_accepted_cursors)
+            .find(|cursor| cursor.reached(write.next_cursor()))
+            .or_else(|| {
+                cursors.get(&(
+                    write.observation().source().clone(),
+                    write.observation().scope().clone(),
+                ))
+            });
+        if let Some(excluded) = excluded_readback(&write, &excluded_sources, accepted)? {
+            outcomes.push((slot, excluded));
+            continue;
+        }
         let retained = stored
             .get(write.observation().observation_id().as_str())
             .ok_or_else(|| {
@@ -2358,7 +2715,7 @@ async fn dispatch_runtime_submit(
         work = "runtime_command",
         "dispatch observation runtime submit"
     );
-    runtime
+    let outcome = runtime
         .dispatch_submit(
             request,
             Arc::new(RuntimeObservationProbe {
@@ -2368,7 +2725,13 @@ async fn dispatch_runtime_submit(
             }),
         )
         .await
-        .map_err(|error| map_observation_submit_error(operation, error))
+        .map_err(|error| map_observation_submit_error(operation, error))?;
+    tracing::trace!(
+        target: "tracedecay::observation_admission_work",
+        work = "runtime_outcome",
+        "receive observation runtime outcome"
+    );
+    Ok(outcome)
 }
 
 fn map_observation_submit_error(
@@ -2555,6 +2918,10 @@ fn projection_runtime_error(
         error,
     )
 }
+
+#[cfg(test)]
+#[path = "observation_source_exclusion_tests.rs"]
+mod source_exclusion_tests;
 
 #[cfg(test)]
 mod tests {

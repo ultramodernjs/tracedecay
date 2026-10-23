@@ -18,7 +18,7 @@ use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::fs;
 use std::io::{Read, Write};
 #[cfg(feature = "real-encoder")]
@@ -1581,7 +1581,7 @@ fn remove_journal_at(root_directory: &Dir, root: &Path) -> Result<(), EncoderErr
     sync_directory(root_directory, root)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn write_journal(path: &Path, journal: &LifecycleJournal) -> Result<(), EncoderError> {
     validate_journal(journal)?;
     let bytes = journal_bytes(journal)?;
@@ -1594,7 +1594,7 @@ fn write_journal(path: &Path, journal: &LifecycleJournal) -> Result<(), EncoderE
     .map_err(|error| io_error("write model lifecycle journal", path, error))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn reserve_journal(path: &Path, journal: &LifecycleJournal) -> Result<(), EncoderError> {
     validate_journal(journal)?;
     let bytes = journal_bytes(journal)?;
@@ -2007,7 +2007,7 @@ fn is_valid_operation_id(value: &str, operation: Operation) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn remove_journal(path: &Path) -> Result<(), EncoderError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
@@ -2407,7 +2407,7 @@ fn sync_directory(directory: &Dir, path: &Path) -> Result<(), EncoderError> {
         .map_err(|error| io_error("sync model lifecycle directory", path, error))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn directory_sync_policy() -> tracedecay_private_fs::framed_log::DirectorySyncPolicy {
     tracedecay_private_fs::framed_log::DirectorySyncPolicy::Strict
 }
@@ -2449,6 +2449,7 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> EncoderError {
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;

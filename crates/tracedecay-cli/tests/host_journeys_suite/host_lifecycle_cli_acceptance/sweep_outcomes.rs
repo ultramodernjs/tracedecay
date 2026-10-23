@@ -3,18 +3,31 @@
 
 use std::fs;
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::Output;
+#[cfg(unix)]
+use std::process::{Child, Command, Stdio};
 
-use tracedecay_agent_hosts::agents::host_bundle::{HostComponentV1, HostKindV1};
+#[cfg(unix)]
+use tracedecay_agent_hosts::agents::host_bundle::HostComponentV1;
+use tracedecay_agent_hosts::agents::host_bundle::HostKindV1;
+#[cfg(unix)]
+use tracedecay_daemon_control::{SOCKET_ENV, default_socket_path};
+#[cfg(unix)]
+use tracedecay_daemon_identity::current_daemon_connection;
+#[cfg(unix)]
+use tracedecay_daemon_protocol::DaemonEndpoint;
+#[cfg(target_os = "linux")]
+use tracedecay_daemon_protocol::unix_socket_path_within_limit;
 #[cfg(unix)]
 use tracedecay_runtime_core::test_executable::write_executable_script;
 
 #[cfg(unix)]
 use super::install_kimi_cli;
-use super::{
-    IsolatedCli, ROO_SETTINGS_RELATIVE, VERIFY_FAILURE_ENV, assert_receipt_digests,
-    assert_seeded_bytes, assert_success, host_case, latest_receipt, seed_host,
-};
+use super::{IsolatedCli, VERIFY_FAILURE_ENV, assert_success, host_case, seed_host};
+#[cfg(unix)]
+use super::{ROO_SETTINGS_RELATIVE, assert_receipt_digests, assert_seeded_bytes, latest_receipt};
 
 /// `EX_TEMPFAIL`: nothing failed, but a host needs an operator step.
 const PENDING_OPERATOR_ACTION_EXIT: i32 = 75;
@@ -376,24 +389,70 @@ fn a_signed_out_kiro_cli_never_blocks_the_kiro_lifecycle() {
 /// canonical report from the sole daemon owner and counts its absence as an
 /// issue.
 #[cfg(unix)]
-pub(super) struct ProfileDaemon(std::process::Child);
+pub(super) struct ProfileDaemon {
+    child: Option<Child>,
+    owned_socket_directory: Option<PathBuf>,
+}
 
 #[cfg(unix)]
 impl ProfileDaemon {
     pub(super) fn start(cli: &IsolatedCli) -> Self {
+        // The daemon relocates sockets that exceed the platform path limit.
+        // Readiness must use that same authority, including on remote workers
+        // whose TMPDIR makes an otherwise ordinary profile path too long.
+        let socket = default_socket_path(&cli.profile).unwrap();
+        let mut daemon = Self {
+            child: None,
+            owned_socket_directory: None,
+        };
+        let socket_override = std::env::var_os(SOCKET_ENV).filter(|path| !path.is_empty());
+        if socket_override.is_none() && socket != cli.profile.join("daemon.sock") {
+            let parent = socket.parent().unwrap().to_path_buf();
+            // Claim only a freshly created directory. Earlier fixture work
+            // may already own a private parent, which this guard must retain.
+            match tracedecay_private_fs::create_private_directory(&parent) {
+                Ok(()) => daemon.owned_socket_directory = Some(parent),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    tracedecay_private_fs::validate_private_directory(&parent).unwrap();
+                }
+                Err(error) => panic!("could not create fixture socket directory: {error}"),
+            }
+        }
+        let log_path = cli.home.path().join("profile-daemon.stderr");
+        let stderr_log = fs::File::create(&log_path).unwrap();
         let mut command = cli.command(&["daemon", "run"]);
         command
             .env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        let daemon = Self(command.spawn().unwrap());
-        let socket = cli.profile.join("daemon.sock");
+            .stdout(Stdio::null())
+            .stderr(stderr_log);
+        daemon.child = Some(command.spawn().unwrap());
+        let stderr = || {
+            fs::read_to_string(&log_path)
+                .unwrap_or_else(|error| format!("could not read daemon stderr: {error}"))
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        // Follow the exact isolated profile's published endpoint, retaining
+        // child ownership and startup diagnostics if admission fails.
+        while !current_daemon_connection(&cli.profile).is_ok_and(|connection| {
+            match connection.endpoint() {
+                DaemonEndpoint::Unix(socket) => {
+                    std::os::unix::net::UnixStream::connect(socket).is_ok()
+                }
+                DaemonEndpoint::Loopback(address) => std::net::TcpStream::connect(address).is_ok(),
+            }
+        }) {
+            if let Some(status) = daemon.child.as_mut().unwrap().try_wait().unwrap() {
+                panic!(
+                    "profile daemon exited before listening for {}: {status}; stderr:\n{}",
+                    cli.profile.display(),
+                    stderr()
+                );
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the profile daemon never listened at {}",
-                socket.display()
+                "the registered daemon never listened for profile {}; stderr:\n{}",
+                cli.profile.display(),
+                stderr()
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
@@ -404,9 +463,50 @@ impl ProfileDaemon {
 #[cfg(unix)]
 impl Drop for ProfileDaemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            if child.wait().is_err() {
+                return;
+            }
+        }
+        if let Some(directory) = self.owned_socket_directory.take() {
+            let _ = fs::remove_dir_all(directory);
+        }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reaches_the_canonical_daemon_socket_for_a_long_profile_path() {
+    if std::env::var_os(SOCKET_ENV).is_some() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_lifecycle_cli_acceptance::sweep_outcomes::doctor_reaches_the_canonical_daemon_socket_for_a_long_profile_path",
+            ])
+            .env_remove(SOCKET_ENV)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the isolated Doctor journey failed");
+        return;
+    }
+
+    let mut cli = IsolatedCli::new();
+    cli.profile = cli.home.path().join("p".repeat(120)).join("profile");
+    install_cline(&cli);
+    let socket = default_socket_path(&cli.profile).unwrap();
+    assert_ne!(socket, cli.profile.join("daemon.sock"));
+
+    {
+        let _daemon = ProfileDaemon::start(&cli);
+        assert_success("profile", "doctor", cli.run(&["doctor"]));
+    }
+
+    assert!(
+        !socket.parent().unwrap().exists(),
+        "the stopped fixture must remove its owned fallback socket directory"
+    );
+    assert!(cli.profile.join("config.toml").exists());
 }
 
 /// Doctor classifies hosts the way `update-plugin` does: Kimi's pending
@@ -518,7 +618,7 @@ fn doctor_fails_a_corrupt_profile_config_with_its_repair() {
     let _daemon = ProfileDaemon::start(&cli);
     let config = cli.profile.join("config.toml");
     let installed = fs::read_to_string(&config).unwrap();
-    fs::write(&config, "pending_upload = 0\n true").unwrap();
+    fs::write(&config, "last_version_check_at = 0\n true").unwrap();
 
     let doctor = cli.run(&["doctor"]);
     let doctor_stderr = stderr(&doctor);
@@ -864,7 +964,12 @@ fn doctor_observes_copilots_vscode_settings_without_failing_on_them() {
 #[cfg(target_os = "linux")]
 #[test]
 fn doctor_warns_on_detected_hosts_without_a_tracedecay_integration() {
-    let cli = IsolatedCli::new();
+    let mut cli = IsolatedCli::new();
+    cli.profile = cli.home.path().join("profile".repeat(20));
+    assert!(
+        !unix_socket_path_within_limit(&cli.profile.join("daemon.sock")),
+        "this journey must exercise production's short endpoint for a deep profile"
+    );
     install_cline(&cli);
     fs::create_dir_all(cli.home.path().join(".config/zed")).unwrap();
     fs::create_dir_all(cli.home.path().join(".gemini/antigravity")).unwrap();

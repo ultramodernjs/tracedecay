@@ -209,6 +209,8 @@ pub(super) fn with_exact_sql_guard<T, F>(
 where
     F: FnOnce() -> Result<T, ExactSqlError>,
 {
+    #[cfg(feature = "test-runtime")]
+    let _statement_clock = clock::fake::for_statement(connection);
     let deadline = if enforce_statement_limit {
         let operation_deadline = clock::now() + EXACT_SQL_EXECUTION_LIMIT;
         Some(execution_deadline.map_or(operation_deadline, |deadline| {
@@ -368,6 +370,10 @@ fn is_allowed_exact_sql_pragma(pragma_name: &str, pragma_value: Option<&str>) ->
                     && value.parse::<u32>().is_ok())
                 || (pragma_name.eq_ignore_ascii_case("incremental_vacuum")
                     && value.parse::<u32>().is_ok())
+                // Offline index preparation may prohibit disk-backed sorter
+                // temporaries. Never authorize switching back to FILE/default.
+                || (pragma_name.eq_ignore_ascii_case("temp_store")
+                    && (value.eq_ignore_ascii_case("memory") || value == "2"))
                 || (pragma_name.eq_ignore_ascii_case("secure_delete")
                     && (value.eq_ignore_ascii_case("on") || value == "1"))
                 || (pragma_name.eq_ignore_ascii_case("user_version")

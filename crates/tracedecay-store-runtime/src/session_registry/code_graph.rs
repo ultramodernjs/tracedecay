@@ -46,6 +46,7 @@ pub(super) use memory_runtime::{
 pub(super) mod graph_attachment;
 #[cfg(test)]
 mod layered_refresh_tests;
+mod removed_scope;
 #[cfg(test)]
 mod sealed_publication_tests;
 mod seals;
@@ -2721,6 +2722,64 @@ impl DaemonSessionRuntimeRegistryV1 {
         })
     }
 
+    /// Admit an existing project's SQL shard for source-release maintenance.
+    /// The caller retains the returned owner for the maintenance lease's whole
+    /// lifetime. This neither mounts a scheduler nor publishes a memory graph
+    /// owner/background reconciliation task, and never initializes a missing
+    /// store or opens native staging.
+    pub async fn admit_code_graph_maintenance_database(
+        &self,
+        project_id: ProjectId,
+        enrollment_roots: impl IntoIterator<Item = std::path::PathBuf>,
+    ) -> Result<(
+        tracedecay_runtime_core::db::DatabaseOwnerV1,
+        tracedecay_runtime_core::db::Database,
+    )> {
+        self.resolver
+            .register_project_authority(
+                crate::store_locator_resolver::LocalProjectEnrollmentAuthorityV1::new(
+                    project_id.clone(),
+                    enrollment_roots,
+                ),
+            )
+            .map_err(|error| {
+                session_registry_error(
+                    "admit graph replay maintenance authority",
+                    format!("{error:?}"),
+                )
+            })?;
+        let shard = StoreShardIdV1::project(
+            self.identity.brain_id().clone(),
+            self.identity.profile_id().clone(),
+            project_id,
+        );
+        let pin = self
+            .profile_authority_pin("admit graph replay maintenance")
+            .await?;
+        let runtime = super::open_runtime(
+            &self.registry,
+            self.resolver.as_ref(),
+            super::StoreRuntimeOpenSpec::new(
+                shard,
+                self.incarnation,
+                Some(pin),
+                None,
+                false,
+                "admit graph replay maintenance",
+            ),
+        )
+        .await?;
+        let owner = tracedecay_runtime_core::db::Database::publish_runtime(
+            runtime,
+            tracedecay_runtime_core::db::DatabaseAccessMode::ReadWrite,
+        )
+        .await?;
+        let database = owner.issue_lease().map_err(|error| {
+            session_registry_error("issue graph replay maintenance lease", format!("{error:?}"))
+        })?;
+        Ok((owner, database))
+    }
+
     pub async fn release_one_sealed_generation_staging_rows(
         &self,
         project_id: ProjectId,
@@ -2849,6 +2908,27 @@ impl DaemonSessionRuntimeRegistryV1 {
         generation_file: &str,
         cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
     ) -> std::result::Result<bool, GraphDbError> {
+        self.reconcile_code_generation_graph_replays(
+            project_id,
+            project_database,
+            generation,
+            generation_file,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_code_generation_graph_replays(
+        &self,
+        project_id: ProjectId,
+        project_database: &tracedecay_runtime_core::db::Database,
+        generation: &CodeGenerationId,
+        generation_file: &str,
+        cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
+        removed_scope: Option<removed_scope::RemovedScopeAuthority>,
+    ) -> std::result::Result<bool, GraphDbError> {
         let sealed_digest = sealed_digest_from_generation_file(generation_file)?;
         let replay_root = project_database
             .database_path()
@@ -2911,6 +2991,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         let graph_lifecycle_cancelled = Arc::clone(&self.graph_lifecycle_cancelled);
         let cancellation = cancellation.clone();
         let generation = generation.clone();
+        let generation_file = generation_file.to_owned();
         tracedecay_runtime_core::native_runtime::spawn_blocking(move || {
             let pool_deadline = Instant::now() + GRAPH_OPERATION_DEADLINE;
             let pool_check = || {
@@ -2923,9 +3004,24 @@ impl DaemonSessionRuntimeRegistryV1 {
                 }
             };
             let replay_pool_lock = lock_project_graph_replay_pool(&replay_root, &pool_check)?;
+            let removed_projection = removed_scope
+                .as_ref()
+                .map(|scope| {
+                    scope.check()?;
+                    scope.projection(
+                        &authority_lease.binding().shard_id,
+                        &generation,
+                        &generation_file,
+                        &replay_root,
+                        &pool_check,
+                    )
+                })
+                .transpose()?
+                .flatten();
 
             let staged_unlink;
             loop {
+                pool_check()?;
                 if cancellation.is_cancelled() {
                     return Err(GraphDbError::Cancelled);
                 }
@@ -2974,13 +3070,27 @@ impl DaemonSessionRuntimeRegistryV1 {
                     ))),
                     deadline: deadline_at,
                 };
-                let outcome = graph_registry.retire_one_code_generation_replay(
-                    registration,
-                    &mut storage,
-                    &context,
-                    &generation,
-                    &sealed_digest,
-                )?;
+                let outcome = if let Some((scope, projection)) =
+                    removed_scope.as_ref().zip(removed_projection.as_ref())
+                {
+                    graph_registry.retire_one_removed_scope_code_generation_replay(
+                        registration,
+                        &mut storage,
+                        &context,
+                        &generation,
+                        &sealed_digest,
+                        projection,
+                        &|| scope.check(),
+                    )?
+                } else {
+                    graph_registry.retire_one_code_generation_replay(
+                        registration,
+                        &mut storage,
+                        &context,
+                        &generation,
+                        &sealed_digest,
+                    )?
+                };
                 match graph_replay_reconcile_disposition(outcome, &generation, &sealed_digest)? {
                     GraphReplayReconcileDisposition::Retired => {}
                     GraphReplayReconcileDisposition::Retained => return Ok(false),
@@ -3002,6 +3112,7 @@ impl DaemonSessionRuntimeRegistryV1 {
             }
             let mut cleanup_sequence = 0_u64;
             loop {
+                pool_check()?;
                 cleanup_sequence = cleanup_sequence.checked_add(1).ok_or_else(|| {
                     GraphDbError::budget_exhausted(GraphBudgetKind::Capacity, u64::MAX)
                 })?;

@@ -171,7 +171,7 @@ fn read_config_observation(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;

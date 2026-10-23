@@ -101,6 +101,53 @@ pub struct RegisteredGlobalDbWeakLeaseIssuerV1 {
 }
 
 impl RegisteredGlobalDbOwnerV1 {
+    /// Passive attach for an existing store during explicit observation
+    /// retirement. Unlike ordinary admission this never installs schema,
+    /// converges historical data, or starts maintenance. A refused/incomplete
+    /// shape stays untouched. The caller retains the exclusive lease until all
+    /// returned clients and their writer operations have settled.
+    pub async fn attach_for_observation_retirement(
+        database: DatabaseOwnerV1,
+        lifecycle: &tracedecay_runtime_core::lifecycle_lease::LifecycleLease,
+    ) -> tracedecay_domain::errors::Result<Self> {
+        let temporary = database.issue_lease().map_err(registered_owner_error)?;
+        if !lifecycle.is_exclusive()
+            || !temporary
+                .canonical_database_path()
+                .parent()
+                .is_some_and(|profile| lifecycle.guards_profile(profile))
+            || temporary.registered_binding().shard_id.scope != StoreShardScopeV1::ProfileSessions
+        {
+            return Err(TraceDecayError::Config {
+                message:
+                    "observation retirement requires the exact profile-session exclusive lease"
+                        .to_owned(),
+            });
+        }
+        let read = temporary
+            .begin_engine_read_snapshot("attach offline observation retirement")
+            .await
+            .map_err(|error| TraceDecayError::Database {
+                operation: "attach offline observation retirement".into(),
+                message: error.to_string(),
+            })?;
+        super::schema_contract::validate_authority_schema_contract(&read).await?;
+        if !super::schema_contract::invariants::authority_invariant_triggers_intact(&read).await? {
+            return Err(TraceDecayError::Config {
+                message: "observation retirement requires intact authority guards; repair/admit the store separately".into(),
+            });
+        }
+        drop(read);
+        drop(temporary);
+        Ok(Self {
+            database,
+            project_graph: Arc::new(OnceLock::new()),
+            session_relation_graph: Arc::new(RwLock::new(None)),
+            session_publication: Arc::new(Mutex::new(())),
+            refused_authority: None,
+        })
+    }
+
     /// Validates the final schema installed during physical Store open before
     /// the owner becomes visible to any caller. The temporary issuance is
     /// dropped before the owner is returned, so it never becomes a hidden
@@ -473,7 +520,7 @@ impl RegisteredGlobalDb {
     /// publisher mints only Test-role authority; this constructor lets a test
     /// drive [`RegisteredGlobalDb::checkpoint_result`] over a
     /// maintenance-scoped publication without bypassing the database facade.
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     pub(crate) fn from_database_for_wal_maintenance_test(database: Database) -> Self {
         Self::from_owned_database(database)
     }
@@ -667,6 +714,42 @@ impl RegisteredGlobalDb {
             .await
     }
 
+    /// [`Self::transact`] for a body whose error type is the caller's own: a
+    /// refused or failed job becomes `wrap(cause)`, and the body's error is
+    /// returned as is.
+    pub(crate) async fn transact_or<R, E>(
+        &self,
+        wrap: impl FnOnce(TraceDecayError) -> E,
+        body: impl AsyncFn(RegisteredGlobalDbWriteTx<'_, '_>) -> Result<R, E> + Send + Sync + 'static,
+    ) -> Result<R, E>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        self.transact(body).await.map_err(wrap)?
+    }
+
+    /// [`Self::transact_or`] for a body that can also end early with a value
+    /// the caller wants as success. The job rolls back either way, so an
+    /// early exit leaves no commit behind.
+    pub(crate) async fn transact_or_rollback<R, E>(
+        &self,
+        wrap: impl FnOnce(TraceDecayError) -> E,
+        body: impl AsyncFn(RegisteredGlobalDbWriteTx<'_, '_>) -> Result<R, JobExit<R, E>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<R, E>
+    where
+        R: Send + 'static,
+        E: Send + 'static,
+    {
+        match self.transact(body).await.map_err(wrap)? {
+            Ok(value) | Err(JobExit::Rollback(value)) => Ok(value),
+            Err(JobExit::Fail(error)) => Err(error),
+        }
+    }
+
     pub fn binding(&self) -> &tracedecay_store::StoreRuntimeBindingV1 {
         self.database.registered_binding()
     }
@@ -674,6 +757,19 @@ impl RegisteredGlobalDb {
     /// Exact non-retaining locator identity for this guarded database client.
     pub fn verified_locator(&self) -> &VerifiedStoreLocatorV1 {
         self.database.registered_verified_locator()
+    }
+
+    /// Offline approvals survive process remounts, but not a different typed
+    /// shard, physical path or replacement database file. Runtime incarnation
+    /// still fences retained capabilities; it is not an operator resume token.
+    pub(crate) fn retirement_store_identity(&self) -> impl serde::Serialize + '_ {
+        let locator = self.verified_locator();
+        (
+            "observation-retirement.physical-store.v1",
+            &locator.shard_id,
+            self.database.database_path(),
+            self.database.opened_file_identity(),
+        )
     }
 
     pub fn work_storage(
@@ -912,27 +1008,6 @@ impl tracedecay_sessions::runtime::git_correlation::GitCorrelationWriteTxn
     }
 }
 
-impl tracedecay_sessions::runtime::workflow_index::WorkflowIngestWriteTxn
-    for RegisteredGlobalDbWriteTransaction<'_>
-{
-    #[allow(clippy::manual_async_fn)]
-    fn commit(
-        self,
-    ) -> impl Future<
-        Output = Result<(), tracedecay_sessions::runtime::workflow_index::WorkflowIndexError>,
-    > + Send {
-        async move {
-            RegisteredGlobalDbWriteTransaction::commit(self)
-                .await
-                .map_err(|error| {
-                    tracedecay_sessions::runtime::workflow_index::WorkflowIndexError::Db(
-                        error.to_string(),
-                    )
-                })
-        }
-    }
-}
-
 impl RegisteredGlobalDbWriteTransaction<'_> {
     pub async fn execute<P>(
         &self,
@@ -998,6 +1073,20 @@ impl RegisteredGlobalDbWriteTransaction<'_> {
     #[tracing::instrument(name = "global_db.registered.txn.rollback", level = "trace", skip_all)]
     pub async fn rollback(self) -> tracedecay_runtime_core::db::engine::Result<()> {
         self.transaction.rollback().await.map_err(engine_error)
+    }
+}
+
+/// The error side of a job body that can end without committing. `Rollback`
+/// carries a value for the caller, so a replay can be reported as a success
+/// without leaving a commit behind; `Fail` is an ordinary failure.
+pub(crate) enum JobExit<R, E> {
+    Rollback(R),
+    Fail(E),
+}
+
+impl<R, E> From<E> for JobExit<R, E> {
+    fn from(error: E) -> Self {
+        Self::Fail(error)
     }
 }
 

@@ -857,7 +857,11 @@ pub(crate) mod test_support {
                         .iter()
                         .find(|stored| {
                             stored.observation().observation_id()
-                                == outcome.receipt().observation().observation_id()
+                                == outcome
+                                    .receipt()
+                                    .expect("fixture persists an observation")
+                                    .observation()
+                                    .observation_id()
                         })
                         .cloned();
                     ObservationBatchPersistOutcome::new(outcome, stored)

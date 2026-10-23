@@ -1554,8 +1554,9 @@ impl crate::session_temporal_refresh_scheduler::history::SessionHistoricalIngest
                     reason_code: "ingest_pass_backpressured".to_owned(),
                     made_progress: false,
                 }
+                .into()
             } else {
-                SessionHistoricalIngestOutcome::Complete
+                SessionHistoricalIngestOutcome::Complete.into()
             }
         })
     }
@@ -1662,6 +1663,7 @@ impl tracedecay_sessions::serving::SessionProjectionServingStatusPort for FixedR
             blocker: None,
             retry_class: None,
             convergence: tracedecay_sessions::serving::SessionConvergenceStatus::unavailable(),
+            history: None,
         }
     }
 }

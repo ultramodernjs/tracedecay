@@ -10,6 +10,7 @@ use tracedecay_domain::{ObservationScopeV1, ProjectId};
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
 use tracedecay_project::project::TraceDecay;
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_session_memory::session::lcm::{
     LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmCompactionCommand,
     LcmCompressionEvidence, LcmHostProtocol,
@@ -204,7 +205,7 @@ async fn admit_codex_session_for_compaction(
     cancellation: &ObservationCancellation,
 ) -> Result<CodexRolloutAdmission> {
     let requested_session = session_id.to_owned();
-    let lookup = tokio::task::spawn_blocking(move || {
+    let lookup = native_runtime::spawn_blocking(move || {
         source.find_session_transcript_paths_bounded(&requested_session)
     })
     .await
@@ -516,17 +517,12 @@ fn pressure_only_command(
             current_tokens,
             ignore_session_patterns: Vec::new(),
             stateless_session_patterns: Vec::new(),
-            threshold_tokens: None,
-            max_assembly_tokens: None,
-            leaf_chunk_tokens: None,
-            max_source_messages,
-            summary_fan_in: None,
-            incremental_max_depth: None,
-            fresh_tail_count,
-            dynamic_leaf_chunk_enabled: None,
-            dynamic_leaf_chunk_max: None,
-            context_length,
-            reserve_tokens_floor: None,
+            overrides: tracedecay_lcm::LcmCompressionOverrides {
+                max_source_messages,
+                fresh_tail_count,
+                context_length,
+                ..Default::default()
+            },
         },
         evidence: LcmCompressionEvidence::PressureOnly { protocol },
     }))

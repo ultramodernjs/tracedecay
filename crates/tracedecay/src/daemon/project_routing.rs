@@ -232,6 +232,7 @@ pub(super) async fn ensure_checkout_topology_before_admission(project_path: &Pat
 }
 
 #[tracing::instrument(name = "daemon.project.route.resolve", level = "trace", skip_all)]
+#[cfg(unix)]
 pub(super) async fn resolved_project_server_key(
     store_administration: &StoreAdministration,
     canonical_project_path: &Path,
@@ -294,6 +295,7 @@ pub(super) async fn resolved_project_server_key(
     }))
 }
 
+#[cfg(unix)]
 pub(super) async fn cached_or_bind_ready_project_server(
     store_administration: &StoreAdministration,
     route: &ProjectRouteKey,

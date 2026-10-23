@@ -15,10 +15,24 @@ pub use connection::{
 pub mod exact_sql;
 pub mod handoff;
 mod ledger;
-/// Canonical schema for the runtime writer ledger installed in registered
-/// SQLite stores.
+/// Schema and transaction-bound maintenance for the runtime writer ledger.
+/// Cleanup requires the exact writer or exclusive-maintenance connection;
+/// replay-window detection never expires live receipts or rotates authority.
 pub mod runtime_ledger {
+    pub use crate::ledger::replay_window::{
+        WriterReplayWindow, WriterReplayWindowPolicy, WriterReplayWindowStatus,
+    };
+    pub use crate::ledger::retention::{
+        MAX_WRITER_LEDGER_CLEANUP_ROWS, WriterLedgerCleanupPlan, WriterLedgerMaintenanceError,
+        WriterLedgerRetentionReport, WriterLedgerRetirementAuthority,
+        preview_retired_writer_ledger_cleanup, preview_writer_ledger_cleanup,
+    };
     pub use crate::ledger::{RETIRE_RUNTIME_EFFECTS_V1, RUNTIME_LEDGER_SCHEMA};
+    pub use crate::writer::ledger_maintenance::{
+        WRITER_LEDGER_DRAIN_INTERVAL, WriterLedgerDrainOutcome, WriterLedgerMaintenance,
+        WriterLedgerMaintenanceReport, WriterLedgerMaintenanceStatus,
+        drain_retired_writer_ledger_page, drain_writer_ledger_page,
+    };
 }
 pub mod native_runtime;
 #[cfg(test)]

@@ -9,7 +9,7 @@ use crate::store::{
 };
 use rusqlite::Connection;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier, mpsc};
@@ -231,7 +231,7 @@ fn malformed_destinations_are_never_replaced_or_repaired() {
 }
 
 // This helper runs only in the unit-test executable, never the production worker.
-// It escrows a precise SQL/publication boundary and blocks on a pipe until killed.
+// It escrows a precise SQL/publication boundary and parks until killed.
 #[test]
 fn interrupted_bootstrap_child() {
     let Some(path) = std::env::var_os(CHILD_ROOT) else {
@@ -259,10 +259,13 @@ fn interrupted_bootstrap_child() {
     )
     .unwrap();
     stdout.flush().unwrap();
-    let mut release = [0_u8; 1];
-    std::io::stdin().read_exact(&mut release).unwrap();
-    drop(held_connection);
-    panic!("parent must kill the child, not release it");
+    drop(stdout);
+    // libtest may close stdin before the parent kills us. Stay at the SQL
+    // boundary instead of unwinding (and closing the connection) on pipe EOF.
+    let _held_connection = held_connection;
+    loop {
+        thread::park();
+    }
 }
 
 struct KillOnDrop(Child);
@@ -289,7 +292,7 @@ fn interrupted_first_bootstrap_leaves_retry_usable() {
                 ])
                 .env(CHILD_ROOT, root.path())
                 .env(CHILD_PHASE, phase)
-                .stdin(Stdio::piped())
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
@@ -315,7 +318,17 @@ fn interrupted_first_bootstrap_leaves_retry_usable() {
         assert!(!NamespaceStore::exists(&root, &namespace()));
         assert_eq!(catalog_count(&root), 0);
         child.0.kill().unwrap();
-        assert!(!child.0.wait().unwrap().success());
+        let status = child.0.wait().unwrap();
+        assert!(!status.success());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "child must remain live until SIGKILL"
+            );
+        }
         assert!(
             stage.join("ncm.sqlite").is_file(),
             "kill must leave a real orphan"

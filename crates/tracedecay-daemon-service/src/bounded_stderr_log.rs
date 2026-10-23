@@ -1,13 +1,14 @@
-//! Bounded retention for a daemon stderr that lands in a plain file.
+//! Bounded retention for daemon stderr and stdout that land in plain files.
 //!
 //! systemd hands the managed daemon the journal, whose retention journald
 //! owns. launchd has no such authority: the generated launch agent points
 //! `StandardErrorPath` at `daemon.err.log` and appends to it for the life of
 //! the agent, across every restart, so a daemon that warns about a persistent
 //! condition grows that file without bound (issue #1981). The daemon owns the
-//! bound itself: when its stderr is a regular file, it rotates that file once
-//! it passes [`DAEMON_STDERR_LOG_ROTATE_BYTES`], keeping exactly one previous
-//! generation, and re-points fd 2 at the fresh file. launchd keeps its own
+//! bound itself: when either stream is a regular file, it rotates that file
+//! once it passes [`DAEMON_STDERR_LOG_ROTATE_BYTES`], keeping exactly one previous
+//! generation, and re-points its descriptor at the fresh file. If both streams
+//! share the file, both descriptors follow the rotation. launchd keeps its own
 //! descriptor on the rotated inode, which is only ever reached by the crash
 //! output of a process launchd starts, and every restart reopens the path.
 
@@ -15,6 +16,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tracedecay_runtime_core::logging::log_daemon_event;
@@ -32,7 +34,11 @@ pub const DAEMON_STDERR_LOG_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Suffix of the single retained previous generation.
 const ROTATED_SUFFIX: &str = ".1";
 
-/// A regular file receiving a process's stderr, and the bound it is held to.
+// stdout and stderr may share one inode (for example, shell `2>&1`). Their
+// rotation tasks must publish and redirect both descriptors as one operation.
+static ROTATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// A regular file receiving a process's output, and the bound it is held to.
 #[derive(Debug)]
 pub struct BoundedStderrLog {
     fd: RawFd,
@@ -55,6 +61,11 @@ impl BoundedStderrLog {
     /// (a terminal, a pipe, or the journal), which nothing here may touch.
     pub fn detect() -> io::Result<Option<Self>> {
         Self::for_fd(libc::STDERR_FILENO, DAEMON_STDERR_LOG_ROTATE_BYTES)
+    }
+
+    /// The bounded log for fd 1, leaving pipes, terminals and journald alone.
+    pub fn detect_stdout() -> io::Result<Option<Self>> {
+        Self::for_fd(libc::STDOUT_FILENO, DAEMON_STDERR_LOG_ROTATE_BYTES)
     }
 
     /// The bounded log for one descriptor when it is a regular file.
@@ -84,10 +95,30 @@ impl BoundedStderrLog {
     /// generation, and everything after the `dup2` lands in the fresh file.
     /// The previous retained generation is replaced, not kept.
     pub fn rotate_if_oversized(&self) -> io::Result<StderrLogRotation> {
-        let size_bytes = borrowed_file(self.fd).metadata()?.len();
+        let _rotation = ROTATION_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("daemon log rotation lock poisoned"))?;
+        let metadata = borrowed_file(self.fd).metadata()?;
+        let size_bytes = metadata.len();
         if size_bytes <= self.rotate_bytes {
             return Ok(StderrLogRotation::WithinBound { size_bytes });
         }
+        let other_stdio = match self.fd {
+            libc::STDOUT_FILENO => Some(libc::STDERR_FILENO),
+            libc::STDERR_FILENO => Some(libc::STDOUT_FILENO),
+            _ => None,
+        };
+        let shared_stdio = if let Some(fd) = other_stdio {
+            let identity = descriptor_identity(self.fd)?;
+            match descriptor_identity(fd) {
+                Ok(other) if other == identity => Some(fd),
+                Ok(_) => None,
+                Err(error) if error.raw_os_error() == Some(libc::EBADF) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let mut rotated = self.path.clone().into_os_string();
         rotated.push(ROTATED_SUFFIX);
         std::fs::rename(&self.path, &rotated)?;
@@ -101,10 +132,17 @@ impl BoundedStderrLog {
         if unsafe { libc::dup2(fresh.as_raw_fd(), self.fd) } < 0 {
             return Err(io::Error::last_os_error());
         }
+        if let Some(fd) = shared_stdio {
+            // SAFETY: both descriptors were inspected under the rotation lock;
+            // `fresh` stays open until both have been redirected.
+            if unsafe { libc::dup2(fresh.as_raw_fd(), fd) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
         Ok(StderrLogRotation::Rotated { size_bytes })
     }
 
-    /// Hold fd 2 to its bound for the life of the daemon.
+    /// Hold the selected descriptor to its bound for the life of the daemon.
     ///
     /// Runs one check now and then one per [`DAEMON_STDERR_LOG_CHECK_INTERVAL`]
     /// until the returned task is aborted at shutdown. Each rotation is
@@ -180,6 +218,18 @@ impl BoundedStderrLog {
     }
 }
 
+fn descriptor_identity(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes a complete stat on success and reports closed fds
+    // without requiring us to construct a File owning an invalid descriptor.
+    if unsafe { libc::fstat(fd, metadata.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful fstat initialized the complete value.
+    let metadata = unsafe { metadata.assume_init() };
+    Ok((metadata.st_dev, metadata.st_ino))
+}
+
 /// A `File` view of a descriptor this module does not own. Wrapped in
 /// `ManuallyDrop` so dropping the view never closes the caller's descriptor.
 fn borrowed_file(fd: RawFd) -> std::mem::ManuallyDrop<File> {
@@ -228,6 +278,84 @@ mod tests {
     use tracedecay_runtime_core::path_safety::canonical_root_identity;
 
     use super::{BoundedStderrLog, StderrLogRotation};
+
+    #[test]
+    #[ignore = "child helper; invoked by stdout rotation regression"]
+    fn stdout_rotation_child() {
+        assert!(std::env::var_os("TRACEDECAY_STDOUT_ROTATION_CHILD").is_some());
+        let mut log = BoundedStderrLog::detect_stdout()
+            .expect("inspect stdout")
+            .expect("regular stdout must be bounded");
+        log.rotate_bytes = 64;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&[b'a'; 80]).unwrap();
+        stdout.flush().unwrap();
+        assert!(matches!(
+            log.rotate_if_oversized().unwrap(),
+            StderrLogRotation::Rotated { size_bytes } if size_bytes >= 80
+        ));
+        if std::env::var_os("TRACEDECAY_SHARED_STDIO").is_some() {
+            std::io::stderr().write_all(&[b'b'; 70]).unwrap();
+            std::io::stderr().flush().unwrap();
+        } else {
+            stdout.write_all(&[b'b'; 70]).unwrap();
+            stdout.flush().unwrap();
+        }
+        assert_eq!(
+            log.rotate_if_oversized().unwrap(),
+            StderrLogRotation::Rotated { size_bytes: 70 }
+        );
+        stdout.write_all(b"fresh stdout\n").unwrap();
+        stdout.flush().unwrap();
+    }
+
+    #[test]
+    fn stdout_regular_file_rotates_and_descriptor_follows_new_generation() {
+        assert_stdout_rotation(false);
+    }
+
+    #[test]
+    fn shared_stdout_and_stderr_follow_the_same_rotated_generation() {
+        assert_stdout_rotation(true);
+    }
+
+    fn assert_stdout_rotation(shared_stdio: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("daemon.out.log");
+        let stdout = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let helper = concat!(module_path!(), "::stdout_rotation_child");
+        let helper = helper.split_once("::").unwrap().1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", helper, "--ignored", "--nocapture", "--quiet"])
+            .env("TRACEDECAY_STDOUT_ROTATION_CHILD", "1");
+        if shared_stdio {
+            command
+                .env("TRACEDECAY_SHARED_STDIO", "1")
+                .stderr(stdout.try_clone().unwrap());
+        }
+        let child = command.stdout(stdout).output().unwrap();
+        assert!(
+            child.status.success(),
+            "stderr={} live={:?}",
+            String::from_utf8_lossy(&child.stderr),
+            std::fs::read_to_string(&path)
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("daemon.out.log.1")).unwrap(),
+            vec![b'b'; 70]
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("fresh stdout\n")
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
 
     #[test]
     fn a_terminal_or_pipe_is_not_a_bounded_log() {

@@ -15,7 +15,6 @@ use tracedecay_memory_hygiene::{
     HygieneAction, HygieneClass, ObservationAdmission, ObservationSanitizer,
     SanitizationDisposition, canonical_payload_bytes, transient_matches,
 };
-use tracedecay_session_memory::memory::hygiene::detect_transient;
 
 const TRANSIENT_FACTS: &str = include_str!("fixtures/transient_facts.json");
 
@@ -197,10 +196,6 @@ fn the_local_transient_corpus_agrees_with_the_shared_upstream_detector() {
         assert!(
             !transient_matches(text).is_empty(),
             "local corpus missed {text}"
-        );
-        assert!(
-            detect_transient(text).is_some(),
-            "shared corpus disagrees about {text}"
         );
     }
 

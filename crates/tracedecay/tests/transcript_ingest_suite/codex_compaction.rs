@@ -30,7 +30,9 @@ use tracedecay_sessions::runtime::hosts::codex::codex_observation_source_v2;
 use tracedecay_sessions::runtime::{SessionProvider, with_transcript_source_profile};
 
 #[cfg(unix)]
-use crate::common::{TestChildProcess, spawn_tracedecay_daemon_with, tracedecay_command_with_home};
+use crate::common::{
+    TestChildProcess, spawn_tracedecay_daemon_logged, tracedecay_command_with_home,
+};
 #[cfg(unix)]
 use crate::restart_atomicity::mark_test_project;
 use crate::support::setup;
@@ -215,7 +217,8 @@ done
     // Record actor turns to prove the canonical daemon owner summarizes this
     // exact admitted range once.
     let requests = tmp.path().join("codex-requests.jsonl");
-    let daemon = spawn_tracedecay_daemon_with(&home, |command| {
+    let daemon_log = tmp.path().join("daemon.log");
+    let daemon = spawn_tracedecay_daemon_logged(&home, &daemon_log, |command| {
         command.env("TRACEDECAY_TEST_CODEX_REQUESTS", &requests);
     });
     let event = serde_json::json!({
@@ -228,6 +231,7 @@ done
     let mut hook = tracedecay_command_with_home(&home);
     let child = hook
         .arg("hook-codex-post-compact")
+        .env("RUST_LOG", "warn")
         .current_dir(&project)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -247,8 +251,9 @@ done
     );
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("PostCompact daemon call failed"),
-        "the PostCompact hook must not fail open around canonical intake: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "the PostCompact hook must not fail open around canonical intake: {}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&daemon_log).unwrap()
     );
     // Query the daemon's production read authority until its background owner
     // publishes the summary; no foreground compression can mask broken routing.

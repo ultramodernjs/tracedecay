@@ -26,6 +26,11 @@ use tracedecay_runtime_core::logging::log_daemon_event;
 use tracedecay_runtime_core::native_runtime;
 
 mod graph_replay;
+mod replay_release;
+pub use replay_release::{
+    GraphReplayReleaseAuthorityV1, GraphReplayReleasePlanV1, GraphReplayReleaseRunV1,
+    plan_graph_replay_releases, plan_project_graph_replay_releases, release_graph_replays,
+};
 mod scope_reconciliation;
 use graph_replay::{defer_graph_replay_pool_busy, log_code_generation_retention_degraded};
 #[cfg(test)]
@@ -407,11 +412,13 @@ pub async fn run_code_generation_retention(
     // crash-rebuild night). A failure still reports degraded and fails the
     // pass so the retry cadence stays short; a deferral fails the pass
     // quietly under the bounded backoff.
+    graph_replay::release_mounted_staging_rows(lease, observations, cancellation).await;
     let mut replay_reconcile_failed = false;
     let mut release_backlog_remains = false;
     let replay_reconcile_attemptable = match graph_replay::reconcile_graph_replay_releases(
         lease,
         &store_root,
+        lease.project_root(),
         observations,
         cancellation,
     )
@@ -470,6 +477,7 @@ pub async fn run_code_generation_retention(
         match graph_replay::reconcile_graph_replay_releases(
             lease,
             &store_root,
+            lease.project_root(),
             observations,
             cancellation,
         )
@@ -526,13 +534,10 @@ pub struct RegisteredProjectStoreV1 {
 /// no mounted graph owns.
 ///
 /// Mounted scopes are skipped: their pass runs with the mounted graph lease.
-/// An unmounted scope has no graph lease, so the graph-replay release queue
-/// the batch appends to waits for the project's next mount; collection is
-/// still exact, because retention hard-links each retired generation into the
-/// replay pool before its release event is durable, so the graph can always
-/// finish that retirement later. Text artifacts, the largest superseded
-/// family, are reclaimed by the batch or, once its index rewrite frees them,
-/// by the continuation pass that follows.
+/// The admitted project lease supplies relational authority without mounting a
+/// scheduler or opening native staging. Each unmounted scope reconciles a
+/// bounded release page even when all its generations were already collected;
+/// source release keeps the short cadence for the subsequent segment sweep.
 ///
 /// The protection set is resolved per scope at pass time, so a scope mounted
 /// after the tick selected it still protects what its scheduler serves, and
@@ -546,12 +551,29 @@ pub struct RegisteredProjectStoreV1 {
 )]
 pub async fn run_registered_code_generation_retention(
     store: &RegisteredProjectStoreV1,
+    lease: &ProjectStoreMaintenanceLeaseV1,
     mounted_store_roots: &BTreeSet<PathBuf>,
     schedulers: &CodeIndexSchedulerRegistryV1,
     profile_database: &RegisteredGlobalDb,
     observations: &StoreTelemetrySamplingRegistry,
     cancellation: &CancellationToken,
 ) -> CodeGenerationRetentionOutcomeV1 {
+    if store.data_root != lease.store_layout().data_root
+        || !tracedecay_runtime_core::path_safety::same_canonical_path(
+            lease.graph_db().database_path(),
+            &lease.store_layout().graph_db_path,
+        )
+        || profile_database.binding().shard_id != lease.profile_database().binding().shard_id
+        || !matches!(&lease.graph_db().registered_binding().shard_id.scope,
+            tracedecay_store::StoreShardScopeV1::Project { project_id }
+                if Some(project_id.as_str()) == lease.store_layout().identity.project_id.as_deref())
+    {
+        log_code_generation_retention_degraded(
+            observations,
+            "graph_replay_lease_identity_mismatch",
+        );
+        return CodeGenerationRetentionOutcomeV1::Failed;
+    }
     let scopes = match code_index_scopes(&store.data_root) {
         Ok(scopes) => scopes,
         Err(error) => {
@@ -567,6 +589,12 @@ pub async fn run_registered_code_generation_retention(
             return CodeGenerationRetentionOutcomeV1::Failed;
         }
     };
+    observations.record_project_maintenance_scopes(
+        &store.canonical_root,
+        scopes
+            .iter()
+            .filter_map(|scope| scope.recorded_root.clone()),
+    );
     let graph_replay_pool_root = store
         .data_root
         .join(tracedecay_runtime_core::config::DB_FILENAME)
@@ -608,6 +636,23 @@ pub async fn run_registered_code_generation_retention(
                 continue;
             }
         };
+        // Source release is independent of generation collection and native
+        // staging. A collected scope may contain only this durable backlog.
+        let release = graph_replay::reconcile_graph_replay_releases(
+            lease,
+            &scope.store_root,
+            &root,
+            observations,
+            cancellation,
+        )
+        .await;
+        let retry_release = matches!(
+            release,
+            graph_replay::ReconcileOutcome::Complete
+                | graph_replay::ReconcileOutcome::Retained
+                | graph_replay::ReconcileOutcome::MoreWork
+        );
+        outcome = outcome.with_pass(release.retention_outcome());
         if !plan.has_collectable_work() {
             continue;
         }
@@ -626,6 +671,19 @@ pub async fn run_registered_code_generation_retention(
             }
             Ok(_) => {}
             Err(failed) => outcome = outcome.with_pass(failed),
+        }
+        if retry_release {
+            outcome = outcome.with_pass(
+                graph_replay::reconcile_graph_replay_releases(
+                    lease,
+                    &scope.store_root,
+                    &root,
+                    observations,
+                    cancellation,
+                )
+                .await
+                .retention_outcome(),
+            );
         }
     }
     outcome

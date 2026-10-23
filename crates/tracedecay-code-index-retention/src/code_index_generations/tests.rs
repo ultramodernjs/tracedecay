@@ -6,6 +6,7 @@ use tracedecay_domain::sha256_hex_suffix;
 
 mod graph_replay_pool_lock_tests;
 mod graph_replay_release_tests;
+mod segment_release_bounds;
 
 /// Marks the newest `count` superseded fixture generations as vector-readable
 /// sources so a fixture keeps exactly one collectable generation: the exact
@@ -1082,6 +1083,75 @@ fn text_artifact_retention_uses_bounded_restartable_batches() {
 }
 
 #[test]
+fn text_artifact_marks_charge_scope_enumeration_and_pointer_observations() {
+    let project = tempfile::tempdir().unwrap();
+    let scopes = (0..4)
+        .map(|index| {
+            let scope = scoped_code_index_store_root(
+                project.path(),
+                Path::new(&format!("/worktree/{index}")),
+            );
+            std::fs::create_dir_all(&scope).unwrap();
+            scope
+        })
+        .collect::<Vec<_>>();
+
+    // Four directory entries plus four pointer observations are required to
+    // prove that this shared project has no published text-artifact marks.
+    // Neither an incomplete enumeration nor an incomplete mark is a plan.
+    for budget in [2, 7] {
+        let mut remaining = budget;
+        let error = plan_collectable_text_artifacts_budgeted_cancellable(
+            &scopes[0],
+            None,
+            GenerationDigestVerificationV1::MetadataOnly,
+            &mut remaining,
+            &|| false,
+        )
+        .expect_err("a partial liveness mark cannot authorize collection");
+        assert!(matches!(
+            error,
+            CodeGenerationRetentionErrorV1::EntryBudgetExceeded
+        ));
+        assert_eq!(remaining, 0);
+    }
+    let mut remaining = 8;
+    let inventory = plan_collectable_text_artifacts_budgeted_cancellable(
+        &scopes[0],
+        None,
+        GenerationDigestVerificationV1::MetadataOnly,
+        &mut remaining,
+        &|| false,
+    )
+    .unwrap();
+    assert!(inventory.candidates.is_empty());
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn text_artifact_marks_stop_before_observing_a_pointer_after_cancellation() {
+    let (store, _) = fixture_store(1);
+    let pointer = read_active_pointer(store.path()).unwrap();
+    std::fs::write(
+        store.path().join(ACTIVE_POINTER_FILE),
+        b"unreadable pointer",
+    )
+    .unwrap();
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let mut remaining = 1;
+    let error = plan_collectable_text_artifacts_budgeted_cancellable(
+        store.path(),
+        Some(&pointer),
+        GenerationDigestVerificationV1::MetadataOnly,
+        &mut remaining,
+        &|| checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0,
+    )
+    .expect_err("cancellation must win before reading the damaged pointer");
+    assert!(matches!(error, CodeGenerationRetentionErrorV1::Cancelled));
+    assert_eq!(remaining, 1);
+}
+
+#[test]
 fn text_artifact_inventory_honors_cancellation_before_marking_or_mutation() {
     let (store, _generations) = fixture_store(1);
     let staging_root = code_text_artifact_staging_root(store.path());
@@ -1698,13 +1768,19 @@ fn metadata_only_segment_census_observes_at_most_one_directory_entry() {
     }
 
     let cancellation_observations = std::cell::Cell::new(0_usize);
-    let holds_segments = store_may_hold_generation_segments(store.path(), &|| {
-        cancellation_observations.set(cancellation_observations.get() + 1);
-        cancellation_observations.get() > 1
-    })
+    let mut remaining_entries = 1;
+    let holds_segments = store_may_hold_generation_segments(
+        store.path(),
+        &|| {
+            cancellation_observations.set(cancellation_observations.get() + 1);
+            cancellation_observations.get() > 1
+        },
+        &mut remaining_entries,
+    )
     .expect("one observed entry conservatively proves possible segment work");
 
     assert!(holds_segments);
+    assert_eq!(remaining_entries, 0);
     assert_eq!(
         cancellation_observations.get(),
         1,
@@ -1724,20 +1800,59 @@ fn metadata_only_segment_census_observes_at_most_one_directory_entry() {
 }
 
 #[test]
-fn metadata_only_segment_census_distinguishes_empty_and_cancelled() {
+fn metadata_only_segment_census_distinguishes_empty_cancelled_and_exhausted() {
     let store = tempfile::TempDir::new().expect("create unpublished store");
     let segments_root = store.path().join(GENERATION_SEGMENTS_DIRECTORY);
     std::fs::create_dir_all(&segments_root).expect("create segment root");
 
+    let mut remaining_entries = 1;
     assert!(
-        !store_may_hold_generation_segments(store.path(), &|| false)
+        !store_may_hold_generation_segments(store.path(), &|| false, &mut remaining_entries)
             .expect("empty segment directory")
     );
+    assert_eq!(remaining_entries, 1);
 
     std::fs::write(segments_root.join("crash-debris"), b"debris").expect("write crash debris");
-    let error = store_may_hold_generation_segments(store.path(), &|| true)
+    let error = store_may_hold_generation_segments(store.path(), &|| true, &mut remaining_entries)
         .expect_err("cancellation wins before an observed entry is accepted");
     assert!(matches!(error, CodeGenerationRetentionErrorV1::Cancelled));
+    assert_eq!(remaining_entries, 1);
+
+    remaining_entries = 0;
+    let error = store_may_hold_generation_segments(store.path(), &|| false, &mut remaining_entries)
+        .expect_err("a nonempty segment directory needs an entry from the shared budget");
+    assert!(matches!(
+        error,
+        CodeGenerationRetentionErrorV1::EntryBudgetExceeded
+    ));
+    assert_eq!(remaining_entries, 0);
+}
+
+#[test]
+fn release_continuation_sweeps_segments_without_collecting_generations() {
+    let store = tempfile::TempDir::new().expect("isolated generation store");
+    let pool = store.path().join("replay-pool");
+    tracedecay_private_fs::create_private_directory(&pool).expect("owner-private pool");
+    let segments = code_generation_segments_root(store.path());
+    std::fs::create_dir_all(&segments).expect("segment root");
+    let bytes = b"orphaned shared segment";
+    let digest = encode_lowercase_hex(&Sha256::digest(bytes));
+    let orphan = segments.join(format!("segment-{digest}.json"));
+    std::fs::write(&orphan, bytes).expect("segment");
+    assert!(matches!(
+        sweep_released_code_generation_segments_cancellable(store.path(), &pool, &|| true,),
+        Err(CodeGenerationRetentionErrorV1::Cancelled)
+    ));
+    assert!(orphan.exists(), "cancelled maintenance cannot sweep");
+    assert!(
+        !sweep_released_code_generation_segments_cancellable(store.path(), &pool, &|| false,)
+            .expect("bounded source-release continuation")
+    );
+    assert!(!orphan.exists());
+    assert!(
+        !store.path().join(ACTIVE_POINTER_FILE).exists(),
+        "segment-only apply does not publish or collect generations"
+    );
 }
 
 #[test]

@@ -481,7 +481,7 @@ fn additional_reservations_share_identity_but_charge_and_release_independently()
                     resident_bytes: 0,
                     unreclaimable_bytes: 0,
                     swapped_bytes: 0,
-                    cgroup_committed_bytes: None,
+                    cgroup_headroom_bytes: None,
                 })
             }),
         )),
@@ -958,7 +958,7 @@ fn post_reclaim_observation_replaces_pressure_state_without_reentering_reclaimer
                 resident_bytes: after_reclaim,
                 unreclaimable_bytes: after_reclaim,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     ));
@@ -1071,7 +1071,7 @@ fn allocator_trim_readmits_growth_when_memory_recovers_inside_checkpoint_throttl
                 resident_bytes: observed,
                 unreclaimable_bytes: observed,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     ));
@@ -1197,11 +1197,11 @@ fn process_status_splits_clean_file_pages_from_unreclaimable_bytes() {
             resident_bytes: 3_355_444 * 1024,
             unreclaimable_bytes: 2_548_172 * 1024,
             swapped_bytes: 491_520 * 1024,
-            cgroup_committed_bytes: None,
+            cgroup_headroom_bytes: None,
         })
     );
     assert_eq!(
-        sample.map(super::ProcessResidentSampleV1::admission_bytes),
+        sample.map(|sample| sample.admission_bytes(u64::MAX)),
         Some((2_548_172 + 491_520) * 1024),
         "swapped anonymous pages are the daemon's heap and count toward admission"
     );
@@ -1232,7 +1232,7 @@ fn macos_phys_footprint_is_the_admission_charge() {
     assert_eq!(sample.resident_bytes, 6_400 * 1024 * 1024);
     assert_eq!(sample.unreclaimable_bytes, 5_200 * 1024 * 1024);
     assert_eq!(
-        sample.admission_bytes(),
+        sample.admission_bytes(u64::MAX),
         5_200 * 1024 * 1024,
         "jetsam charges phys_footprint, not the larger resident_size"
     );
@@ -1244,12 +1244,12 @@ fn macos_phys_footprint_is_the_admission_charge() {
     let internal_only = super::process_resident_sample_from_macos_vm_info_v1(8, 0, 5)
         .expect("internal is the fallback when footprint is missing");
     assert_eq!(internal_only.unreclaimable_bytes, 5);
-    assert_eq!(internal_only.admission_bytes(), 5);
+    assert_eq!(internal_only.admission_bytes(u64::MAX), 5);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn cgroup_committed_bytes_refuse_growth_that_unreclaimable_bytes_would_admit() {
+fn cgroup_headroom_bytes_refuse_growth_that_unreclaimable_bytes_would_admit() {
     let limit_bytes = 100 * 1024 * 1024;
     let limit = bytes(limit_bytes);
     let decide = |memory_max: &str, inactive_file: u64| {
@@ -1265,12 +1265,12 @@ fn cgroup_committed_bytes_refuse_growth_that_unreclaimable_bytes_would_admit() {
             format!("inactive_file {inactive_file}\n"),
         )
         .expect("stat");
-        let committed = super::cgroup_committed_bytes_v1(&proc_self_cgroup, &cgroup_root);
+        let committed = super::cgroup_headroom_bytes_v1(&proc_self_cgroup, &cgroup_root);
         let sample = Arc::new(Mutex::new(super::ProcessResidentSampleV1 {
             resident_bytes: 10,
             unreclaimable_bytes: 10,
             swapped_bytes: 0,
-            cgroup_committed_bytes: committed,
+            cgroup_headroom_bytes: committed,
         }));
         let sampled = Arc::clone(&sample);
         let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
@@ -1303,6 +1303,119 @@ fn cgroup_committed_bytes_refuse_growth_that_unreclaimable_bytes_would_admit() {
     assert!(
         decide("max\n", 0).is_ok(),
         "an unlimited cgroup does not treat memory.current as a kill line"
+    );
+    assert!(
+        decide(&format!("{}\n", 10 * limit_bytes), 0).is_ok(),
+        "a larger shared cgroup with room does not spend the daemon's smaller process budget"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cgroup_headroom_respects_a_larger_but_fuller_ancestor() {
+    const MIB: u64 = 1024 * 1024;
+    let (_directory, membership, root) = cgroup_fixture(
+        Some("0::/trace.slice/daemon.scope\n"),
+        Some(&format!("{}\n", 400 * MIB)),
+        None,
+    );
+    let leaf = root.join("trace.slice/daemon.scope");
+    let parent = root.join("trace.slice");
+    fs::write(leaf.join("memory.current"), (20 * MIB).to_string()).unwrap();
+    fs::write(parent.join("memory.max"), (1000 * MIB).to_string()).unwrap();
+    fs::write(parent.join("memory.current"), (990 * MIB).to_string()).unwrap();
+    assert_eq!(
+        super::cgroup_headroom_bytes_v1(&membership, &root),
+        Some(10 * MIB)
+    );
+    fs::write(parent.join("memory.current"), (900 * MIB).to_string()).unwrap();
+    assert_eq!(
+        super::cgroup_headroom_bytes_v1(&membership, &root),
+        Some(100 * MIB)
+    );
+}
+
+#[test]
+fn sized_reservations_charge_only_the_measured_cgroup_headroom() {
+    const MIB: u64 = 1024 * 1024;
+    let limit = bytes(800 * MIB);
+    let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
+        limit,
+        Arc::new(|| {
+            Some(ProcessResidentSampleV1 {
+                resident_bytes: 100 * MIB,
+                unreclaimable_bytes: 100 * MIB,
+                swapped_bytes: 0,
+                cgroup_headroom_bytes: Some(200 * MIB),
+            })
+        }),
+    ));
+    let authority = Arc::new(ProcessResidentMemoryV1::with_pressure(limit, pressure));
+    let watermark = authority.admission_watermark_bytes();
+    let headroom = authority.headroom_below(watermark);
+    assert_eq!(headroom.available_bytes, 200 * MIB);
+    let owner = key("project-a", "worktree-a", "generation-a", "text-build");
+    let held = authority
+        .reserve_up_to(owner, bytes(headroom.available_bytes + 1), watermark)
+        .expect("the actual allocation fits without charging the 80 MiB watermark band");
+    assert_eq!(held.reserved_bytes(), 200 * MIB);
+    assert_eq!(authority.snapshot().used_bytes, 200 * MIB);
+    drop(held);
+    assert_eq!(authority.snapshot().used_bytes, 0);
+}
+
+#[test]
+fn narrowed_budgets_and_waiters_share_cgroup_capacity_without_charging_peers() {
+    const MIB: u64 = 1024 * 1024;
+    let room = Arc::new(AtomicU64::new(560 * MIB));
+    let sampled = Arc::clone(&room);
+    let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
+        bytes(800 * MIB),
+        Arc::new(move || {
+            Some(ProcessResidentSampleV1 {
+                resident_bytes: 10 * MIB,
+                unreclaimable_bytes: 10 * MIB,
+                swapped_bytes: 0,
+                cgroup_headroom_bytes: Some(sampled.load(Ordering::SeqCst)),
+            })
+        }),
+    ));
+    let authority = Arc::new(ProcessResidentMemoryV1::with_pressure(
+        bytes(80 * MIB),
+        Arc::clone(&pressure),
+    ));
+    assert_eq!(authority.headroom_below(80 * MIB).available_bytes, 70 * MIB);
+
+    room.store(10 * MIB, Ordering::SeqCst);
+    assert_eq!(authority.headroom_below(80 * MIB).available_bytes, 0);
+    let epoch = pressure.subscribe_headroom();
+    let before = *epoch.borrow();
+    authority.wait_for_headroom(16 * MIB, 80 * MIB);
+    authority.wait_for_headroom(40 * MIB, 100 * MIB);
+    room.store(20 * MIB, Ordering::SeqCst);
+    pressure.sample_and_publish();
+    // The shared process latch remains raised until its low watermark clears.
+    assert_eq!(*epoch.borrow(), before);
+    room.store(200 * MIB, Ordering::SeqCst);
+    pressure.sample_and_publish();
+    assert!(*epoch.borrow() > before);
+    assert_eq!(authority.headroom_below(80 * MIB).available_bytes, 70 * MIB);
+
+    // With a nominal process latch, a request still waits for its own room.
+    room.store(100 * MIB, Ordering::SeqCst);
+    pressure.sample_and_publish();
+    let before = *epoch.borrow();
+    authority.wait_for_headroom(200 * MIB, 400 * MIB);
+    authority.wait_for_headroom(160 * MIB, 400 * MIB);
+    authority.wait_for_headroom(240 * MIB, 400 * MIB);
+    authority.wait_for_headroom(200 * MIB, 300 * MIB);
+    pressure.sample_and_publish();
+    assert_eq!(*epoch.borrow(), before);
+    room.store(180 * MIB, Ordering::SeqCst);
+    pressure.sample_and_publish();
+    assert!(
+        *epoch.borrow() > before,
+        "the satisfiable request wakes the common epoch"
     );
 }
 
@@ -1367,8 +1480,8 @@ fn admission_counts_swapped_anonymous_pages() {
     fs::write(cgroup.join("memory.stat"), "inactive_file 0\n").expect("stat");
     fs::write(cgroup.join("memory.swap.current"), format!("{resident}\n")).expect("swap");
     assert_eq!(
-        super::cgroup_committed_bytes_v1(&proc_self_cgroup, &cgroup_root),
-        Some(2 * resident),
+        super::cgroup_headroom_bytes_v1(&proc_self_cgroup, &cgroup_root),
+        Some(limit_bytes - 2 * resident),
         "the cgroup's swapped pages are committed to it"
     );
 }
@@ -1392,7 +1505,7 @@ fn checkpoints_read_the_process_once_per_interval_and_then_see_growth() {
                 resident_bytes: resident,
                 unreclaimable_bytes: resident,
                 swapped_bytes: 0,
-                cgroup_committed_bytes: None,
+                cgroup_headroom_bytes: None,
             })
         }),
     );
@@ -1437,7 +1550,7 @@ fn headroom_is_the_ceiling_less_the_larger_of_ledger_and_measurement() {
                     resident_bytes: observed,
                     unreclaimable_bytes: observed,
                     swapped_bytes: 0,
-                    cgroup_committed_bytes: None,
+                    cgroup_headroom_bytes: None,
                 })
             }),
         )),
@@ -1493,7 +1606,7 @@ fn allocator_reclaim_preserves_cgroup_pressure_until_sample_recovers() {
         resident_bytes: 1,
         unreclaimable_bytes: 1,
         swapped_bytes: 0,
-        cgroup_committed_bytes: Some(limit.get()),
+        cgroup_headroom_bytes: Some(0),
     }));
     let sampled = Arc::clone(&sample);
     let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
@@ -1520,7 +1633,7 @@ fn allocator_reclaim_preserves_cgroup_pressure_until_sample_recovers() {
         Err(ResidentMemoryAdmissionFailureV1::ObservedOverBudget { .. })
     ));
 
-    sample.lock().expect("sample").cgroup_committed_bytes = Some(1);
+    sample.lock().expect("sample").cgroup_headroom_bytes = Some(limit.get() - 1);
     assert_eq!(pressure.measure_admission_bytes(), 1);
     assert!(matches!(
         pressure.state(),
@@ -1534,4 +1647,102 @@ fn allocator_reclaim_preserves_cgroup_pressure_until_sample_recovers() {
             )
             .is_ok()
     );
+}
+
+#[test]
+fn sized_admission_remeasures_and_charges_the_supported_smaller_budget() {
+    const MIB: u64 = 1024 * 1024;
+    let measured = Arc::new(AtomicU64::new(300 * MIB));
+    let sampled = Arc::clone(&measured);
+    let reads = Arc::new(AtomicU64::new(0));
+    let sampled_reads = Arc::clone(&reads);
+    let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
+        bytes(1000 * MIB),
+        Arc::new(move || {
+            sampled_reads.fetch_add(1, Ordering::SeqCst);
+            let observed = sampled.load(Ordering::SeqCst);
+            Some(ProcessResidentSampleV1 {
+                resident_bytes: observed,
+                unreclaimable_bytes: observed,
+                swapped_bytes: 0,
+                cgroup_headroom_bytes: None,
+            })
+        }),
+    ));
+    let authority = Arc::new(ProcessResidentMemoryV1::with_pressure(
+        bytes(1000 * MIB),
+        Arc::clone(&pressure),
+    ));
+    let watermark = authority.admission_watermark_bytes();
+    assert_eq!(watermark, 900 * MIB);
+    assert_eq!(
+        authority.headroom_below(watermark).available_bytes,
+        600 * MIB
+    );
+    measured.store(700 * MIB, Ordering::SeqCst);
+    let before = reads.load(Ordering::SeqCst);
+    let reservation = authority
+        .reserve_up_to(
+            key("project-a", "worktree-a", "generation-a", "text-build"),
+            bytes(600 * MIB),
+            watermark,
+        )
+        .expect("the smaller build fits despite growth since planning");
+    assert_eq!(reads.load(Ordering::SeqCst), before + 1);
+    assert_eq!(reservation.reserved_bytes(), 200 * MIB);
+    assert_eq!(authority.snapshot().used_bytes, 200 * MIB);
+    drop(reservation);
+    assert_eq!(authority.snapshot().used_bytes, 0);
+
+    measured.store(950 * MIB, Ordering::SeqCst);
+    let refused = authority
+        .reserve_up_to(
+            key("project-a", "worktree-a", "generation-b", "text-build"),
+            bytes(600 * MIB),
+            watermark,
+        )
+        .expect_err("sizing must still refuse measured pressure");
+    assert!(refused.is_observed_over_budget());
+    assert_eq!(authority.snapshot().used_bytes, 0);
+}
+
+#[test]
+fn sized_admissions_share_the_watermark_without_charging_its_margin() {
+    let pressure = Arc::new(ResidentMemoryPressureV1::with_sampler(
+        bytes(1000),
+        Arc::new(|| None),
+    ));
+    let authority = Arc::new(ProcessResidentMemoryV1::with_pressure(
+        bytes(1000),
+        pressure,
+    ));
+    let watermark = authority.admission_watermark_bytes();
+    let owner = key("project-a", "worktree-a", "generation-a", "text-build");
+    let mut reservations = (0..3)
+        .map(|_| {
+            authority
+                .reserve_up_to(owner.clone(), bytes(300), watermark)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(authority.snapshot().used_bytes, 900);
+    let refused = authority
+        .reserve_up_to(owner.clone(), bytes(300), watermark)
+        .unwrap_err();
+    assert_eq!(
+        refused,
+        ResidentMemoryAdmissionFailureV1::ReservationCeiling {
+            used_bytes: 900,
+            requested_bytes: 300,
+            limit_bytes: 900,
+        }
+    );
+    drop(reservations.pop());
+    let maximum = authority
+        .reserve_up_to(owner, bytes(u64::MAX), watermark)
+        .expect("bounded sizing cannot overflow while reserving available bytes");
+    assert_eq!(maximum.reserved_bytes(), 300);
+    assert_eq!(authority.snapshot().used_bytes, 900);
+    drop((reservations, maximum));
+    assert_eq!(authority.snapshot().used_bytes, 0);
 }

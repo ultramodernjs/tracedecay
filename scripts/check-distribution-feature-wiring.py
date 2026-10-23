@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Validate source and packaged Cargo feature ownership for distribution builds.
+"""Validate source feature ownership and the NCM release contract.
 
-The checks are public-contract and layering rules only: the packaged manifest
-must carry the source feature set, optional native dependencies must stay
-optional and feature-wired, and the supported `lang-*` surface must match the
-extraction owner. How a feature is forwarded through intermediate crates is
-Cargo's job; resolved behavior is proven by the packaged-artifact builds and
-launch checks in check-distribution-acceptance.sh. Per-language isolation
-compiles run via `--check-extraction-manifest` inside the isolated Bazel fixture
-and are not part of the release acceptance gate.
+Unpublished-crate distribution acceptance was retired upstream. Keep the
+fork's source-contract and NCM guards independent of that build pipeline:
+optional dependencies stay feature-wired and public `lang-*` aliases match
+the extraction owner. Explicit --*-packaged paths may still be supplied to
+compare normalized manifests, but no packaging or compilation runs here.
 
 When the source manifest is this checkout's production manifest, the gate also
 validates the explicit NCM distribution matrix: arm64 macOS V2 is the only
@@ -22,10 +19,8 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import os
 from pathlib import Path
 import re
-import subprocess
 import tomllib
 from typing import Any
 
@@ -216,78 +211,6 @@ def require_language_surface(
         )
 
 
-def require_isolated_language_features_compile(
-    manifest_path: Path,
-    authority_features: set[str],
-    cargo_config: Path | None,
-    offline: bool,
-) -> None:
-    manifest = load(manifest_path)
-    package_name = manifest.get("package", {}).get("name")
-    if not isinstance(package_name, str):
-        raise SystemExit(
-            "distribution acceptance: extraction build manifest has no package name"
-        )
-
-    build_features = language_feature_names(manifest.get("features", {}))
-    if build_features != authority_features:
-        raise SystemExit(
-            "distribution acceptance: extraction build manifest language features "
-            "differ from the packaged authority"
-        )
-
-    cargo = os.environ.get("CARGO")
-    rustc = os.environ.get("RUSTC")
-    scratch = os.environ.get("TEST_TMPDIR")
-    if (
-        not cargo
-        or not Path(cargo).is_absolute()
-        or not Path(cargo).is_file()
-        or not rustc
-        or not Path(rustc).is_absolute()
-        or not Path(rustc).is_file()
-        or not scratch
-        or not Path(scratch).is_dir()
-        or not manifest_path.resolve().is_relative_to(Path(scratch).resolve())
-    ):
-        raise SystemExit(
-            "distribution acceptance: isolated extraction compilation requires "
-            "the Bazel test's declared CARGO, RUSTC and TEST_TMPDIR"
-        )
-
-    for feature in sorted(authority_features):
-        command = [
-            cargo,
-            "check",
-            "--manifest-path",
-            str(manifest_path),
-            "--package",
-            package_name,
-            "--lib",
-            "--no-default-features",
-            "--features",
-            feature,
-        ]
-        if cargo_config is not None:
-            command.extend(["--config", str(cargo_config)])
-        if offline:
-            command.append("--offline")
-        completed = subprocess.run(
-            command,
-            cwd=manifest_path.parent,
-            env={**os.environ, "CARGO_TARGET_DIR": str(manifest_path.parent / "target")},
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            details = completed.stderr.strip() or completed.stdout.strip()
-            raise SystemExit(
-                f"distribution acceptance: {feature} does not compile in isolation"
-                + (f"\n{details}" if details else "")
-            )
-
-
 def _ncm_failure(message: str) -> None:
     raise SystemExit(f"distribution acceptance: NCM {message}")
 
@@ -308,20 +231,25 @@ def _load_worker_platform_policy_module() -> Any:
     return module
 
 
-def _load_release_profile_module() -> Any:
-    """Load the source-tag release feature resolver without package imports."""
-    module_path = Path(__file__).with_name("resolve-release-source-profile.py")
-    spec = importlib.util.spec_from_file_location(
-        "tracedecay_distribution_release_profile", module_path
-    )
-    if spec is None or spec.loader is None:
-        _ncm_failure(f"release source profile resolver is unavailable: {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as error:
-        _ncm_failure(f"release source profile resolver could not load: {error}")
-    return module
+def expand_local_features(
+    features: dict[str, list[str]], selected: list[str]
+) -> set[str]:
+    """Traverse local aliases; dependency feature edges remain Cargo's job.
+
+    Retained from the retired release-source-profile resolver so the NCM
+    guard does not depend on unpublished-crate distribution tooling.
+    """
+    resolved: set[str] = set()
+    pending = list(selected)
+    while pending:
+        feature = pending.pop()
+        if feature in resolved:
+            continue
+        resolved.add(feature)
+        for member in features.get(feature, []):
+            if member in features:
+                pending.append(member)
+    return resolved
 
 
 def _ncm_feature_members(manifest: dict[str, Any], feature: str, label: str) -> set[str]:
@@ -491,7 +419,14 @@ def _require_ncm_release_workflow(path: Path) -> None:
             rf"(?ms)^      - name: {re.escape(step)}\n(.*?)(?=^      - |\Z)",
             workflow,
         )
-        if match is None or "        if: matrix.ncm == 'supported'\n" not in match[1]:
+        # Recovery jobs only rebuild inventory and have no CLI/worker to
+        # package. Accept that additional restriction, never an OR that could
+        # admit Native-only targets or an arbitrary replacement condition.
+        guard = None if match is None else re.search(r"(?m)^        if: (.+)$", match[1])
+        if guard is None or guard[1] not in {
+            "matrix.ncm == 'supported'",
+            "matrix.ncm == 'supported' && matrix.inventory_only != true",
+        }:
             _ncm_failure(
                 f"release workflow {path.name} must guard {step!r} with the "
                 "supported sidecar target"
@@ -849,8 +784,7 @@ def _require_ncm_release_profile(
     if not isinstance(root_features, dict):
         _ncm_failure("root manifest has no feature table for release profile validation")
     _ncm_feature_members(root_manifest, "production", "root manifest")
-    resolver = _load_release_profile_module()
-    root_production = resolver.expand_local_features(root_features, ["production"])
+    root_production = expand_local_features(root_features, ["production"])
     forbidden = root_production & {"memory-provider-host", "test-transport"}
     if forbidden:
         _ncm_failure(
@@ -861,7 +795,7 @@ def _require_ncm_release_profile(
     if not isinstance(cli_features, dict):
         _ncm_failure("CLI manifest has no feature table for release profile validation")
     defaults = _ncm_feature_members(cli_manifest, "default", "CLI manifest")
-    cli_defaults = resolver.expand_local_features(cli_features, sorted(defaults))
+    cli_defaults = expand_local_features(cli_features, sorted(defaults))
     missing = {"production", "memory-provider-host"} - cli_defaults
     if missing:
         _ncm_failure("CLI default must enable " + ", ".join(sorted(missing)))
@@ -874,7 +808,7 @@ def _require_ncm_release_profile(
     }:
         _ncm_failure("CLI default must exclude test-transport")
     host_members: set[str] = set()
-    for feature in resolver.expand_local_features(cli_features, ["memory-provider-host"]):
+    for feature in expand_local_features(cli_features, ["memory-provider-host"]):
         host_members.update(_ncm_feature_members(cli_manifest, feature, "CLI manifest"))
     required_host_members = {
         "tracedecay/memory-provider-host",
@@ -1038,20 +972,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    # Source manifests default to this checkout; packaged manifests must be
-    # the extracted `.crate` trees, so they have no default, comparing a
-    # manifest with itself is not package verification.
+    # Default to source-contract validation, not package verification. Optional
+    # normalized manifests retain the comparison API used by regression fixtures.
     parser.add_argument("--root-source", type=Path, default=root_manifest)
-    parser.add_argument("--root-packaged", type=Path, required=True)
+    parser.add_argument("--root-packaged", type=Path)
     parser.add_argument("--code-index-source", type=Path, default=code_index_manifest)
-    parser.add_argument("--code-index-packaged", type=Path, required=True)
+    parser.add_argument("--code-index-packaged", type=Path)
     parser.add_argument("--extraction-source", type=Path, default=extraction_manifest)
-    parser.add_argument("--extraction-packaged", type=Path, required=True)
+    parser.add_argument("--extraction-packaged", type=Path)
     parser.add_argument("--cli-source", type=Path, default=cli_manifest)
-    parser.add_argument("--cli-packaged", type=Path, required=True)
-    parser.add_argument("--check-extraction-manifest", type=Path)
-    parser.add_argument("--cargo-config", type=Path)
-    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--cli-packaged", type=Path)
     parser.add_argument("--ncm-platform-policy", type=Path)
     parser.add_argument("--ncm-worker-manifest", type=Path)
     parser.add_argument("--ncm-model-manifest", type=Path)
@@ -1064,27 +994,19 @@ def main() -> int:
     parser.add_argument("--ncm-release-workflow", type=Path, action="append")
     arguments = parser.parse_args()
     root_source = load(arguments.root_source)
-    extraction_packaged = load(arguments.extraction_packaged)
+    extraction_packaged = load(arguments.extraction_packaged or arguments.extraction_source)
     validate(
         root_source,
-        load(arguments.root_packaged),
+        load(arguments.root_packaged or arguments.root_source),
         load(arguments.code_index_source),
-        load(arguments.code_index_packaged),
+        load(arguments.code_index_packaged or arguments.code_index_source),
         load(arguments.extraction_source),
         extraction_packaged,
         load(arguments.cli_source),
-        load(arguments.cli_packaged),
+        load(arguments.cli_packaged or arguments.cli_source),
     )
-    if arguments.check_extraction_manifest is not None:
-        require_isolated_language_features_compile(
-            arguments.check_extraction_manifest,
-            language_feature_names(extraction_packaged.get("features", {})),
-            arguments.cargo_config,
-            arguments.offline,
-        )
-    # The archive acceptance script supplies a source manifest from this
-    # checkout. Fixture callers use temporary source manifests and therefore
-    # opt out unless they pass an explicit NCM policy path.
+    # Production source checks always validate NCM. Temporary fixture roots
+    # opt in explicitly so generic feature fixtures need no release assets.
     ncm_policy_path = arguments.ncm_platform_policy
     if ncm_policy_path is None and arguments.root_source.resolve() == root_manifest.resolve():
         ncm_policy_path = ncm_policy
@@ -1130,7 +1052,7 @@ def main() -> int:
                 else None
             ),
         )
-    print("distribution feature wiring is valid")
+    print("source feature wiring and NCM release contracts are valid")
     return 0
 
 

@@ -249,6 +249,55 @@ impl GraphDbRegistry {
         generation: &tracedecay_domain::CodeGenerationId,
         sealed_state_digest: &crate::SealedGraphStateDigest,
     ) -> Result<GraphReplayCollectionOutcome, GraphDbError> {
+        self.retire_code_generation_replay(
+            registration,
+            authority,
+            context,
+            generation,
+            sealed_state_digest,
+            None,
+        )
+    }
+
+    /// Retire a shared code-shard head only under the caller's freshly
+    /// revalidated vanished-scope authority. Exact head CAS, inbound
+    /// dependencies, pending publishers and every live reader still veto it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_one_removed_scope_code_generation_replay(
+        &self,
+        registration: GraphDbRegistration,
+        authority: &mut dyn GraphPublicationStoreV1,
+        context: &GraphPublicationOperationContextV1<'_>,
+        generation: &tracedecay_domain::CodeGenerationId,
+        sealed_state_digest: &crate::SealedGraphStateDigest,
+        removed_projection: &GraphProjectionIdentityV1,
+        revalidate_scope: &dyn Fn() -> Result<(), GraphDbError>,
+    ) -> Result<GraphReplayCollectionOutcome, GraphDbError> {
+        require_projection_binding(&registration, removed_projection)?;
+        revalidate_scope()?;
+        self.retire_code_generation_replay(
+            registration,
+            authority,
+            context,
+            generation,
+            sealed_state_digest,
+            Some((removed_projection, revalidate_scope)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn retire_code_generation_replay(
+        &self,
+        registration: GraphDbRegistration,
+        authority: &mut dyn GraphPublicationStoreV1,
+        context: &GraphPublicationOperationContextV1<'_>,
+        generation: &tracedecay_domain::CodeGenerationId,
+        sealed_state_digest: &crate::SealedGraphStateDigest,
+        removed_scope: Option<(
+            &GraphProjectionIdentityV1,
+            &dyn Fn() -> Result<(), GraphDbError>,
+        )>,
+    ) -> Result<GraphReplayCollectionOutcome, GraphDbError> {
         check_all(&registration, context, "generation.publication")?;
         let database = self.resolve(registration.clone())?;
         let mut projections = Vec::new();
@@ -413,32 +462,29 @@ impl GraphDbRegistry {
         // Every verified head is serving authority. A code-shard head stays
         // authority even while its generation is deleted, because one shared
         // projection serves every generation of the scope until a successor
-        // publish supersedes it; only per-generation namespaces make a
-        // deleted generation's head disposable.
+        // publish supersedes it. A per-generation namespace, or the exact
+        // projection authorized by a freshly proven vanished scope, makes
+        // a deleted generation's head disposable.
         retained.extend(
             heads
                 .keys()
                 .filter(|locator| {
                     !candidate_locators.contains(*locator)
-                        || is_code_graph_shard_namespace(&locator.projection.namespace)
+                        || (is_code_graph_shard_namespace(&locator.projection.namespace)
+                            && !removed_scope.is_some_and(|(projection, _)| {
+                                projection.namespace.as_str()
+                                    == locator.projection.namespace.as_str()
+                                    && projection.projection.as_str()
+                                        == locator.projection.projection.as_str()
+                            }))
                 })
                 .cloned(),
         );
         if candidates.is_empty() {
             for (locator, _) in retired_cleanup {
-                if matches!(
-                    database.delete_generation_contents(&locator, &|| {
-                        check_registration_request(&registration, "publication.retired_cleanup")
-                    })?,
-                    GenerationContentsDeletion::RetentionPending
-                ) {
-                    tracing::info!(
-                        event = "graph_replay_retirement_pending",
-                        generation = generation.as_str(),
-                        "retired cleanup deferred until the staging engine is already open"
-                    );
-                    return Ok(GraphReplayCollectionOutcome::RetentionPending);
-                }
+                database.delete_generation_contents(&locator, &|| {
+                    check_registration_request(&registration, "publication.retired_cleanup")
+                })?;
             }
             return Ok(GraphReplayCollectionOutcome::Absent);
         }
@@ -446,8 +492,8 @@ impl GraphDbRegistry {
             let mut state = database.wait_verified_generations_write()?;
             for head in state.heads.values() {
                 if candidate_locators.contains(&head.locator) && Arc::strong_count(head) == 1 {
-                    // Once the code index deletes a per-generation head, the
-                    // registry's installed pointer is not reader liveness.
+                    // When durable authority permits head retirement, the
+                    // registry's installed pointer alone is not reader liveness.
                     // Its dependency closure remains protected; any snapshot
                     // clone raises the count and retains the whole lease.
                     for dependency in head.dependencies.values() {
@@ -509,6 +555,12 @@ impl GraphDbRegistry {
                 return Err(GraphDbError::invalid(error.to_string()));
             }
         };
+        if let Some((_, revalidate_scope)) = removed_scope
+            && let Err(error) = revalidate_scope()
+        {
+            clear_retiring_fence(&database, &locator)?;
+            return Err(error);
+        }
         let selected_head = heads.get(&locator);
         let retirement_outcome = match selected_head {
             Some(head) => authority.retire_verified_head_replay(&retirement, head, context),
@@ -530,32 +582,17 @@ impl GraphDbRegistry {
                         generation = generation.as_str(),
                         graph_generation = %locator.generation,
                         replay_sequence = replay.sequence.get(),
-                        "verified per-generation graph replay head retired"
+                        "verified disposable graph replay head retired"
                     );
                 }
-                // Retirement is the linearization point. A failure after it
-                // may leak derived bytes, but cannot destroy the source of an
-                // active relational replay. A hibernated engine must not be
-                // opened here: keep the queue entry and finish native delete
-                // on a later tick that already holds the engine open.
-                let deletion = match database.delete_generation_contents(&locator, &|| {
+                // Retirement is the source-release linearization point. Native
+                // cleanup may wait, with its replay payload durably retained,
+                // but must not stop the caller retiring other matching replays.
+                if let Err(error) = database.delete_generation_contents(&locator, &|| {
                     check_registration_request(&registration, "publication.replay_retirement")
                 }) {
-                    Ok(deletion) => deletion,
-                    Err(error) => {
-                        clear_retiring_fence(&database, &locator)?;
-                        return Err(error);
-                    }
-                };
-                if matches!(deletion, GenerationContentsDeletion::RetentionPending) {
                     clear_retiring_fence(&database, &locator)?;
-                    tracing::info!(
-                        event = "graph_replay_retirement_pending",
-                        generation = generation.as_str(),
-                        graph_generation = %locator.generation,
-                        "native row delete deferred until the staging engine is already open"
-                    );
-                    return Ok(GraphReplayCollectionOutcome::RetentionPending);
+                    return Err(error);
                 }
                 Ok(GraphReplayCollectionOutcome::Retired(Box::new(source)))
             }
@@ -671,6 +708,7 @@ impl GraphDbRegistry {
         sealed_state_digest: &crate::SealedGraphStateDigest,
     ) -> Result<bool, GraphDbError> {
         check_all(&registration, context, "generation.publication")?;
+        let database = self.resolve(registration.clone())?;
         let mut projection_after = None;
         loop {
             let request = GraphPublicationProjectionPageRequestV1::new(
@@ -726,6 +764,21 @@ impl GraphDbRegistry {
                                 return Err(GraphDbError::conflict(
                                     "publication.finalize_one_code_generation_replay_cleanup",
                                 ));
+                            }
+                            if matches!(
+                                database.delete_generation_contents(
+                                    &locator_from_key(&tombstone.key)?,
+                                    &|| {
+                                        check_all(
+                                            &registration,
+                                            context,
+                                            "publication.retired_cleanup",
+                                        )
+                                    }
+                                )?,
+                                GenerationContentsDeletion::RetentionPending
+                            ) {
+                                continue;
                             }
                             return match authority
                                 .finalize_retired_replay_cleanup(&tombstone.retirement(), context)
@@ -844,7 +897,48 @@ impl GraphDbRegistry {
             .verified_head(projection, context)
             .map_err(GraphDbError::from)?
         else {
-            return Ok(SupersededReplayRetirement::default());
+            // The last head and its source-release event may both be gone.
+            // Retained tombstoned payloads still enumerate native debt, and
+            // draining them must not depend on another publication arriving.
+            let mut receipt = SupersededReplayRetirement::default();
+            let mut after = None;
+            loop {
+                let request = GraphPublicationRetiredCleanupPageRequestV1::new(
+                    projection.clone(),
+                    after.clone(),
+                    MAX_GRAPH_REPLAY_PAGE_RECORDS_V1,
+                )
+                .map_err(|error| GraphDbError::invalid(error.to_string()))?;
+                let page = authority
+                    .retired_cleanup_page(&request, context)
+                    .map_err(GraphDbError::from)?;
+                for tombstone in page.records {
+                    if tombstone.key.projection != *projection {
+                        return Err(GraphDbError::Corrupt {
+                            message: "retired graph cleanup page escaped its projection".to_owned(),
+                        });
+                    }
+                    Self::finish_retired_replay(
+                        &database,
+                        &|| operation.check(self, context),
+                        authority,
+                        context,
+                        &locator_from_key(&tombstone.key)?,
+                        &tombstone.retirement(),
+                        &mut receipt,
+                    )?;
+                }
+                let Some(continuation) = page.continuation else {
+                    return Ok(receipt);
+                };
+                validate_replay_cursor(
+                    projection,
+                    after.as_ref(),
+                    &continuation,
+                    "retired graph cleanup",
+                )?;
+                after = Some(continuation);
+            }
         };
         let head_locator = locator_from_key(&head.key)?;
 
