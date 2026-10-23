@@ -421,9 +421,11 @@ def test_end_to_end():
 
         rc = subprocess.run(
             [sys.executable, os.path.join(HERE, "grade.py"), "--run-dir", rdir, "--scenarios", sdir],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
         )
         check("e2e: grade.py exit 0", rc.returncode == 0, rc.stderr[-400:])
+        check("e2e: report stdout is UTF-8 even with a Windows pipe encoding", "Δ" in rc.stdout)
         sb = json.load(open(os.path.join(rdir, "scoreboard.json")))
         by_cond = {r["condition"]: r for r in sb["results"]}
         check("e2e: both conditions graded", set(by_cond) == {"full", "bare"})
@@ -854,7 +856,7 @@ def test_scenario_selection():
         path.write_bytes(source)
         command = [sys.executable, str(Path(HERE) / "select_scenarios.py"),
                    work, "custom_case", "0", "", "1"]
-        selected = subprocess.run(command, capture_output=True, text=True)
+        selected = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
         rows = [line.split("\t") for line in selected.stdout.splitlines()]
         check("runner: custom filename selects the declared id for both hosts",
               selected.returncode == 0 and len(rows) == 2
@@ -865,11 +867,11 @@ def test_scenario_selection():
                   "Rename the stock check. Preserve behavior."
               ] for row, host in zip(rows, ["claude", "codex"])))
         path.write_bytes(source + b"\n")
-        changed = subprocess.run(command, capture_output=True, text=True)
+        changed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
         check("runner: scenario byte changes update the selected identity",
               changed.returncode == 0 and bool(changed.stdout)
               and changed.stdout.split("\t")[4] == hashlib.sha256(source + b"\n").hexdigest())
-        excluded = subprocess.run(command[:-1] + ["0"], capture_output=True, text=True)
+        excluded = subprocess.run(command[:-1] + ["0"], capture_output=True, text=True, encoding="utf-8")
         check("runner: baseline opt-in remains required",
               excluded.returncode == 0 and not excluded.stdout)
 
@@ -934,7 +936,7 @@ def test_claude_permissions():
         result = subprocess.run(
             ["bash", "-c", 'source "$1" && claude_allowed_tools "$2" "$3"',
              "permissions", str(Path(HERE) / "claude_tools.sh"), condition, "/tmp/eval binary"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8",
         )
         allowed = set(result.stdout.strip().split(","))
         check(f"permissions: {condition} retains identical native editing capabilities",
@@ -1062,7 +1064,7 @@ def test_learned_skill_end_to_end():
                            "learned_skill_variant": variant, "learned_skill_id": skill}, f)
         rc = subprocess.run(
             [sys.executable, os.path.join(HERE, "grade.py"), "--run-dir", rdir, "--scenarios", sdir],
-            capture_output=True, text=True)
+            capture_output=True, text=True, encoding="utf-8")
         check("learned e2e: grade.py exit 0", rc.returncode == 0, rc.stderr[-400:])
         sb = json.load(open(os.path.join(rdir, "scoreboard.json")))
         rows = {r["variant"]: r for r in sb.get("learned_skill", [])}
@@ -1238,7 +1240,7 @@ def test_outcome_vs_adoption():
                 with open(os.path.join(rdir, base + ".effects.json"), "w") as f:
                     json.dump(snapshot, f)
         rc = subprocess.run([sys.executable, os.path.join(HERE, "grade.py"), "--run-dir", rdir, "--scenarios", sdir],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, encoding="utf-8")
         sb = json.load(open(os.path.join(rdir, "scoreboard.json")))
         status = sorted(r["correctness"]["status"] for r in sb["results"])
         check("effect e2e: snapshot files reach the grader per run",

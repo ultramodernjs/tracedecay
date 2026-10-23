@@ -14,6 +14,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{ProjectId, canonical_sha256};
 use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_runtime_core::native_runtime;
+use tracedecay_runtime_core::path_safety::canonical_root_identity;
 use tracedecay_runtime_core::storage::StoreLayout;
 
 use crate::lease::ProjectStoreMaintenanceLeaseV1;
@@ -101,21 +102,36 @@ pub fn plan_project_graph_replay_releases(
         .project_id
         .as_deref()
         .ok_or_else(|| release_error("graph replay project identity unavailable"))?;
-    let store_root = code_index_store_root(&layout.data_root, checkout_root);
+    // Scope hashes use the scheduler's plain canonical identity. In
+    // particular, std::fs::canonicalize returns a different (`\\?\`)
+    // spelling on Windows. Resolve before lookup and provenance comparison,
+    // including for removed checkouts whose existing parent is still known.
+    let checkout_identity = canonical_root_identity(checkout_root);
+    let canonical_store = code_index_store_root(&layout.data_root, &checkout_identity);
+    let requested_store = code_index_store_root(&layout.data_root, checkout_root);
+    let layout_identity = canonical_root_identity(&layout.project_root);
     let scopes = tracedecay_code_index_retention::code_index_generations::code_index_scopes(
         &layout.data_root,
     )
     .map_err(|error| release_error(error.to_string()))?;
-    if !scopes.iter().any(|scope| {
-        scope.store_root == store_root
-            && (scope.recorded_root.as_deref() == Some(checkout_root)
-                || checkout_root == layout.project_root)
-    }) {
-        return Err(release_error(
-            "graph replay checkout root is not recorded for this scope",
-        ));
-    }
-    plan_graph_replay_releases(project_id, &store_root, checkout_root, after)
+    let proven_scope = |store_root: &Path| {
+        scopes.iter().find(|scope| {
+            scope.store_root == store_root
+                // code_index_scopes already verified that the record hashes
+                // to this exact directory; normalization must not bypass it.
+                && (scope.recorded_root.as_deref().is_some_and(|recorded| {
+                    canonical_root_identity(recorded) == checkout_identity
+                }) || checkout_identity == layout_identity)
+        })
+    };
+    let scope = proven_scope(&canonical_store)
+        // Preserve an explicitly requested legacy scope hashed with a raw
+        // spelling, but only under the same strict provenance checks.
+        .or_else(|| proven_scope(&requested_store))
+        .ok_or_else(|| {
+            release_error("graph replay checkout root is not recorded for this scope")
+        })?;
+    plan_graph_replay_releases(project_id, &scope.store_root, &checkout_identity, after)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -168,7 +184,6 @@ pub async fn release_graph_replays(
             "graph replay maintenance lease identity mismatch",
         ));
     }
-    let store_root = code_index_store_root(&layout.data_root, checkout_root);
     let layout = layout.clone();
     let checkout = checkout_root.to_path_buf();
     let after = after.map(str::to_owned);
@@ -190,6 +205,9 @@ pub async fn release_graph_replays(
             "graph replay apply requires admitted write authority",
         ));
     }
+    // The preview selected and bound this exact queue into its digest; do not
+    // recompute it from the caller's potentially different path spelling.
+    let store_root = plan.store_root.clone();
     let mut released = 0;
     let mut retained = 0;
     for release in &plan.releases {

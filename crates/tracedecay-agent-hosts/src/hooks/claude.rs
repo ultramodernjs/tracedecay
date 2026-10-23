@@ -97,13 +97,12 @@ pub async fn hook_claude_post_compact(runtime: &HookRuntimeV1) -> i32 {
 /// Claude Code `PostToolUse` / `PostToolUseFailure` hook handler.
 #[tracing::instrument(name = "hosts.hooks.claude.post_tool_use", level = "trace", skip_all)]
 pub async fn hook_claude_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
-    let started = Instant::now();
     let event = read_hook_event!(
         runtime,
         tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
         "PostToolUse"
     );
-    let (root, response) = claude_post_tool_use_response(runtime, &event, started).await;
+    let (root, response) = claude_post_tool_use_response(runtime, &event).await;
     if let Some(response) = response
         && !super::write_hook_output(
             &runtime.profile,
@@ -124,7 +123,6 @@ pub async fn hook_claude_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
 async fn claude_post_tool_use_response(
     runtime: &HookRuntimeV1,
     event: &str,
-    started: Instant,
 ) -> (Option<PathBuf>, Option<String>) {
     let parsed = serde_json::from_str::<Value>(event).unwrap_or(Value::Null);
     let hook_event_name = if is_post_tool_use_failure_event(&parsed) {
@@ -165,7 +163,6 @@ pub async fn hook_stop(runtime: &HookRuntimeV1) -> i32 {
 /// SessionStart and Stop share one guidance envelope. The project root is
 /// resolved once and reused for both dispatch and stdout delivery.
 async fn claude_guidance_hook(runtime: &HookRuntimeV1, hook_name: &'static str) -> i32 {
-    let started = Instant::now();
     let event = read_hook_event!(
         runtime,
         tracedecay_domain::NativeHostIdentityV1::ClaudeCode,

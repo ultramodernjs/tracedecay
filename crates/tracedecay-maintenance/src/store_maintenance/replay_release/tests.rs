@@ -10,6 +10,60 @@ use tracedecay_code_index_retention::code_index_generations::{
     plan_code_generation_retention,
 };
 
+#[test]
+fn project_preview_uses_canonical_checkout_identity_for_scope_and_confirmation() {
+    use tracedecay_code_index_retention::code_index_generations::record_scope_root;
+    use tracedecay_runtime_core::path_safety::canonical_existing_identity;
+
+    let temp = tempfile::tempdir().expect("isolated release fixture");
+    let checkout = temp.path().join("checkout");
+    std::fs::create_dir(&checkout).expect("checkout");
+    // On Windows these are respectively plain C:\ and verbatim \\?\C:\.
+    let plain = canonical_existing_identity(&checkout).expect("plain checkout identity");
+    let verbatim = checkout.canonicalize().expect("native canonical checkout");
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+        &plain,
+        &temp.path().join("profile"),
+        "project.release-preview-identity",
+    )
+    .expect("fixture layout");
+    let root = code_index_store_root(&layout.data_root, &plain);
+    write_segmented_generation_store_fixture(&root, 1);
+    record_scope_root(&root, &plain).expect("record canonical root");
+    let before = inventory(&layout.data_root);
+    let expected =
+        plan_project_graph_replay_releases(&layout, &plain, None).expect("plain preview");
+    for spelling in [&verbatim, &plain.join("..").join("checkout")] {
+        assert_eq!(
+            plan_project_graph_replay_releases(&layout, spelling, None).expect("alias preview"),
+            expected,
+            "equivalent checkout spellings must bind the same queue and digest"
+        );
+    }
+    assert_eq!(inventory(&layout.data_root), before, "preview is read-only");
+    assert!(!layout.graph_db_path.exists());
+
+    // A linked checkout needs its own valid record, not just a directory
+    // whose name hashes to the caller-supplied path.
+    let linked = temp.path().join("linked");
+    std::fs::create_dir(&linked).expect("linked checkout");
+    let linked = canonical_existing_identity(&linked).expect("linked identity");
+    let linked_scope = code_index_store_root(&layout.data_root, &linked);
+    write_segmented_generation_store_fixture(&linked_scope, 1);
+    assert!(plan_project_graph_replay_releases(&layout, &linked, None).is_err());
+    record_scope_root(&linked_scope, &plain).expect("record mismatching root");
+    assert!(plan_project_graph_replay_releases(&layout, &linked, None).is_err());
+    record_scope_root(&linked_scope, &linked).expect("record matching linked root");
+    let linked_plan = plan_project_graph_replay_releases(
+        &layout,
+        &linked.canonicalize().expect("native linked spelling"),
+        None,
+    )
+    .expect("proven linked preview");
+    assert_eq!(linked_plan.store_root, linked_scope);
+    assert_eq!(linked_plan.checkout_root, linked);
+}
+
 #[asupersync::test]
 async fn release_handler_previews_and_confirms_a_real_durable_queue() {
     let temp = tempfile::tempdir().expect("isolated release fixture");
