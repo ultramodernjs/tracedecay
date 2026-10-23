@@ -567,7 +567,9 @@ pub(crate) async fn run_session_temporal_refresh_scheduler(
                 // just completed. Publish it before admitting any model work.
                 state.mark_running();
                 state.hold_history_for_projection();
-                if projection_published_work(&report) {
+                // Saturation can mean a bounded pass has not visited every
+                // recovery yet, even when all selected projectors deferred.
+                if report.saturated || projection_published_work(&report) {
                     state.requeue_projection();
                     tokio::task::yield_now().await;
                 } else {

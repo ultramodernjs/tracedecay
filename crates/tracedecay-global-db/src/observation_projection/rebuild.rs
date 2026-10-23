@@ -45,7 +45,6 @@ static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 const SESSION_JSON_COLUMN: &str = "session_json";
 const MERGED_SESSION_JSON_COLUMN: &str = "merged.value";
 const MESSAGE_JSON_COLUMN: &str = "message_json";
-const STAGED_MESSAGE_JSON_COLUMN: &str = "staged.message_json";
 
 const SESSION_JSON_FIELDS: &[&str] = &[
     "project_key",
@@ -2475,60 +2474,54 @@ async fn prepare_rebuild_output_activation(
     .await
     .map_err(|error| storage("materialize preexisting projection outputs", error))?;
 
-    let message_conflicts = format!(
-        "{}
-                     OR (active.provider <> 'hermes' AND (
-                         COALESCE(active.content, active.placeholder_text, '') IS NOT {}
-                         OR active.metadata_json IS NOT {}
-                     ))",
-        json_extract_neq_predicates(
-            "active",
-            STAGED_MESSAGE_JSON_COLUMN,
-            MESSAGE_SESSION_JSON_FIELDS
-        ),
-        json_extract_expr(STAGED_MESSAGE_JSON_COLUMN, "text"),
-        json_extract_expr(STAGED_MESSAGE_JSON_COLUMN, "metadata_json"),
-    );
-    let mut conflicts = conn
+    // Staged rows contain logical bodies and hydrated protection receipts.
+    // At-rest content/metadata may instead contain canonical-body and receipt
+    // references; comparing those bytes would falsely collide on shared outputs.
+    let mut candidates = conn
         .query(
-            &format!(
-                "SELECT staged.output_provider, staged.output_message_id
+            "SELECT staged.message_json
              FROM observation_projection_rebuild_messages AS staged
              JOIN temp.observation_projection_rebuild_preexisting_outputs AS ownership
                ON ownership.output_provider = staged.output_provider
               AND ownership.output_message_id = staged.output_message_id
-             LEFT JOIN lcm_raw_messages AS active
-               ON active.provider = staged.output_provider
-              AND active.message_id = staged.output_message_id
              WHERE staged.projector_version = ?1 AND staged.generation = ?2
                AND (
                  (ownership.active_exists = 0 AND ownership.staged_created = 0)
                  OR (
                    ownership.active_exists = 1
                    AND NOT (ownership.current_owned = 1 AND ownership.cross_owned = 0)
-                   AND (
-                     {message_conflicts}
-                   )
                  )
-               )
-             LIMIT 1"
-            ),
+               )",
             params![SESSION_MESSAGE_PROJECTOR_VERSION, generation],
         )
         .await
         .map_err(|error| storage("validate staged projection outputs", error))?;
-    if let Some(row) = conflicts
+    while let Some(row) = candidates
         .next()
         .await
         .map_err(|error| storage("validate staged projection outputs", error))?
     {
+        let json: String = row
+            .get(0)
+            .map_err(|error| storage("validate staged projection outputs", error))?;
+        let mut staged: SessionMessageRecord =
+            decode_json(&json, "decode staged projection output")?;
+        if let Some(actual) =
+            read_message(conn, &staged.provider, &staged.message_id).await?
+        {
+            // Hermes owns its body independently; only its session columns
+            // participate in projection output identity.
+            if staged.provider == "hermes" {
+                staged.text.clone_from(&actual.text);
+                staged.metadata_json.clone_from(&actual.metadata_json);
+            }
+            if actual == staged {
+                continue;
+            }
+        }
         return Err(ProjectionStoreError::OutputCollision {
-            provider: row
-                .get(0)
-                .map_err(|error| storage("validate staged projection outputs", error))?,
-            message_id: row
-                .get(1)
-                .map_err(|error| storage("validate staged projection outputs", error))?,
+            provider: staged.provider,
+            message_id: staged.message_id,
         });
     }
     Ok(())
