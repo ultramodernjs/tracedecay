@@ -12,7 +12,7 @@ use tracedecay_store::ObservationReplayRequest;
 use crate::codex::write_jsonl;
 use crate::restart_atomicity::{
     ProjectSessionTestRuntime, ingest_global_sources_for_provider, mark_test_project,
-    open_project_session_db,
+    observation_source_cursor, open_project_session_db,
 };
 use crate::support::{init_git_repo, setup};
 
@@ -194,7 +194,8 @@ async fn codex_workflow_lifecycle_goal_plan_task_persist_on_production_observati
     init_git_repo(&project);
     mark_test_project(&project);
 
-    write_codex_rollout_with_workflow_lifecycle(&home, &project, "codex-wf-lifecycle");
+    let rollout =
+        write_codex_rollout_with_workflow_lifecycle(&home, &project, "codex-wf-lifecycle");
 
     let runtime = open_project_session_db(&project).await.unwrap();
     let _ =
@@ -258,11 +259,11 @@ async fn codex_workflow_lifecycle_goal_plan_task_persist_on_production_observati
     );
     for lookalike in ["task_completed", "task_failed"] {
         assert!(
-            blobs.iter().any(|blob| {
+            !blobs.iter().any(|blob| {
                 blob.contains(&format!("\"native_kind\":\"{lookalike}\""))
                     && blob.contains("\"state\":\"unsupported\"")
             }),
-            "fixture must admit {lookalike} as an unsupported lookalike"
+            "unsupported-only {lookalike} must be covered without durable evidence"
         );
         assert!(
             !blobs.iter().any(|blob| {
@@ -271,6 +272,15 @@ async fn codex_workflow_lifecycle_goal_plan_task_persist_on_production_observati
             "lookalike {lookalike} must not appear as a lifecycle fact"
         );
     }
+
+    assert_eq!(
+        observation_source_cursor(&runtime, "codex", "codex-wf-lifecycle", &project)
+            .await
+            .expect("unsupported lookalikes must not block rollout coverage")
+            .position(),
+        std::fs::metadata(&rollout).unwrap().len(),
+        "coverage must advance past unsupported lookalikes to the final user message"
+    );
 
     let workflow_rows = codex_workflow_fact_rows(&runtime).await;
     assert!(
