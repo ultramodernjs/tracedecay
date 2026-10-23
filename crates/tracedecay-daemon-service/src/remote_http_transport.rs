@@ -1123,7 +1123,7 @@ mod tests {
         // a protected owner-only DACL rather than the temporary directory's ACL.
         std::io::Write::write_all(
             &mut tracedecay_private_fs::create_private_file(&private_key).unwrap(),
-            PRIVATE_KEY.as_bytes(),
+            PRIVATE_KEY,
         )
         .unwrap();
         let config = RemoteBrainTlsConfig::from_optional_parts(

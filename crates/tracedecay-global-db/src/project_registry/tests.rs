@@ -827,7 +827,7 @@ async fn full_clone_adopts_a_shallow_first_project_and_enriches_its_history() {
         &unrelated,
         &["commit", "-q", "--amend", "-am", "unrelated root"],
     );
-    git(&unrelated, &["remote", "add", "origin", &url]);
+    git(&unrelated, &["remote", "add", "origin", url]);
     assert!(
         harness
             .registered
