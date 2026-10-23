@@ -223,6 +223,7 @@ fn pending_producer_failure(status: &serde_json::Value) -> bool {
                                         "execution has not completed"
                                             | "is queued for producer execution"
                                             | "producer execution was unavailable"
+                                            | "producer execution was backpressured"
                                     )
                             })
                     })
