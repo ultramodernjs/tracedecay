@@ -303,7 +303,7 @@ fn spooled_capture_events_drain_promptly_while_open_and_after_a_restart() {
         "spooled events on an open project must drain within {PROMPT_DRAIN:?}, not the 30 s sweep"
     );
 
-    assert_only_producer_work_owed(&home, &project);
+    assert_transports_settled(&home, &project);
 
     // Daemon down: captures still land in the spool.
     drop(daemon);
@@ -322,7 +322,7 @@ fn spooled_capture_events_drain_promptly_while_open_and_after_a_restart() {
         "records spooled across a restart must drain within {PROMPT_DRAIN:?} without another client"
     );
 
-    assert_only_producer_work_owed(&home, &project);
+    assert_transports_settled(&home, &project);
 
     // The project the daemon opened for its spool keeps draining new appends.
     capture_edit(&home, &project, "after-restart");
@@ -330,7 +330,7 @@ fn spooled_capture_events_drain_promptly_while_open_and_after_a_restart() {
         drain_latency(&records, PROMPT_DRAIN).is_some(),
         "an append after the restart must drain within {PROMPT_DRAIN:?}"
     );
-    assert_only_producer_work_owed(&home, &project);
+    assert_transports_settled(&home, &project);
 }
 
 #[test]
