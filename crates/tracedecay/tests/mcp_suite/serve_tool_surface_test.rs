@@ -368,7 +368,7 @@ fn is_work_or_workflow_name(name: &str) -> bool {
 /// Daemon-owned runtime state that changes on its own while a session runs:
 /// code-index generations, dashboard automation spools, the shared and
 /// per-project databases (`tracedecay.grafeo`, `tracedecay.sealed`, the replay
-/// log) with their delivery spools, and the daemon's own
+/// log, the memory recall admission ledger) with their delivery spools, and the daemon's own
 /// authority, socket, and mmap files. A catalog profile never writes these, so
 /// the profile-state comparison skips every entry whose name starts with one.
 const DAEMON_OWNED_PREFIXES: &[&str] = &[
@@ -379,6 +379,7 @@ const DAEMON_OWNED_PREFIXES: &[&str] = &[
     "hook_analytics",
     "lcm-payloads",
     "maintenance",
+    "memory-recall-admission-ledger",
     "monitor.mmap",
     "response-handles",
     "sessions.db",
