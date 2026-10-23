@@ -59,6 +59,12 @@ pub fn probe_project_path(path: &Path, available_roots: &[PathBuf]) -> PathProbe
     let mut boundary_checked = false;
     for component in path.components() {
         current.push(component);
+        // A Windows drive/UNC prefix is not an ancestor by itself. Inspect it
+        // only after RootDir has made it a complete filesystem root; `C:` is
+        // drive-relative and a verbatim prefix such as `\\?\C:` is invalid.
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_dir() => {}
             Err(cause) if cause.kind() == std::io::ErrorKind::NotFound && boundary_checked => {
