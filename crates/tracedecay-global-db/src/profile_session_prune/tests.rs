@@ -395,10 +395,15 @@ async fn explicit_forget_selects_only_the_named_project_and_aliases() {
         .registered_database(HostAdmissionScope::Profile)
         .unwrap();
     let read = database.read_snapshot().await.unwrap();
-    let roots = vec![PathBuf::from(fixture_path("/live")), PathBuf::from(fixture_path("/old-alias"))];
+    let roots = vec![
+        PathBuf::from(fixture_path("/live")),
+        PathBuf::from(fixture_path("/old-alias")),
+    ];
     let registry = vec![roots.clone()];
     let probe = |path: &Path| {
-        if path.starts_with(fixture_path("/missing")) || path.starts_with(fixture_path("/old-alias")) {
+        if path.starts_with(fixture_path("/missing"))
+            || path.starts_with(fixture_path("/old-alias"))
+        {
             PathProbe::Missing
         } else {
             PathProbe::Live
@@ -437,10 +442,15 @@ async fn explicit_forget_selects_only_the_named_project_and_aliases() {
             .await
             .is_err()
     );
-    let incomplete =
-        plan_profile_session_forget(&read, &registry, &[PathBuf::from(fixture_path("/old-alias"))], &probe, 1)
-            .await
-            .unwrap();
+    let incomplete = plan_profile_session_forget(
+        &read,
+        &registry,
+        &[PathBuf::from(fixture_path("/old-alias"))],
+        &probe,
+        1,
+    )
+    .await
+    .unwrap();
     assert!(
         incomplete.selected_sources.is_empty(),
         "unnamed live aliases must remain protected"

@@ -29,11 +29,13 @@ class BuildEvalBinaryTest(unittest.TestCase):
         self.repo = root / "repo"
         (self.repo / "scripts").mkdir(parents=True)
         shutil.copy(SCRIPT, self.repo / "scripts" / SCRIPT.name)
-        self.bazel_bin = root / "bazel-bin"
+        # `bazel info bazel-bin` can resolve into a custom output_base and
+        # either the output path or the checkout can contain spaces.
+        self.bazel_bin = root / "output base" / "bazel-bin"
         cli = self.bazel_bin / "crates" / "tracedecay-cli"
         cli.mkdir(parents=True)
         # A binary from an earlier build, present before the build runs.
-        self.built = cli / "tracedecay"
+        self.built = cli / ("tracedecay.exe" if os.name == "nt" else "tracedecay")
         self.built.write_text("#!/bin/sh\necho tracedecay 1.2.3\n")
         self.built.chmod(0o755)
         self.log = root / "bazel.log"
