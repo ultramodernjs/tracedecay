@@ -345,9 +345,17 @@ mod identity_anchor_tests {
             crate::git::normalize_git_remote_url("file:///srv/repos/remote.git/"),
             crate::git::normalize_git_remote_url("/srv/repos/remote.git"),
         );
+        // A Unix-rooted path has no drive and is not absolute on Windows.
+        // Exercise a local remote with an absolute path on the current host.
+        let local_checkout = std::env::temp_dir().join("checkout");
+        assert!(local_checkout.is_absolute());
         assert_eq!(
-            crate::git::local_remote_path("file:///srv/repos/checkout"),
-            Some(PathBuf::from("/srv/repos/checkout"))
+            crate::git::local_remote_path(&format!("file://{}", local_checkout.display())),
+            Some(local_checkout.clone())
+        );
+        assert_eq!(
+            crate::git::local_remote_path(&local_checkout.to_string_lossy()),
+            Some(local_checkout)
         );
         assert_eq!(
             crate::git::local_remote_path("git@github.com:owner/repo.git"),

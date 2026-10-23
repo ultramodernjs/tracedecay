@@ -46,7 +46,7 @@ class BuildEvalBinaryTest(unittest.TestCase):
         bazel.write_text(FAKE_BAZEL)
         bazel.chmod(bazel.stat().st_mode | stat.S_IXUSR)
         self.env = {
-            "PATH": f"{fakes}:{os.environ['PATH']}",
+            "PATH": f"{fakes}{os.pathsep}{os.environ['PATH']}",
             "FAKE_BAZEL_LOG": str(self.log),
             "FAKE_BAZEL_BIN": str(self.bazel_bin),
         }
@@ -63,7 +63,7 @@ class BuildEvalBinaryTest(unittest.TestCase):
     def test_builds_the_shipping_target_and_prints_its_identity(self):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), str(self.built))
+        self.assertEqual(Path(result.stdout.strip()), self.built)
         self.assertIn(
             "build --config=release //crates/tracedecay-cli:tracedecay",
             self.log.read_text(),
@@ -73,13 +73,19 @@ class BuildEvalBinaryTest(unittest.TestCase):
 
     def test_windows_build_selects_the_executable_suffix(self):
         windows_binary = self.built.with_suffix(".exe")
-        self.built.rename(windows_binary)
+        if self.built != windows_binary:
+            self.built.rename(windows_binary)
         uname = self.fakes / "uname"
         uname.write_text("#!/bin/sh\necho MINGW64_NT-10.0\n")
         uname.chmod(0o755)
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), str(windows_binary))
+        self.assertEqual(Path(result.stdout.strip()), windows_binary)
+
+    def test_bazel_info_accepts_windows_line_endings(self):
+        result = self.run_script(FAKE_BAZEL_BIN=str(self.bazel_bin) + "\r")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), self.built)
 
     def test_config_override_reaches_bazel(self):
         result = self.run_script(TRACEDECAY_EVAL_BAZEL_CONFIG="dist")
@@ -98,7 +104,7 @@ class BuildEvalBinaryTest(unittest.TestCase):
         explicit.chmod(0o755)
         result = self.run_script(TRACEDECAY_BIN=str(explicit))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), str(explicit))
+        self.assertEqual(Path(result.stdout.strip()), explicit)
         self.assertIn("tracedecay 9.9.9", result.stderr)
         self.assertFalse(self.log.exists())
 

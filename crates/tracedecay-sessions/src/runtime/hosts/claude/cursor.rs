@@ -13,6 +13,11 @@ pub(super) fn claude_source_id(path: &Path) -> Option<String> {
 
 pub(super) fn claude_observation_path_source_id(projects_dir: &Path, path: &Path) -> String {
     let relative = path.strip_prefix(projects_dir).unwrap_or(path);
+    // Windows accepts either separator, but discovery constructs native
+    // backslashes. Hash the same spelling for a supplied path and its
+    // discovered counterpart; keep Unix filename bytes untouched.
+    #[cfg(windows)]
+    let relative = relative.components().collect::<std::path::PathBuf>();
     observation_path_source_id(&tracedecay_runtime_core::os_str_bytes::native_os_str_bytes(
         relative.as_os_str(),
     ))
