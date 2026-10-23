@@ -16,7 +16,7 @@ FAKE_BAZEL = """#!/bin/sh
 echo "$@" >> "$FAKE_BAZEL_LOG"
 case "$1" in
   build) exit "${FAKE_BUILD_RC:-0}" ;;
-  info) echo "$FAKE_BAZEL_BIN" ;;
+  info) printf '%s\\n' "$FAKE_BAZEL_BIN" ;;
 esac
 """
 
@@ -81,6 +81,31 @@ class BuildEvalBinaryTest(unittest.TestCase):
         result = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(result.stdout.strip()), windows_binary)
+
+    def test_native_windows_output_base_is_normalized_at_the_shell_boundary(self):
+        # Exercise native Bazel's spelling even on a POSIX host. The shim maps
+        # just this synthetic drive path to the fixture's actual output base.
+        native = r"Q:\custom output base\execroot\_main\bazel-out\x64_windows-fastbuild\bin"
+        cygpath = self.fakes / "cygpath"
+        cygpath.write_text(
+            '#!/bin/sh\n'
+            'case "$1" in\n'
+            '  -u) test "$2" = "$FAKE_NATIVE_BAZEL_BIN" || exit 4; '
+            '(cd "$FAKE_REAL_BAZEL_BIN" && pwd) ;;\n'
+            '  -am) printf "%s\\n" "$FAKE_EXPECTED_BINARY" ;;\n'
+            '  *) exit 4 ;;\n'
+            'esac\n'
+        )
+        cygpath.chmod(0o755)
+        result = self.run_script(
+            FAKE_BAZEL_BIN=native + "\r",
+            FAKE_NATIVE_BAZEL_BIN=native,
+            FAKE_REAL_BAZEL_BIN=str(self.bazel_bin),
+            FAKE_EXPECTED_BINARY=str(self.built),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.strip()), self.built)
+        self.assertIn("tracedecay 1.2.3", result.stderr)
 
     def test_bazel_info_accepts_windows_line_endings(self):
         result = self.run_script(FAKE_BAZEL_BIN=str(self.bazel_bin) + "\r")
