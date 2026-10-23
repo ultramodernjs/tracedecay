@@ -18,10 +18,11 @@ use tracedecay_memory_provider_registry::{
     ProviderReply, SourceAttribution, SourceDisposition, TerminalCode,
 };
 
+use tracedecay_rusqlite_runtime::recall_admission::control_attribution::{
+    RecallControlTraceRefV1, RetainedRecallControlScopeV1,
+};
+
 use super::super::{
-    cognitive_recall::control_attribution::{
-        RecallControlTraceRefV1, RetainedRecallControlScopeV1,
-    },
     observation_journey::control_dispatch::JourneyControlDispatchReplyV1,
     provider_history::source_attribution_json,
 };

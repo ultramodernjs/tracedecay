@@ -463,6 +463,49 @@ async fn seed_project_facts(
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_composition_and_fact_recall_work_without_an_ambient_tokio_runtime() {
+    let (_temporary, project_root, graph, project_id) = real_project_fixture().await;
+    seed_project_facts(&graph, &project_root, &project_id).await;
+    let call = valid_recall_call(
+        project_id.as_str(),
+        &recall_request_value(project_id.as_str(), "probe", "TraceDecay"),
+    );
+    let retrieval = session_mount(project_id.as_str());
+    let task = native_runtime::NativeTask::spawn(async move {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let port = project_native_memory_application_port_off_runtime(
+            Arc::new(tokio::sync::RwLock::new(graph)),
+            project_root,
+            retrieval,
+        )
+        .await
+        .expect("construct Native application port from a native worker");
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        native_runtime::spawn_blocking(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let reply = port.recall(&call);
+            assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+            let payload = reply.payload.expect("recall payload");
+            let body: Value = serde_json::from_slice(&payload.bytes).expect("recall payload JSON");
+            let empty_candidates: &[Value] = &[];
+            assert_ne!(
+                body["candidates"]
+                    .as_array()
+                    .expect("recall candidates")
+                    .as_slice(),
+                empty_candidates
+            );
+            // The port owns a synchronous actor join on drop.
+            drop(port);
+        })
+        .await
+        .expect("join Native application-port read");
+    })
+    .expect("admit native composition task");
+    assert_eq!(task.await, native_runtime::NativeTaskOutcome::Completed(()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_declares_only_health_and_recall() {
     let (_temporary, project_root, graph, project_id) = real_project_fixture().await;
     let port = native_port(&graph, project_root, project_id.as_str());

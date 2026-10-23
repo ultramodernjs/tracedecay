@@ -16,13 +16,13 @@ use tracedecay_memory_provider_registry::{
     rfc3339_utc_micros,
 };
 
-use super::super::cognitive_recall::control_attribution::RetainedRecallControlScopeV1;
 use super::super::provider_history::{
     original_source_fence_digest, retained_history_source, source_attribution_json,
 };
 use super::authority::{ProviderSourceIntentActionErrorV1, ResolvedCanonicalControlObservationV1};
 use super::feedback_receipt::{
     AcceptedDeletionCommandV1, AcceptedFeedbackAssertionV1, HostSourceCommandErrorV1,
+    accept_deletion_command, accept_feedback_assertion,
 };
 use super::portability::{
     HostSnapshotCleanupResultV1, HostSnapshotCleanupStateV1, cleanup_source_snapshots,
@@ -33,6 +33,7 @@ use super::{
     ControlInvocationV1, ControlOperationIdentityV1, ControlResult, ProjectProviderControlPortV1,
     ResolvedControlStateV1, outcome, projection,
 };
+use tracedecay_rusqlite_runtime::recall_admission::control_attribution::RetainedRecallControlScopeV1;
 
 /// Built-in provider-local retention-lock policy. Version one adds no host lock
 /// claims to a deletion request. A provider's explicit lock report remains its
@@ -644,16 +645,18 @@ async fn cleanup_snapshots(
     let control = invocation.control.clone();
     // The enclosing executor keeps forwarding the original cancellation while
     // this existing blocking-pool operation settles all witnessed removals.
-    tokio::task::spawn_blocking(move || {
-        let cleanup = cleanup_source_snapshots(&ledger, &source.authorized, &intent, &control);
-        (source, cleanup)
-    })
-    .await
-    .map_err(|_| {
-        ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-            "host snapshot cleanup worker",
-        ))
-    })
+    invocation
+        .runtime
+        .spawn_blocking(move || {
+            let cleanup = cleanup_source_snapshots(&ledger, &source.authorized, &intent, &control);
+            (source, cleanup)
+        })
+        .await
+        .map_err(|_| {
+            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                "host snapshot cleanup worker",
+            ))
+        })
 }
 
 fn unconfirmed_cleanup(requested: bool) -> HostSnapshotCleanupResultV1 {
@@ -832,16 +835,25 @@ async fn accept_feedback(
     let target = source.target.clone();
     let attribution = source.granted_source()?.attribution.clone();
     let control = invocation.control.clone();
-    tokio::task::spawn_blocking(move || {
-        ledger.accept_feedback_assertion(&context, &request, &target, &attribution, &control)
-    })
-    .await
-    .map_err(|_| {
-        ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-            "feedback assertion acceptance worker",
-        ))
-    })?
-    .map_err(command_error)
+    invocation
+        .runtime
+        .spawn_blocking(move || {
+            accept_feedback_assertion(
+                ledger.path(),
+                &context,
+                &request,
+                &target,
+                &attribution,
+                &control,
+            )
+        })
+        .await
+        .map_err(|_| {
+            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                "feedback assertion acceptance worker",
+            ))
+        })?
+        .map_err(command_error)
 }
 
 async fn accept_deletion(
@@ -856,16 +868,25 @@ async fn accept_deletion(
     let target = source.target.clone();
     let attribution = source.granted_source()?.attribution.clone();
     let control = invocation.control.clone();
-    tokio::task::spawn_blocking(move || {
-        ledger.accept_deletion_command(&context, &request, &target, &attribution, &control)
-    })
-    .await
-    .map_err(|_| {
-        ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
-            "deletion command acceptance worker",
-        ))
-    })?
-    .map_err(command_error)
+    invocation
+        .runtime
+        .spawn_blocking(move || {
+            accept_deletion_command(
+                ledger.path(),
+                &context,
+                &request,
+                &target,
+                &attribution,
+                &control,
+            )
+        })
+        .await
+        .map_err(|_| {
+            ControlFailureV1::new(ControlFailureStageV1::BlockingRead(
+                "deletion command acceptance worker",
+            ))
+        })?
+        .map_err(command_error)
 }
 
 fn feedback_identity(accepted: &AcceptedFeedbackAssertionV1) -> ControlOperationIdentityV1 {

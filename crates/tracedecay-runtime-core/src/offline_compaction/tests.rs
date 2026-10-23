@@ -173,7 +173,7 @@ fn offline_compaction_occupied_page_slack_repacked_even_when_freelist_is_empty()
 
 #[test]
 fn offline_compaction_busy_profile_never_replaces_database() {
-    use tracedecay_runtime_core::lifecycle_lease::acquire_shared_for_profile;
+    use crate::lifecycle_lease::acquire_shared_for_profile;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let database = fixture(&root);

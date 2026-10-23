@@ -102,6 +102,7 @@ use tracedecay_memory_provider_registry::{
     SupervisedReadinessConfigV1, SupervisedReadinessError, TerminalCode,
 };
 use tracedecay_runtime_core::cancellation::CancellationToken as HostCancellationToken;
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_store::{
     ObservationReplayRequest, ObservationStore, ObservationStoreError, StoredObservation,
 };
@@ -486,6 +487,17 @@ pub(crate) enum ObservationJourneyError {
     ProviderInstanceUnavailable,
     #[error("required provider instance proof did not complete before its deadline")]
     ProviderInstanceDeadlineExceeded,
+}
+
+fn observation_runtime_unavailable() -> ObservationJourneyError {
+    ObservationJourneyError::Worker(std::io::Error::other(
+        "observation journey Tokio runtime unavailable",
+    ))
+}
+
+fn observation_tokio_handle() -> Result<tokio::runtime::Handle, ObservationJourneyError> {
+    native_runtime::tokio_handle("memory_observation.journey")
+        .ok_or_else(observation_runtime_unavailable)
 }
 
 /// One way the mounted journey failed to stop cleanly.
@@ -2688,6 +2700,7 @@ impl CensusTransitionV1 {
             if let Some(observed) = observe() {
                 return Ok(observed);
             }
+            // ambient-tokio: await_instance_ready enters on_tokio; all other callers are Tokio tests.
             if tokio::time::timeout_at(deadline, &mut changed)
                 .await
                 .is_err()
@@ -3693,6 +3706,20 @@ impl ProjectObservationJourneyV1 {
         grant: &tracedecay_memory_provider_registry::HistoryGrant,
         bounds: ReplayBoundsV1<'_>,
     ) -> Result<(), ObservationJourneyError> {
+        check_replay_bounds(bounds, 0)?;
+        native_runtime::on_tokio(
+            "memory_observation.history_delivery",
+            self.await_history_delivery_in_tokio(grant, bounds),
+        )
+        .ok_or_else(observation_runtime_unavailable)?
+        .await
+    }
+
+    async fn await_history_delivery_in_tokio(
+        &self,
+        grant: &tracedecay_memory_provider_registry::HistoryGrant,
+        bounds: ReplayBoundsV1<'_>,
+    ) -> Result<(), ObservationJourneyError> {
         use super::provider_history::ProviderHistoryErrorV1;
         check_replay_bounds(bounds, 0)?;
         if grant.sources.len() > 256 {
@@ -3759,28 +3786,34 @@ impl ProjectObservationJourneyV1 {
                 let sources = sources.clone();
                 let token = cancellation.0.clone();
                 let deadline = bounds.deadline;
-                let settled = tokio::task::spawn_blocking(move || {
-                    let evidence = journal
-                        .read_source_deliveries(
-                            &lane,
-                            &snapshot_grant.destination_scope,
-                            &stream,
-                            &sources,
-                            tracedecay_memory_observation::RecoveryTimeBudgetV1 {
-                                remaining_micros: i64::try_from(
-                                    deadline
-                                        .saturating_duration_since(tokio::time::Instant::now())
-                                        .as_micros(),
-                                )
-                                .unwrap_or(i64::MAX),
-                            },
+                let settled = observation_tokio_handle()?
+                    .spawn_blocking(move || {
+                        let evidence = journal
+                            .read_source_deliveries(
+                                &lane,
+                                &snapshot_grant.destination_scope,
+                                &stream,
+                                &sources,
+                                tracedecay_memory_observation::RecoveryTimeBudgetV1 {
+                                    remaining_micros: i64::try_from(
+                                        deadline
+                                            .saturating_duration_since(tokio::time::Instant::now())
+                                            .as_micros(),
+                                    )
+                                    .unwrap_or(i64::MAX),
+                                },
+                                &token,
+                            )
+                            .map_err(ObservationJourneyError::Journal)?;
+                        validate_history_delivery_evidence(
+                            &snapshot_grant,
+                            evidence,
                             &token,
+                            deadline,
                         )
-                        .map_err(ObservationJourneyError::Journal)?;
-                    validate_history_delivery_evidence(&snapshot_grant, evidence, &token, deadline)
-                })
-                .await
-                .map_err(ObservationJourneyError::IngestTask)??;
+                    })
+                    .await
+                    .map_err(ObservationJourneyError::IngestTask)??;
                 if settled {
                     authority
                         .revalidate_async(
@@ -3798,6 +3831,7 @@ impl ProjectObservationJourneyV1 {
             biased;
             () = bounds.cancellation.cancelled() => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
             () = self.stopping.cancelled() => Err(ObservationJourneyError::Cancelled { admitted: 0 }),
+            // ambient-tokio: await_history_delivery polls this private future through on_tokio.
             result = tokio::time::timeout_at(bounds.deadline, work) => {
                 match result {
                     Err(_) => Err(ObservationJourneyError::DeadlineExceeded { admitted: 0 }),
@@ -3813,6 +3847,27 @@ impl ProjectObservationJourneyV1 {
     /// journal, idempotency, backpressure and supervised provider path as live
     /// observations. Every effect retains the original source session/key.
     pub(crate) async fn replay_authorized_history_page(
+        &self,
+        page: super::provider_history::ProviderHistoryPageV1,
+        destination: OwnedExactScope,
+        policy_revision: u64,
+        bounds: ReplayBoundsV1<'_>,
+    ) -> Result<ReplayPassV1, ObservationJourneyError> {
+        check_replay_bounds(bounds, 0)?;
+        native_runtime::on_tokio(
+            "memory_observation.history_replay",
+            self.replay_authorized_history_page_in_tokio(
+                page,
+                destination,
+                policy_revision,
+                bounds,
+            ),
+        )
+        .ok_or_else(observation_runtime_unavailable)?
+        .await
+    }
+
+    async fn replay_authorized_history_page_in_tokio(
         &self,
         page: super::provider_history::ProviderHistoryPageV1,
         destination: OwnedExactScope,
@@ -3847,6 +3902,7 @@ impl ProjectObservationJourneyV1 {
             tokio::select! {
                 () = bounds.cancellation.cancelled() => return Err(ObservationJourneyError::Cancelled { admitted: 0 }),
                 () = self.stopping.cancelled() => return Err(ObservationJourneyError::Cancelled { admitted: 0 }),
+                // ambient-tokio: replay_authorized_history_page polls this future through on_tokio.
                 result = tokio::time::timeout_at(bounds.deadline, authority.revalidate_async(
                     &self.adapter.context.provider_lane.provider_id, grant, &control,
                 )) => {
@@ -3985,6 +4041,34 @@ impl ProjectObservationJourneyV1 {
     where
         S: ObservationStore + ?Sized,
     {
+        // Preserve the loop's no-work and terminal ordering before resolving
+        // a runtime: neither an empty pass nor an already stopped caller
+        // needs a timer, a journal read, or a store poll.
+        if max_pages == 0 || self.stopping.is_cancelled() {
+            return Ok(ReplayPassV1 {
+                admitted: 0,
+                halted: None,
+                shed: None,
+            });
+        }
+        check_replay_bounds(bounds, 0)?;
+        native_runtime::on_tokio(
+            "memory_observation.canonical_replay",
+            self.replay_canonical_observations_in_tokio(store, max_pages, bounds),
+        )
+        .ok_or_else(observation_runtime_unavailable)?
+        .await
+    }
+
+    async fn replay_canonical_observations_in_tokio<S>(
+        &self,
+        store: &S,
+        max_pages: usize,
+        bounds: ReplayBoundsV1<'_>,
+    ) -> Result<ReplayPassV1, ObservationJourneyError>
+    where
+        S: ObservationStore + ?Sized,
+    {
         let mut admitted = 0_u64;
         for _ in 0..max_pages {
             // Journey shutdown is not a caller terminal: every record is
@@ -3998,6 +4082,7 @@ impl ProjectObservationJourneyV1 {
             let request = ObservationReplayRequest::new(after_sequence, REPLAY_PAGE_ITEMS)
                 .map_err(ObservationJourneyError::Replay)?;
             let page =
+                // ambient-tokio: replay_canonical_observations polls this future through on_tokio.
                 match tokio::time::timeout_at(bounds.deadline, store.replay_observations(request))
                     .await
                 {
@@ -4090,12 +4175,13 @@ impl ProjectObservationJourneyV1 {
     async fn replay_watermark(&self) -> Result<u64, ObservationJourneyError> {
         let journal = Arc::clone(&self.journal);
         let source_stream = self.source_stream.clone();
-        let sequence = tokio::task::spawn_blocking(move || {
-            journal.maximum_replay_sequence(SourceAuthorityV1::HostSession, &source_stream)
-        })
-        .await
-        .map_err(ObservationJourneyError::IngestTask)?
-        .map_err(ObservationJourneyError::Journal)?;
+        let sequence = observation_tokio_handle()?
+            .spawn_blocking(move || {
+                journal.maximum_replay_sequence(SourceAuthorityV1::HostSession, &source_stream)
+            })
+            .await
+            .map_err(ObservationJourneyError::IngestTask)?
+            .map_err(ObservationJourneyError::Journal)?;
         Ok(sequence.map_or(0, |sequence| sequence.0))
     }
 
@@ -4156,6 +4242,30 @@ impl ProjectObservationJourneyV1 {
             + Sync
             + 'static,
     {
+        native_runtime::on_tokio(
+            "memory_observation.ingest",
+            self.ingest_record_with_adapter_in_tokio(record, adapter, bounds),
+        )
+        .ok_or_else(observation_runtime_unavailable)?
+        .await
+    }
+
+    async fn ingest_record_with_adapter_in_tokio<A>(
+        &self,
+        record: SourceRecordV1<StoredObservation>,
+        adapter: Arc<A>,
+        bounds: ReplayBoundsV1<'_>,
+    ) -> Result<RecordOutcomeV1, ObservationJourneyError>
+    where
+        A: ObservationAdmissionAdapterV1<
+                Record = StoredObservation,
+                Error = AdmissionAdapterError,
+                Control = ReplayIngestControlV1,
+            > + Send
+            + Sync
+            + 'static,
+    {
+        let runtime = observation_tokio_handle()?;
         let journal = Arc::clone(&self.journal);
         let wake = Arc::clone(&self.wake);
         let backpressure = Arc::clone(&self.backpressure);
@@ -4178,7 +4288,7 @@ impl ProjectObservationJourneyV1 {
             let caller = bounds.cancellation.clone();
             let stopping = self.stopping.clone();
             let record_cancellation = control.cancellation.clone();
-            tokio::spawn(async move {
+            runtime.spawn(async move {
                 tokio::select! {
                     () = caller.cancelled() => {}
                     () = stopping.cancelled() => {}
@@ -4193,7 +4303,7 @@ impl ProjectObservationJourneyV1 {
         // budget breach.
         let started = std::time::Instant::now();
         let ingest_control = Arc::clone(&control);
-        let task = tokio::task::spawn_blocking(move || {
+        let task = runtime.spawn_blocking(move || {
             let ingress = IngressRuntimeV1::new(
                 journal.as_ref(),
                 adapter.as_ref(),
@@ -4207,6 +4317,7 @@ impl ProjectObservationJourneyV1 {
         // The caller is bounded even when the record is not: the blocking pool
         // is shared, and a pass that has spent its budget has to return rather
         // than wait for a turn on it.
+        // ambient-tokio: ingest_record_with_adapter polls this private future through on_tokio.
         let joined = tokio::time::timeout_at(bounds.deadline + FOREGROUND_ABORT_GRACE, task).await;
         relay.abort();
         // Sampled on every path, including the ones that failed. A latency
@@ -4324,14 +4435,15 @@ impl ProjectObservationJourneyV1 {
         let backpressure = Arc::clone(&self.backpressure);
         let lane = self.provider_lane.clone();
         let now_unix_micros = tracedecay_contracts::now_micros().0;
-        tokio::task::spawn_blocking(move || {
-            journal
-                .lane_pressure(&lane)
-                .map(|pressure| backpressure.observe(&pressure, now_unix_micros))
-        })
-        .await
-        .map_err(ObservationJourneyError::IngestTask)?
-        .map_err(ObservationJourneyError::Journal)
+        observation_tokio_handle()?
+            .spawn_blocking(move || {
+                journal
+                    .lane_pressure(&lane)
+                    .map(|pressure| backpressure.observe(&pressure, now_unix_micros))
+            })
+            .await
+            .map_err(ObservationJourneyError::IngestTask)?
+            .map_err(ObservationJourneyError::Journal)
     }
 
     /// Refreshes the lane and publishes it whenever it is not nominal.
@@ -4516,6 +4628,22 @@ impl ProjectObservationJourneyV1 {
         if cancellation.is_cancelled() || self.stopping.is_cancelled() {
             return Err(ObservationJourneyError::Cancelled { admitted: 0 });
         }
+        native_runtime::on_tokio(
+            "memory_observation.instance_readiness",
+            self.await_instance_ready_in_tokio(cancellation, within),
+        )
+        .ok_or_else(observation_runtime_unavailable)?
+        .await
+    }
+
+    async fn await_instance_ready_in_tokio(
+        &self,
+        cancellation: &HostCancellationToken,
+        within: Duration,
+    ) -> Result<(), ObservationJourneyError> {
+        if cancellation.is_cancelled() || self.stopping.is_cancelled() {
+            return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+        }
         let wait = self
             .provider_instance_id
             .readiness_changed
@@ -4546,6 +4674,23 @@ impl ProjectObservationJourneyV1 {
         cancellation: &HostCancellationToken,
         within: Duration,
     ) -> Result<(), ObservationJourneyError> {
+        if cancellation.is_cancelled() || self.stopping.is_cancelled() {
+            return Err(ObservationJourneyError::Cancelled { admitted: 0 });
+        }
+        native_runtime::on_tokio(
+            "memory_observation.delivery_settlement",
+            self.await_delivery_settled_in_tokio(cancellation, within),
+        )
+        .ok_or_else(observation_runtime_unavailable)?
+        .await
+    }
+
+    async fn await_delivery_settled_in_tokio(
+        &self,
+        cancellation: &HostCancellationToken,
+        within: Duration,
+    ) -> Result<(), ObservationJourneyError> {
+        let runtime = observation_tokio_handle()?;
         let deadline = tokio::time::Instant::now() + within;
         loop {
             if cancellation.is_cancelled() || self.stopping.is_cancelled() {
@@ -4554,44 +4699,46 @@ impl ProjectObservationJourneyV1 {
 
             let journal = Arc::clone(&self.journal);
             let provider_id = self.provider_id.clone();
-            let unsettled = tokio::task::spawn_blocking(move || {
-                journal
-                    .inspect(&tracedecay_memory_observation::JournalInspectionFilterV1 {
-                        provider_id: Some(provider_id),
-                        states: vec![
-                            DeliveryStateV1::Pending,
-                            DeliveryStateV1::Leased,
-                            DeliveryStateV1::EffectUnknown,
-                        ],
-                        limit: 1,
-                        ..Default::default()
-                    })
-                    .map(|page| page.total_rows)
-            })
-            .await
-            .map_err(ObservationJourneyError::IngestTask)?
-            .map_err(ObservationJourneyError::Journal)?;
-            if self.provider_instance_id.is_ready() && unsettled == 0 {
-                let journal = Arc::clone(&self.journal);
-                let provider_id = self.provider_id.clone();
-                let failed = tokio::task::spawn_blocking(move || {
+            let unsettled = runtime
+                .spawn_blocking(move || {
                     journal
                         .inspect(&tracedecay_memory_observation::JournalInspectionFilterV1 {
                             provider_id: Some(provider_id),
                             states: vec![
-                                DeliveryStateV1::Rejected,
-                                DeliveryStateV1::Cancelled,
-                                DeliveryStateV1::Expired,
-                                DeliveryStateV1::Exhausted,
+                                DeliveryStateV1::Pending,
+                                DeliveryStateV1::Leased,
+                                DeliveryStateV1::EffectUnknown,
                             ],
                             limit: 1,
                             ..Default::default()
                         })
-                        .map(|page| page.rows.into_iter().next().map(|row| row.state))
+                        .map(|page| page.total_rows)
                 })
                 .await
                 .map_err(ObservationJourneyError::IngestTask)?
                 .map_err(ObservationJourneyError::Journal)?;
+            if self.provider_instance_id.is_ready() && unsettled == 0 {
+                let journal = Arc::clone(&self.journal);
+                let provider_id = self.provider_id.clone();
+                let failed = runtime
+                    .spawn_blocking(move || {
+                        journal
+                            .inspect(&tracedecay_memory_observation::JournalInspectionFilterV1 {
+                                provider_id: Some(provider_id),
+                                states: vec![
+                                    DeliveryStateV1::Rejected,
+                                    DeliveryStateV1::Cancelled,
+                                    DeliveryStateV1::Expired,
+                                    DeliveryStateV1::Exhausted,
+                                ],
+                                limit: 1,
+                                ..Default::default()
+                            })
+                            .map(|page| page.rows.into_iter().next().map(|row| row.state))
+                    })
+                    .await
+                    .map_err(ObservationJourneyError::IngestTask)?
+                    .map_err(ObservationJourneyError::Journal)?;
                 if let Some(state) = failed {
                     return Err(ObservationJourneyError::RequiredDeliveryFailed { state });
                 }
@@ -4621,6 +4768,7 @@ impl ProjectObservationJourneyV1 {
                     return Err(ObservationJourneyError::Cancelled { admitted: 0 });
                 }
                 () = &mut changed => {}
+                // ambient-tokio: await_delivery_settled polls this private future through on_tokio.
                 () = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
             }
         }
@@ -4651,8 +4799,9 @@ impl ProjectObservationJourneyV1 {
             )));
         }
         let weak = Arc::downgrade(self);
-        let task = tokio::spawn(async move {
+        let task = observation_tokio_handle()?.spawn(async move {
             loop {
+                // ambient-tokio: this loop is spawned on the explicit owned Tokio handle above.
                 tokio::time::sleep(LIVE_REPLAY_PARK).await;
                 let Some(journey) = weak.upgrade() else {
                     break;
@@ -4688,6 +4837,7 @@ impl ProjectObservationJourneyV1 {
                             // same record at park rate against the same full
                             // lane. Nothing is lost: the watermark holds and
                             // the refusal was already reported typed.
+                            // ambient-tokio: this loop is spawned on an explicit owned Tokio handle.
                             tokio::time::sleep(LIVE_REPLAY_ERROR_BACKOFF).await;
                             continue;
                         }
@@ -4700,6 +4850,7 @@ impl ProjectObservationJourneyV1 {
                                 // off; a queue that drains clears on a later
                                 // pass, a permanent conflict stays visible.
                                 journey.record_halt(halt);
+                                // ambient-tokio: this loop is spawned on an explicit owned Tokio handle.
                                 tokio::time::sleep(LIVE_REPLAY_ERROR_BACKOFF).await;
                             }
                             None => journey.clear_stall(),
@@ -4728,6 +4879,7 @@ impl ProjectObservationJourneyV1 {
                         // standing one reaches `stalled_on` and shutdown
                         // instead of being the same warning every backoff.
                         journey.record_fault(replay_recoverability(&error), &error);
+                        // ambient-tokio: this loop is spawned on an explicit owned Tokio handle.
                         tokio::time::sleep(LIVE_REPLAY_ERROR_BACKOFF).await;
                     }
                 }
@@ -4778,6 +4930,7 @@ impl ProjectObservationJourneyV1 {
         // a final admission may have crossed a threshold the remembered
         // measurement was taken one row before. If the shared deadline prevents
         // a fresh reading, explicitly label the cached handover instead.
+        // ambient-tokio: the production caller is provider_host::shutdown_in_tokio under on_tokio.
         let (backlog, backlog_cached) = match tokio::time::timeout_at(
             deadline,
             self.refresh_backlog(),
@@ -4831,6 +4984,7 @@ impl ProjectObservationJourneyV1 {
         };
         if let Some(task) = live_replay_task {
             task.abort();
+            // ambient-tokio: provider_host::shutdown_in_tokio polls this under on_tokio.
             match tokio::time::timeout_at(deadline, task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) if error.is_cancelled() => {}
@@ -4845,7 +4999,9 @@ impl ProjectObservationJourneyV1 {
             Err(poisoned) => poisoned.into_inner().take(),
         };
         if let Some(worker) = worker {
+            // ambient-tokio: provider_host::shutdown_in_tokio polls this under on_tokio.
             let join = tokio::task::spawn_blocking(move || worker.join());
+            // ambient-tokio: provider_host::shutdown_in_tokio polls this under on_tokio.
             match tokio::time::timeout_at(deadline, join).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(_))) => failures.push(ObservationShutdownFailureV1::WorkerPanicked),
@@ -4900,10 +5056,12 @@ impl ProjectObservationJourneyV1 {
             now_unix_micros: tracedecay_contracts::now_micros().0,
             reap_budget: self.dispatch_policy.reap_budget,
         };
+        // ambient-tokio: provider_host::shutdown_in_tokio polls this under on_tokio.
         let pass = tokio::task::spawn_blocking(move || {
             DeliveryRuntimeV1::new(journal.as_ref(), delivery.as_ref(), wake.as_ref())
                 .shutdown(&request)
         });
+        // ambient-tokio: provider_host::shutdown_in_tokio polls this under on_tokio.
         match tokio::time::timeout_at(deadline, pass).await {
             Ok(Ok(Ok(report))) if report.quiesced => {}
             Ok(Ok(Ok(report))) => failures.push(ObservationShutdownFailureV1::LeasesOutstanding {
@@ -5789,10 +5947,10 @@ pub(crate) async fn mount_observer_dormant(
     if cancellation.is_cancelled() {
         return Err(ObservationJourneyError::Cancelled { admitted: 0 });
     }
-    let journey =
-        tokio::task::spawn_blocking(move || construct_project_observation_journey(inputs))
-            .await
-            .map_err(ObservationJourneyError::MountTask)??;
+    let journey = observation_tokio_handle()?
+        .spawn_blocking(move || construct_project_observation_journey(inputs))
+        .await
+        .map_err(ObservationJourneyError::MountTask)??;
     if cancellation.is_cancelled() {
         return Err(ObservationJourneyError::Cancelled { admitted: 0 });
     }
@@ -5854,6 +6012,7 @@ mod tests {
 
     mod control_dispatch;
     mod journal_replay;
+    mod runtime_boundaries;
 
     /// Seeded crash and restart fuzzing of this mount. It lives
     /// beside the journey's own suite because it reuses these fixtures to
@@ -11820,8 +11979,24 @@ mod tests {
         // failure stood in front of is delivered, and the stall is cleared
         // rather than left standing over a healthy stream. The budget spans the
         // backoff a recorded fault deliberately waits out.
-        let (state, attempts) =
-            wait_for_settlement_within(journey.journal_path(), Duration::from_secs(30)).await;
+        // Delivery can acknowledge before replay finishes its pass and clears
+        // the fault. Both owners must converge within the same existing budget.
+        let (state, attempts) = tokio::time::timeout(Duration::from_secs(30), async {
+            let settled =
+                wait_for_settlement_within(journey.journal_path(), Duration::from_secs(30)).await;
+            while journey.stalled_on().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            settled
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "delivery and replay did not converge; stall={:?}; {}",
+                journey.stalled_on(),
+                journal_snapshot(journey.journal_path())
+            )
+        });
         assert_eq!(
             (state.as_str(), attempts),
             ("acknowledged", 1),
@@ -11898,39 +12073,14 @@ mod tests {
     // Blocking journal I/O never runs on a runtime worker.               //
     // ------------------------------------------------------------------ //
 
-    /// Holds this journal's write lock from a plain thread for a bounded
-    /// while, exactly as a second process would.
-    ///
-    /// The point is not the lock: it is that opening the journal, and reaping
-    /// its leases, are synchronous SQLite calls that can genuinely wait. A
-    /// mount or a shutdown that pays that wait on a tokio worker parks the
-    /// runtime, and on a single-worker runtime it parks all of it.
-    fn hold_journal_write_lock(path: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
-        let path = path.to_path_buf();
-        let (ready, holding) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let mut connection = rusqlite::Connection::open(&path).unwrap();
-            let transaction = connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            ready.send(()).unwrap();
-            std::thread::sleep(hold);
-            transaction.rollback().unwrap();
-        });
-        holding.recv().unwrap();
-        handle
-    }
-
     /// A journey mount opens a SQLite file and applies its schema. On one
     /// runtime worker, doing that inline stops every other task on that
     /// worker for as long as the disk — or another writer — takes.
     ///
-    /// The heartbeat is counted *inside* the mounting task, between the
-    /// instant before the mount call and the instant after, so the window is
-    /// exactly the mount and nothing else. An inline mount has no await point
-    /// in that window at all, so a task sharing its worker cannot advance the
-    /// counter even once; a mount on the blocking pool leaves the worker free
-    /// for the whole wait.
+    /// The writer releases its lock only when another task runs on the sole
+    /// worker after the mount starts. An inline open prevents that task from
+    /// running until the writer's safety timeout, so the test checks task
+    /// ordering rather than a machine-dependent heartbeat rate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn mounting_a_journey_does_not_park_the_runtime_worker() {
         let temp = TempDir::new().unwrap();
@@ -11970,46 +12120,46 @@ mod tests {
             .await;
         drop(first);
 
-        let beats = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let heartbeat = tokio::spawn({
-            let beats = Arc::clone(&beats);
-            let stop = Arc::clone(&stop);
-            async move {
-                while !stop.load(Ordering::Relaxed) {
-                    beats.fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
-                }
+        let (ready, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn({
+            let journal_path = journal_path.clone();
+            move || {
+                let mut connection = rusqlite::Connection::open(journal_path).unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                ready.send(()).unwrap();
+                let released_by_worker = released.recv_timeout(Duration::from_secs(5)).is_ok();
+                transaction.rollback().unwrap();
+                released_by_worker
             }
         });
+        holding.recv().expect("journal writer acquired its lock");
 
-        // Another writer holds the journal for long enough that the schema
-        // transaction inside the open really does wait.
-        let holder = hold_journal_write_lock(&journal_path, Duration::from_millis(400));
+        let (mount_started, started) = tokio::sync::oneshot::channel();
+        let heartbeat = tokio::spawn(async move {
+            started.await.expect("mounting task started");
+            release.send(()).expect("journal writer is waiting");
+        });
 
         let mount = tokio::spawn({
-            let beats = Arc::clone(&beats);
             let inputs = inputs();
             let store = store.clone();
             async move {
-                let before = beats.load(Ordering::Relaxed);
-                let journey = mount_and_replay(inputs, store, &HostCancellationToken::new()).await;
-                let after = beats.load(Ordering::Relaxed);
-                (journey, before, after)
+                mount_started.send(()).expect("heartbeat is waiting");
+                mount_and_replay(inputs, store, &HostCancellationToken::new()).await
             }
         });
-        let (journey, before, after) = mount.await.expect("the mounting task");
-        let journey = journey.expect("second mount");
-        stop.store(true, Ordering::Relaxed);
-        heartbeat.await.expect("the heartbeat task");
-        holder.join().unwrap();
-
+        let journey = mount.await.expect("the mounting task");
+        let heartbeat = heartbeat.await;
+        let released_by_worker = holder.join().expect("journal writer thread");
         assert!(
-            after - before >= 1_000,
-            "the runtime worker advanced only {} times while the journey mounted against a \
-             contended journal: the open is still running on the worker",
-            after - before,
+            released_by_worker,
+            "the sole runtime worker could not release the journal writer while mounting"
         );
+        heartbeat.expect("the heartbeat task");
+        let journey = journey.expect("second mount");
         assert_eq!(journey.journal_path(), journal_path.as_path());
         journey
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))

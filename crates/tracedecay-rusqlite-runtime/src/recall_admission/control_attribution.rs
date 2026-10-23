@@ -39,18 +39,18 @@ const RETAINED_CANDIDATE_ID_PREFIX: &str = "advisory.retained-identity-v1.";
 /// retained state. The material is held only in zeroizing storage and is never
 /// included in a debug representation or a retained record.
 #[derive(Clone)]
-pub(crate) struct RecallLocatorKeyV1(Arc<Zeroizing<Vec<u8>>>);
+pub struct RecallLocatorKeyV1(Arc<Zeroizing<Vec<u8>>>);
 
 impl RecallLocatorKeyV1 {
-    pub(crate) fn from_material(material: Vec<u8>) -> Result<Self> {
+    pub fn from_material(material: Vec<u8>) -> Result<Self> {
         if material.len() != 32 {
             return Err(invalid("recall locator key length"));
         }
         Ok(Self(Arc::new(Zeroizing::new(material))))
     }
 
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn for_test() -> Self {
         Self::from_material(vec![0xA5; 32]).expect("fixed recall locator test key")
     }
 
@@ -67,7 +67,7 @@ impl std::fmt::Debug for RecallLocatorKeyV1 {
 
 /// Typed refusal of retained attribution; absence never supplies authority.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RecallControlAttributionErrorV1 {
+pub enum RecallControlAttributionErrorV1 {
     #[error("invalid retained recall control attribution: {0}")]
     Invalid(&'static str),
     #[error("retained recall control target was not found")]
@@ -84,16 +84,24 @@ pub(crate) enum RecallControlAttributionErrorV1 {
 
 type Result<T> = std::result::Result<T, RecallControlAttributionErrorV1>;
 
+#[derive(Clone, Copy)]
+pub(super) struct RetainedItemBindingV1<'a> {
+    pub(super) provider_id: &'a str,
+    pub(super) registration_revision: u64,
+    pub(super) provider_rank: usize,
+    pub(super) candidate_id: &'a str,
+}
+
 /// Versioned address of the ledger's existing `(scope digest, trace id)` key.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RecallControlTraceRefV1 {
+pub struct RecallControlTraceRefV1 {
     wire: String,
     exact_scope_sha256: String,
     trace_id: String,
 }
 
 impl RecallControlTraceRefV1 {
-    pub(crate) fn parse(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         if value.len() != TRACE_PREFIX.len() + 129 {
             return Err(invalid("trace reference length"));
         }
@@ -110,15 +118,15 @@ impl RecallControlTraceRefV1 {
         })
     }
 
-    pub(crate) fn trace_id(&self) -> &str {
+    pub fn trace_id(&self) -> &str {
         &self.trace_id
     }
 
-    pub(crate) fn exact_scope_sha256(&self) -> &str {
+    pub fn exact_scope_sha256(&self) -> &str {
         &self.exact_scope_sha256
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.wire
     }
 
@@ -126,20 +134,20 @@ impl RecallControlTraceRefV1 {
     /// context input to every opaque source locator derived from that trace.
     /// Callers resolving a retained source must prove that the trace and the
     /// freshly mounted destination are the same scope before using it.
-    pub(crate) fn is_bound_to_scope(&self, scope: &OwnedExactScope) -> bool {
+    pub fn is_bound_to_scope(&self, scope: &OwnedExactScope) -> bool {
         self.exact_scope_sha256 == scope.exact_scope_sha256()
     }
 }
 
 /// Original provider rank in the final trace, never a normalization-list rank.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RecallControlItemRefV1 {
+pub struct RecallControlItemRefV1 {
     wire: String,
     provider_rank: usize,
 }
 
 impl RecallControlItemRefV1 {
-    pub(crate) fn parse(value: &str) -> Result<Self> {
+    pub fn parse(value: &str) -> Result<Self> {
         if value.len() > ITEM_PREFIX.len() + 20 {
             return Err(invalid("item reference length"));
         }
@@ -158,16 +166,16 @@ impl RecallControlItemRefV1 {
         })
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.wire
     }
 }
 
 /// Previously confirmed data, structurally checked but never fresh authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct RetainedRecallControlBindingV1 {
-    pub(crate) stable_memory_ref: String,
-    pub(crate) original_sources: Vec<RecallSourceAttributionV1>,
+pub struct RetainedRecallControlBindingV1 {
+    pub stable_memory_ref: String,
+    pub original_sources: Vec<RecallSourceAttributionV1>,
 }
 
 impl RetainedRecallControlBindingV1 {
@@ -238,8 +246,8 @@ pub struct PreparedRecallControlMetadataV1 {
 impl PreparedRecallControlMetadataV1 {
     /// `bindings` must come from final successful host hydration, keyed by the
     /// original candidate identity. This function confers no source authority.
-    #[cfg(test)]
-    pub(crate) fn prepare(
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn prepare(
         trace: &RecallExplainTraceV1,
         delivery_scope: &OwnedExactScope,
         bindings: &BTreeMap<String, RetainedRecallControlBindingV1>,
@@ -252,7 +260,7 @@ impl PreparedRecallControlMetadataV1 {
         )
     }
 
-    pub(crate) fn prepare_with_key(
+    pub fn prepare_with_key(
         trace: &RecallExplainTraceV1,
         delivery_scope: &OwnedExactScope,
         bindings: &BTreeMap<String, RetainedRecallControlBindingV1>,
@@ -401,11 +409,11 @@ impl PreparedRecallControlMetadataV1 {
     }
 
     /// Use only after the enclosing atomic trace write reports success.
-    pub(crate) fn trace_ref(&self) -> &RecallControlTraceRefV1 {
+    pub fn trace_ref(&self) -> &RecallControlTraceRefV1 {
         &self.trace_ref
     }
 
-    pub(crate) fn item_ref(&self, provider_rank: usize) -> Option<RecallControlItemRefV1> {
+    pub fn item_ref(&self, provider_rank: usize) -> Option<RecallControlItemRefV1> {
         self.rows.get(&provider_rank)?;
         Some(RecallControlItemRefV1 {
             wire: format!("{ITEM_PREFIX}{provider_rank}"),
@@ -530,28 +538,28 @@ impl PreparedRecallControlMetadataV1 {
 
 /// Retained producing identity and delivery scope; the caller must authorize them.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RetainedRecallControlScopeV1 {
-    pub(crate) provider_id: OwnedProviderId,
-    pub(crate) registration_revision: u64,
-    pub(crate) delivery_scope: OwnedExactScope,
+pub struct RetainedRecallControlScopeV1 {
+    pub provider_id: OwnedProviderId,
+    pub registration_revision: u64,
+    pub delivery_scope: OwnedExactScope,
 }
 
 /// Exact retained member selected by observation identity, including multi-source items.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RetainedRecallControlSourceV1 {
+pub struct RetainedRecallControlSourceV1 {
     /// In-memory context for re-redacting the persisted source locator. The
     /// trace itself is never serialized into the control tables.
-    pub(crate) trace: RecallControlTraceRefV1,
-    pub(crate) scope: RetainedRecallControlScopeV1,
-    pub(crate) candidate_id: String,
-    pub(crate) provider_rank: usize,
-    pub(crate) stable_memory_ref: String,
-    pub(crate) original_source: RecallSourceAttributionV1,
+    pub trace: RecallControlTraceRefV1,
+    pub scope: RetainedRecallControlScopeV1,
+    pub candidate_id: String,
+    pub provider_rank: usize,
+    pub stable_memory_ref: String,
+    pub original_source: RecallSourceAttributionV1,
 }
 
 impl RecallAdmissionLedgerV1 {
     /// Execute on the caller's existing blocking pool with its original control.
-    pub(crate) fn read_retained_control_scope(
+    pub fn read_retained_control_scope(
         &self,
         trace: &RecallControlTraceRefV1,
         control: &OperationControl,
@@ -563,7 +571,7 @@ impl RecallAdmissionLedgerV1 {
     }
 
     /// One composite-key JOIN reads a single item; siblings are never fetched.
-    pub(crate) fn read_retained_control_source(
+    pub fn read_retained_control_source(
         &self,
         trace: &RecallControlTraceRefV1,
         item: &RecallControlItemRefV1,
@@ -829,10 +837,12 @@ fn validate_retained_control_items_on_connection(
             locator_key,
             trace.exact_scope_sha256(),
             trace.trace_id(),
-            scope.provider_id.as_str(),
-            scope.registration_revision,
-            provider_rank,
-            &candidate_id,
+            RetainedItemBindingV1 {
+                provider_id: scope.provider_id.as_str(),
+                registration_revision: scope.registration_revision,
+                provider_rank,
+                candidate_id: &candidate_id,
+            },
             &item_bytes,
         )?;
         if expected_item_mac != item_mac {
@@ -1073,14 +1083,17 @@ fn decode_source(
             .map(|value| u64::try_from(value).map_err(|_| invalid("retained tokens")))
             .transpose()?,
     };
+    let item_binding = RetainedItemBindingV1 {
+        provider_id: scope.provider_id.as_str(),
+        registration_revision: scope.registration_revision,
+        provider_rank,
+        candidate_id: &candidate_id,
+    };
     let expected_item_mac = retained_item_bytes_mac(
         locator_key,
         trace.exact_scope_sha256(),
         trace.trace_id(),
-        scope.provider_id.as_str(),
-        scope.registration_revision,
-        provider_rank,
-        &candidate_id,
+        item_binding,
         &serde_json::to_vec(&item_value)?,
     )?;
     if expected_item_mac != item_mac {
@@ -1112,12 +1125,9 @@ fn decode_source(
         .map_err(RecallControlAttributionErrorV1::Control)?;
     let retained_observation_id = opaque_control_locator(
         locator_key,
-        scope.provider_id.as_str(),
         RETAINED_SOURCE_LOCATOR_PREFIX,
         trace,
-        scope.registration_revision,
-        item.provider_rank,
-        &candidate_id,
+        item_binding,
         "observation_id",
         observation_id,
     )?;
@@ -1198,12 +1208,14 @@ fn redact_control_binding(
 ) -> Result<RetainedRecallControlBindingV1> {
     let stable_memory_ref = opaque_control_locator(
         locator_key,
-        provider_id,
         RETAINED_MEMORY_REF_PREFIX,
         trace,
-        registration_revision,
-        provider_rank,
-        candidate_id,
+        RetainedItemBindingV1 {
+            provider_id,
+            registration_revision,
+            provider_rank,
+            candidate_id,
+        },
         "stable_memory_ref",
         &binding.stable_memory_ref,
     )?;
@@ -1228,7 +1240,7 @@ fn redact_control_binding(
     })
 }
 
-pub(crate) fn redact_retained_source_attribution_with_key(
+pub fn redact_retained_source_attribution_with_key(
     locator_key: &RecallLocatorKeyV1,
     provider_id: &str,
     trace: &RecallControlTraceRefV1,
@@ -1237,15 +1249,18 @@ pub(crate) fn redact_retained_source_attribution_with_key(
     candidate_id: &str,
     source: &RecallSourceAttributionV1,
 ) -> Result<RecallSourceAttributionV1> {
+    let binding = RetainedItemBindingV1 {
+        provider_id,
+        registration_revision,
+        provider_rank,
+        candidate_id,
+    };
     let locator = |field: &str, value: &str| {
         opaque_control_locator(
             locator_key,
-            provider_id,
             RETAINED_SOURCE_LOCATOR_PREFIX,
             trace,
-            registration_revision,
-            provider_rank,
-            candidate_id,
+            binding,
             field,
             value,
         )
@@ -1271,11 +1286,8 @@ pub(crate) fn redact_retained_source_attribution_with_key(
             .transpose()?,
         content_sha256: opaque_control_digest(
             locator_key,
-            provider_id,
             trace,
-            registration_revision,
-            provider_rank,
-            candidate_id,
+            binding,
             "content_sha256",
             &source_identity.content_sha256,
         )?,
@@ -1330,26 +1342,26 @@ fn redact_scope(
     candidate_id: &str,
     scope: &RecallOutcomeScopeV1,
 ) -> Result<RecallOutcomeScopeV1> {
+    let binding = RetainedItemBindingV1 {
+        provider_id,
+        registration_revision,
+        provider_rank,
+        candidate_id,
+    };
     let locator = |field: &str, value: &str| {
         opaque_control_locator(
             locator_key,
-            provider_id,
             RETAINED_SOURCE_LOCATOR_PREFIX,
             trace,
-            registration_revision,
-            provider_rank,
-            candidate_id,
+            binding,
             field,
             value,
         )
     };
     let digest = opaque_control_digest(
         locator_key,
-        provider_id,
         trace,
-        registration_revision,
-        provider_rank,
-        candidate_id,
+        binding,
         "origin_scope_digest",
         &scope.resolved_scope_digest,
     )?;
@@ -1366,52 +1378,37 @@ fn redact_scope(
 
 fn opaque_control_locator(
     locator_key: &RecallLocatorKeyV1,
-    provider_id: &str,
     prefix: &str,
     trace: &RecallControlTraceRefV1,
-    registration_revision: u64,
-    provider_rank: usize,
-    candidate_id: &str,
+    binding: RetainedItemBindingV1<'_>,
     field: &str,
     value: &str,
 ) -> Result<String> {
     Ok(format!(
         "{prefix}{}",
-        opaque_control_digest(
-            locator_key,
-            provider_id,
-            trace,
-            registration_revision,
-            provider_rank,
-            candidate_id,
-            field,
-            value,
-        )?
+        opaque_control_digest(locator_key, trace, binding, field, value)?
     ))
 }
 
 fn opaque_control_digest(
     locator_key: &RecallLocatorKeyV1,
-    provider_id: &str,
     trace: &RecallControlTraceRefV1,
-    registration_revision: u64,
-    provider_rank: usize,
-    candidate_id: &str,
+    binding: RetainedItemBindingV1<'_>,
     field: &str,
     value: &str,
 ) -> Result<String> {
-    let revision = registration_revision.to_be_bytes();
-    let rank = (provider_rank as u64).to_be_bytes();
+    let revision = binding.registration_revision.to_be_bytes();
+    let rank = (binding.provider_rank as u64).to_be_bytes();
     hmac_hex(
         locator_key,
         b"tracedecay.recall-control-opaque-locator.v2",
         &[
             trace.exact_scope_sha256.as_bytes(),
             trace.trace_id.as_bytes(),
-            provider_id.as_bytes(),
+            binding.provider_id.as_bytes(),
             &revision,
             &rank,
-            candidate_id.as_bytes(),
+            binding.candidate_id.as_bytes(),
             field.as_bytes(),
             value.as_bytes(),
         ],
@@ -1454,28 +1451,25 @@ pub(crate) fn retained_trace_bytes_mac(
     )
 }
 
-pub(crate) fn retained_item_bytes_mac(
+pub(super) fn retained_item_bytes_mac(
     locator_key: &RecallLocatorKeyV1,
     exact_scope_sha256: &str,
     trace_id: &str,
-    provider_id: &str,
-    registration_revision: u64,
-    provider_rank: usize,
-    candidate_id: &str,
+    binding: RetainedItemBindingV1<'_>,
     item_bytes: &[u8],
 ) -> Result<String> {
-    let revision = registration_revision.to_be_bytes();
-    let rank = (provider_rank as u64).to_be_bytes();
+    let revision = binding.registration_revision.to_be_bytes();
+    let rank = (binding.provider_rank as u64).to_be_bytes();
     hmac_hex(
         locator_key,
         b"tracedecay.retained-recall-item-bytes.v1",
         &[
             exact_scope_sha256.as_bytes(),
             trace_id.as_bytes(),
-            provider_id.as_bytes(),
+            binding.provider_id.as_bytes(),
             &revision,
             &rank,
-            candidate_id.as_bytes(),
+            binding.candidate_id.as_bytes(),
             item_bytes,
         ],
     )
@@ -1574,7 +1568,7 @@ pub(crate) fn is_opaque_retained_memory_ref(value: &str) -> bool {
     is_opaque_locator(value, RETAINED_MEMORY_REF_PREFIX)
 }
 
-pub(crate) fn validate_opaque_retained_source(source: &RecallSourceAttributionV1) -> Result<()> {
+pub fn validate_opaque_retained_source(source: &RecallSourceAttributionV1) -> Result<()> {
     if source.source_sequence == 0 {
         return Err(invalid("retained source sequence is not resolvable"));
     }
@@ -1769,7 +1763,7 @@ fn require_id(value: &str) -> Result<()> {
     require_size(value, MAX_ID_BYTES)
 }
 
-pub(crate) fn validate_retained_candidate_identity(value: &str) -> Result<()> {
+pub fn validate_retained_candidate_identity(value: &str) -> Result<()> {
     validate_retained_trace_candidate_id(value)
 }
 
@@ -1777,7 +1771,7 @@ pub(crate) fn validate_retained_candidate_identity(value: &str) -> Result<()> {
 /// its candidate and source locators. The registry's deterministic trace id
 /// is useful while reconciling an in-memory result, but the retained trace
 /// reference must not expose a dictionary-recoverable request id.
-pub(crate) fn retained_trace_id_with_key(
+pub fn retained_trace_id_with_key(
     locator_key: &RecallLocatorKeyV1,
     exact_scope_sha256: &str,
     request_id: &str,
@@ -1800,7 +1794,7 @@ pub(crate) fn retained_trace_id_with_key(
 /// Projects every provider candidate into one request/context-bound opaque id.
 /// The HMAC key is durable host material, so the result is resistant to
 /// offline dictionary recovery of provider-controlled ids.
-pub(crate) fn retained_candidate_identity_alias_for_context(
+pub fn retained_candidate_identity_alias_for_context(
     locator_key: &RecallLocatorKeyV1,
     exact_scope_sha256: &str,
     request_id: &str,
@@ -1825,7 +1819,7 @@ pub(crate) fn retained_candidate_identity_alias_for_context(
     ))
 }
 
-pub(crate) fn retained_candidate_identity_alias_for_report(
+pub fn retained_candidate_identity_alias_for_report(
     report: &tracedecay_memory_provider_registry::RecallAdmissionReport,
     locator_key: &RecallLocatorKeyV1,
     candidate_id: &str,
@@ -1843,7 +1837,7 @@ pub(crate) fn retained_candidate_identity_alias_for_report(
 
 /// Returns the complete collision-safe projection in provider order. An alias
 /// is disambiguated if it happens to equal another raw id or an earlier alias.
-pub(crate) fn retained_candidate_identity_aliases_for_report(
+pub fn retained_candidate_identity_aliases_for_report(
     report: &tracedecay_memory_provider_registry::RecallAdmissionReport,
     locator_key: &RecallLocatorKeyV1,
 ) -> Result<BTreeMap<String, String>> {
@@ -1899,7 +1893,7 @@ pub(crate) fn opaque_denial_stable_memory_ref(
 
 /// Retained candidate ids must already be host projections. A missing alias is
 /// a typed refusal at the ledger boundary; it can never fall back to raw bytes.
-pub(crate) fn validate_retained_trace_candidate_id(value: &str) -> Result<()> {
+pub fn validate_retained_trace_candidate_id(value: &str) -> Result<()> {
     if !value.starts_with(RETAINED_CANDIDATE_ID_PREFIX) {
         return Err(invalid("retained candidate identity is not opaque"));
     }
@@ -1922,7 +1916,7 @@ pub(crate) fn validate_retained_trace_candidate_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_retained_provider_rank(rank: usize) -> Result<()> {
+pub fn validate_retained_provider_rank(rank: usize) -> Result<()> {
     if valid_rank(rank) {
         Ok(())
     } else {
@@ -1946,6 +1940,72 @@ mod tests {
     use tracedecay_memory_provider_registry::{
         CancellationToken, RecallExplainItemV1, RecallExplainProviderExplanationV1,
     };
+
+    #[test]
+    fn opaque_control_locator_matches_known_bytes() {
+        let key = RecallLocatorKeyV1::from_material((0_u8..32).collect()).unwrap();
+        let trace = RecallControlTraceRefV1::parse(&format!(
+            "{TRACE_PREFIX}{}:{}",
+            "b".repeat(64),
+            "d".repeat(64),
+        ))
+        .unwrap();
+        let binding = RetainedItemBindingV1 {
+            provider_id: "provider.native\0route",
+            registration_revision: 0x0102_0304_0506_0708,
+            provider_rank: 0x0102_0304,
+            candidate_id: "candidate.\u{03b1}\0retained",
+        };
+        // Python hmac/sha256 over the domain and each field, each prefixed
+        // with its u64 big-endian byte length, gives this fixed digest.
+        let expected = "d37c9e581c946030ed939a1c8761e7738b8e051523aecab0c16148446932e6b2";
+        assert_eq!(
+            opaque_control_digest(
+                &key,
+                &trace,
+                binding,
+                "observation_id",
+                "source.\u{03b2}\0record",
+            )
+            .unwrap(),
+            expected
+        );
+        assert_eq!(
+            opaque_control_locator(
+                &key,
+                RETAINED_SOURCE_LOCATOR_PREFIX,
+                &trace,
+                binding,
+                "observation_id",
+                "source.\u{03b2}\0record",
+            )
+            .unwrap(),
+            format!("{RETAINED_SOURCE_LOCATOR_PREFIX}{expected}")
+        );
+    }
+
+    #[test]
+    fn retained_item_bytes_mac_matches_known_bytes() {
+        let key = RecallLocatorKeyV1::from_material((0_u8..32).collect()).unwrap();
+        let binding = RetainedItemBindingV1 {
+            provider_id: "provider.native\0route",
+            registration_revision: 0x0102_0304_0506_0708,
+            provider_rank: 0x0102_0304,
+            candidate_id: "candidate.\u{03b1}\0retained",
+        };
+        // The independently computed vector includes non-UTF-8 item bytes.
+        assert_eq!(
+            retained_item_bytes_mac(
+                &key,
+                &"b".repeat(64),
+                &"d".repeat(64),
+                binding,
+                b"\0{\"candidate\":\"\xce\xb1\"}\xff\n",
+            )
+            .unwrap(),
+            "c8d122eed2c1d3f2991951da4b17a866184e74a830bdbfabb1d703526cffc84d"
+        );
+    }
 
     fn control(millis: u64) -> OperationControl {
         OperationControl::new(

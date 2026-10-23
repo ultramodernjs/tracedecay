@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tracedecay_domain::ManifestDigest;
 use tracedecay_project::project::TraceDecay;
 use tracedecay_runtime_core::native_runtime;
+use tracedecay_rusqlite_runtime::recall_admission::control_attribution;
 
 use super::{
     AdvisoryMemoryContextV1, CognitiveRecallMountError, cognitive_recall, native_authority,
@@ -88,7 +89,7 @@ pub struct ProjectMemoryProviderHostMountV1 {
     )>,
     cognitive_recall_mount: Option<Arc<ProjectCognitiveRecallMountV1>>,
     native_session_retrieval_mount: Option<Arc<native_authority::NativeSessionRetrievalMountV1>>,
-    locator_key: cognitive_recall::control_attribution::RecallLocatorKeyV1,
+    locator_key: control_attribution::RecallLocatorKeyV1,
 }
 
 impl ProjectMemoryProviderHostMountV1 {
@@ -489,19 +490,22 @@ async fn mount_project_memory_provider_host_in_tokio(
                 return Err("selected NCM participation is disabled".to_owned());
             };
             let profile_id = inputs.profile_id.clone();
-            tokio::task::spawn_blocking(move || {
-                factory(
-                    profile_id,
-                    worker_binary,
-                    state_root,
-                    1,
-                    mode,
-                    namespace_binding,
-                    Some(admission_authority),
-                )
-            })
-            .await
-            .map_err(|error| format!("NCM construction task unavailable: {error}"))?
+            let runtime = native_runtime::tokio_handle("memory_provider.ncm_construction")
+                .ok_or_else(|| "NCM construction runtime unavailable".to_owned())?;
+            runtime
+                .spawn_blocking(move || {
+                    factory(
+                        profile_id,
+                        worker_binary,
+                        state_root,
+                        1,
+                        mode,
+                        namespace_binding,
+                        Some(admission_authority),
+                    )
+                })
+                .await
+                .map_err(|error| format!("NCM construction task unavailable: {error}"))?
         }
         .await;
         match constructed {
@@ -632,6 +636,8 @@ async fn mount_project_memory_provider_full_in_tokio(
 ) -> std::result::Result<Arc<ProjectMemoryProviderFullMountV1>, String> {
     use tracedecay_memory_provider_registry::ObservationMountRequirementV1;
 
+    let runtime = native_runtime::tokio_handle("memory_provider.full_mount")
+        .ok_or_else(|| "memory provider Tokio runtime unavailable".to_owned())?;
     let hook_origin_reader = Arc::new(provider_history::HookOriginReaderV1::new(
         inputs.graph.hook_store_layout().data_root.clone(),
         inputs.brain_id.clone(),
@@ -733,7 +739,7 @@ async fn mount_project_memory_provider_full_in_tokio(
             journal: journey.history_journal(),
             provider_id: provider.provider_id.clone(),
             policy_revision: 1,
-            runtime: tokio::runtime::Handle::current(),
+            runtime: runtime.clone(),
         });
         if let Err(error) = authority.validate_mount() {
             fail_partial_provider_mount!(format!("provider history mount refused: {error}"));
@@ -803,10 +809,10 @@ async fn mount_project_memory_provider_full_in_tokio(
             .map(|mount| mount.inner.control_ledger()),
         locator_key: host.locator_key.clone(),
         live_journals: control_journals,
-        runtime: tokio::runtime::Handle::current(),
+        runtime: runtime.clone(),
     };
     let blocking_control = control.clone();
-    let mut work = tokio::task::spawn_blocking(move || {
+    let mut work = runtime.spawn_blocking(move || {
         provider_control::authority::ProviderControlAuthorityV1::from_mounted_data(
             control_inputs,
             &blocking_control,
@@ -874,13 +880,13 @@ async fn shutdown_partial_provider_journeys(journeys: &[Arc<ProjectObservationJo
     }
 }
 
-fn new_recall_locator_key()
--> std::result::Result<cognitive_recall::control_attribution::RecallLocatorKeyV1, String> {
+fn new_recall_locator_key() -> std::result::Result<control_attribution::RecallLocatorKeyV1, String>
+{
     let mut bytes = vec![0_u8; 32];
     getrandom::fill(&mut bytes).map_err(|error| {
         format!("OS entropy unavailable for the project recall locator key: {error}")
     })?;
-    cognitive_recall::control_attribution::RecallLocatorKeyV1::from_material(bytes)
+    control_attribution::RecallLocatorKeyV1::from_material(bytes)
         .map_err(|error| format!("project recall locator key was rejected: {error}"))
 }
 

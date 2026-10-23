@@ -475,6 +475,9 @@ impl ProviderInvocationBoundaryV1 {
     ///
     /// `Ok` carries the census that satisfied `admits`; `Err` carries the last
     /// one seen before `within` elapsed.
+    ///
+    /// Poll this future inside a running Tokio runtime with time enabled.
+    /// Reading [`Self::worker_census`] does not require a runtime.
     pub async fn await_worker_census(
         &self,
         provider_id: &str,
@@ -498,6 +501,7 @@ impl ProviderInvocationBoundaryV1 {
             let woken = tokio::select! {
                 biased;
                 () = &mut changed => true,
+                // ambient-tokio: this Tokio-only wait is polled by timer-enabled Tokio callers.
                 () = tokio::time::sleep(remaining) => false,
             };
             if !woken {
@@ -515,6 +519,10 @@ impl ProviderInvocationBoundaryV1 {
     /// its budget, was cancelled, or could not be run at all -- and, for the
     /// two caller outcomes, whether the host stopped its worker or the worker
     /// is still running.
+    ///
+    /// Poll this future in a running Tokio runtime with time enabled. The
+    /// service's advisory recall boundary enters its owned runtime on every
+    /// poll. A caller without a runtime is refused before starting a worker.
     pub async fn invoke<T>(
         &self,
         request: ProviderInvocationRequestV1<'_>,
@@ -561,6 +569,18 @@ impl ProviderInvocationBoundaryV1 {
                 provider_id: provider_id.to_owned(),
             });
         }
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                if withdrawn_already(&mut cancelled).await {
+                    return Err(cancelled_before_contact(provider_id));
+                }
+                return Err(ProviderInvocationFaultV1::WorkerUnavailable {
+                    provider_id: provider_id.to_owned(),
+                    detail: format!("provider invocation Tokio runtime unavailable: {error}"),
+                });
+            }
+        };
         let ledger = self.ledger(provider_id);
         if let Err(refusal) = ledger.admit(provider_id, self.limits) {
             // Admission refusals are still pre-contact. Cancellation that
@@ -610,6 +630,11 @@ impl ProviderInvocationBoundaryV1 {
             }
         };
         let started = std::time::Instant::now();
+        let timeout = {
+            let _entered = runtime.enter();
+            // ambient-tokio: the captured runtime is entered while its timer is constructed.
+            tokio::time::sleep(budget)
+        };
         // Three outcomes, one race. Completion is polled first, but accepting
         // it has a second consent boundary: cancellation may have become ready
         // before the delivered branch was chosen. Once withdrawal is observed,
@@ -618,7 +643,7 @@ impl ProviderInvocationBoundaryV1 {
             biased;
             delivered = &mut receiver => Ok(delivered),
             () = &mut cancelled => Err(WaitEndV1::Cancelled),
-            () = tokio::time::sleep(budget) => Err(WaitEndV1::DeadlineExceeded),
+            () = timeout => Err(WaitEndV1::DeadlineExceeded),
         };
         let stop = match ended {
             Ok(Ok(outcome)) => {

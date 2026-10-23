@@ -6,7 +6,7 @@ package(default_visibility = ["//visibility:public"])
 load("@c//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
-load("//scripts:bazel/rust_test.bzl", "perf_rustc_flags", "rust_test")
+load("//scripts:bazel/rust_test.bzl", "profile_rustc_flags", "rust_test")
 
 rust_library(
     name = "tracedecay-memory-provider-ncm",
@@ -20,7 +20,7 @@ rust_library(
     deps = all_crate_deps(normal = True) + ["//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     aliases = aliases(normal = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default"],
 )
 
@@ -36,7 +36,7 @@ rust_library(
     deps = all_crate_deps(normal = True) + ["//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     aliases = aliases(normal = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
 )
 
@@ -52,7 +52,7 @@ rust_library(
     deps = all_crate_deps(normal = True) + ["//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     aliases = aliases(normal = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend"],
 )
 
@@ -65,7 +65,7 @@ rust_test(
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-provider-ncm:tracedecay-memory-provider-ncm__+rust-backend_+test-helpers_+test-transport__dev", "//crates/tracedecay-memory-conformance:tracedecay-memory-conformance__dev", "//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev", "//crates/tracedecay-memory-provider-registry:tracedecay-memory-provider-registry__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
     data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
@@ -81,7 +81,7 @@ rust_test(
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-provider-ncm:tracedecay-memory-provider-ncm__+rust-backend_+test-helpers_+test-transport__dev", "//crates/tracedecay-memory-conformance:tracedecay-memory-conformance__dev", "//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev", "//crates/tracedecay-memory-provider-registry:tracedecay-memory-provider-registry__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
     data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
@@ -97,7 +97,7 @@ rust_test(
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-provider-ncm:tracedecay-memory-provider-ncm__+rust-backend_+test-helpers_+test-transport__dev", "//crates/tracedecay-memory-conformance:tracedecay-memory-conformance__dev", "//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev", "//crates/tracedecay-memory-provider-registry:tracedecay-memory-provider-registry__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
     data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
@@ -113,7 +113,7 @@ rust_test(
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-provider-ncm:tracedecay-memory-provider-ncm__+rust-backend_+test-helpers_+test-transport__dev", "//crates/tracedecay-memory-conformance:tracedecay-memory-conformance__dev", "//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev", "//crates/tracedecay-memory-provider-registry:tracedecay-memory-provider-registry__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
     data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
@@ -129,7 +129,7 @@ rust_test(
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-provider-ncm:tracedecay-memory-provider-ncm__+rust-backend_+test-helpers_+test-transport__dev", "//crates/tracedecay-memory-conformance:tracedecay-memory-conformance__dev", "//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev", "//crates/tracedecay-memory-provider-registry:tracedecay-memory-provider-registry__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
     data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
@@ -145,7 +145,7 @@ rust_test(
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-provider-ncm:tracedecay-memory-provider-ncm__+rust-backend_+test-helpers_+test-transport__dev", "//crates/tracedecay-memory-conformance:tracedecay-memory-conformance__dev", "//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev", "//crates/tracedecay-memory-provider-registry:tracedecay-memory-provider-registry__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True),
     data = glob(["assets/**", "data/**", "fixtures/**", "resources/**", "tests/**", "tests/fixtures/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
@@ -161,7 +161,7 @@ rust_test(
     deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-memory-conformance:tracedecay-memory-conformance__dev", "//crates/tracedecay-memory-ncm-runtime:tracedecay-memory-ncm-runtime__+test-transport__dev", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api__dev", "//crates/tracedecay-memory-provider-registry:tracedecay-memory-provider-registry__dev"],
     proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
     aliases = aliases(normal = True, normal_dev = True),
-    rustc_flags = perf_rustc_flags(1),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),
     compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True)
         + ["//product/ncm:receipts_backend"],
     data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),

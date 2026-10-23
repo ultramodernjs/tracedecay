@@ -8,6 +8,9 @@ license = "MIT"
 repository = "https://github.com/ScriptedAlchemy/tracedecay"
 
 [features]
+recall-admission = ["dep:hex", "dep:hmac", "dep:zeroize", "dep:tracedecay-memory-provider-registry"]
+# Typed recall inspection and fixed-key constructors for dependent test builds.
+test-helpers = []
 test-transport = []
 # Starts a default native runtime on first use when the host never called
 # `native_runtime::install`. Tests only; production hosts install at startup.
@@ -17,6 +20,8 @@ test-runtime = []
 async-channel.workspace = true
 dunce = "1.0.5"
 futures-util.workspace = true
+hex = { workspace = true, optional = true }
+hmac = { version = "0.13.0", features = ["zeroize"], optional = true }
 rusqlite = { workspace = true, features = ["bundled", "cache", "hooks", "limits", "trace"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -30,7 +35,9 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 tracedecay-domain = { path = "../tracedecay-domain" }
 tracedecay-contracts = { path = "../tracedecay-contracts" }
 tracedecay-store = { path = "../tracedecay-store" }
+tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry", optional = true }
 tracing.workspace = true
+zeroize = { version = "1.9.0", optional = true }
 
 # Thread CPU time for the long-poll count on native tasks.
 [target.'cfg(unix)'.dependencies]
@@ -39,7 +46,7 @@ libc.workspace = true
 [dev-dependencies]
 # Self dev-dependency: every workspace test build shares one resolution, so
 # this gives each test the lazy default runtime.
-tracedecay-rusqlite-runtime = { path = ".", features = ["test-runtime"] }
+tracedecay-rusqlite-runtime = { path = ".", features = ["test-runtime", "recall-admission"] }
 tokio = { version = "1", default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 tempfile.workspace = true

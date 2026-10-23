@@ -7102,7 +7102,6 @@ dependencies = [
  "fs2",
  "getrandom 0.4.3",
  "hex",
- "hmac",
  "libc",
  "rusqlite",
  "rustls",
@@ -7159,7 +7158,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "zeroize",
 ]
 
 [[package]]
@@ -7815,6 +7813,8 @@ dependencies = [
  "async-channel",
  "dunce",
  "futures-util",
+ "hex",
+ "hmac",
  "libc",
  "proptest",
  "ring",
@@ -7827,10 +7827,12 @@ dependencies = [
  "tokio",
  "tracedecay-contracts",
  "tracedecay-domain",
+ "tracedecay-memory-provider-registry",
  "tracedecay-rusqlite-runtime",
  "tracedecay-store",
  "tracedecay-tool-catalog",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

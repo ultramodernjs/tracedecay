@@ -41,8 +41,6 @@ pub mod compaction_receipt;
 pub mod generation;
 pub mod lease;
 pub mod loop_run;
-#[cfg(unix)]
-pub mod offline_compaction;
 pub mod retention;
 pub mod store_maintenance;
 pub mod telemetry;

@@ -168,7 +168,7 @@ fn compact_database(
     max_pages: u64,
     apply: Option<&str>,
 ) -> tracedecay_domain::errors::Result<()> {
-    use tracedecay_maintenance::offline_compaction::{
+    use tracedecay_runtime_core::offline_compaction::{
         compact_offline_v1, inspect_compaction_candidate_v1,
     };
     let database = profile_root.join(database);
@@ -1535,7 +1535,7 @@ mod compact_tests {
         assert!(compact_database(&profile, "user-sessions.db", 1 << 20, Some("stale")).is_err());
         assert_eq!(std::fs::read(&database).unwrap(), before);
 
-        let plan = tracedecay_maintenance::offline_compaction::inspect_compaction_candidate_v1(
+        let plan = tracedecay_runtime_core::offline_compaction::inspect_compaction_candidate_v1(
             &profile,
             &database,
             1 << 20,

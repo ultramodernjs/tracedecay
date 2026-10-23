@@ -53,6 +53,7 @@ use tracedecay_memory_provider_registry::{
     OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits,
     ProviderOperation, ProviderReply, TerminalCode, TerminalRecord,
 };
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_session_memory::fact_store::DatabaseFactStore;
 use tracedecay_session_memory::memory::MemoryApplication;
 use tracedecay_session_memory::session::{SessionDataFreshness, SessionTemporalQuery};
@@ -190,12 +191,12 @@ pub(crate) async fn project_native_memory_application_port_off_runtime(
     project_root: PathBuf,
     session_retrieval: Arc<NativeSessionRetrievalMountV1>,
 ) -> Result<Arc<dyn NativeMemoryApplicationPort>, NativeMemoryApplicationPortBuildError> {
-    tokio::task::spawn_blocking(move || {
+    native_runtime::spawn_blocking(move || {
         ProjectNativeMemoryApplicationPort::new(cg, project_root, session_retrieval)
             .map(|port| Arc::new(port) as Arc<dyn NativeMemoryApplicationPort>)
     })
     .await
-    .map_err(|error| NativeMemoryApplicationPortBuildError::BlockingJoin(error.to_string()))?
+    .map_err(NativeMemoryApplicationPortBuildError::BlockingJoin)?
 }
 
 impl ProjectNativeMemoryApplicationPort {
@@ -1322,6 +1323,7 @@ fn recall_with_runtime(
                 }
             }
         };
+        // ambient-tokio: this timer is constructed and polled inside the read actor's Runtime::block_on.
         match tokio::time::timeout(budget, read).await {
             Ok(outcome) => outcome,
             Err(_) => Err(NativeReadFailure::DeadlineExceeded),
@@ -2032,12 +2034,14 @@ impl NativeCancellationBridge {
     fn start(control: &OperationControl, cancellation: &CancellationSignal) -> Self {
         let provider_cancellation = control.cancellation();
         let cancellation = cancellation.clone();
+        // ambient-tokio: recall_session_history calls this only inside the read actor's Runtime::block_on.
         let task = tokio::spawn(async move {
             loop {
                 if provider_cancellation.is_cancelled() {
                     cancellation.cancel(now_micros());
                     break;
                 }
+                // ambient-tokio: the read actor's runtime owns and polls this spawned cancellation task.
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });

@@ -10,6 +10,9 @@ import subprocess
 
 
 STORAGE_OWNERS = {
+    # Separate provider state, never canonical Native facts or session storage.
+    "tracedecay-memory-ncm-runtime",  # NCM namespace stores and snapshots.
+    "tracedecay-memory-observation",  # Delivery journal, receipts and replay.
     "tracedecay-query",
     "tracedecay-runtime-core",
     "tracedecay-rusqlite-runtime",

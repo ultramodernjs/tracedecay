@@ -180,6 +180,58 @@ async fn settle_until(
     }
 }
 
+#[test]
+fn missing_runtime_refuses_invocation_before_contact_or_worker_admission() {
+    let boundary = boundary();
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let contacted = Arc::clone(&contacts);
+    let mut invocation = std::pin::pin!(boundary.invoke(
+        uncancelled(Duration::from_secs(5)),
+        move || {
+            contacted.fetch_add(1, Ordering::Relaxed);
+        },
+    ));
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        invocation.as_mut().poll(&mut context),
+        Poll::Ready(Err(ProviderInvocationFaultV1::WorkerUnavailable {
+            ref provider_id,
+            ..
+        })) if provider_id == PROVIDER
+    ));
+    assert_eq!(contacts.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        boundary.worker_census(PROVIDER),
+        ProviderWorkerCensusV1::default()
+    );
+}
+
+#[test]
+fn cancellation_preempts_missing_runtime_refusal_before_contact() {
+    let boundary = boundary();
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let contacted = Arc::clone(&contacts);
+    let mut invocation = std::pin::pin!(boundary.invoke(
+        ProviderInvocationRequestV1 {
+            provider_id: PROVIDER,
+            execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
+            budget: Duration::from_secs(5),
+            cancelled: Box::pin(ReadyAfterFirstPoll { polled: false }),
+        },
+        move || contacted.fetch_add(1, Ordering::Relaxed),
+    ));
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    assert_eq!(
+        invocation.as_mut().poll(&mut context),
+        Poll::Ready(Err(cancelled_before_contact()))
+    );
+    assert_eq!(contacts.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        boundary.worker_census(PROVIDER),
+        ProviderWorkerCensusV1::default()
+    );
+}
+
 /// A worker that returns inside its budget delivers its outcome and leaves the
 /// provider owning nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

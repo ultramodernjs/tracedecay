@@ -585,6 +585,8 @@ impl ProjectCognitiveRecallPortV1 {
     /// identity must equal the one the request carries, and cancelling it
     /// while the provider is working cancels the in-flight handshake, call,
     /// and any pinned fallback call.
+    ///
+    /// Poll this future in a running Tokio runtime with time enabled.
     pub async fn recall_admitted(
         &self,
         request: CognitiveRecallRequest,
@@ -597,6 +599,7 @@ impl ProjectCognitiveRecallPortV1 {
     /// Recalls with the canonical JSON produced by the host's freshly
     /// revalidated typed history grant. The mounted authority still admits it
     /// at dispatch; carrying this claim never grants source access by itself.
+    /// Poll this future in a running Tokio runtime with time enabled.
     pub async fn recall_admitted_with_history(
         &self,
         request: CognitiveRecallRequest,
@@ -703,7 +706,13 @@ impl ProjectCognitiveRecallPortV1 {
         // One live token for this recall, cancelled by the caller's own
         // signal. The bridge task is aborted on every exit path by the guard,
         // so a completed recall leaves nothing waiting on the signal.
-        let (cancellation_token, _cancellation_bridge) = bridge_cancellation(cancellation);
+        let (cancellation_token, _cancellation_bridge) = bridge_cancellation(cancellation)
+            .map_err(|error| {
+                CognitiveRecallPortError::Invocation(ProviderInvocationFaultV1::WorkerUnavailable {
+                    provider_id: self.routing.active_provider().as_str().to_owned(),
+                    detail: format!("recall cancellation Tokio runtime unavailable: {error}"),
+                })
+            })?;
         // The same token, kept out of the plan. When the host stops waiting it
         // fires this itself: the bridge task dies with this call, so a
         // cooperative provider would otherwise be left holding a token nothing
@@ -1141,18 +1150,19 @@ impl Drop for CancellationBridgeGuard {
 /// control of the recall already holds.
 fn bridge_cancellation(
     signal: &CancellationSignal,
-) -> (CancellationToken, CancellationBridgeGuard) {
+) -> Result<(CancellationToken, CancellationBridgeGuard), tokio::runtime::TryCurrentError> {
+    let runtime = tokio::runtime::Handle::try_current()?;
     let token = CancellationToken::new();
     if signal.is_cancelled() {
         token.cancel();
     }
     let bridged = token.clone();
     let signal = signal.clone();
-    let task = tokio::spawn(async move {
+    let task = runtime.spawn(async move {
         signal.cancelled().await;
         bridged.cancel();
     });
-    (token, CancellationBridgeGuard(task))
+    Ok((token, CancellationBridgeGuard(task)))
 }
 
 /// Host-owned request construction for whichever provider the router
