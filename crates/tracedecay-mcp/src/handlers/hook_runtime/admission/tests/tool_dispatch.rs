@@ -35,15 +35,18 @@ async fn prove_dispatch_cutoff(refuse_first: bool) {
     let envelope = &fixture.envelope;
     let effects = Arc::new(AtomicUsize::new(0));
     let attempts = Arc::new(AtomicUsize::new(0));
+    let allow_effect = Arc::new(tokio::sync::Semaphore::new(0));
     let (ran, mut runs) = tokio::sync::mpsc::unbounded_channel();
     let producer = BoundedHookOrchestratorV1::new(1, {
         let effects = Arc::clone(&effects);
         let attempts = Arc::clone(&attempts);
+        let allow_effect = Arc::clone(&allow_effect);
         let expected_event = daemon_mint_hook_v2_envelope(envelope);
         let expected_session = fixture.lifecycle.session_id.clone();
         move |request: HookOrchestrationRequestV1, _| {
             let effects = Arc::clone(&effects);
             let attempts = Arc::clone(&attempts);
+            let allow_effect = Arc::clone(&allow_effect);
             let ran = ran.clone();
             let expected_event = expected_event.clone();
             let expected_session = expected_session.clone();
@@ -56,6 +59,7 @@ async fn prove_dispatch_cutoff(refuse_first: bool) {
                     ran.send(false).unwrap();
                     return HookOrchestrationWorkOutcomeV1::RetryableFailure;
                 }
+                allow_effect.acquire().await.unwrap().forget();
                 effects.fetch_add(1, Ordering::SeqCst);
                 ran.send(true).unwrap();
                 HookOrchestrationWorkOutcomeV1::Completed
@@ -113,10 +117,13 @@ async fn prove_dispatch_cutoff(refuse_first: bool) {
         )
         .unwrap()
     };
-    assert!(
-        effects.load(Ordering::SeqCst) == 1 || !pending().is_empty(),
-        "a committed Tool boundary cannot lose both its intent execution and durable debt"
-    );
+    // The producer runs on another runtime. Reading effects before pending
+    // work is not a snapshot: it can execute and settle between those reads,
+    // leaving an old zero beside a newly empty ledger (notably on Windows).
+    // Hold successful work so replay must retain its exact debt until released.
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert_eq!(pending(), vec![envelope.clone()]);
+    allow_effect.add_permits(1);
     if refuse_first {
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(10), runs.recv())
