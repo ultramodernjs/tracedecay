@@ -688,6 +688,41 @@ def main() -> int:
     if ncm_valid.returncode != 0:
         raise SystemExit("valid NCM distribution matrix was rejected: " + ncm_valid.stderr)
 
+    # Both ordinary releases and inventory-only recovery must retain the
+    # supported-target restriction. Check each step independently so an
+    # intact packaging guard cannot hide an unguarded installed verification.
+    workflow = (VALIDATOR.parent.parent / ".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
+    supported_guard = "matrix.ncm == 'supported'"
+    recovery_guard = supported_guard + " && matrix.inventory_only != true"
+    for step in ("Package NCM worker sidecar", "Verify installed NCM release"):
+        original = f"- name: {step}\n        if: {recovery_guard}\n"
+        if original not in workflow:
+            raise SystemExit(f"NCM recovery workflow fixture no longer guards {step!r}")
+        for guard, accepted in (
+            (supported_guard, True),
+            ("matrix.inventory_only != true", False),
+            (supported_guard + " || matrix.inventory_only != true", False),
+            ("matrix.ncm == 'native-only'", False),
+        ):
+            with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as directory:
+                path = Path(directory) / "release.yml"
+                path.write_text(
+                    workflow.replace(original, f"- name: {step}\n        if: {guard}\n"),
+                    encoding="utf-8",
+                )
+                result = run_fixture(
+                    root_source=NCM_ROOT_MANIFEST,
+                    root_packaged=NCM_ROOT_MANIFEST,
+                    ncm_files=ncm_fixture(),
+                    ncm_workflows=[path],
+                )
+            if (result.returncode == 0) != accepted:
+                raise SystemExit(f"unexpected NCM guard verdict for {step!r}: {guard}: {result.stderr}")
+            if not accepted and "supported sidecar target" not in result.stderr:
+                raise SystemExit("NCM guard failed for an unexpected reason: " + result.stderr)
+
     ncm_without_receipt_digest = ncm_fixture()
     acquisition_without_receipt_digest = ncm_without_receipt_digest["model-acquisition.json"]
     assert isinstance(acquisition_without_receipt_digest, dict)

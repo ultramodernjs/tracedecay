@@ -24,6 +24,18 @@ use crate::observation::retention::{ObservationRetentionConfig, RetentionMode};
 use super::*;
 use crate::tests::harness::RegisteredGlobalDbTestRuntime;
 
+fn assert_no_writer_operations(
+    db: &RegisteredGlobalDb,
+    before: tracedecay_rusqlite_runtime::repository::RepositoryWriterRuntimeSnapshot,
+) {
+    let after = crate::tests::harness::writer_telemetry(db);
+    // Idle writer housekeeping can refresh WAL/checkpoint gauges independently
+    // of planning. Submitted operations and their commits must remain unchanged.
+    assert_eq!(before.operations, after.operations);
+    assert_eq!(before.batches, after.batches);
+    assert_eq!(before.commit_sequence, after.commit_sequence);
+}
+
 async fn record(
     db: &RegisteredGlobalDb,
     scope: ObservationScopeV1,
@@ -280,11 +292,7 @@ async fn ownership_plan_matches_native_records_not_sessions_or_text() {
         .await
         .unwrap();
     assert_eq!(plan, repeated, "read-only plans must be stable");
-    assert_eq!(
-        before,
-        crate::tests::harness::writer_telemetry(profile),
-        "planning must never submit a write"
-    );
+    assert_no_writer_operations(profile, before);
 }
 
 #[asupersync::test]
@@ -520,7 +528,7 @@ async fn ownership_plan_skips_released_profile_rows_and_continues() {
     assert_eq!(page.retained, 0);
     assert_eq!(page.verified.len(), 1);
     assert_eq!(page.verified[0].profile_observation_id, expected);
-    assert_eq!(before, crate::tests::harness::writer_telemetry(profile));
+    assert_no_writer_operations(profile, before);
     let end = profile
         .plan_session_ownership_page(&targets, page.next_after_sequence, 1)
         .await
@@ -610,14 +618,8 @@ async fn ownership_plan_retains_profile_when_project_evidence_is_released() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(
-        before_profile,
-        crate::tests::harness::writer_telemetry(profile)
-    );
-    assert_eq!(
-        before_target,
-        crate::tests::harness::writer_telemetry(target)
-    );
+    assert_no_writer_operations(profile, before_profile);
+    assert_no_writer_operations(target, before_target);
     let end = profile
         .plan_session_ownership_page(&targets, page.next_after_sequence, 2)
         .await
@@ -706,6 +708,6 @@ async fn ownership_plan_propagates_corrupt_target_evidence() {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(before, crate::tests::harness::writer_telemetry(profile));
+        assert_no_writer_operations(profile, before);
     }
 }

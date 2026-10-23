@@ -9621,7 +9621,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn codex_turn_context_withholding_allows_following_message_and_durable_restart() {
+    async fn codex_turn_context_exclusion_allows_following_message_and_durable_restart() {
         let temp = TempDir::new().unwrap();
         let fixture = mount_hygiene_fixture(&temp, "project.codex-unknown-replay").await;
         let project_root = std::fs::canonicalize(temp.path().join("project")).unwrap();
