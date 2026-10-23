@@ -37,7 +37,10 @@ const REGISTRATION_REVISION: u64 = 7;
 static WORKSPACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn corpus_bytes() -> Result<Vec<u8>, Box<dyn Error>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CORPUS_PATH);
+    // Bazel's launcher supplies this run's manifest directory; the compiled
+    // value may name a different execroot when the binary came from cache.
+    let path = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or("manifest directory")?)
+        .join(CORPUS_PATH);
     Ok(std::fs::read(path)?)
 }
 

@@ -140,6 +140,9 @@ TEST_DATA = {
     ("tracedecay-memory-conformance", "baseline"): [
         "product/evaluation/coding-memory-scenarios.v1.json",
     ],
+    ("tracedecay-memory-evaluation", "metrics"): [
+        "product/evaluation/coding-memory-scenarios.v1.json",
+    ],
     ("tracedecay-code-index", "code_index_suite"): [
         "crates/tracedecay-code-extraction/fixtures/sample.astro",
     ],

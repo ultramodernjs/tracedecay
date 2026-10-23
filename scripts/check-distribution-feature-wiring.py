@@ -419,7 +419,14 @@ def _require_ncm_release_workflow(path: Path) -> None:
             rf"(?ms)^      - name: {re.escape(step)}\n(.*?)(?=^      - |\Z)",
             workflow,
         )
-        if match is None or "        if: matrix.ncm == 'supported'\n" not in match[1]:
+        # Recovery jobs only rebuild inventory and have no CLI/worker to
+        # package. Accept that additional restriction, never an OR that could
+        # admit Native-only targets or an arbitrary replacement condition.
+        guard = None if match is None else re.search(r"(?m)^        if: (.+)$", match[1])
+        if guard is None or guard[1] not in {
+            "matrix.ncm == 'supported'",
+            "matrix.ncm == 'supported' && matrix.inventory_only != true",
+        }:
             _ncm_failure(
                 f"release workflow {path.name} must guard {step!r} with the "
                 "supported sidecar target"

@@ -33,7 +33,9 @@ fn catalog() -> Result<MetricCatalog, CatalogError> {
 }
 
 fn corpus_json() -> Result<Value, Box<dyn Error>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CORPUS_PATH);
+    // Resolve against this run's directory, not a cached Bazel execroot.
+    let path = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or("manifest directory")?)
+        .join(CORPUS_PATH);
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
@@ -905,7 +907,9 @@ impl Drop for ScratchRoot {
 }
 
 fn load_corpus() -> Result<ScenarioCorpus, Box<dyn Error>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CORPUS_PATH);
+    // Resolve against this run's directory, not a cached Bazel execroot.
+    let path = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").ok_or("manifest directory")?)
+        .join(CORPUS_PATH);
     Ok(ScenarioCorpus::from_json_bytes(&std::fs::read(path)?)?)
 }
 
