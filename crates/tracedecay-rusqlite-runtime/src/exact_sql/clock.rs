@@ -142,9 +142,21 @@ pub(super) mod fake {
 
     #[cfg(feature = "test-runtime")]
     fn clock_for_path(path: &std::path::Path) -> Option<Arc<FakeClock>> {
+        // Most test-runtime connections have no fake clock. Keep their SQL
+        // admission free of filesystem probes, and use the stored spelling
+        // directly when SQLite already reports the registered canonical path.
+        {
+            let clocks = STATEMENT_CLOCKS.lock().unwrap();
+            if clocks.is_empty() {
+                return None;
+            }
+            if let Some(clock) = clocks.get(path) {
+                return Some(Arc::clone(clock));
+            }
+        }
         // Registration uses canonical filesystem identity. SQLite may report
-        // another spelling (notably a non-verbatim Windows path), so a raw
-        // string lookup silently leaves the statement on the wall clock.
+        // another spelling (notably a non-verbatim Windows path), so aliases
+        // still resolve before falling back to the wall clock.
         let path = path.canonicalize().ok()?;
         STATEMENT_CLOCKS.lock().unwrap().get(&path).cloned()
     }

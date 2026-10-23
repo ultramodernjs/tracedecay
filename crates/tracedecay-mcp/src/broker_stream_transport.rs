@@ -727,7 +727,9 @@ mod tests {
         ] {
             let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
             server.set_nonblocking(true).unwrap();
-            client.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
             let lifecycle = ProjectServerResponseLifecycle::default();
             let transport = BrokerStreamTransport::new(BrokerStream::Unix(
                 asupersync::net::unix::UnixStream::from_std(server).unwrap(),
@@ -749,7 +751,9 @@ mod tests {
             if deliver {
                 result.expect("the client needs the typed refusal to retry its route");
                 let mut line = String::new();
-                std::io::BufReader::new(client).read_line(&mut line).unwrap();
+                std::io::BufReader::new(client)
+                    .read_line(&mut line)
+                    .unwrap();
                 let response: serde_json::Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(response["error"]["data"]["reason_code"], code);
             } else {
