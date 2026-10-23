@@ -1997,11 +1997,17 @@ fn assert_legal_host_response(provider: &str, state: &str, expected: &Value, out
             *project_root = Value::String("<PROJECT_ROOT>".to_string());
         }
         assert_eq!(document, expected, "{provider}/{state} stdout");
-    } else if provider == "pi" && !stdout.is_empty() {
+    } else if matches!(provider, "kiro" | "pi")
+        && stdout != expected["stdout"].as_str().unwrap()
+    {
         // The real daemon can finish its advisory cycle before this hook.
-        // Pi carries that notice as plain text rather than a JSON context field.
-        // This fixture seeds no findings; reject arbitrary guidance or payloads.
-        assert_eq!(expected["stdout"].as_str().unwrap(), "");
+        // Kiro and Pi carry that notice as plain text, with "{}" and ""
+        // respectively as their no-guidance fallback. Accept either timing,
+        // but this fixture seeds no findings: reject arbitrary guidance or payloads.
+        assert_eq!(
+            expected["stdout"].as_str().unwrap(),
+            if provider == "kiro" { "{}" } else { "" }
+        );
         let encoded = stdout
             .strip_prefix("TraceDecay feedback ready for authorized lookup: ")
             .unwrap_or_else(|| panic!("{provider}/{state} emitted unexpected context: {stdout}"));
