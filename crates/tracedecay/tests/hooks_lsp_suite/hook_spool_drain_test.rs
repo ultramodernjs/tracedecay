@@ -255,6 +255,23 @@ fn assert_only_producer_work_owed(home: &Path, project: &Path) {
     );
 }
 
+/// Stop boundaries can finish feedback and park awaiting a lifecycle, or be
+/// superseded by a newer stop. Neither needs a native conversation database
+/// to settle its producer debt. Receipt-only journeys therefore require the
+/// transports to settle, not that producer execution lose a race with status.
+/// Saved-edit journeys still require their missing native prerequisite above.
+fn assert_transports_settled(home: &Path, project: &Path) {
+    let settled = |status: &serde_json::Value| {
+        status == &json!({ "status": "drained" })
+            || (pending_producer_failure(status)
+                && status["failures"]
+                    .as_array()
+                    .is_some_and(|failures| failures.len() == 1))
+    };
+    let status = await_hook_replay_status(home, project, settled, PROMPT_DRAIN);
+    assert!(settled(&status), "transport work must settle: {status}");
+}
+
 fn latency_until(limit: Duration, drained: impl Fn() -> bool) -> Option<Duration> {
     let started = Instant::now();
     while started.elapsed() < limit {
@@ -362,7 +379,7 @@ fn a_failed_receipt_drain_is_reported_on_status_and_clears_when_the_spool_drains
     std::fs::remove_file(&corrupt).unwrap();
     capture_stop(&home, &project, "after-repair");
     assert!(receipt_drain_latency(&receipts, PROMPT_DRAIN).is_some());
-    assert_only_producer_work_owed(&home, &project);
+    assert_transports_settled(&home, &project);
     assert_eq!(published_receipts(&receipts), Vec::<PathBuf>::new());
 }
 
@@ -423,7 +440,7 @@ fn a_receipt_spool_root_that_is_not_a_directory_is_reported_on_status() {
 }
 
 /// A receipt backlog larger than one drain batch settles in back-to-back
-/// sweeps, while its unfinished native producer work remains visible.
+/// sweeps, independently of its producer work's progress.
 #[test]
 fn a_receipt_backlog_beyond_one_batch_drains_without_waiting_for_the_sweep() {
     const BACKLOG: usize = 65;
@@ -477,7 +494,7 @@ fn a_receipt_backlog_beyond_one_batch_drains_without_waiting_for_the_sweep() {
         "a {BACKLOG}-receipt backlog must drain within {PROMPT_DRAIN:?}, not one batch per 30 s sweep; {} left",
         published_receipts(&receipts).len()
     );
-    assert_only_producer_work_owed(&home, &project);
+    assert_transports_settled(&home, &project);
 }
 
 #[test]
@@ -551,7 +568,7 @@ fn delivery_receipts_drain_promptly_after_the_last_append_and_after_a_restart() 
         receipt_drain_latency(&receipts, PROMPT_DRAIN).is_some(),
         "an acknowledged exact output retry must replay its durable settlement"
     );
-    assert_only_producer_work_owed(&home, &project);
+    assert_transports_settled(&home, &project);
 }
 
 /// The maintained daemon admission path mints the durable identity. Inspecting

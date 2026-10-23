@@ -9669,26 +9669,52 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(progress.frames_persisted, records.len() as u64);
+        // Unsupported-only Codex frames advance coverage without persisting a
+        // canonical observation. The header and following message stay durable.
+        assert_eq!(progress.frames_persisted, 2);
         let stored = fixture
             .store
             .replay_observations(ObservationReplayRequest::new(0, records.len()).unwrap())
             .await
             .unwrap();
-        let unknown = stored.iter().find(|record| {
-            serde_json::from_value::<CanonicalObservationEnvelopeV1>(record.observation().payload().clone())
-                .unwrap().facts().iter().any(|fact| matches!(fact,
-                    CanonicalObservationFactV1::Unknown { native_kind, state: CanonicalUnknownStateV1::Unsupported }
-                    if native_kind == "turn_context"))
-        }).expect("the real Codex normalizer emits Unsupported turn_context evidence");
-        let unknown_id = unknown.observation().observation_id().clone();
-        let unknown_payload = unknown.observation().payload().clone();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().all(|record| {
+            serde_json::from_value::<CanonicalObservationEnvelopeV1>(
+                record.observation().payload().clone(),
+            )
+            .unwrap()
+            .native_record_kind()
+                != "turn_context"
+        }));
         let following = stored
             .iter()
             .find(|record| record.observation().payload().to_string().contains(message))
             .expect("the following message was durably admitted");
         let following_id = following.observation().observation_id().clone();
-        assert!(unknown.sequence() < following.sequence());
+        let cursor = fixture
+            .store
+            .get_source_cursor(
+                following.observation().source(),
+                following.observation().scope(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cursor.position(),
+            std::fs::metadata(&transcript).unwrap().len()
+        );
+        let resumed = try_admit_codex_jsonl_observations_for_project_with_admission(
+            &transcript,
+            &project_root,
+            fixture.project_id.clone(),
+            &admission,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.frames_persisted, 0);
         assert_eq!(
             run_startup_replay(
                 fixture.journey.as_ref(),
@@ -9714,47 +9740,12 @@ mod tests {
             );
             assert!(envelope.to_string().contains(message));
             assert!(!envelope.to_string().contains("turn_context"));
-            assert!(!envelope.to_string().contains(unknown_id.as_str()));
         }
-        assert_eq!(
-            fixture
-                .store
-                .get_observation(&unknown_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .observation()
-                .payload(),
-            &unknown_payload
-        );
         let before = journal_snapshot(fixture.journey.journal_path());
         assert!(
-            before.starts_with("journal=1 delivery=1 withheld=1 receipts=1 cursors=1 "),
+            before.starts_with("journal=1 delivery=1 withheld=0 receipts=1 cursors=1 "),
             "{before}"
         );
-        {
-            let envelope = provider_observation_envelope(
-                SESSION_MESSAGE_OBSERVATION_KIND,
-                SESSION_MESSAGE_PAYLOAD_CONTRACT,
-                &unknown_payload,
-                &unknown_id,
-            );
-            let digest = tracedecay_domain::canonical_text::sha256_hex(
-                &canonical_payload_bytes(&envelope).unwrap(),
-            );
-            let connection = rusqlite::Connection::open(fixture.journey.journal_path()).unwrap();
-            let (reason, actual_digest, findings): (String, String, i64) = connection
-                .query_row(
-                    "SELECT reason, source_payload_sha256, finding_count \
-                 FROM tdmem_observation_withheld_v2 WHERE source_event_id = ?1",
-                    [unknown_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            assert_eq!(reason, "unknown_eligibility");
-            assert_eq!(actual_digest, digest);
-            assert_eq!(findings, 0);
-        }
         assert!(
             fixture
                 .journey
