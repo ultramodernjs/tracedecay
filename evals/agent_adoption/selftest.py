@@ -448,7 +448,7 @@ def test_end_to_end():
         check("e2e: artifact and one-time setup identity preserved",
               sb["meta"]["binary_sha256"] == "artifact-digest"
               and sb["meta"]["fixture_setup_elapsed_ms"] == 1250)
-        report = open(os.path.join(rdir, "report.md")).read()
+        report = open(os.path.join(rdir, "report.md"), encoding="utf-8").read()
         check("e2e: report has channel table", "Channel efficacy" in report)
         check("e2e: report includes effectiveness and unknown setup attribution",
               "Matched task effectiveness and observed cost" in report
@@ -1075,7 +1075,7 @@ def test_learned_skill_end_to_end():
         check("learned e2e: timed-out variant counted invalid",
               rows.get("generated", {}).get("invalid") == 1 and rows["generated"]["n"] == 0)
         check("learned e2e: report section present",
-              "Learned-skill qualification" in open(os.path.join(rdir, "report.md")).read())
+              "Learned-skill qualification" in open(os.path.join(rdir, "report.md"), encoding="utf-8").read())
 
 
 def test_carry_claude_profile():
@@ -1096,8 +1096,9 @@ def test_carry_claude_profile():
         check("carry: only env and model cross the boundary",
               set(carried) == {"env", "model"} and carried["model"] == "k3[1m]"
               and carried["env"]["ANTHROPIC_BASE_URL"] == "https://example.invalid/")
+        # Windows chmod supports the read-only flag, not owner/group modes.
         check("carry: copy is read-only",
-              oct(os.stat(dest).st_mode & 0o777) == "0o400")
+              os.stat(dest).st_mode & 0o222 == 0)
         with open(src, "w") as fh:
             json.dump({"permissions": {"allow": []}}, fh)
         dest2 = os.path.join(td, "none.json")
