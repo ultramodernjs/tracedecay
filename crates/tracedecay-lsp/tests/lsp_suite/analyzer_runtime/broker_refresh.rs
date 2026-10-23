@@ -740,7 +740,7 @@ async fn broker_cancels_partial_refresh_without_poisoning_warm_client() {
     std::fs::write(
         &script_path,
         fake_lsp_script_with_preamble(
-            &control.script_preamble(&["partial-frame-flushed"]),
+            &control.script_preamble(&["initialized", "partial-frame-flushed"]),
             PARTIAL_DIAGNOSTIC_PUBLISH,
         ),
     )
@@ -781,6 +781,9 @@ async fn broker_cancels_partial_refresh_without_poisoning_warm_client() {
                 .collect_diagnostics_with_timeouts(phase_gated_fake_lsp_timeouts())
                 .await
         });
+        // Startup has its own budget. Do not spend the partial-frame phase
+        // deadline on Python launch, initialize, or reaping the prior client.
+        control.wait_for("initialized").await.release().await;
         control
             .wait_for("partial-frame-flushed")
             .await
