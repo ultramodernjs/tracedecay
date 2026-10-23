@@ -87,19 +87,6 @@ fn json_extract_select_list(column: &str, fields: &[&str]) -> String {
         .join(",\n                ")
 }
 
-fn json_extract_neq_predicates(left_alias: &str, json_column: &str, fields: &[&str]) -> String {
-    fields
-        .iter()
-        .map(|field| {
-            format!(
-                "{left_alias}.{field} IS NOT {}",
-                json_extract_expr(json_column, field)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n                     OR ")
-}
-
 fn records_transient_projection_retry(error: &ProjectionStoreError) -> bool {
     matches!(error, ProjectionStoreError::Storage { .. }) && !error.is_sqlite_disk_image_corrupt()
 }
@@ -2506,9 +2493,7 @@ async fn prepare_rebuild_output_activation(
             .map_err(|error| storage("validate staged projection outputs", error))?;
         let mut staged: SessionMessageRecord =
             decode_json(&json, "decode staged projection output")?;
-        if let Some(actual) =
-            read_message(conn, &staged.provider, &staged.message_id).await?
-        {
+        if let Some(actual) = read_message(conn, &staged.provider, &staged.message_id).await? {
             // Hermes owns its body independently; only its session columns
             // participate in projection output identity.
             if staged.provider == "hermes" {

@@ -670,6 +670,39 @@ impl ClaudeHostJourney {
             .to_owned()
     }
 
+    /// Startup normally reuses the v2 journal slot. If renewal cannot prove
+    /// that slot safe, admission uses this daemon run's fallback instead.
+    fn startup_sync_keys(&self) -> [String; 2] {
+        let authority: DaemonAuthorityRecord = serde_json::from_slice(
+            &fs::read(daemon_authority_path(&self.profile)).expect("current daemon authority"),
+        )
+        .expect("canonical daemon authority");
+        let project_id = self.project_id();
+        [
+            format!(
+                "session-sync.startup.{}.{project_id}",
+                authority.process_run_id
+            ),
+            format!("session-sync.startup.v2.{project_id}"),
+        ]
+    }
+
+    fn startup_history_status(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        keys: &[String; 2],
+        deadline: Instant,
+    ) -> Value {
+        // Match admission's preference for an existing same-run fallback;
+        // otherwise a previous run's immutable stable receipt could win.
+        let fallback = self.startup_sync_status(runtime, &keys[0], deadline);
+        if fallback["reason_code"] == "session_sync_operation_not_found" {
+            self.startup_sync_status(runtime, &keys[1], deadline)
+        } else {
+            fallback
+        }
+    }
+
     /// Reads the daemon's existing internal scheduler status transport. The CLI
     /// public tool catalog intentionally omits this administration binding.
     fn startup_sync_status(
@@ -824,22 +857,14 @@ impl ClaudeHostJourney {
     /// Drain the actual startup import and retained projection before the
     /// fixture writes evidence. These read-only status calls schedule no import.
     fn await_startup_history(&self) {
-        let authority: DaemonAuthorityRecord = serde_json::from_slice(
-            &fs::read(daemon_authority_path(&self.profile)).expect("current daemon authority"),
-        )
-        .expect("canonical daemon authority");
-        let key = format!(
-            "session-sync.startup.{}.{}",
-            authority.process_run_id,
-            self.project_id()
-        );
+        let keys = self.startup_sync_keys();
         let deadline = Instant::now() + SETTLEMENT_BUDGET;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("startup status runtime");
         loop {
-            let outcome = self.startup_sync_status(&runtime, &key, deadline);
+            let outcome = self.startup_history_status(&runtime, &keys, deadline);
             let status = outcome["status"].as_str().expect("startup sync status");
             match status {
                 "accepted" | "joined" => {}
@@ -2647,22 +2672,14 @@ fn assert_default_native_settings(journey: &ClaudeHostJourney) {
 }
 
 fn await_native_startup_history(journey: &ClaudeHostJourney) {
-    let authority: DaemonAuthorityRecord = serde_json::from_slice(
-        &fs::read(daemon_authority_path(&journey.profile)).expect("current daemon authority"),
-    )
-    .expect("canonical daemon authority");
-    let key = format!(
-        "session-sync.startup.{}.{}",
-        authority.process_run_id,
-        journey.project_id()
-    );
+    let keys = journey.startup_sync_keys();
     let deadline = Instant::now() + SETTLEMENT_BUDGET;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("startup status runtime");
     loop {
-        let outcome = journey.startup_sync_status(&runtime, &key, deadline);
+        let outcome = journey.startup_history_status(&runtime, &keys, deadline);
         match outcome["status"].as_str().expect("startup sync status") {
             "complete" => {
                 assert!(

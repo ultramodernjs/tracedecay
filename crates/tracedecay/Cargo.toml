@@ -351,6 +351,9 @@ tracedecay-search-eval = { path = "../tracedecay-search-eval", optional = true }
 libc.workspace = true
 
 [dev-dependencies]
+# Focused integration tests need the native runtime without workspace-wide
+# dev-dependency feature unification from the storage crate's own tests.
+tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", features = ["test-runtime"] }
 rusqlite.workspace = true
 tree-sitter.workspace = true
 rustls = { workspace = true, features = ["ring", "std", "tls12"] }

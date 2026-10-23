@@ -8,10 +8,6 @@ use std::time::Duration;
 
 use serde_json::json;
 use tempfile::TempDir;
-use tracing::Subscriber;
-use tracing::span::{Attributes, Id};
-use tracing_subscriber::Layer;
-use tracing_subscriber::layer::{Context, SubscriberExt};
 
 use super::SessionTemporalRefreshTestAuthority;
 use tracedecay_domain::{
@@ -559,21 +555,21 @@ async fn wait_until(predicate: impl Fn() -> bool, timeout: Duration) -> bool {
     true
 }
 
-struct SummaryConvergencePageCensus(Arc<AtomicUsize>);
-
-impl<S: Subscriber> Layer<S> for SummaryConvergencePageCensus {
-    fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
-        if attributes.metadata().name() == "daemon.lcm.summary_convergence.page" {
-            self.0.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-}
-
 #[tokio::test]
 async fn initial_projection_discovery_failure_withholds_summary_admission_until_recovery() {
     let temp = TempDir::new().unwrap();
     let authority = profile_authority(&temp, "history-initial-discovery-failure").await;
     let path = authority.database().db_path().to_path_buf();
+    let seeded = HealthyProvidersWithBlockedCursorIngestor::new(authority.database.clone());
+    assert!(
+        seeded
+            .admit_healthy_provider("claude", "session.initial-discovery-recovery")
+            .await
+    );
+    // The native worker does not inherit a thread-local tracing subscriber.
+    // Use the durable summary backfill frontier as an admission witness instead.
+    let backfill_census = "SELECT COUNT(*) FROM lcm_gc_meta
+        WHERE key = 'summary_convergence_queue_backfill_store_id_v1'";
     // Cached readers survive pathname loss. Temporarily withhold the discovery
     // table through the registered writer so the real refresh query must fail.
     authority
@@ -585,10 +581,6 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
         )
         .await
         .unwrap();
-    let pages = Arc::new(AtomicUsize::new(0));
-    let _capture = tracedecay_runtime_core::logging::set_tracing_capture(
-        tracing_subscriber::registry().with(SummaryConvergencePageCensus(Arc::clone(&pages))),
-    );
     let report = run_session_temporal_refresh_pass(
         &authority.database,
         &Arc::new(SessionTemporalRefreshWakeState::default()),
@@ -624,7 +616,7 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
     .await
     .expect("the initial failed discovery must report its stalled storage retry");
     assert_eq!(
-        pages.load(Ordering::Acquire),
+        scalar(authority.database(), backfill_census).await,
         0,
         "an unknown failed projection frontier must withhold full summary admission"
     );
@@ -640,9 +632,10 @@ async fn initial_projection_discovery_failure_withholds_summary_admission_until_
         .await
         .unwrap();
     assert!(wake.wake_and_wait_until_idle(Duration::from_secs(2)).await);
-    assert!(
-        pages.load(Ordering::Acquire) > 0,
-        "restoring the discovery table must admit convergence and prove the census is live"
+    assert_eq!(
+        scalar(authority.database(), backfill_census).await,
+        1,
+        "restoring the discovery table must admit convergence and advance the durable census"
     );
     assert_eq!(ingestor.passes.get(), 1);
     registry.shutdown().await;
