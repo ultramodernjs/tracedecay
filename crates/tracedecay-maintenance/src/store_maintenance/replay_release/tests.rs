@@ -21,6 +21,8 @@ fn project_preview_uses_canonical_checkout_identity_for_scope_and_confirmation()
     // On Windows these are respectively plain C:\ and verbatim \\?\C:\.
     let plain = canonical_existing_identity(&checkout).expect("plain checkout identity");
     let verbatim = checkout.canonicalize().expect("native canonical checkout");
+    #[cfg(windows)]
+    assert_ne!(plain, verbatim, "exercise both Windows namespace spellings");
     let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &plain,
         &temp.path().join("profile"),
@@ -64,13 +66,35 @@ fn project_preview_uses_canonical_checkout_identity_for_scope_and_confirmation()
     assert_eq!(linked_plan.checkout_root, linked);
 }
 
+#[test]
+fn project_preview_preserves_an_explicit_legacy_scope_binding() {
+    let temp = tempfile::tempdir().expect("isolated legacy scope fixture");
+    let checkout = temp.path().join("checkout");
+    std::fs::create_dir(&checkout).expect("checkout");
+    let plain = canonical_root_identity(&checkout);
+    let legacy = plain.join("..").join("checkout");
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+        &plain,
+        &temp.path().join("profile"),
+        "project.legacy-release-preview",
+    )
+    .expect("fixture layout");
+    let legacy_scope = code_index_store_root(&layout.data_root, &legacy);
+    write_segmented_generation_store_fixture(&legacy_scope, 1);
+    let preview = plan_project_graph_replay_releases(&layout, &legacy, None)
+        .expect("layout identity proves explicitly requested legacy scope");
+    assert_eq!(preview.store_root, legacy_scope);
+    assert_eq!(preview.checkout_root, plain);
+}
+
 #[asupersync::test]
 async fn release_handler_previews_and_confirms_a_real_durable_queue() {
     let temp = tempfile::tempdir().expect("isolated release fixture");
     let profile = temp.path().join("profile");
     let checkout = temp.path().join("checkout");
     std::fs::create_dir_all(&checkout).expect("checkout");
-    let checkout = checkout.canonicalize().expect("canonical checkout");
+    let checkout = tracedecay_runtime_core::path_safety::canonical_existing_identity(&checkout)
+        .expect("canonical checkout identity");
     let (lease, _scope, _owner) =
         maintenance_lease(&profile, &checkout, "project.release-handler").await;
     let root = code_index_store_root(&lease.store_layout().data_root, &checkout);
@@ -155,11 +179,14 @@ async fn release_handler_previews_and_confirms_a_real_durable_queue() {
         before_preview,
         "refused confirmation cannot mutate the fixture"
     );
+    // Confirmation through an equivalent spelling must acknowledge and sweep
+    // the preview's queue, not a fresh hash of the caller's path string.
+    let checkout_alias = checkout.join("..").join("checkout");
     let GraphReplayReleaseRunV1::Applied {
         released, retained, ..
     } = release_graph_replays(
         &lease,
-        &checkout,
+        &checkout_alias,
         None,
         Some(&plan.plan_digest),
         &cancellation,
