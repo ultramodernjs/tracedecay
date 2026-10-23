@@ -289,17 +289,27 @@ mod tests {
             ..crate::ports::hook_runtime::crate_test_runtime(profile.clone())
         };
         super::super::dispatch::publish_daemon_bindings(&runtime, &layout).unwrap();
-        let event = serde_json::json!({
-            "hook_event_name": "PostToolUse",
-            "session_id": "slow-root-session",
-            "tool_use_id": "slow-root-call",
-            "cwd": project,
-            "tool_name": "Write",
-            "tool_input": {"file_path": project.join("src/lib.rs"), "content": ""},
-            "tool_response": {"filePath": project.join("src/lib.rs")},
-        });
+        // Use the maintained native schema: a partial hand-built payload is
+        // rejected before dispatch (transcript_path, prompt_id, permission_mode
+        // and duration_ms are required even though their values are ignored).
+        let mut event: Value = serde_json::from_str(include_str!(
+            "../../../tracedecay-hooks/fixtures/host_events/claude/post_tool_use_write.json"
+        ))
+        .unwrap();
+        event["session_id"] = serde_json::json!("slow-root-session");
+        event["tool_use_id"] = serde_json::json!("slow-root-call");
+        event["prompt_id"] = serde_json::json!("slow-root-call");
+        event["cwd"] = serde_json::json!(project);
+        event["tool_input"]["file_path"] = serde_json::json!(project.join("src/lib.rs"));
+        event["tool_response"]["filePath"] = serde_json::json!(project.join("src/lib.rs"));
+        let event = event.to_string();
+        tracedecay_hooks::decode_native_hook_event(
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
+            event.as_bytes(),
+        )
+        .expect("fixture must reach native dispatch before testing its admission clock");
         let started = Instant::now();
-        claude_post_tool_use_response(&runtime, &event.to_string()).await;
+        claude_post_tool_use_response(&runtime, &event).await;
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert!(
             profile.data_dir().join("admission-called").is_file(),
