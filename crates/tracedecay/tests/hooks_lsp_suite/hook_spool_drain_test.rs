@@ -829,7 +829,7 @@ fn an_edit_in_a_never_opened_linked_worktree_binds_it_and_reaches_the_daemon() {
         assert!(
             Command::new(git_program())
                 .args(["worktree", "add", "-q", "-b", branch])
-                .arg(root)
+                .arg(tracedecay_runtime_core::path_safety::plain_host_path(root))
                 .current_dir(&project)
                 .status()
                 .unwrap()

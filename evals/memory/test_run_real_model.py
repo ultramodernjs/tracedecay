@@ -10,6 +10,14 @@ from unittest import mock
 from pathlib import Path
 
 
+# Bazel's Windows sandbox may have no USERPROFILE/HOMEDRIVE. Give both the
+# imported runner and its isolation assertions a real, throwaway user home.
+TEST_HOME = tempfile.TemporaryDirectory(prefix="real-model-runner-home-")
+HOME_ENV = mock.patch.dict("os.environ", {"HOME": TEST_HOME.name, "USERPROFILE": TEST_HOME.name})
+HOME_ENV.start()
+unittest.addModuleCleanup(TEST_HOME.cleanup)
+unittest.addModuleCleanup(HOME_ENV.stop)
+
 MODULE_PATH = Path(__file__).with_name("run_real_model.py")
 SPEC = importlib.util.spec_from_file_location("run_real_model", MODULE_PATH)
 run_real_model = importlib.util.module_from_spec(SPEC)

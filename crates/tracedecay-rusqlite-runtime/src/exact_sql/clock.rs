@@ -141,14 +141,19 @@ pub(super) mod fake {
     }
 
     #[cfg(feature = "test-runtime")]
+    fn clock_for_path(path: &std::path::Path) -> Option<Arc<FakeClock>> {
+        // Registration uses canonical filesystem identity. SQLite may report
+        // another spelling (notably a non-verbatim Windows path), so a raw
+        // string lookup silently leaves the statement on the wall clock.
+        let path = path.canonicalize().ok()?;
+        STATEMENT_CLOCKS.lock().unwrap().get(&path).cloned()
+    }
+
+    #[cfg(feature = "test-runtime")]
     pub(in crate::exact_sql) fn for_statement(connection: &rusqlite::Connection) -> InstalledClock {
-        let clock = connection.path().and_then(|path| {
-            STATEMENT_CLOCKS
-                .lock()
-                .unwrap()
-                .get(std::path::Path::new(path))
-                .cloned()
-        });
+        let clock = connection
+            .path()
+            .and_then(|path| clock_for_path(std::path::Path::new(path)));
         let previous = INSTALLED.with(|installed| installed.borrow().clone());
         if let Some(clock) = clock {
             clock.install();

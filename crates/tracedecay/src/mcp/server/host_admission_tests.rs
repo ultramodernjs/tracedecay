@@ -210,7 +210,7 @@ async fn file_edit_request_acks_durable_work_while_effect_is_held() {
         let entered = Arc::clone(&entered);
         let release = Arc::clone(&release);
         let effects = Arc::clone(&effects);
-        let expected_root = project.path().canonicalize().unwrap();
+        let expected_root = tracedecay_runtime_core::path_safety::canonical_existing_identity(project.path()).unwrap();
         Arc::new(move |root, paths| {
             assert_eq!(root, expected_root);
             assert_eq!(paths, ["src/lib.rs"]);
@@ -245,7 +245,9 @@ async fn file_edit_request_acks_durable_work_while_effect_is_held() {
         .unwrap();
     assert!(response.error.is_none(), "{response:?}");
     assert_eq!(response.result, Some(json!({})));
-    entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("durably ACKed file edit must reach the held effect");
     assert_eq!(broker.pending_count().await, 1);
     assert_eq!(effects.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -328,7 +330,7 @@ async fn retained_file_edits_reconcile_branch_drift_without_blocking_the_source(
         .unwrap();
     let effects = Arc::new(AtomicUsize::new(0));
     let available = Arc::new(AtomicBool::new(false));
-    let root = project.path().canonicalize().unwrap();
+    let root = tracedecay_runtime_core::path_safety::canonical_existing_identity(project.path()).unwrap();
     let mut context = registered_context(cg, &authority);
     context.host_admission_broker = Some(Arc::clone(&broker));
     context = context.with_code_index_hook_sink({

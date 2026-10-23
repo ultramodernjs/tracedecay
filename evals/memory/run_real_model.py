@@ -172,7 +172,7 @@ def resolve_tracedecay_bin(explicit):
     if explicit:
         env["TRACEDECAY_BIN"] = str(explicit)
     result = subprocess.run(
-        [str(REPO_ROOT / "scripts/build-eval-binary.sh")],
+        ["bash", str(REPO_ROOT / "scripts/build-eval-binary.sh")],
         env=env,
         stdout=subprocess.PIPE,
         text=True,
