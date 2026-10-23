@@ -1066,7 +1066,10 @@ mod tests {
             .unwrap()
             .port();
         let mut configured = config(&format!("http://127.0.0.1:{port}"));
-        configured.timeout = Duration::from_millis(500);
+        // Windows can take a TCP retry interval to report a refused loopback
+        // connection. Do not turn that transport failure into our own timeout;
+        // the slow-engine test above exercises the short deadline separately.
+        configured.timeout = Duration::from_secs(5);
         assert_eq!(
             DecisionEngineClientV1::new(configured)
                 .unwrap()

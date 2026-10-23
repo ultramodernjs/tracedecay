@@ -113,7 +113,7 @@ class BinaryResolutionTest(unittest.TestCase):
             binary.chmod(0o755)
             with contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(
-                    run_real_model.resolve_tracedecay_bin(binary), str(binary)
+                    Path(run_real_model.resolve_tracedecay_bin(binary)), binary
                 )
                 with self.assertRaises(SystemExit):
                     run_real_model.resolve_tracedecay_bin(Path(tmp) / "missing")
