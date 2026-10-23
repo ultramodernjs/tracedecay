@@ -25,7 +25,6 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-rusqlite = { version = "0.40.1", default-features = false }
 tracedecay-contracts = { path = "../tracedecay-contracts" }
 tracedecay-automation = { path = "../tracedecay-automation" }
 tracedecay-code-index-runtime = { path = "../tracedecay-code-index-runtime", default-features = false }

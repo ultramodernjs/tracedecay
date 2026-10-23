@@ -20,9 +20,6 @@ use tracedecay_memory_provider_registry::{
 };
 use tracedecay_tool_catalog::{EffectClass, SortContractId};
 
-use super::super::cognitive_recall::control_attribution::{
-    RecallControlAttributionErrorV1, RetainedRecallControlScopeV1,
-};
 use super::super::observation_journey::control_dispatch::{
     JourneyControlDispatchErrorV1, JourneyControlNotDispatchedV1,
 };
@@ -31,6 +28,9 @@ use super::feedback_receipt::AcceptedDeletionCommandV1;
 use super::{
     AuthorizedControlSourceV1, CompletedProviderControlV1, ControlFailureStageV1, ControlFailureV1,
     ControlInvocationV1, ControlOperationIdentityV1, ControlResult, projection,
+};
+use tracedecay_rusqlite_runtime::recall_admission::control_attribution::{
+    RecallControlAttributionErrorV1, RetainedRecallControlScopeV1,
 };
 
 type OutcomeResult<T> = Result<T, RetainedSurfaceExecutionErrorV1>;

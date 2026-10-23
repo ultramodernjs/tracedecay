@@ -25,6 +25,22 @@ rust_library(
 )
 
 rust_library(
+    name = "tracedecay-mcp-catalog__d123898208a",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    crate_name = "tracedecay_mcp_catalog",
+    edition = crate_edition(),
+    compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
+        + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//crates/tracedecay-api:tracedecay-api__d0f58af4dc5", "//crates/tracedecay-contracts:tracedecay-contracts", "//crates/tracedecay-sessions:tracedecay-sessions__d0543ef96e4", "//crates/tracedecay-tool-catalog:tracedecay-tool-catalog"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    aliases = aliases(normal = True),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 0, perf_opt_level = 1),
+    crate_features = [],
+)
+
+rust_library(
     name = "tracedecay-mcp-catalog__dev",
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",

@@ -487,11 +487,13 @@ async fn native_composition_and_fact_recall_work_without_an_ambient_tokio_runtim
             assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
             let payload = reply.payload.expect("recall payload");
             let body: Value = serde_json::from_slice(&payload.bytes).expect("recall payload JSON");
-            assert!(
-                !body["candidates"]
+            let empty_candidates: &[Value] = &[];
+            assert_ne!(
+                body["candidates"]
                     .as_array()
                     .expect("recall candidates")
-                    .is_empty()
+                    .as_slice(),
+                empty_candidates
             );
             // The port owns a synchronous actor join on drop.
             drop(port);

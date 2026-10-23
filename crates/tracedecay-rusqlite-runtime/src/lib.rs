@@ -40,6 +40,8 @@ mod native_runtime_wake_tests;
 mod operation;
 mod persistence;
 pub mod reader;
+#[cfg(feature = "recall-admission")]
+pub mod recall_admission;
 pub mod remote;
 pub mod repository;
 pub mod runtime;

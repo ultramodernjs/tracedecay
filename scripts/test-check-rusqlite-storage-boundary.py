@@ -69,6 +69,8 @@ def valid_metadata() -> dict:
     packages.extend(
         package(owner, dependencies=[dependency("rusqlite")])
         for owner in (
+            "tracedecay-memory-ncm-runtime",
+            "tracedecay-memory-observation",
             "tracedecay-query",
             "tracedecay-runtime-core",
             "tracedecay-rusqlite-runtime",
@@ -116,6 +118,23 @@ class StorageBoundaryTests(unittest.TestCase):
             "windows-wrapper",
         ):
             self.check.evaluate_storage_boundary(metadata)
+
+    def test_rejects_sqlite_in_daemon_and_maintenance(self) -> None:
+        for consumer in (
+            "tracedecay-daemon-service",
+            "tracedecay-maintenance",
+        ):
+            with self.subTest(consumer=consumer):
+                metadata = valid_metadata()
+                metadata["packages"].append(
+                    package(consumer, dependencies=[dependency("rusqlite")])
+                )
+
+                with self.assertRaisesRegex(
+                    self.check.StorageBoundaryViolation,
+                    consumer,
+                ):
+                    self.check.evaluate_storage_boundary(metadata)
 
     def test_rejects_production_forward_to_test_helpers(self) -> None:
         metadata = valid_metadata()

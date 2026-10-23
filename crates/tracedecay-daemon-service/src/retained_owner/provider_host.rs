@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tracedecay_domain::ManifestDigest;
 use tracedecay_project::project::TraceDecay;
 use tracedecay_runtime_core::native_runtime;
+use tracedecay_rusqlite_runtime::recall_admission::control_attribution;
 
 use super::{
     AdvisoryMemoryContextV1, CognitiveRecallMountError, cognitive_recall, native_authority,
@@ -88,7 +89,7 @@ pub struct ProjectMemoryProviderHostMountV1 {
     )>,
     cognitive_recall_mount: Option<Arc<ProjectCognitiveRecallMountV1>>,
     native_session_retrieval_mount: Option<Arc<native_authority::NativeSessionRetrievalMountV1>>,
-    locator_key: cognitive_recall::control_attribution::RecallLocatorKeyV1,
+    locator_key: control_attribution::RecallLocatorKeyV1,
 }
 
 impl ProjectMemoryProviderHostMountV1 {
@@ -879,13 +880,13 @@ async fn shutdown_partial_provider_journeys(journeys: &[Arc<ProjectObservationJo
     }
 }
 
-fn new_recall_locator_key()
--> std::result::Result<cognitive_recall::control_attribution::RecallLocatorKeyV1, String> {
+fn new_recall_locator_key() -> std::result::Result<control_attribution::RecallLocatorKeyV1, String>
+{
     let mut bytes = vec![0_u8; 32];
     getrandom::fill(&mut bytes).map_err(|error| {
         format!("OS entropy unavailable for the project recall locator key: {error}")
     })?;
-    cognitive_recall::control_attribution::RecallLocatorKeyV1::from_material(bytes)
+    control_attribution::RecallLocatorKeyV1::from_material(bytes)
         .map_err(|error| format!("project recall locator key was rejected: {error}"))
 }
 

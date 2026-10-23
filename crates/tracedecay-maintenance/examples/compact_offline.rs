@@ -4,7 +4,7 @@
 #[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::Path;
-    use tracedecay_maintenance::offline_compaction::{
+    use tracedecay_runtime_core::offline_compaction::{
         compact_offline_v1, inspect_compaction_candidate_v1,
     };
 

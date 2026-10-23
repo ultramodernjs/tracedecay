@@ -25,7 +25,7 @@ rust_library(
 )
 
 rust_library(
-    name = "tracedecay-memory-hygiene__d9514a033c4",
+    name = "tracedecay-memory-hygiene__d05b0895cec",
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
     crate_name = "tracedecay_memory_hygiene",
@@ -33,7 +33,7 @@ rust_library(
     compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
         + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True) + glob(["policy/**"], allow_empty = True),
     version = "1.0.0-beta.89",
-    deps = all_crate_deps(normal = True) + ["//crates/tracedecay-domain:tracedecay-domain", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api", "//crates/tracedecay-privacy:tracedecay-privacy", "//crates/tracedecay-session-memory:tracedecay-session-memory__d708e4dea92"],
+    deps = all_crate_deps(normal = True) + ["//crates/tracedecay-domain:tracedecay-domain", "//crates/tracedecay-memory-provider-api:tracedecay-memory-provider-api", "//crates/tracedecay-privacy:tracedecay-privacy", "//crates/tracedecay-session-memory:tracedecay-session-memory__dc82d5f97c4"],
     proc_macro_deps = all_crate_deps(proc_macro = True),
     aliases = aliases(normal = True),
     rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 1),

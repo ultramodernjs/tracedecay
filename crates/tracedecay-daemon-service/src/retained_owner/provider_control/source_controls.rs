@@ -16,13 +16,13 @@ use tracedecay_memory_provider_registry::{
     rfc3339_utc_micros,
 };
 
-use super::super::cognitive_recall::control_attribution::RetainedRecallControlScopeV1;
 use super::super::provider_history::{
     original_source_fence_digest, retained_history_source, source_attribution_json,
 };
 use super::authority::{ProviderSourceIntentActionErrorV1, ResolvedCanonicalControlObservationV1};
 use super::feedback_receipt::{
     AcceptedDeletionCommandV1, AcceptedFeedbackAssertionV1, HostSourceCommandErrorV1,
+    accept_deletion_command, accept_feedback_assertion,
 };
 use super::portability::{
     HostSnapshotCleanupResultV1, HostSnapshotCleanupStateV1, cleanup_source_snapshots,
@@ -33,6 +33,7 @@ use super::{
     ControlInvocationV1, ControlOperationIdentityV1, ControlResult, ProjectProviderControlPortV1,
     ResolvedControlStateV1, outcome, projection,
 };
+use tracedecay_rusqlite_runtime::recall_admission::control_attribution::RetainedRecallControlScopeV1;
 
 /// Built-in provider-local retention-lock policy. Version one adds no host lock
 /// claims to a deletion request. A provider's explicit lock report remains its
@@ -837,7 +838,14 @@ async fn accept_feedback(
     invocation
         .runtime
         .spawn_blocking(move || {
-            ledger.accept_feedback_assertion(&context, &request, &target, &attribution, &control)
+            accept_feedback_assertion(
+                ledger.path(),
+                &context,
+                &request,
+                &target,
+                &attribution,
+                &control,
+            )
         })
         .await
         .map_err(|_| {
@@ -863,7 +871,14 @@ async fn accept_deletion(
     invocation
         .runtime
         .spawn_blocking(move || {
-            ledger.accept_deletion_command(&context, &request, &target, &attribution, &control)
+            accept_deletion_command(
+                ledger.path(),
+                &context,
+                &request,
+                &target,
+                &attribution,
+                &control,
+            )
         })
         .await
         .map_err(|_| {

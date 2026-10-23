@@ -72,6 +72,22 @@ rust_library(
     crate_features = [],
 )
 
+rust_library(
+    name = "tracedecay-maintenance__dfe224d282e",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    crate_name = "tracedecay_maintenance",
+    edition = crate_edition(),
+    compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
+        + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True) + ["//:.bazelrc", "//:Cargo.toml"],
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//crates/tracedecay-automation:tracedecay-automation", "//crates/tracedecay-code-index-retention:tracedecay-code-index-retention__d7af5817331", "//crates/tracedecay-code-index-runtime:tracedecay-code-index-runtime__+full_+lite__d0819b92f01", "//crates/tracedecay-contracts:tracedecay-contracts", "//crates/tracedecay-domain:tracedecay-domain", "//crates/tracedecay-global-db:tracedecay-global-db__d6815898881", "//crates/tracedecay-graph-db:tracedecay-graph-db", "//crates/tracedecay-lcm:tracedecay-lcm__d628b8dfb94", "//crates/tracedecay-private-fs:tracedecay-private-fs", "//crates/tracedecay-runtime-core:tracedecay-runtime-core__dd694e6765d", "//crates/tracedecay-store-runtime:tracedecay-store-runtime__d2aff1aeff7", "//crates/tracedecay-store:tracedecay-store", "//crates/tracedecay-tool-catalog:tracedecay-tool-catalog"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    aliases = aliases(normal = True),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 0, perf_opt_level = 1),
+    crate_features = [],
+)
+
 rust_binary(
     name = "compact_offline",
     srcs = glob(["examples/**/*.rs"]),

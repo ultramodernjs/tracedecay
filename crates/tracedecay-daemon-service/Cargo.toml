@@ -21,9 +21,7 @@ test-helpers = []
 memory-provider-host = [
     "dep:chrono",
     "dep:fs2",
-    "dep:hmac",
-    "dep:rusqlite",
-    "dep:zeroize",
+    "tracedecay-rusqlite-runtime/recall-admission",
     "dep:tracedecay-memory-provider-registry",
     "dep:tracedecay-memory-provider-ncm",
     "dep:tracedecay-memory-observation",
@@ -56,9 +54,6 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
 fs2 = { version = "0.4", optional = true }
-hmac = { version = "0.13.0", features = ["zeroize"], optional = true }
-rusqlite = { version = "0.40.1", default-features = false, features = ["backup"], optional = true }
-zeroize = { version = "1.9.0", optional = true }
 tracedecay-agent-hosts = { path = "../tracedecay-agent-hosts" }
 tracedecay-api = { path = "../tracedecay-api" }
 tracedecay-contracts = { path = "../tracedecay-contracts" }
@@ -97,6 +92,8 @@ url.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.40.1", default-features = false }
+tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime", features = ["test-helpers"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 # The real provider fixture installs its model through the canonical encoder.

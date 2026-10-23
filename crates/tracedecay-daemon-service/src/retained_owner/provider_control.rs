@@ -23,13 +23,6 @@ use tracedecay_memory_provider_registry::{
     OperationControl, OwnedProviderId, ProviderOperation, TerminalCode,
 };
 
-use super::cognitive_recall::{
-    RecallAdmissionLedgerV1,
-    control_attribution::{
-        RecallControlAttributionErrorV1, RecallControlItemRefV1, RecallControlTraceRefV1,
-        RetainedRecallControlScopeV1,
-    },
-};
 use super::observation_journey::{
     ProjectObservationJourneyV1,
     control_dispatch::{
@@ -39,6 +32,13 @@ use super::observation_journey::{
 };
 use super::provider_history::ProviderHistoryErrorV1;
 use authority::{AuthorizedRetainedControlSourceV1, ProviderControlAuthorityV1};
+use tracedecay_rusqlite_runtime::recall_admission::{
+    RecallAdmissionLedgerV1,
+    control_attribution::{
+        RecallControlAttributionErrorV1, RecallControlItemRefV1, RecallControlTraceRefV1,
+        RetainedRecallControlScopeV1,
+    },
+};
 
 pub(crate) mod authority;
 mod feedback_receipt;
@@ -1205,7 +1205,7 @@ mod tests {
         let invocation =
             ControlInvocationV1::new(&context, &request, runtime.handle().clone()).unwrap();
         let (settle_tx, settle_rx) = tokio::sync::oneshot::channel();
-        let mut work = Box::pin(invocation.run_controlled(async {
+        let mut work = std::pin::pin!(invocation.run_controlled(async {
             settle_rx.await.unwrap();
             assert!(invocation.control.cancellation().is_cancelled());
             Ok("actual settled result")

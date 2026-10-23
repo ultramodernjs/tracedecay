@@ -37,7 +37,8 @@ use tracedecay_private_fs::framed_log::{
 use tracedecay_private_fs::{create_private_file, open_private_directory, open_private_file};
 use tracedecay_runtime_core::storage::{PrivateStoreIo, reject_symlink_components};
 
-use super::super::cognitive_recall::RecallAdmissionLedgerV1;
+#[cfg(test)]
+use tracedecay_rusqlite_runtime::recall_admission::RecallAdmissionLedgerV1;
 
 const ROOT_NAME: &str = "recall-source-commands-v1";
 const LOCK_NAME: &str = ".admission.lock";
@@ -489,109 +490,108 @@ impl StoredSourceCommandV1 {
     }
 }
 
-impl RecallAdmissionLedgerV1 {
-    /// Execute on the controller's existing blocking pool using its original
-    /// live `OperationControl`, after current source/target authorization.
-    pub(crate) fn accept_feedback_assertion(
-        &self,
-        context: &RequestContext,
-        request: &ProviderFeedbackRequestV1,
-        target: &LifecycleTarget,
-        original_attribution: &SourceAttribution,
-        control: &OperationControl,
-    ) -> std::result::Result<AcceptedFeedbackAssertionV1, FeedbackAssertionErrorV1> {
-        checkpoint(control)?;
-        let binding = FeedbackAssertionBindingV1::prepare(
-            context,
-            request,
-            target,
-            original_attribution,
-            now_micros(),
-        )?;
-        accepted_feedback(accept_at_root(
-            &receipt_root(self.path())?,
-            binding.into(),
-            control,
-            ArtifactQuota::DEFAULT,
-            publish_receipt,
-        )?)
-    }
+/// Execute on the controller's existing blocking pool using its original
+/// live `OperationControl`, after current source/target authorization.
+pub(crate) fn accept_feedback_assertion(
+    ledger_path: &Path,
+    context: &RequestContext,
+    request: &ProviderFeedbackRequestV1,
+    target: &LifecycleTarget,
+    original_attribution: &SourceAttribution,
+    control: &OperationControl,
+) -> std::result::Result<AcceptedFeedbackAssertionV1, FeedbackAssertionErrorV1> {
+    checkpoint(control)?;
+    let binding = FeedbackAssertionBindingV1::prepare(
+        context,
+        request,
+        target,
+        original_attribution,
+        now_micros(),
+    )?;
+    accepted_feedback(accept_at_root(
+        &receipt_root(ledger_path)?,
+        binding.into(),
+        control,
+        ArtifactQuota::DEFAULT,
+        publish_receipt,
+    )?)
+}
 
-    pub(crate) fn accept_deletion_command(
-        &self,
-        context: &RequestContext,
-        request: &ProviderDeleteBySourceRequestV1,
-        target: &LifecycleTarget,
-        original_attribution: &SourceAttribution,
-        control: &OperationControl,
-    ) -> Result<AcceptedDeletionCommandV1> {
-        checkpoint(control)?;
-        let binding = DeletionCommandBindingV1::prepare(
-            context,
-            request,
-            target,
-            original_attribution,
-            now_micros(),
-        )?;
-        accepted_deletion(accept_at_root(
-            &receipt_root(self.path())?,
-            binding.into(),
-            control,
-            ArtifactQuota::DEFAULT,
-            publish_receipt,
-        )?)
-    }
+pub(crate) fn accept_deletion_command(
+    ledger_path: &Path,
+    context: &RequestContext,
+    request: &ProviderDeleteBySourceRequestV1,
+    target: &LifecycleTarget,
+    original_attribution: &SourceAttribution,
+    control: &OperationControl,
+) -> Result<AcceptedDeletionCommandV1> {
+    checkpoint(control)?;
+    let binding = DeletionCommandBindingV1::prepare(
+        context,
+        request,
+        target,
+        original_attribution,
+        now_micros(),
+    )?;
+    accepted_deletion(accept_at_root(
+        &receipt_root(ledger_path)?,
+        binding.into(),
+        control,
+        ArtifactQuota::DEFAULT,
+        publish_receipt,
+    )?)
+}
 
-    #[cfg(test)]
-    pub(crate) fn retained_feedback_assertion(
-        &self,
-        context: &RequestContext,
-        control: &OperationControl,
-    ) -> Result<AcceptedFeedbackAssertionV1> {
-        accepted_feedback(self.retained_source_command(
-            context,
-            SourceCommandKindV1::Feedback,
-            control,
-        )?)
-    }
+#[cfg(test)]
+pub(crate) fn retained_feedback_assertion(
+    ledger_path: &Path,
+    context: &RequestContext,
+    control: &OperationControl,
+) -> Result<AcceptedFeedbackAssertionV1> {
+    accepted_feedback(retained_source_command(
+        ledger_path,
+        context,
+        SourceCommandKindV1::Feedback,
+        control,
+    )?)
+}
 
-    #[cfg(test)]
-    pub(crate) fn retained_deletion_command(
-        &self,
-        context: &RequestContext,
-        control: &OperationControl,
-    ) -> Result<AcceptedDeletionCommandV1> {
-        accepted_deletion(self.retained_source_command(
-            context,
-            SourceCommandKindV1::DeleteBySource,
-            control,
-        )?)
-    }
+#[cfg(test)]
+pub(crate) fn retained_deletion_command(
+    ledger_path: &Path,
+    context: &RequestContext,
+    control: &OperationControl,
+) -> Result<AcceptedDeletionCommandV1> {
+    accepted_deletion(retained_source_command(
+        ledger_path,
+        context,
+        SourceCommandKindV1::DeleteBySource,
+        control,
+    )?)
+}
 
-    #[cfg(test)]
-    fn retained_source_command(
-        &self,
-        context: &RequestContext,
-        kind: SourceCommandKindV1,
-        control: &OperationControl,
-    ) -> Result<StoredSourceCommandV1> {
-        checkpoint(control)?;
-        context
-            .validate()
-            .map_err(|_| invalid("authenticated context"))?;
-        let key = request_key(context.actor(), context.scope(), kind, context.request_id())?;
-        let root = receipt_root(self.path())?;
-        prepare_root(&root, control)?;
-        let _lock = acquire_admission_lock(&root, control)?;
-        let path = receipt_path(&root, &key);
-        let (file, record) =
-            read_record(&path, control)?.ok_or(HostSourceCommandErrorV1::Missing)?;
-        if record.lookup_key != key || record.binding.kind() != kind {
-            return Err(HostSourceCommandErrorV1::Corrupt("request lookup kind/key"));
-        }
-        confirm_existing_durability(&path, &file, control)?;
-        Ok(record)
+#[cfg(test)]
+fn retained_source_command(
+    ledger_path: &Path,
+    context: &RequestContext,
+    kind: SourceCommandKindV1,
+    control: &OperationControl,
+) -> Result<StoredSourceCommandV1> {
+    checkpoint(control)?;
+    context
+        .validate()
+        .map_err(|_| invalid("authenticated context"))?;
+    let key = request_key(context.actor(), context.scope(), kind, context.request_id())?;
+    let root = receipt_root(ledger_path)?;
+    prepare_root(&root, control)?;
+    let _lock = acquire_admission_lock(&root, control)?;
+    let path = receipt_path(&root, &key);
+    let (file, record) = read_record(&path, control)?.ok_or(HostSourceCommandErrorV1::Missing)?;
+    if record.lookup_key != key || record.binding.kind() != kind {
+        return Err(HostSourceCommandErrorV1::Corrupt("request lookup kind/key"));
     }
+    confirm_existing_durability(&path, &file, control)?;
+    Ok(record)
 }
 
 // Called only on the successful return of durable acceptance/read methods.
@@ -1358,9 +1358,7 @@ mod tests {
         let retained_bytes = std::fs::read(&path).unwrap();
 
         let ledger = RecallAdmissionLedgerV1::open_for_control_test(temporary.path()).unwrap();
-        let replay = ledger
-            .retained_feedback_assertion(&context, &control())
-            .unwrap();
+        let replay = retained_feedback_assertion(ledger.path(), &context, &control()).unwrap();
         assert_eq!(replay, accepted);
         assert!(
             replay
@@ -1398,9 +1396,7 @@ mod tests {
         assert!(encoded["binding"]["target"].get("reference_kind").is_none());
 
         let ledger = RecallAdmissionLedgerV1::open_for_control_test(temporary.path()).unwrap();
-        let replay = ledger
-            .retained_feedback_assertion(&context, &control())
-            .unwrap();
+        let replay = retained_feedback_assertion(ledger.path(), &context, &control()).unwrap();
         assert_eq!(replay, accepted);
         assert!(
             replay
@@ -2048,9 +2044,7 @@ mod tests {
                 .unwrap();
         let accepted = accept_deletion(&root, command.clone()).unwrap();
         let ledger = RecallAdmissionLedgerV1::open_for_control_test(temporary.path()).unwrap();
-        let replay = ledger
-            .retained_deletion_command(&context, &control())
-            .unwrap();
+        let replay = retained_deletion_command(ledger.path(), &context, &control()).unwrap();
         assert_eq!(replay, accepted);
         assert!(
             replay

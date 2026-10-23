@@ -105,6 +105,22 @@ rust_library(
 )
 
 rust_library(
+    name = "tracedecay-query__d8d3c20f845",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    crate_name = "tracedecay_query",
+    edition = crate_edition(),
+    compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
+        + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//crates/tracedecay-code-index:tracedecay-code-index__-default_-medium__db8c674cf38", "//crates/tracedecay-contracts:tracedecay-contracts", "//crates/tracedecay-domain:tracedecay-domain", "//crates/tracedecay-graph-db:tracedecay-graph-db", "//crates/tracedecay-private-fs:tracedecay-private-fs", "//crates/tracedecay-runtime-core:tracedecay-runtime-core__dd694e6765d", "//crates/tracedecay-temporal-query:tracedecay-temporal-query"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    aliases = aliases(normal = True),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 0, perf_opt_level = 1),
+    crate_features = [],
+)
+
+rust_library(
     name = "tracedecay-query__dd0c74662a8",
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",

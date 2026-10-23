@@ -21,16 +21,16 @@ use tracedecay_memory_provider_registry::{
 use tracedecay_runtime_core::db::Database;
 use tracedecay_store::StoreShardIdV1;
 
-use super::super::cognitive_recall::{
-    LEDGER_FILE_NAME, RecallAdmissionLedgerV1,
-    control_attribution::{
-        RecallLocatorKeyV1, RetainedRecallControlScopeV1, RetainedRecallControlSourceV1,
-    },
-};
 use super::super::provider_history::{
     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
     PhysicalPathIdentityV1, PhysicalPathKind, ProviderHistoryErrorV1, ProviderHistoryReaderV1,
     bounded_read, original_source_fence_digest,
+};
+use tracedecay_rusqlite_runtime::recall_admission::{
+    LEDGER_FILE_NAME, RecallAdmissionLedgerV1,
+    control_attribution::{
+        RecallLocatorKeyV1, RetainedRecallControlScopeV1, RetainedRecallControlSourceV1,
+    },
 };
 
 type Result<T> = std::result::Result<T, ProviderHistoryErrorV1>;

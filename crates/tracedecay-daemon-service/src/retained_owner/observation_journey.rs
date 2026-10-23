@@ -11979,8 +11979,24 @@ mod tests {
         // failure stood in front of is delivered, and the stall is cleared
         // rather than left standing over a healthy stream. The budget spans the
         // backoff a recorded fault deliberately waits out.
-        let (state, attempts) =
-            wait_for_settlement_within(journey.journal_path(), Duration::from_secs(30)).await;
+        // Delivery can acknowledge before replay finishes its pass and clears
+        // the fault. Both owners must converge within the same existing budget.
+        let (state, attempts) = tokio::time::timeout(Duration::from_secs(30), async {
+            let settled =
+                wait_for_settlement_within(journey.journal_path(), Duration::from_secs(30)).await;
+            while journey.stalled_on().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            settled
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "delivery and replay did not converge; stall={:?}; {}",
+                journey.stalled_on(),
+                journal_snapshot(journey.journal_path())
+            )
+        });
         assert_eq!(
             (state.as_str(), attempts),
             ("acknowledged", 1),
@@ -12057,39 +12073,14 @@ mod tests {
     // Blocking journal I/O never runs on a runtime worker.               //
     // ------------------------------------------------------------------ //
 
-    /// Holds this journal's write lock from a plain thread for a bounded
-    /// while, exactly as a second process would.
-    ///
-    /// The point is not the lock: it is that opening the journal, and reaping
-    /// its leases, are synchronous SQLite calls that can genuinely wait. A
-    /// mount or a shutdown that pays that wait on a tokio worker parks the
-    /// runtime, and on a single-worker runtime it parks all of it.
-    fn hold_journal_write_lock(path: &Path, hold: Duration) -> std::thread::JoinHandle<()> {
-        let path = path.to_path_buf();
-        let (ready, holding) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let mut connection = rusqlite::Connection::open(&path).unwrap();
-            let transaction = connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            ready.send(()).unwrap();
-            std::thread::sleep(hold);
-            transaction.rollback().unwrap();
-        });
-        holding.recv().unwrap();
-        handle
-    }
-
     /// A journey mount opens a SQLite file and applies its schema. On one
     /// runtime worker, doing that inline stops every other task on that
     /// worker for as long as the disk — or another writer — takes.
     ///
-    /// The heartbeat is counted *inside* the mounting task, between the
-    /// instant before the mount call and the instant after, so the window is
-    /// exactly the mount and nothing else. An inline mount has no await point
-    /// in that window at all, so a task sharing its worker cannot advance the
-    /// counter even once; a mount on the blocking pool leaves the worker free
-    /// for the whole wait.
+    /// The writer releases its lock only when another task runs on the sole
+    /// worker after the mount starts. An inline open prevents that task from
+    /// running until the writer's safety timeout, so the test checks task
+    /// ordering rather than a machine-dependent heartbeat rate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn mounting_a_journey_does_not_park_the_runtime_worker() {
         let temp = TempDir::new().unwrap();
@@ -12129,46 +12120,46 @@ mod tests {
             .await;
         drop(first);
 
-        let beats = Arc::new(AtomicUsize::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let heartbeat = tokio::spawn({
-            let beats = Arc::clone(&beats);
-            let stop = Arc::clone(&stop);
-            async move {
-                while !stop.load(Ordering::Relaxed) {
-                    beats.fetch_add(1, Ordering::Relaxed);
-                    tokio::task::yield_now().await;
-                }
+        let (ready, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn({
+            let journal_path = journal_path.clone();
+            move || {
+                let mut connection = rusqlite::Connection::open(journal_path).unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                ready.send(()).unwrap();
+                let released_by_worker = released.recv_timeout(Duration::from_secs(5)).is_ok();
+                transaction.rollback().unwrap();
+                released_by_worker
             }
         });
+        holding.recv().expect("journal writer acquired its lock");
 
-        // Another writer holds the journal for long enough that the schema
-        // transaction inside the open really does wait.
-        let holder = hold_journal_write_lock(&journal_path, Duration::from_millis(400));
+        let (mount_started, started) = tokio::sync::oneshot::channel();
+        let heartbeat = tokio::spawn(async move {
+            started.await.expect("mounting task started");
+            release.send(()).expect("journal writer is waiting");
+        });
 
         let mount = tokio::spawn({
-            let beats = Arc::clone(&beats);
             let inputs = inputs();
             let store = store.clone();
             async move {
-                let before = beats.load(Ordering::Relaxed);
-                let journey = mount_and_replay(inputs, store, &HostCancellationToken::new()).await;
-                let after = beats.load(Ordering::Relaxed);
-                (journey, before, after)
+                mount_started.send(()).expect("heartbeat is waiting");
+                mount_and_replay(inputs, store, &HostCancellationToken::new()).await
             }
         });
-        let (journey, before, after) = mount.await.expect("the mounting task");
-        let journey = journey.expect("second mount");
-        stop.store(true, Ordering::Relaxed);
-        heartbeat.await.expect("the heartbeat task");
-        holder.join().unwrap();
-
+        let journey = mount.await.expect("the mounting task");
+        let heartbeat = heartbeat.await;
+        let released_by_worker = holder.join().expect("journal writer thread");
         assert!(
-            after - before >= 1_000,
-            "the runtime worker advanced only {} times while the journey mounted against a \
-             contended journal: the open is still running on the worker",
-            after - before,
+            released_by_worker,
+            "the sole runtime worker could not release the journal writer while mounting"
         );
+        heartbeat.expect("the heartbeat task");
+        let journey = journey.expect("second mount");
         assert_eq!(journey.journal_path(), journal_path.as_path());
         journey
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))

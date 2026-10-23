@@ -57,6 +57,22 @@ rust_library(
 )
 
 rust_library(
+    name = "tracedecay-host-admission__d86dd37989d",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    crate_name = "tracedecay_host_admission",
+    edition = crate_edition(),
+    compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
+        + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//crates/tracedecay-domain:tracedecay-domain", "//crates/tracedecay-global-db:tracedecay-global-db__d6815898881", "//crates/tracedecay-privacy:tracedecay-privacy", "//crates/tracedecay-private-fs:tracedecay-private-fs", "//crates/tracedecay-runtime-core:tracedecay-runtime-core__dd694e6765d", "//crates/tracedecay-session-memory:tracedecay-session-memory__dc82d5f97c4", "//crates/tracedecay-sessions:tracedecay-sessions__d0543ef96e4", "//crates/tracedecay-store:tracedecay-store"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    aliases = aliases(normal = True),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 0, perf_opt_level = 1),
+    crate_features = [],
+)
+
+rust_library(
     name = "tracedecay-host-admission__da13ef1915e",
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",

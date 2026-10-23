@@ -185,7 +185,7 @@ fn missing_runtime_refuses_invocation_before_contact_or_worker_admission() {
     let boundary = boundary();
     let contacts = Arc::new(AtomicUsize::new(0));
     let contacted = Arc::clone(&contacts);
-    let mut invocation = Box::pin(boundary.invoke(
+    let mut invocation = std::pin::pin!(boundary.invoke(
         uncancelled(Duration::from_secs(5)),
         move || {
             contacted.fetch_add(1, Ordering::Relaxed);
@@ -211,7 +211,7 @@ fn cancellation_preempts_missing_runtime_refusal_before_contact() {
     let boundary = boundary();
     let contacts = Arc::new(AtomicUsize::new(0));
     let contacted = Arc::clone(&contacts);
-    let mut invocation = Box::pin(boundary.invoke(
+    let mut invocation = std::pin::pin!(boundary.invoke(
         ProviderInvocationRequestV1 {
             provider_id: PROVIDER,
             execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,

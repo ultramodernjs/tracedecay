@@ -14,13 +14,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crate::lifecycle_lease::{ExclusiveLeaseAttempt, try_acquire_exclusive_for_profile};
+use crate::storage::reject_symlink_components;
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tracedecay_runtime_core::lifecycle_lease::{
-    ExclusiveLeaseAttempt, try_acquire_exclusive_for_profile,
-};
-use tracedecay_runtime_core::storage::reject_symlink_components;
 
 const STAGING_PREFIX: &str = ".td-offline-compact-";
 

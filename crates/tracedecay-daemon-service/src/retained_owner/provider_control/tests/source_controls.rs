@@ -33,13 +33,6 @@ use tracedecay_sessions::runtime::hosts::claude::ClaudeSource;
 use tracedecay_sessions::runtime::hosts::claude_observation::ingest_source_with_observations_with_admission;
 use tracedecay_store::{ObservationReplayRequest, ObservationStore, StoredObservation};
 
-use crate::retained_owner::cognitive_recall::{
-    RecallAdmissionLedgerV1,
-    control_attribution::{
-        PreparedRecallControlMetadataV1, RecallLocatorKeyV1, RetainedRecallControlBindingV1,
-        retained_candidate_identity_alias_for_context, retained_trace_id_with_key,
-    },
-};
 use crate::retained_owner::observation_journey::ObservationJourneyPolicyV1;
 use crate::retained_owner::provider_control::ProviderControlMountInputsV1;
 use crate::retained_owner::provider_control::authority::{
@@ -49,6 +42,13 @@ use crate::retained_owner::provider_history::{
     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
     ORIGINAL_PROVENANCE_UNAVAILABLE, OriginalObservationAuthorityV1, ProviderHistoryErrorV1,
     ProviderHistoryReaderV1, source_attribution_json,
+};
+use tracedecay_rusqlite_runtime::recall_admission::{
+    RecallAdmissionLedgerV1,
+    control_attribution::{
+        PreparedRecallControlMetadataV1, RecallLocatorKeyV1, RetainedRecallControlBindingV1,
+        retained_candidate_identity_alias_for_context, retained_trace_id_with_key,
+    },
 };
 
 const SESSION: &str = "source-control-session";
@@ -567,16 +567,20 @@ async fn source_controls_refuse_without_publishing_commands_or_deletion_fences()
                 if detail.contains(ORIGINAL_PROVENANCE_UNAVAILABLE)
         ));
         assert!(
-            fixture
-                .ledger
-                .retained_feedback_assertion(&context, &operation_control())
-                .is_err()
+            super::super::feedback_receipt::retained_feedback_assertion(
+                fixture.ledger.path(),
+                &context,
+                &operation_control()
+            )
+            .is_err()
         );
         assert!(
-            fixture
-                .ledger
-                .retained_deletion_command(&context, &operation_control())
-                .is_err()
+            super::super::feedback_receipt::retained_deletion_command(
+                fixture.ledger.path(),
+                &context,
+                &operation_control()
+            )
+            .is_err()
         );
     }
     assert!(

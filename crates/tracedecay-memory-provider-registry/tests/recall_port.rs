@@ -227,7 +227,7 @@ fn missing_runtime_refuses_recall_before_provider_contact() {
     )
     .expect("mounted port");
     let cancellation = live_signal();
-    let mut recall = Box::pin(port.recall_admitted(
+    let mut recall = std::pin::pin!(port.recall_admitted(
         request(
             resolved_scope(Some("refs/heads/recall-port")),
             60_000_000,

@@ -41,6 +41,22 @@ rust_library(
 )
 
 rust_library(
+    name = "tracedecay-code-index-runtime__+full_+lite__d0819b92f01",
+    srcs = glob(["src/**/*.rs"]) + glob(["tests/code_index_scheduler/**/*.rs"]),
+    crate_root = "src/lib.rs",
+    crate_name = "tracedecay_code_index_runtime",
+    edition = crate_edition(),
+    compile_data = glob(["src/**/*"], exclude=["src/**/*.rs"], allow_empty = True)
+        + glob(["assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True) + ["//crates/tracedecay-application:tracedecay-application__d01e9b24e8d", "//crates/tracedecay-code-extraction:tracedecay-code-extraction", "//crates/tracedecay-code-index-retention:tracedecay-code-index-retention__d7af5817331", "//crates/tracedecay-code-index:tracedecay-code-index__-default_-medium__db8c674cf38", "//crates/tracedecay-contracts:tracedecay-contracts", "//crates/tracedecay-domain:tracedecay-domain", "//crates/tracedecay-global-db:tracedecay-global-db__d6815898881", "//crates/tracedecay-graph-db:tracedecay-graph-db", "//crates/tracedecay-graph-query:tracedecay-graph-query__d45196ab43a", "//crates/tracedecay-lsp:tracedecay-lsp__de5ce82d506", "//crates/tracedecay-policy:tracedecay-policy", "//crates/tracedecay-privacy:tracedecay-privacy", "//crates/tracedecay-private-fs:tracedecay-private-fs", "//crates/tracedecay-query:tracedecay-query__d8d3c20f845", "//crates/tracedecay-runtime-core:tracedecay-runtime-core__dd694e6765d", "//crates/tracedecay-session-temporal-store:tracedecay-session-temporal-store__dca22e82281", "//crates/tracedecay-store:tracedecay-store", "//crates/tracedecay-tool-catalog:tracedecay-tool-catalog"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    aliases = aliases(normal = True),
+    rustc_flags = profile_rustc_flags(dev_opt_level = 1, perf_opt_level = 2),
+    crate_features = ["full", "lite"],
+)
+
+rust_library(
     name = "tracedecay-code-index-runtime__+full_+lite__da9b78911ae",
     srcs = glob(["src/**/*.rs"]) + glob(["tests/code_index_scheduler/**/*.rs"]),
     crate_root = "src/lib.rs",

@@ -37,10 +37,11 @@ use tracedecay_private_fs::{
 use tracedecay_runtime_core::db::Database;
 use tracedecay_runtime_core::storage::reject_symlink_components;
 
+use tracedecay_rusqlite_runtime::recall_admission::{
+    RecallAdmissionLedgerV1, control_attribution::RetainedRecallControlScopeV1,
+};
+
 use super::super::{
-    cognitive_recall::{
-        RecallAdmissionLedgerV1, control_attribution::RetainedRecallControlScopeV1,
-    },
     observation_journey::{
         delivery_operation_id, history_source_stream, validate_history_delivery_evidence,
     },

@@ -34,14 +34,14 @@ use tracedecay_store::{
     RetrievalAnchorDispositionStore, StoreShardIdV1, StoreShardScopeV1, StoredObservation,
 };
 
-use super::cognitive_recall::control_attribution::{
-    RecallControlTraceRefV1, RecallLocatorKeyV1, redact_retained_source_attribution_with_key,
-    validate_opaque_retained_source, validate_retained_candidate_identity,
-    validate_retained_provider_rank,
-};
 use super::observation_journey::exact_scope_for_session;
 use tracedecay_memory_provider_registry::recall_admission::{
     RecallOutcomeScopeV1, source_attribution::RecallSourceAttributionV1,
+};
+use tracedecay_rusqlite_runtime::recall_admission::control_attribution::{
+    RecallControlTraceRefV1, RecallLocatorKeyV1, redact_retained_source_attribution_with_key,
+    validate_opaque_retained_source, validate_retained_candidate_identity,
+    validate_retained_provider_rank,
 };
 
 const MAX_HISTORY_PAGE: usize = 256;
@@ -2816,7 +2816,7 @@ mod tests {
             polled.set(true);
             std::task::Poll::Ready(Ok::<(), ()>(()))
         });
-        let mut read = Box::pin(bounded_read(&control, authority, "history runtime"));
+        let mut read = std::pin::pin!(bounded_read(&control, authority, "history runtime"));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(
             std::future::Future::poll(read.as_mut(), &mut context),
@@ -2834,7 +2834,7 @@ mod tests {
             30_000,
             cancellation,
         );
-        let mut read = Box::pin(bounded_read(
+        let mut read = std::pin::pin!(bounded_read(
             &control,
             std::future::pending::<Result<(), ()>>(),
             "history runtime",
