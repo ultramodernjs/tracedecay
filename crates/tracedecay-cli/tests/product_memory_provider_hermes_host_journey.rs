@@ -210,9 +210,11 @@ impl HermesJourney {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
                 stderr.contains("code_index_scheduler_unavailable"),
-                "init failed outside scheduler warming window\nstdout:\n{}\nstderr:\n{}",
+                "init failed outside scheduler warming window\nstdout:\n{}\nstderr:\n{}\ndaemon log:\n{}",
                 String::from_utf8_lossy(&output.stdout),
-                stderr
+                stderr,
+                fs::read_to_string(self.home.path().join("daemon.stderr.log"))
+                    .unwrap_or_else(|error| format!("could not read daemon log: {error}"))
             );
             assert!(Instant::now() < deadline, "init never became available");
             std::thread::sleep(Duration::from_millis(50));
