@@ -94,7 +94,13 @@ pub async fn open_project_retained_memory_target(
         if authority.project_id != *admitted_project_id {
             return denied();
         }
-        if authority.served_project_root != registered_root {
+        // A registered host root may be plain while the graph carries the
+        // Windows verbatim spelling. Authorize the directory identity, not its
+        // spelling; the mounted and on-disk project IDs must still agree.
+        if !tracedecay_runtime_core::path_safety::same_canonical_path(
+            &authority.served_project_root,
+            registered_root,
+        ) {
             return denied();
         }
         if authority.store_layout_project_id != *admitted_project_id {
