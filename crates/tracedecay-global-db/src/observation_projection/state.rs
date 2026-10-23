@@ -1200,8 +1200,7 @@ pub(super) fn reconcile_session_rows_detailed(
             .chain(expected.started_at)
             .min(),
         ended_at: actual.ended_at.into_iter().chain(expected.ended_at).max(),
-        transcript_path: reconcile_optional(
-            "transcript_path",
+        transcript_path: reconcile_transcript_path(
             actual.transcript_path.as_ref(),
             expected.transcript_path.as_ref(),
         )?,
@@ -1230,6 +1229,25 @@ pub(super) fn reconcile_session_rows_detailed(
 
 fn project_key_is_directory(session: &SessionRecord) -> bool {
     session.project_key == session.project_path
+}
+
+/// Transcript locators retain their stored display spelling, but Windows drive,
+/// separator and verbatim-prefix aliases must not become session collisions.
+/// Use the shared lexical identity policy: reconciliation also runs during
+/// audit/rebuild, when the original file may no longer exist.
+fn reconcile_transcript_path(
+    actual: Option<&String>,
+    expected: Option<&String>,
+) -> Result<Option<String>, SessionReconcileConflict> {
+    use tracedecay_sessions::runtime::shared::path_identity_key;
+
+    if let (Some(actual), Some(expected)) = (actual, expected)
+        && actual != expected
+        && path_identity_key(actual) == path_identity_key(expected)
+    {
+        return Ok(Some(actual.clone()));
+    }
+    reconcile_optional("transcript_path", actual, expected)
 }
 
 fn reconcile_optional<T: Clone + Eq>(
@@ -1763,6 +1781,62 @@ mod reconcile_tests {
             "project_key",
             "distinct directories must never merge"
         );
+    }
+
+    #[test]
+    fn transcript_path_reconciliation_accepts_windows_display_spellings() {
+        for (stored_path, projected_path) in [
+            (
+                r"C:\home\.codex/sessions/2026/01/01\rollout.jsonl",
+                r"C:\home\.codex\sessions\2026\01\01\rollout.jsonl",
+            ),
+            (
+                r"C:\sessions\rollout.jsonl",
+                r"\\?\c:\sessions\rollout.jsonl",
+            ),
+            (
+                r"\\server\share\sessions/rollout.jsonl",
+                r"\\?\UNC\server\share\sessions\rollout.jsonl",
+            ),
+        ] {
+            let mut stored = record("/earlier-cwd");
+            stored.project_key = "user".to_owned();
+            stored.transcript_path = Some(stored_path.to_owned());
+            let mut projected = record("/current-cwd");
+            projected.project_key = "user".to_owned();
+            projected.transcript_path = Some(projected_path.to_owned());
+
+            let merged = reconcile_session_rows_detailed(&stored, &projected)
+                .expect("Windows display spellings name the same transcript");
+            assert_eq!(merged.project_path, stored.project_path);
+            assert_eq!(merged.transcript_path, stored.transcript_path);
+            assert!(reconcile_session_rows_detailed(&projected, &stored).is_ok());
+        }
+    }
+
+    #[test]
+    fn transcript_path_reconciliation_preserves_distinct_path_identities() {
+        for (stored_path, projected_path) in [
+            (r"C:\sessions\one.jsonl", r"\\?\c:\sessions\two.jsonl"),
+            (r"C:\sessions\rollout.jsonl", r"D:\sessions\rollout.jsonl"),
+            (
+                r"\\server\share\rollout.jsonl",
+                r"\\server\other\rollout.jsonl",
+            ),
+            (
+                r"/sessions/literal\rollout.jsonl",
+                "/sessions/literal/rollout.jsonl",
+            ),
+        ] {
+            let mut stored = record("/project");
+            stored.transcript_path = Some(stored_path.to_owned());
+            let mut projected = stored.clone();
+            projected.transcript_path = Some(projected_path.to_owned());
+
+            let conflict = reconcile_session_rows_detailed(&stored, &projected)
+                .expect_err("different transcript identities must not merge");
+            assert_eq!(conflict.field(), "transcript_path");
+        }
     }
 
     #[test]
