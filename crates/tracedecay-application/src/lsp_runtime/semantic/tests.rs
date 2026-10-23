@@ -103,11 +103,16 @@ impl PendingAnalyzerRequest {
 
     async fn assert_stopped(mut self) {
         let mut byte = [0_u8];
-        let bytes = tokio::time::timeout(TEST_BOUND, self.stream.read(&mut byte))
+        let result = tokio::time::timeout(TEST_BOUND, self.stream.read(&mut byte))
             .await
-            .expect("cancelled analyzer work must release its process")
-            .unwrap();
-        assert_eq!(bytes, 0);
+            .expect("cancelled analyzer work must release its process");
+        match result {
+            Ok(0) => {}
+            // Killing a process with a pending read closes its TCP socket
+            // with RST on Windows, rather than the graceful EOF Unix sends.
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("cancelled analyzer control socket remained active: {other:?}"),
+        }
     }
 }
 

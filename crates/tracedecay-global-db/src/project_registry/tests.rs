@@ -772,17 +772,21 @@ async fn full_clone_adopts_a_shallow_first_project_and_enriches_its_history() {
     let (original, full) = cloned_repository(&harness, "shallow-first");
     std::fs::write(original.join("lib.rs"), "pub fn next() {}\n").unwrap();
     git(&original, &["commit", "-q", "-am", "advance history"]);
-    let url = format!("file://{}/", original.display());
-    git(&full, &["remote", "set-url", "origin", &url]);
+    let remote = tracedecay_runtime_core::path_safety::plain_host_path(&original);
+    let url = remote.to_str().expect("utf-8 fixture remote");
+    git(&full, &["remote", "set-url", "origin", url]);
     let shallow = original.with_file_name("shallow-first-shallow");
+    // Force the upload-pack transport so depth applies to a local path without
+    // inventing a file:// URL from a Windows drive or verbatim spelling.
     git(
         original.parent().unwrap(),
         &[
             "clone",
             "-q",
+            "--no-local",
             "--depth",
             "1",
-            &url,
+            url,
             shallow.to_str().unwrap(),
         ],
     );

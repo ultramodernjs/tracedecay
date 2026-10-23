@@ -188,7 +188,7 @@ fn registered_scope_route_rejects_foreign_nested_repository() {
 #[test]
 fn registered_scope_route_admits_a_clone_whose_marker_names_the_project() {
     let repository = repository();
-    let registered_root = repository.path().canonicalize().expect("registered root");
+    let registered_root = registered_root(&repository);
     let project_id = ProjectId::new("project.registered-route").expect("project id");
     let clone_parent = tempfile::TempDir::new().expect("clone parent");
     let clone = clone_parent.path().join("clone");

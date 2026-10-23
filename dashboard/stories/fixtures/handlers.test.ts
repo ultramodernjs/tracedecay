@@ -13,5 +13,10 @@ describe('fixture handlers', () => {
     expect(((await bound.json()) as { domain_state: string }).domain_state).toBe('ready');
 
     await expect(fetch('http://localhost/api/plugins/holographic/?limit=100')).rejects.toThrow();
+    // Matched catch-alls must also refuse unknown paths without network I/O.
+    await expect(fetch('http://localhost/api/not-a-fixture')).rejects.toThrow();
+    await expect(
+      fetch('http://localhost/api/work/not-a-fixture', { method: 'POST' }),
+    ).rejects.toThrow();
   });
 });

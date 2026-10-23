@@ -109,7 +109,9 @@ impl McpServer {
             };
         // Ref is mutable checkout state. Fixed route identity must still match
         // exactly; indexing reconciles the canonical current branch below.
-        if root.as_path() != effect_root || !current_scope.identifies_same_checkout(scope) {
+        if !tracedecay_runtime_core::path_safety::same_canonical_path(&root, effect_root)
+            || !current_scope.identifies_same_checkout(scope)
+        {
             return Err(HostAdmissionOutcome::degraded("project_route_stale"));
         }
         let resolved = match crate::mcp::project_route::resolve_registered_project_route(
@@ -177,7 +179,9 @@ impl McpServer {
             );
         }
         let (cg, branch) = server.reopen_if_branch_drifted_memoized().await;
-        if cg.project_root() != root {
+        // A graph opened from a Windows verbatim path and a registry route
+        // spelled as a plain host path still name the same checkout.
+        if !tracedecay_runtime_core::path_safety::same_canonical_path(cg.project_root(), &root) {
             return HostAdmissionOutcome::degraded("project_route_stale");
         }
         if let Some(seq) = admission_seq {

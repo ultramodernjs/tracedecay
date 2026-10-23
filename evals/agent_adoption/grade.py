@@ -2134,9 +2134,13 @@ def main() -> int:
     with open(os.path.join(run_dir, "scoreboard.json"), "w") as f:
         json.dump(scoreboard, f, indent=2)
         f.write("\n")
-    with open(os.path.join(run_dir, "report.md"), "w") as f:
+    with open(os.path.join(run_dir, "report.md"), "w", encoding="utf-8") as f:
         f.write(render_report(scoreboard))
 
+    # Reports contain Unicode (for example the delta column). Windows pipes
+    # otherwise inherit cp1252 and fail even after the scoreboard was written.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     print(render_report(scoreboard))
     return 0
 

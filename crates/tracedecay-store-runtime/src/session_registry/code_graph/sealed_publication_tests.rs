@@ -1518,7 +1518,10 @@ async fn removed_scope_fixture(project: &str) -> RemovedScopeFixture {
             removed_root.to_str().unwrap(),
         ],
     );
-    let removed_root = removed_root.canonicalize().unwrap();
+    // Scope hashes and the scheduler's worktree id use the plain canonical
+    // identity, not Windows canonicalize's `\\?\` verbatim spelling.
+    let removed_root =
+        tracedecay_runtime_core::path_safety::canonical_existing_identity(&removed_root).unwrap();
     let removed_store =
         scoped_code_index_store_root(fixture.scoped_store.parent().unwrap(), &removed_root);
     let mut scheduler = CodeIndexWorktreeSchedulerV1::open(

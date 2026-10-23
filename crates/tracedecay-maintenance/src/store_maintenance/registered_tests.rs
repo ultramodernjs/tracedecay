@@ -376,8 +376,12 @@ fn scope_reconciliation_graph_heads_case(collected: bool) {
                 removed.to_str().unwrap(),
             ],
         );
-        let checkout = checkout.canonicalize().unwrap();
-        let removed = removed.canonicalize().unwrap();
+        let checkout = tracedecay_runtime_core::path_safety::canonical_existing_identity(&checkout)
+            .unwrap();
+        // Match the scheduler's plain canonical identity: hashing Windows'
+        // verbatim canonicalize spelling creates a different scope directory.
+        let removed = tracedecay_runtime_core::path_safety::canonical_existing_identity(&removed)
+            .unwrap();
         let (lease, _scope, _owner) = maintenance_lease(
             &temp.path().join("profile"),
             &checkout,
