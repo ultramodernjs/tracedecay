@@ -28,7 +28,7 @@ const MAX_SOURCES: usize = 100_000;
 /// with production same-generation, new-generation and writer-race regressions.
 pub fn require_profile_session_prune_admission() -> Result<()> {
     Err(error(
-        "profile-session prune admission/replay integration is not installed; apply and destructive projects forget are disabled (use --keep-store to retain evidence explicitly)",
+        "profile-session prune admission/replay integration is not installed; public prune-sessions apply is disabled",
     ))
 }
 

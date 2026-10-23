@@ -412,7 +412,12 @@ impl HermesJourney {
     }
 
     fn run_provider_fixture(&self, mode: &str, timestamp_ns: u128) -> Value {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        // Bazel's launcher supplies the current runfiles package. A cached
+        // binary's compile-time manifest directory belongs to another execroot.
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let script = manifest_dir
             .join("tests/product_memory_provider_hermes_host_journey/hermes_sync_turn.py");
         let plugin = self.home.path().join(".hermes/plugins/tracedecay");
         let output = python_command()

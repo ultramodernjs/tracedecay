@@ -133,6 +133,9 @@ TEST_DATA = {
         ":build-support/source_provenance_git.rs",
         ":build-support/watched_input_file.rs",
     ],
+    ("tracedecay-cli", "product_memory_provider_hermes_host_journey"): [
+        ":tests/product_memory_provider_hermes_host_journey/hermes_sync_turn.py",
+    ],
     ("tracedecay-cli", "tracedecay_unit_test"): ["//:.github/release-targets.json"],
     ("tracedecay-memory-conformance", "baseline"): [
         "product/evaluation/coding-memory-scenarios.v1.json",
