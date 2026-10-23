@@ -2893,6 +2893,10 @@ fn hash_path(hasher: &mut Sha256, path: &Path) {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
+        // Match Path equality and discovery's native separator spelling.
+        // Otherwise a caller's forward-slash path can miss the quarantine
+        // witness (and cursor) recorded under its discovered backslash path.
+        let path = path.components().collect::<PathBuf>();
         for unit in path.as_os_str().encode_wide() {
             hasher.update(unit.to_le_bytes());
         }

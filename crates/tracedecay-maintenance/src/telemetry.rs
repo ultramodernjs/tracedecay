@@ -1491,28 +1491,77 @@ mod store_file_identity_tests {
 
         let replacement = temporary.path().join("replacement.db");
         std::fs::write(&replacement, b"replacement").expect("replacement file");
-        std::fs::rename(&replacement, &database_path).expect("rename over the store");
-        assert_eq!(
-            state_of(&registry, &database_path),
-            [(database_path.clone(), StoreFileIdentityStateV1::Replaced)]
-        );
+        #[cfg(windows)]
+        {
+            // The SQLite runtime deliberately pins its database without
+            // FILE_SHARE_DELETE. Neither an atomic replace nor an unlink may
+            // displace that live authority on Windows.
+            tracedecay_runtime_core::db::DatabaseAuthority::replace_file_atomically(
+                &replacement,
+                &database_path,
+                "held store replacement fixture",
+            )
+            .expect_err("a pinned Windows database must reject replacement");
+            std::fs::remove_file(&database_path)
+                .expect_err("a pinned Windows database must reject removal");
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Current)]
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix permits displacing an open inode; the guarded port must
+            // keep the mounted identity rather than adopt the new pathname.
+            std::fs::rename(&replacement, &database_path).expect("rename over the store");
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Replaced)]
+            );
+            registry.register_port(&database_path, &scope, || {
+                database.storage_telemetry_handle()
+            });
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Replaced)],
+                "a rebind through the held handle must not adopt the replacement"
+            );
+            std::fs::remove_file(&database_path).expect("remove the store file");
+            assert_eq!(
+                state_of(&registry, &database_path),
+                [(database_path.clone(), StoreFileIdentityStateV1::Missing)]
+            );
+        }
+    }
 
-        // Profile-wide stores rebind on every project open; the held database
-        // refuses to issue a reader over the replacement, so the port keeps
-        // the identity it mounted.
-        registry.register_port(&database_path, &scope, || {
-            database.storage_telemetry_handle()
-        });
+    #[test]
+    fn a_store_file_identity_detects_replacement_and_removal() {
+        let temporary = tempfile::tempdir().expect("identity fixture root");
+        let path = temporary.path().join("store.db");
+        std::fs::write(&path, b"original").expect("original file");
+        let mounted = Some(super::store_file_identity(&path).expect("mounted file identity"));
         assert_eq!(
-            state_of(&registry, &database_path),
-            [(database_path.clone(), StoreFileIdentityStateV1::Replaced)],
-            "a rebind through the held handle must not adopt the replacement"
+            super::store_file_identity_state(&path, mounted),
+            StoreFileIdentityStateV1::Current
         );
-
-        std::fs::remove_file(&database_path).expect("remove the store file");
+        let replacement = temporary.path().join("replacement.db");
+        std::fs::write(&replacement, b"replacement").expect("replacement file");
+        // Use the same Windows-safe atomic swap as durable record publication.
+        // No SQLite pin is held here, so both hosts can exercise detection.
+        tracedecay_runtime_core::db::DatabaseAuthority::replace_file_atomically(
+            &replacement,
+            &path,
+            "store identity replacement fixture",
+        )
+        .expect("replace the unpinned store");
         assert_eq!(
-            state_of(&registry, &database_path),
-            [(database_path.clone(), StoreFileIdentityStateV1::Missing)]
+            super::store_file_identity_state(&path, mounted),
+            StoreFileIdentityStateV1::Replaced
+        );
+        std::fs::remove_file(&path).expect("remove the unpinned store");
+        assert_eq!(
+            super::store_file_identity_state(&path, mounted),
+            StoreFileIdentityStateV1::Missing
         );
     }
 }
