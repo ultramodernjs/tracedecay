@@ -283,6 +283,60 @@ async fn file_edit_request_acks_durable_work_while_effect_is_held() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn file_edit_replay_accepts_the_same_checkout_under_a_canonical_path_alias() {
+    let (cg, project, authority) = init_indexed_repo().await;
+    let owner = registered_runtime(&authority)
+        .project_registry_context_by_alias(project.path())
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, scope) = tracedecay_mcp::scope::resolve_query_scope(&owner, project.path()).unwrap();
+    // Windows verbatim paths do not interpret dot components, so exercise
+    // their prefix there and an equivalent non-normalized spelling on Unix.
+    let canonical = project.path().canonicalize().unwrap();
+    let alias = if cfg!(windows) {
+        canonical
+    } else {
+        canonical.join("src/..")
+    };
+    let effects = Arc::new(AtomicUsize::new(0));
+    let context = registered_context(cg, &authority).with_code_index_hook_sink({
+        let effects = Arc::clone(&effects);
+        let expected = project.path().to_path_buf();
+        Arc::new(move |root, paths| {
+            assert!(tracedecay_runtime_core::path_safety::same_canonical_path(
+                &root, &expected
+            ));
+            assert_eq!(paths, ["src/lib.rs"]);
+            effects.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { super::CodeIndexDemandAdmissionV1::Queued })
+        })
+    });
+    let server = McpServer::new_with_registered_test_context(context, Vec::new())
+        .await
+        .unwrap();
+    let outcome = server
+        .run_hook_event_plan(
+            server.cg().await,
+            project.path(),
+            tracedecay_mcp::hook_events::HookEventPlan::SyncFilesAt {
+                root: alias,
+                scope,
+                agent: HostIntegrationIdV1::Claude,
+                event_kind: tracedecay_mcp::hook_events::HookEventKind::FileEdit,
+                had_command: false,
+                route: None,
+                rel_paths: vec!["src/lib.rs".to_owned()],
+            },
+            None,
+        )
+        .await;
+    assert_eq!(outcome.status, HostAdmissionStatus::Committed);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    server.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_path_hints_emit_activity_only_for_queued_paths() {
     let (cg, project, authority) = init_indexed_repo().await;

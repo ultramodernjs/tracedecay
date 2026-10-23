@@ -216,3 +216,94 @@ async fn claude_guidance_hook(runtime: &HookRuntimeV1, hook_name: &'static str) 
     }
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::time::Duration;
+    use tracedecay_contracts::ResolvedScope;
+    use tracedecay_domain::{ProjectId, RepositoryId, WorktreeId};
+    use tracedecay_runtime_core::config::ProfileRoot;
+
+    #[tokio::test]
+    async fn slow_project_root_discovery_does_not_spend_daemon_admission_window() {
+        fn slow_root<'a>(
+            _: &'a ProfileRoot,
+            requested: &'a Path,
+        ) -> Pin<Box<dyn Future<Output = Option<PathBuf>> + Send + 'a>> {
+            Box::pin(async move {
+                // Longer than the 25ms admission window on every platform.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Some(requested.to_path_buf())
+            })
+        }
+        fn scope(_: &Path, project: &ProjectId) -> Result<ResolvedScope, String> {
+            ResolvedScope::new(
+                project.clone(),
+                RepositoryId::new("repository.slow-hook-root").unwrap(),
+                WorktreeId::new("worktree.slow-hook-root").unwrap(),
+                None,
+            )
+            .map_err(|error| error.to_string())
+        }
+        fn daemon<'a>(
+            profile: &'a ProfileRoot,
+            _: Option<&'a Path>,
+            tool: &'a str,
+            arguments: Value,
+            _: bool,
+        ) -> Pin<Box<dyn Future<Output = tracedecay_domain::errors::Result<Value>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                assert_eq!(tool, "tracedecay_hook_runtime");
+                assert_eq!(arguments["action"], "hook_v2_admit");
+                std::fs::write(profile.data_dir().join("admission-called"), b"called").unwrap();
+                Ok(serde_json::json!({
+                    "action": "hook_v2_admit",
+                    "status": "rejected",
+                    "disposition": "catchup_required",
+                }))
+            })
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        let profile = ProfileRoot::under_home(home.path());
+        let project_id = "proj_slow_hook_root";
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(&project, project_id)
+            .unwrap();
+        let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+            &project,
+            profile.data_dir(),
+            project_id,
+        )
+        .unwrap();
+        let runtime = HookRuntimeV1 {
+            project_root_resolver: slow_root,
+            scope_resolver: scope,
+            daemon_tool: daemon,
+            ..crate::ports::hook_runtime::crate_test_runtime(profile.clone())
+        };
+        super::super::dispatch::publish_daemon_bindings(&runtime, &layout).unwrap();
+        let event = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "slow-root-session",
+            "tool_use_id": "slow-root-call",
+            "cwd": project,
+            "tool_name": "Write",
+            "tool_input": {"file_path": project.join("src/lib.rs"), "content": ""},
+            "tool_response": {"filePath": project.join("src/lib.rs")},
+        });
+        let started = Instant::now();
+        claude_post_tool_use_response(&runtime, &event.to_string()).await;
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(
+            profile.data_dir().join("admission-called").is_file(),
+            "slow root discovery must still leave time for daemon admission"
+        );
+    }
+}

@@ -2128,6 +2128,17 @@ mod tests {
     }
 
     #[test]
+    fn settling_a_directory_does_not_require_opening_it_as_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        // Unix change times can settle; Windows has no directory rewrite
+        // witness. Both cases must return, rather than retrying a failed open.
+        let settled = spin_until_jsonl_change_settled(directory.path());
+        if RewriteWitness::NATIVE.proves_unchanged_bytes() {
+            assert!(settled);
+        }
+    }
+
+    #[test]
     fn rename_after_generation_capture_scans_one_handle_then_resets_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("active.jsonl");
