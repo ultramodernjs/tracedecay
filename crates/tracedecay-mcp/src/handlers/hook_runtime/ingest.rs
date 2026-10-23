@@ -10,6 +10,7 @@ use tracedecay_domain::{ObservationScopeV1, ProjectId};
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
 use tracedecay_project::project::TraceDecay;
+use tracedecay_runtime_core::native_runtime;
 use tracedecay_session_memory::session::lcm::{
     LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmCompactionCommand,
     LcmCompressionEvidence, LcmHostProtocol,
@@ -204,7 +205,7 @@ async fn admit_codex_session_for_compaction(
     cancellation: &ObservationCancellation,
 ) -> Result<CodexRolloutAdmission> {
     let requested_session = session_id.to_owned();
-    let lookup = tokio::task::spawn_blocking(move || {
+    let lookup = native_runtime::spawn_blocking(move || {
         source.find_session_transcript_paths_bounded(&requested_session)
     })
     .await
