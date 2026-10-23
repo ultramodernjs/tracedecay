@@ -484,7 +484,7 @@ async fn broker_bounds_lsp_document_write_hangs() {
     let err = result
         .expect("refresh should be bounded while writing document text")
         .expect_err("hung document write should crash the engine");
-    assert!(err.to_string().contains("timed out"));
+    assert!(err.to_string().contains("timed out"), "{err}");
     let snapshot = broker.snapshot();
     assert_engine_state(&snapshot, FAKE_LANGUAGE, lsp::broker::EngineState::Crashed);
     let failed = authority.analyzer_readiness();

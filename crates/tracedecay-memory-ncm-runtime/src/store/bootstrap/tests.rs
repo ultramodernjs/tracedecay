@@ -323,7 +323,11 @@ fn interrupted_first_bootstrap_leaves_retry_usable() {
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
-            assert_eq!(status.signal(), Some(9), "child must remain live until SIGKILL");
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "child must remain live until SIGKILL"
+            );
         }
         assert!(
             stage.join("ncm.sqlite").is_file(),
