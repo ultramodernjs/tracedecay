@@ -445,9 +445,15 @@ async fn expired_startup_settles_its_spawned_process_before_a_successor() {
 async fn broker_bounds_lsp_document_write_hangs() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("hanging_write_lsp.py");
+    // Establish a healthy client before applying the short write-hang budget.
+    // That budget also bounds initialize writes; a cold Python launch on a
+    // loaded runner must not turn this transport test into a startup test.
     std::fs::write(
         &script_path,
-        fake_lsp_script_that_initializes_then_stops_reading(),
+        fake_lsp_script_with_preamble(
+            "",
+            &format!("{FAKE_DIAGNOSTIC_PUBLISH}        import time\n        time.sleep(60)\n"),
+        ),
     )
     .unwrap();
     let mut broker = lsp::broker::DiagnosticBroker::new_for_test(
@@ -466,9 +472,18 @@ async fn broker_bounds_lsp_document_write_hangs() {
         .await
         .unwrap()
         .expect("fake analyzer is executable");
+    broker
+        .refresh_documents_with_timeouts(
+            FAKE_LANGUAGE,
+            vec![fake_document(FAKE_LANGUAGE, FAKE_PATH, "let nope")],
+            loaded_runner_fake_lsp_timeouts(),
+        )
+        .await
+        .expect("warm-up must finish initialization and publish diagnostics");
+    assert_eq!(authority.analyzer_readiness().state(), AnalyzerState::Ready);
 
     let result = tokio::time::timeout(
-        FAKE_LSP_START_TIMEOUT + OUTER_ASYNC_TIMEOUT,
+        OUTER_ASYNC_TIMEOUT,
         broker.refresh_documents_with_timeouts(
             FAKE_LANGUAGE,
             vec![fake_document(
