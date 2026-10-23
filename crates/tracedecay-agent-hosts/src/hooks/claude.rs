@@ -131,6 +131,9 @@ async fn claude_post_tool_use_response(
         "PostToolUse"
     };
     let root = event_project_root_with_identity(runtime, &parsed).await;
+    // Registry discovery is not daemon admission. Charging its cold-start
+    // cost to the 25ms admission window can make every retry spool forever.
+    let started = Instant::now();
     let hook_telemetry = record_hook_invoked_parsed(
         runtime,
         root.as_deref(),
@@ -170,6 +173,9 @@ async fn claude_guidance_hook(runtime: &HookRuntimeV1, hook_name: &'static str) 
     );
     let parsed = serde_json::from_str::<Value>(&event).unwrap_or(Value::Null);
     let root = event_project_root_with_identity(runtime, &parsed).await;
+    // Match the telemetry/admission boundary used by PostToolUse. In
+    // particular, a slow Windows registry probe must not starve Stop retries.
+    let started = Instant::now();
     let hook_telemetry = record_hook_invoked_parsed(
         runtime,
         root.as_deref(),

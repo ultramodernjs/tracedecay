@@ -2310,7 +2310,9 @@ fn retained_scan_step(
                                     ),
                                 });
                             } else {
-                                let child = entry.path();
+                                // Keep the source root's spelling. Windows read_dir
+                                // may expose a verbatim-prefixed DirEntry path.
+                                let child = dir.join(entry.file_name());
                                 let charge = candidate_charge(&child, metadata_charge)?;
                                 if path_byte_len(&child) > bounds.max_path_bytes
                                     || metadata_charge > bounds.max_metadata_bytes
@@ -2430,7 +2432,9 @@ fn retained_scan_step(
                                         path: scan.directories[*directory_index].path.clone(),
                                         source,
                                     })?;
-                                let path = entry.path();
+                                let path = scan.directories[*directory_index]
+                                    .path
+                                    .join(entry.file_name());
                                 if path.extension().and_then(|value| value.to_str())
                                     != Some("jsonl")
                                 {
