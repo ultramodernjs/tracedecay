@@ -23,6 +23,18 @@ common --repo_env=RUSTC_BOOTSTRAP=1
 # Hosts can extend this repository profile with their private fleet settings.
 build --config=tracedecay
 build:tracedecay --@rules_rust//rust/toolchain/channel=nightly
+build --config=dev
+# Development uses Cargo's cheaper workspace policy. External kernels keep
+# their perf optimization, and release/dist still select compilation_mode=opt.
+build:dev --//:workspace_rust_profile=dev
+build:perf --//:workspace_rust_profile=perf
+# Metadata feedback is not a linked build or a test run. Select supported Rust
+# targets explicitly; targets without metadata outputs are skipped. Build tools
+# still compile, and binary metadata can require dependency rlibs.
+build:check --//:workspace_rust_profile=dev
+build:check --@rules_rust//rust/settings:pipelined_compilation=true
+build:check --@rules_rust//rust/settings:always_enable_metadata_output_groups=true
+build:check --output_groups=build_metadata
 build --incompatible_enable_cc_toolchain_resolution
 build --action_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
 build --workspace_status_command=scripts/bazel/workspace_status.sh
@@ -85,6 +97,7 @@ build:dist --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
 build:dist --@rules_rust//rust/settings:extra_rustc_flag=-Cembed-bitcode=yes
 
 # Hosted CI: keep going past one failure so a run reports every red target.
+build:ci --config=perf
 build:ci --keep_going
 build:ci --show_timestamps
 test:ci --test_summary=terse

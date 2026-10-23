@@ -3,6 +3,34 @@ load("//scripts:bazel/rust_test.bzl", "rust_test")
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
+py_test(
+    name = "gen_builds_profiles_test",
+    size = "small",
+    srcs = ["test-gen-builds-profiles.py"],
+    main = "test-gen-builds-profiles.py",
+    data = [
+        "bazel/gen_builds.py",
+        "//:Cargo.toml",
+    ],
+    legacy_create_init = 0,
+)
+
+py_binary(
+    name = "measure_builds",
+    srcs = ["bazel/measure_builds.py"],
+    main = "bazel/measure_builds.py",
+    legacy_create_init = 0,
+)
+
+py_test(
+    name = "build_measurements_test",
+    size = "small",
+    srcs = ["test-bazel-build-measurements.py"],
+    main = "test-bazel-build-measurements.py",
+    data = ["bazel/measure_builds.py"],
+    legacy_create_init = 0,
+)
+
 py_binary(
     name = "measure_unused_tool_context",
     srcs = ["measure-unused-tool-context.py"],

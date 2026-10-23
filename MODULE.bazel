@@ -19,6 +19,8 @@ single_version_override(
         "//scripts:bazel/patches/rules-rust-windows-file-url-path-deps.patch",
         # Genrule tools must include Rustfmt's compiler runtime libraries.
         "//scripts:bazel/patches/rules-rust-rustfmt-runtime-inputs.patch",
+        # Test metadata must preserve inherited env and rustc's output suffix.
+        "//scripts:bazel/patches/rules-rust-test-metadata.patch",
     ],
     patch_strip = 1,
 )

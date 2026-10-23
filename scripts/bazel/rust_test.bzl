@@ -161,12 +161,18 @@ def _isolated_rust_test_impl(ctx):
     environment["RUSTC_WRAPPER"] = ""
     environment["RUSTC_WORKSPACE_WRAPPER"] = ""
     environment.setdefault("RUST_TEST_THREADS", "4")
+    output_groups = {"clippy_checks": depset()}
+    if OutputGroupInfo in ctx.attr.test_binary:
+        binary_groups = ctx.attr.test_binary[OutputGroupInfo]
+        output_groups["clippy_checks"] = getattr(binary_groups, "clippy_checks", depset())
+        # rules_rust test binaries expose metadata only when
+        # always_enable_metadata_output_groups is enabled. Do not fabricate
+        # an empty group and call an unsupported metadata build a check.
+        if hasattr(binary_groups, "build_metadata"):
+            output_groups["build_metadata"] = binary_groups.build_metadata
     return [
         DefaultInfo(executable = executable, runfiles = runfiles),
-        OutputGroupInfo(
-            clippy_checks = getattr(ctx.attr.test_binary[OutputGroupInfo], "clippy_checks", depset())
-            if OutputGroupInfo in ctx.attr.test_binary else depset(),
-        ),
+        OutputGroupInfo(**output_groups),
         RunEnvironmentInfo(
             environment = environment,
             inherited_environment = [
@@ -212,14 +218,20 @@ def compiler_fixture_test(name, test_binary, **kwargs):
         **kwargs
     )
 
-def perf_rustc_flags(opt_level):
-    """The Cargo `perf` profile for one crate outside `-c opt`: its opt-level
-    with debug assertions and overflow checks. `-c opt` (release) keeps the
-    toolchain's opt-level 3 without them."""
+def profile_rustc_flags(dev_opt_level, perf_opt_level):
+    """Select workspace Cargo dev/perf optimization; external kernels stay perf."""
     return select({
         "//:opt_mode": [],
+        # This specializes both overlapping settings, so release wins even
+        # when callers combine --//:workspace_rust_profile=dev with -c opt.
+        "//:dev_opt_mode": [],
+        "//:dev_profile": [
+            "-Copt-level={}".format(dev_opt_level),
+            "-Cdebug-assertions=on",
+            "-Coverflow-checks=on",
+        ],
         "//conditions:default": [
-            "-Copt-level={}".format(opt_level),
+            "-Copt-level={}".format(perf_opt_level),
             "-Cdebug-assertions=on",
             "-Coverflow-checks=on",
         ],

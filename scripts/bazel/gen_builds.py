@@ -300,23 +300,57 @@ def run(cmd, cwd=REPO):
     return _ANSI.sub("", out.stdout)
 
 
-def perf_opt_levels():
-    """Cargo `perf` opt-level per package name, the profile hosted CI tests
-    with. `perf` inherits `dev`, so a package resolves to its perf override,
-    then its dev override, then the perf and dev profile defaults."""
-    profiles = tomllib.loads((REPO / "Cargo.toml").read_text(encoding="utf-8"))["profile"]
-    perf = profiles.get("perf", {})
-    dev = profiles.get("dev", {})
-    default = perf.get("opt-level", dev.get("opt-level", 0))
-    names = set(perf.get("package", {})) | set(dev.get("package", {}))
+def profile_opt_levels(profiles, name):
+    """Resolve Cargo opt-level inheritance, keeping package overrides separate.
+
+    A child profile's global opt-level does not replace inherited package
+    overrides. The `*` package override applies only to non-workspace crates.
+    """
+    chain = []
+    current = name
+    builtin_parents = {"test": "dev", "bench": "release"}
+    while current is not None:
+        if current in chain:
+            sys.exit(f"profile inheritance cycle: {' -> '.join(chain + [current])}")
+        if current not in profiles and current not in {"dev", "release", "test", "bench"}:
+            sys.exit(f"unknown Cargo profile {current!r}")
+        chain.append(current)
+        profile = profiles.get(current, {})
+        parent = profile.get("inherits", builtin_parents.get(current))
+        if parent is None and current not in {"dev", "release"}:
+            sys.exit(f"Cargo profile {current!r} must declare inherits")
+        current = parent
+
+    default = 3 if chain[-1] == "release" else 0
     levels = {}
-    for name in names - {"*"}:
-        for profile in (perf, dev):
-            level = profile.get("package", {}).get(name, {}).get("opt-level")
-            if level is not None:
-                levels[name] = level
-                break
+    for current in reversed(chain):
+        profile = profiles.get(current, {})
+        default = profile.get("opt-level", default)
+        for package, settings in profile.get("package", {}).items():
+            if "opt-level" in settings:
+                levels[package] = settings["opt-level"]
     return default, levels
+
+
+def package_opt_level(profile, name, *, workspace_member):
+    """Apply named overrides before external-only wildcard and profile defaults."""
+    default, levels = profile
+    return levels.get(name, default if workspace_member else levels.get("*", default))
+
+
+def external_perf_flags(locked, members, perf_profile):
+    """Keep external kernels at their baseline perf levels in every workspace profile."""
+    _, levels = perf_profile
+    lines = []
+    for package in sorted(locked, key=lambda pkg: (pkg["name"], pkg["version"])):
+        level = levels.get(package["name"])
+        if package["name"] in members or level is None:
+            continue
+        prefix = f"external/rules_rust++crate+{CRATE_HUB}__{package['name']}-{package['version']}/"
+        lines.append(
+            f'build "--@rules_rust//rust/settings:per_crate_rustc_flag={prefix}@-Copt-level={level}"'
+        )
+    return lines
 
 
 def cargo_metadata():
@@ -640,7 +674,11 @@ def main():
         sys.exit("usage: gen_builds.py [--check]")
     check_only = sys.argv[1:] == ["--check"]
     meta = cargo_metadata()
-    opt_default, opt_levels = perf_opt_levels()
+    cargo_profiles = tomllib.loads((REPO / "Cargo.toml").read_text(encoding="utf-8")).get("profile", {})
+    opt_profiles = {
+        name: profile_opt_levels(cargo_profiles, name)
+        for name in ("dev", "perf")
+    }
     members = {p["name"]: p for p in meta["packages"]}
     dir_of = {
         p["name"]: Path(p["manifest_path"]).parent.relative_to(REPO).as_posix()
@@ -1095,11 +1133,12 @@ def main():
             lines.append("    },")
             return "\n".join(lines)
 
-        # Mirror the Cargo `perf` profile hosted CI tests with: the package's
-        # opt-level with debug assertions and overflow checks on. `-c opt`
-        # (release) keeps the toolchain's own opt-level 3 without assertions.
+        # Workspace profiles keep assertions on; release takes precedence.
+        # External kernel policy stays at perf levels in either selection.
         rustc_flags_attr = (
-            f"    rustc_flags = perf_rustc_flags({opt_levels.get(name, opt_default)}),"
+            "    rustc_flags = profile_rustc_flags("
+            f"dev_opt_level = {json.dumps(package_opt_level(opt_profiles['dev'], name, workspace_member=True))}, "
+            f"perf_opt_level = {json.dumps(package_opt_level(opt_profiles['perf'], name, workspace_member=True))}),"
         )
         used_names = set()
 
@@ -1138,7 +1177,7 @@ def main():
             f'load("@{CRATE_HUB}//:defs.bzl", "aliases", "all_crate_deps", "crate_edition")\n'
             'load("@rules_rust//cargo:defs.bzl", "cargo_build_script")\n'
             'load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")\n'
-            'load("//scripts:bazel/rust_test.bzl", "perf_rustc_flags", "rust_test")\n'
+            'load("//scripts:bazel/rust_test.bzl", "profile_rustc_flags", "rust_test")\n'
         )
 
         if lib_t:
@@ -1641,20 +1680,13 @@ def main():
             return None
         return BANNER + "\n" + block + "\n"
 
-    # External crates Cargo's perf profile optimizes past the dev default.
+    # External kernels keep the baseline perf policy. Workspace dev/perf
+    # selection must not append flags that override release or dist.
     # rules_rust matches per-crate flags on a prefix of the crate root's exec
     # path, which carries the canonical name of the crate_universe repository
     # (`rules_rust++crate+<hub>__<name>-<version>`).
     locked = tomllib.loads((REPO / "Cargo.lock").read_text(encoding="utf-8"))["package"]
-    external_flags = []
-    for package in sorted(locked, key=lambda pkg: (pkg["name"], pkg["version"])):
-        level = opt_levels.get(package["name"])
-        if package["name"] in members or level is None:
-            continue
-        prefix = f"external/rules_rust++crate+{CRATE_HUB}__{package['name']}-{package['version']}/"
-        external_flags.append(
-            f'build "--@rules_rust//rust/settings:per_crate_rustc_flag={prefix}@-Copt-level={level}"'
-        )
+    external_flags = external_perf_flags(locked, members, opt_profiles["perf"])
     bazelrc = REPO / ".bazelrc"
     rc_block = (
         GEN_BEGIN

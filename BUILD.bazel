@@ -1,5 +1,6 @@
 load("@npm//:defs.bzl", "npm_link_all_packages")
 load("@rules_rust//rust:toolchain.bzl", "current_rustfmt_toolchain")
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
 
 current_rustfmt_toolchain(
     name = "rustfmt_toolchain",
@@ -35,10 +36,32 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+string_flag(
+    name = "workspace_rust_profile",
+    build_setting_default = "dev",
+    values = ["dev", "perf"],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "dev_profile",
+    flag_values = {":workspace_rust_profile": "dev"},
+    visibility = ["//visibility:public"],
+)
+
 # `-c opt` is the release build: generated Rust targets drop their Cargo
-# `perf` opt-level and debug assertions under it (scripts/bazel/gen_builds.py).
+# dev/perf opt-level and debug assertions under it.
 config_setting(
     name = "opt_mode",
+    values = {"compilation_mode": "opt"},
+    visibility = ["//visibility:public"],
+)
+
+# Specialize dev_profile and opt_mode together so select() is unambiguous
+# and release wins regardless of the selected feedback profile.
+config_setting(
+    name = "dev_opt_mode",
+    flag_values = {":workspace_rust_profile": "dev"},
     values = {"compilation_mode": "opt"},
     visibility = ["//visibility:public"],
 )
