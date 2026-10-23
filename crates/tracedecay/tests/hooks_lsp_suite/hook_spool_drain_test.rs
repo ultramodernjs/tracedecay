@@ -230,36 +230,10 @@ fn pending_producer_failure(status: &serde_json::Value) -> bool {
         })
 }
 
-/// Transport settlement does not complete Cursor's native producer prerequisite.
-/// These fixtures have no native conversation database to supply that work.
-fn assert_only_producer_work_owed(home: &Path, project: &Path) {
-    let status = await_hook_replay_status(
-        home,
-        project,
-        |status| {
-            pending_producer_failure(status)
-                && status["failures"]
-                    .as_array()
-                    .is_some_and(|failures| failures.len() == 1)
-        },
-        PROMPT_DRAIN,
-    );
-    assert!(
-        pending_producer_failure(&status),
-        "producer work must remain truthfully owed: {status}"
-    );
-    assert_eq!(
-        status["failures"].as_array().unwrap().len(),
-        1,
-        "settled transports must have no remaining failure: {status}"
-    );
-}
-
 /// Stop boundaries can finish feedback and park awaiting a lifecycle, or be
 /// superseded by a newer stop. Neither needs a native conversation database
-/// to settle its producer debt. Receipt-only journeys therefore require the
-/// transports to settle, not that producer execution lose a race with status.
-/// Saved-edit journeys still require their missing native prerequisite above.
+/// to settle its producer debt. Journeys therefore require the transports to
+/// settle, not that producer execution lose a race with status.
 fn assert_transports_settled(home: &Path, project: &Path) {
     let settled = |status: &serde_json::Value| {
         status == &json!({ "status": "drained" })
