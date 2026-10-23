@@ -803,7 +803,9 @@ fn admitted_edit_sequence(log: &str, root: &Path) -> Option<u64> {
             ("project", root.display().to_string()),
             (
                 "paths_digest",
-                sha256_hex(format!("{:?}", ["src/lib.rs"]).as_bytes()),
+                // Admission hashes native relative PathBufs, whose Debug spelling
+                // contains escaped backslashes on Windows, not slash strings.
+                sha256_hex(format!("{:?}", [Path::new("src").join("lib.rs")]).as_bytes()),
             ),
         ],
     );
