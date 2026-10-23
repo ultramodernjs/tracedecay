@@ -143,7 +143,7 @@ fn codex_completed_agent_message_refuses_private_or_malformed_shapes() {
 }
 
 #[test]
-fn codex_response_item_does_not_duplicate_completed_agent_message() {
+fn codex_response_item_preserves_assistant_message() {
     let native = json!({
         "type": "response_item", "payload": {
             "type": "message", "role": "assistant", "id": "agent-message-native-42",
@@ -160,12 +160,15 @@ fn codex_response_item_does_not_duplicate_completed_agent_message() {
     )
     .unwrap();
 
+    // Codex response_item rows are messages in their own right, including
+    // rollouts without a matching item_completed event.
     assert!(matches!(
         envelope.facts(),
-        [CanonicalObservationFactV1::Unknown {
-            native_kind,
-            state: CanonicalUnknownStateV1::Unsupported,
-        }] if native_kind == "response_item.message.assistant"
+        [CanonicalObservationFactV1::Message {
+            role: CanonicalMessageRoleV1::Assistant,
+            content,
+            ..
+        }] if content == &native["payload"]["content"]
     ));
 }
 
