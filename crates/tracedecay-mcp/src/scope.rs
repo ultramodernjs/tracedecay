@@ -196,6 +196,12 @@ mod tests {
         );
     }
 
+    fn canonical_root(root: &Path) -> std::path::PathBuf {
+        // Match the resolver's host spelling; Git for Windows also rejects
+        // the verbatim prefix returned by std::fs::canonicalize.
+        tracedecay_runtime_core::path_safety::canonical_existing_identity(root).unwrap()
+    }
+
     fn init_repo(root: &Path) {
         git(root, &["init", "-q", "-b", "main"]);
         git(root, &["config", "user.email", "t@t.com"]);
@@ -236,7 +242,7 @@ mod tests {
     #[test]
     fn subdirectory_request_converges_to_registered_canonical_root() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().pipe_canonical_identity_placeholder();
+        let root = canonical_root(temp.path());
         init_repo(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
         let subdir = root.join("src/deep");
@@ -256,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn enrolled_monorepo_package_retains_its_path_local_scope() {
         let temp = TempDir::new().unwrap();
-        let repository = temp.path().pipe_canonical_identity_placeholder();
+        let repository = canonical_root(temp.path());
         init_repo(&repository);
         write_identity_marker(&repository, "project.enclosing-repository");
         let package = repository.join("packages/app");
@@ -298,7 +304,7 @@ mod tests {
     #[test]
     fn relative_requested_root_fails_closed_without_cwd_fallback() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().pipe_canonical_identity_placeholder();
+        let root = canonical_root(temp.path());
         let owner = owner_for(&root, "project.mcp-scope-test");
 
         let error = resolve_query_scope(&owner, Path::new("relative/root")).unwrap_err();
@@ -312,7 +318,7 @@ mod tests {
     #[test]
     fn noncanonical_project_id_fails_closed_without_normalization() {
         let temp = TempDir::new().unwrap();
-        let root = temp.path().pipe_canonical_identity_placeholder();
+        let root = canonical_root(temp.path());
         let owner = owner_for(&root, " project.mcp-scope-test");
 
         let error = resolve_query_scope(&owner, &root).unwrap_err();
@@ -328,7 +334,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let registered = temp.path().join("registered");
         std::fs::create_dir_all(&registered).unwrap();
-        let registered = registered.pipe_canonical_identity_placeholder();
+        let registered = canonical_root(&registered);
         init_repo(&registered);
         write_identity_marker(&registered, "project.mcp-scope-test");
         let owner = owner_for(&registered, "project.mcp-scope-test");
@@ -353,7 +359,7 @@ mod tests {
         let root = temp.path().join("main-checkout");
         std::fs::create_dir_all(&root).unwrap();
         init_repo(&root);
-        let root = root.pipe_canonical_identity_placeholder();
+        let root = canonical_root(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
         let linked = root.join(".claude/worktrees/linked-feature");
         git(
@@ -366,7 +372,7 @@ mod tests {
                 "feature",
             ],
         );
-        let linked = linked.pipe_canonical_identity_placeholder();
+        let linked = canonical_root(&linked);
         let owner = owner_for(&root, "project.mcp-scope-test");
 
         let main_scope = resolve_query_scope(&owner, &root).unwrap();
@@ -403,7 +409,7 @@ mod tests {
         let root = temp.path().join("main-checkout");
         std::fs::create_dir_all(&root).unwrap();
         init_repo(&root);
-        let root = root.pipe_canonical_identity_placeholder();
+        let root = canonical_root(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
         let linked = temp.path().join("linked-feature");
         git(
@@ -416,7 +422,7 @@ mod tests {
                 "feature-dotdot",
             ],
         );
-        let linked = linked.pipe_canonical_identity_placeholder();
+        let linked = canonical_root(&linked);
         let requested = root.join("../linked-feature");
         let owner = owner_for(&root, "project.mcp-scope-test");
         let project_id = tracedecay_domain::ProjectId::new("project.mcp-scope-test").unwrap();
@@ -441,7 +447,7 @@ mod tests {
         let root = temp.path().join("main-checkout");
         std::fs::create_dir_all(&root).unwrap();
         init_repo(&root);
-        let root = root.pipe_canonical_identity_placeholder();
+        let root = canonical_root(&root);
         write_identity_marker(&root, "project.mcp-scope-test");
         let linked = temp.path().join("linked-feature");
         git(
@@ -454,7 +460,7 @@ mod tests {
                 "feature-symlink",
             ],
         );
-        let linked = linked.pipe_canonical_identity_placeholder();
+        let linked = canonical_root(&linked);
         let requested = root.join("linked-alias");
         symlink(&linked, &requested).unwrap();
         let owner = owner_for(&root, "project.mcp-scope-test");

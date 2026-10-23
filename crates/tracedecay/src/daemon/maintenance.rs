@@ -2106,6 +2106,9 @@ mod tests {
         }
     }
 
+    // Unlinking a mounted SQLite file is Unix-only: Windows denies deletion
+    // while SQLite holds the file open, so this failure cannot be induced there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_mounted_store_deleted_under_the_daemon_requires_a_restart() {
         let temporary = tempfile::tempdir().expect("store identity fixture root");

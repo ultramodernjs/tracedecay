@@ -29,7 +29,19 @@ fail() {
   exit 2
 }
 
+# Native Bazel/Python use drive-letter paths; MSYS tools use POSIX paths.
+# Normalize once at each boundary (and discard CR from Windows bazel info).
+shell_path() {
+  local path="${1%$'\r'}"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
 if [[ -n "${TRACEDECAY_BIN:-}" ]]; then
+  TRACEDECAY_BIN="$(shell_path "$TRACEDECAY_BIN")"
   [[ -f "$TRACEDECAY_BIN" && -x "$TRACEDECAY_BIN" ]] ||
     fail "TRACEDECAY_BIN=$TRACEDECAY_BIN is not an executable file; unset it to build the default with: $build_cmd"
   bin="$(cd "$(dirname "$TRACEDECAY_BIN")" && pwd)/$(basename "$TRACEDECAY_BIN")"
@@ -42,6 +54,7 @@ else
     fail "eval binary build failed; not reusing any older binary. Reproduce with: $build_cmd"
   bazel_bin="$(cd "$repo_root" && bazel info --config="$config" bazel-bin)" ||
     fail "could not resolve the Bazel output directory (bazel info --config=$config bazel-bin)"
+  bazel_bin="$(shell_path "$bazel_bin")"
   exe=""
   case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) exe=".exe" ;;
@@ -59,4 +72,10 @@ else
 fi
 version="$("$bin" --version 2>/dev/null | head -1)" || version=unknown
 echo "eval binary: $bin ($origin; ${version:-unknown}; sha256 ${digest%% *})" >&2
-printf '%s\n' "$bin"
+# Forward-slash drive-letter paths work for native Python as well as Bash,
+# including when this result is carried into an isolated re-entry.
+if command -v cygpath >/dev/null 2>&1; then
+  cygpath -am "$bin"
+else
+  printf '%s\n' "$bin"
+fi

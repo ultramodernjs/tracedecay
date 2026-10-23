@@ -161,6 +161,32 @@ pub(super) mod fake {
         InstalledClock(previous)
     }
 
+    #[cfg(all(test, feature = "test-runtime"))]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn statement_clock_uses_canonical_database_identity() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("clock.sqlite3");
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            std::fs::create_dir(directory.path().join("nested")).unwrap();
+            let alias = directory.path().join("nested/../clock.sqlite3");
+            let tick = Duration::from_secs(10);
+            {
+                let _registration = StatementClock::ticking(&path, tick);
+                let canonical = clock_for_path(&path).unwrap();
+                let aliased = clock_for_path(&alias).unwrap();
+                assert!(Arc::ptr_eq(&canonical, &aliased));
+                let _installed = for_statement(&connection);
+                let first = now();
+                assert_eq!(now().duration_since(first), tick);
+            }
+            assert!(clock_for_path(&path).is_none());
+            assert!(clock_for_path(&alias).is_none());
+        }
+    }
+
     #[cfg(test)]
     #[derive(Default)]
     pub(crate) struct TaskClock(Option<Arc<FakeClock>>);
