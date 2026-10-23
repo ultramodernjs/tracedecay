@@ -196,6 +196,11 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
     );
     let store = TempDir::new().expect("store root");
     let (registry, request, _) = admit_package(&fixture, &store).await;
+    // Freeze the retained publication before invalidating its ignored-source
+    // proof. Reconciling the changed checkout first may legally publish a
+    // successor with an empty roster (see the test above), leaving nothing for
+    // the restart to refuse and making the park wait depend on host timing.
+    registry.shutdown().await;
     git(
         fixture.path(),
         &["add", "-f", "node_modules/pkg/index.d.ts"],
@@ -204,8 +209,6 @@ export function GenerationAnchor(value: PublicWidget) { return value; }
         fixture.path(),
         &["commit", "-qm", "track dependency source"],
     );
-    reconcile_through_worker(&registry, fixture.path(), &request.scope).await;
-    registry.shutdown().await;
 
     let restarted = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
     let (projection_entered, release_projection) =

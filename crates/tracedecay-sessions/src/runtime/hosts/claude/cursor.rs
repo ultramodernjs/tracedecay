@@ -43,6 +43,22 @@ pub(super) fn claude_cursor_key(path: &Path) -> TranscriptCursorKey {
     TranscriptCursorKey::opaque(claude_non_unicode_cursor_key(path))
 }
 
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::*;
+
+    #[test]
+    fn observation_path_identity_matches_both_windows_separators() {
+        let projects = Path::new(r"C:\home\.claude\projects");
+        let native = Path::new(r"C:\home\.claude\projects\other-project\session.jsonl");
+        let supplied = Path::new(r"C:\home\.claude/projects/other-project/session.jsonl");
+        assert_eq!(
+            claude_observation_path_source_id(projects, native),
+            claude_observation_path_source_id(projects, supplied),
+        );
+    }
+}
+
 fn claude_non_unicode_cursor_key(path: &Path) -> String {
     encode_cursor_key(
         claude_native_platform(),

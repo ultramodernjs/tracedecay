@@ -1814,6 +1814,25 @@ mod recent_first_discovery_tests {
         read_codex_history_frontier, read_host_provider_coverage,
     };
 
+    #[cfg(windows)]
+    #[test]
+    fn cursor_and_corpus_hashes_match_both_windows_separators() {
+        use sha2::{Digest, Sha256};
+
+        let native = Path::new(r"C:\home\.codex\sessions\2026\10\09\rollout.jsonl");
+        let supplied = Path::new(r"C:\home\.codex/sessions/2026/10/09/rollout.jsonl");
+        assert_eq!(
+            crate::runtime::hosts::codex::codex_cursor_key(native),
+            crate::runtime::hosts::codex::codex_cursor_key(supplied),
+        );
+        let digest = |path: &Path| {
+            let mut hasher = Sha256::new();
+            crate::runtime::hosts::codex::hash_path(&mut hasher, path);
+            hasher.finalize()
+        };
+        assert_eq!(digest(native), digest(supplied));
+    }
+
     /// Creates `sessions/YYYY/MM/DD/rollout-<name>.jsonl` under the Codex home.
     fn write_dated_rollout(home: &Path, date: (&str, &str, &str), name: &str) -> PathBuf {
         let dir = home
