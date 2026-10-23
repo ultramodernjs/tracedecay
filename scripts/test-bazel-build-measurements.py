@@ -6,7 +6,7 @@ from contextlib import redirect_stderr
 import io
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import signal
 import tempfile
@@ -308,6 +308,56 @@ class Measurements(unittest.TestCase):
             with M.invalidate({self.source: self.original}, "sample"):
                 self.assertEqual(self.source.read_bytes(), self.original
                                  + b"\n// tracedecay build measurement sample\n")
+        self.assertEqual(self.source.read_bytes(), self.original)
+
+    def test_windows_text_translation_does_not_change_marker_bytes(self):
+        open_file, write = M.os.open, M.os.write
+        native_binary = getattr(M.os, "O_BINARY", 0)
+        binary_flag = native_binary or (1 << 30)
+        binary_modes = {}
+
+        def windows_open(path, flags):
+            # Keep the real descriptor binary even on Windows, so the shim
+            # applies CRT text translation exactly once on every platform.
+            descriptor = open_file(path, (flags & ~binary_flag) | native_binary)
+            binary_modes[descriptor] = bool(flags & binary_flag)
+            return descriptor
+
+        def windows_write(descriptor, data):
+            if binary_modes[descriptor]:
+                return write(descriptor, data)
+            translated = data.replace(b"\n", b"\r\n")
+            self.assertEqual(write(descriptor, translated), len(translated))
+            return len(data)
+
+        marker = b"\n// tracedecay build measurement sample\n"
+        peer_suffix = b"// peer edit\r\n"
+        with patch.object(M.os, "O_BINARY", binary_flag, create=True), \
+                patch.object(M.os, "open", windows_open), \
+                patch.object(M.os, "write", windows_write):
+            with M.invalidate({self.source: self.original}, "sample"):
+                self.assertEqual(self.source.read_bytes(), self.original + marker)
+            self.assertEqual(self.source.read_bytes(), self.original)
+
+            with self.assertRaisesRegex(M.SourceConflict, "unexpected edit"):
+                with M.invalidate({self.source: self.original}, "sample"):
+                    with self.source.open("ab") as source:
+                        source.write(peer_suffix)
+            self.assertEqual(self.source.read_bytes(), self.original + marker + peer_suffix)
+
+    def test_windows_relative_paths_match_bazel_source_roots(self):
+        class WindowsRelativePath(type(self.source)):
+            def relative_to(self, *args):
+                return PureWindowsPath(*super().relative_to(*args).parts)
+
+        source = WindowsRelativePath(self.source)
+        ticks = iter((0.0, 1.0))
+        row = M.sample(
+            self.options(), "dev:false:1", self.root / "sample",
+            {source: self.original}, self.root, "sample",
+            run=self.fake_run, clock=lambda: next(ticks), execroot=self.execroot)
+        self.assertTrue(row["eligible"], row["errors"])
+        self.assertEqual(row["execution"]["invalidated_roots_not_executed"], [])
         self.assertEqual(self.source.read_bytes(), self.original)
 
     def test_partial_append_with_peer_suffix_is_not_removed(self):

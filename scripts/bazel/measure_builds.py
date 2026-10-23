@@ -53,7 +53,9 @@ def invalidate(originals, token):
             if path.read_bytes() != original:
                 raise SourceConflict(f"source changed before invalidation: {path}")
             marker = f"\n// tracedecay build measurement {token}\n".encode()
-            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND)
+            # Windows CRT text mode translates LF even for os.write(bytes).
+            # Cleanup must see the exact marker bytes, including partial writes.
+            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0))
             changed[path] = [marker, False]
             try:
                 pending = marker
@@ -341,7 +343,7 @@ def sample(options, config, directory, originals, root, token,
     finally:
         # Even interruption or restoration conflict leaves the raw outcome on disk.
         (directory / "sample.json").write_text(json.dumps(row, indent=2) + "\n")
-    invalidated = [str(p.relative_to(root)) for p in originals]
+    invalidated = [p.relative_to(root).as_posix() for p in originals]
     for name, read in (
         ("log", lambda: parse_log((directory / "build.log").read_text())),
         ("bep", lambda: parse_bep(directory / "bep.json")),
